@@ -31,115 +31,139 @@ interface TimelineEntry {
   sortTime?: number;
 }
 
+export interface TimelinePayload {
+  items: PrReviewItem[];
+  error?: string;
+  rateLimited?: boolean;
+  truncated?: boolean;
+}
+
+interface SourceBucket {
+  kind: PrReviewItemKind;
+  collected: TimelineEntry[];
+  bytes: number;
+  truncated: boolean;
+  seenRows: Map<string, string>;
+}
+
+export class TimelineCollector {
+  private readonly buckets = new Map<string, SourceBucket>();
+  private readonly itemQuota: number;
+  private readonly byteQuota: number;
+  private readonly errors: string[] = [];
+  private rateLimitedFlag = false;
+
+  constructor(sources: readonly CommentSourceOp[]) {
+    const sourceCount = Math.max(sources.length, 1);
+    this.itemQuota = Math.max(1, Math.floor(TIMELINE_MAX_ITEMS / sourceCount));
+    this.byteQuota = Math.max(1, Math.floor(TIMELINE_MAX_BYTES / sourceCount));
+  }
+
+  admitPage(source: CommentSourceOp, pageRows: readonly NormalizedRow[]): void {
+    const bucket = this.bucket(source);
+    for (const row of pageRows) {
+      if (row.system === true) continue;
+      const id = String(row.id);
+      const digest = rowBodyDigest(row);
+      if (bucket.seenRows.get(id) === digest) continue;
+      bucket.seenRows.set(id, digest);
+      const entry = projectRow(source.key, bucket.kind, row);
+      const size = Buffer.byteLength(JSON.stringify(entry.item), 'utf8') + 1;
+      if (bucket.collected.length >= this.itemQuota || bucket.bytes + size > this.byteQuota) {
+        bucket.truncated = true;
+        break;
+      }
+      bucket.bytes += size;
+      bucket.collected.push(entry);
+    }
+  }
+
+  overQuota(source: CommentSourceOp): boolean {
+    const bucket = this.bucket(source);
+    if (bucket.truncated) return true;
+    if (bucket.collected.length >= this.itemQuota || bucket.bytes >= this.byteQuota) {
+      bucket.truncated = true;
+      return true;
+    }
+    return false;
+  }
+
+  noteFailure(sourceKey: string, error: unknown): void {
+    this.errors.push(`${sourceKey}: ${safeDriverErrorText(error)}`);
+    this.buckets.delete(sourceKey);
+    if (error instanceof DriverOpError && error.info.errorClass === 'RATE_LIMIT') {
+      this.rateLimitedFlag = true;
+    }
+  }
+
+  get rateLimited(): boolean {
+    return this.rateLimitedFlag;
+  }
+
+  assemble(): TimelinePayload {
+    const entries: TimelineEntry[] = [];
+    let truncated = false;
+    for (const bucket of this.buckets.values()) {
+      entries.push(...bucket.collected);
+      if (bucket.truncated) truncated = true;
+    }
+    sortTimeline(entries);
+    return {
+      items: entries.map(e => e.item),
+      ...(this.errors.length > 0 ? { error: this.errors.join('; ') } : {}),
+      ...(this.rateLimitedFlag ? { rateLimited: true } : {}),
+      ...(truncated ? { truncated: true } : {}),
+    };
+  }
+
+  private bucket(source: CommentSourceOp): SourceBucket {
+    let bucket = this.buckets.get(source.key);
+    if (!bucket) {
+      bucket = {
+        kind: KIND_BY_CLASS[classifyCommentSource(source)],
+        collected: [],
+        bytes: 0,
+        truncated: false,
+        seenRows: new Map(),
+      };
+      this.buckets.set(source.key, bucket);
+    }
+    return bucket;
+  }
+}
+
 export async function buildDriverReviewTimeline(
   driver: TimelineSourceReader,
   prNumber: number,
-): Promise<{ items: PrReviewItem[]; error?: string; rateLimited?: boolean; truncated?: boolean }> {
-  const entries: TimelineEntry[] = [];
-  const errors: string[] = [];
-  let rateLimited = false;
-  let truncated = false;
-  const sourceCount = Math.max(driver.commentSources.length, 1);
-  const itemQuota = Math.max(1, Math.floor(TIMELINE_MAX_ITEMS / sourceCount));
-  const byteQuota = Math.max(1, Math.floor(TIMELINE_MAX_BYTES / sourceCount));
+): Promise<TimelinePayload> {
+  const collector = new TimelineCollector(driver.commentSources);
   for (const source of driver.commentSources) {
-    const kind = KIND_BY_CLASS[classifyCommentSource(source)];
-    const collected: TimelineEntry[] = [];
-    let sourceBytes = 0;
-    let sourceTruncated = false;
-    const markTruncated = (): void => {
-      sourceTruncated = true;
-      truncated = true;
-    };
-    const overQuota = (): boolean => {
-      if (sourceTruncated) return true;
-      if (collected.length >= itemQuota || sourceBytes >= byteQuota) {
-        markTruncated();
-        return true;
-      }
-      return false;
-    };
-    const seenRows = new Map<string, string>();
-    const admit = (pageRows: NormalizedRow[]): void => {
-      for (const row of pageRows) {
-        compactRowForTimeline(row);
-        if (row.system === true) continue;
-        const id = String(row.id);
-        const digest = String(row.bodyDigest ?? '');
-        if (seenRows.get(id) === digest) continue;
-        seenRows.set(id, digest);
-        const entry = projectRow(source.key, kind, row);
-        const size = Buffer.byteLength(JSON.stringify(entry.item), 'utf8') + 1;
-        if (collected.length >= itemQuota || sourceBytes + size > byteQuota) {
-          markTruncated();
-          break;
-        }
-        sourceBytes += size;
-        collected.push(entry);
-      }
-    };
     let pagedInline = false;
-    let rows: NormalizedRow[];
     try {
-      rows = await driver.runCommentSource(
+      const rows = await driver.runCommentSource(
         source,
         { prNumber },
         pageRows => {
           pagedInline = true;
-          admit(pageRows);
-          return pageRows.map(r => ({ id: r.id, bodyDigest: r.bodyDigest }));
+          collector.admitPage(source, pageRows);
+          return pageRows.map(r => ({ id: r.id, bodyDigest: rowBodyDigest(r) }));
         },
-        () => overQuota(),
+        () => collector.overQuota(source),
       );
-      if (!pagedInline) admit(rows);
-      entries.push(...collected);
+      if (!pagedInline) collector.admitPage(source, rows);
     } catch (err) {
       console.warn(`[review-timeline] source ${source.key} failed:`, safeDriverErrorText(err));
-      errors.push(`${source.key}: ${safeDriverErrorText(err)}`);
-      if (err instanceof DriverOpError && err.info.errorClass === 'RATE_LIMIT') {
-        rateLimited = true;
-        break;
-      }
-      continue;
+      collector.noteFailure(source.key, err);
+      if (collector.rateLimited) break;
     }
   }
-  sortTimeline(entries);
-  return {
-    items: entries.map(e => e.item),
-    ...(errors.length > 0 ? { error: errors.join('; ') } : {}),
-    ...(rateLimited ? { rateLimited: true } : {}),
-    ...(truncated ? { truncated: true } : {}),
-  };
-}
-
-interface TimelineBodyStash {
-  timelineToken?: ReturnType<typeof rowTokens>[number];
-  timelineBody: { body?: string; bodyTruncated?: boolean };
-}
-
-function compactRowForTimeline(row: NormalizedRow): void {
-  const token = rowTokens(row)[0];
-  if (row.bodyDigest === undefined) row.bodyDigest = rowBodyDigest(row);
-  const body = sizedBody(stripBaxianMarkerLines(typeof row.body === 'string' ? row.body : ''));
-  (row as NormalizedRow & TimelineBodyStash).timelineToken = token;
-  (row as NormalizedRow & TimelineBodyStash).timelineBody = body;
-  delete row.body;
-}
-
-function timelineStash(row: NormalizedRow): TimelineBodyStash {
-  const stashed = row as NormalizedRow & Partial<TimelineBodyStash>;
-  if (stashed.timelineBody !== undefined) {
-    return { timelineToken: stashed.timelineToken, timelineBody: stashed.timelineBody };
-  }
-  return {
-    timelineToken: rowTokens(row)[0],
-    timelineBody: sizedBody(stripBaxianMarkerLines(typeof row.body === 'string' ? row.body : '')),
-  };
+  return collector.assemble();
 }
 
 function projectRow(sourceKey: string, kind: PrReviewItemKind, row: NormalizedRow): TimelineEntry {
   const id = String(row.id);
-  const { timelineToken: token, timelineBody } = timelineStash(row);
+  const token = rowTokens(row)[0];
+  const timelineBody = sizedBody(stripBaxianMarkerLines(typeof row.body === 'string' ? row.body : ''));
   const line = typeof row.line === 'number' ? row.line
     : typeof row.originalLine === 'number' ? row.originalLine : undefined;
   const createdAt = typeof row.createdAt === 'string' ? row.createdAt

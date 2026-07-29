@@ -4,9 +4,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type {
   BaxianConfig,
+  CodeVerdictOutboxEntry,
   SpecVerdictOutboxEntry,
   TaskState,
 } from '../../src/shared/index.js';
+import { taskAttentionGeneration } from '../../src/shared/index.js';
 import {
   DispatchTerminalError, PlatformMergeRecheckError, type AgentManager,
 } from '../../src/agent/manager.js';
@@ -20,6 +22,7 @@ import { DriverOpError } from '../../src/platform/git-driver.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 import type { CommentSourceOp } from '../../src/platform/types.js';
 import { buildAckMarker, buildReviewTokenLine } from '../../src/platform/markers.js';
+import { PrConversationCache, prReviewCacheRevision } from '../../src/platform/pr-conversation-cache.js';
 import { sha256Hex } from '../../src/platform/body-digest.js';
 import { COMMENT_BODY_MAX_BYTES } from '../../src/platform/command-renderer.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
@@ -219,6 +222,12 @@ function specVerdictBody(entry: SpecVerdictOutboxEntry): string {
 function pendingSpecVerdict(task: Pick<TaskState, 'outbox'>): SpecVerdictOutboxEntry | undefined {
   return task.outbox?.find(
     (entry): entry is SpecVerdictOutboxEntry => entry.type === 'git.spec-verdict',
+  );
+}
+
+function pendingCodeVerdict(task: Pick<TaskState, 'outbox'>): CodeVerdictOutboxEntry | undefined {
+  return task.outbox?.find(
+    (entry): entry is CodeVerdictOutboxEntry => entry.type === 'git.code-verdict',
   );
 }
 
@@ -731,6 +740,266 @@ describe('git spec approval gate verdicts', () => {
     expect(pendingSpecVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
     expect(driver.ops).toEqual([]);
     expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('human code verdict delivery', () => {
+  async function seedCodeReview(over: Partial<TaskState> = {}): Promise<TaskState> {
+    return seed({
+      status: 'review',
+      phase: 'code',
+      signalToken: 'aaaa11112222',
+      reviewHeadAnchorSha: SHA1,
+      latestHeadSha: SHA1,
+      passToken: 'abcdef123456',
+      failToken: '123456abcdef',
+      ...over,
+    });
+  }
+
+  it('writes a current-anchor pass marker and leaves transition ownership to the poller', async () => {
+    await seedCodeReview();
+
+    const result = await manager.submitCodeVerdict('task-1', 'pass', 'checked locally');
+
+    expect(result.status).toBe('review');
+    expect(pendingCodeVerdict(result)).toMatchObject({
+      key: 'abcdef123456',
+      data: { writeAttemptedAt: expect.any(String) },
+    });
+    const writes = driver.ops.filter(op => op.op === 'comment');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.vars).toMatchObject({
+      prNumber: 42,
+      body: [
+        'Human code verdict: pass',
+        '',
+        'checked locally',
+        '',
+        buildReviewTokenLine({ kind: 'pass', anchorSha: SHA1, token: 'abcdef123456' }),
+      ].join('\n'),
+    });
+  });
+
+  it('refuses to write a verdict after the live PR head has changed', async () => {
+    await seedCodeReview();
+    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+
+    await expect(manager.submitCodeVerdict('task-1', 'pass'))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(driver.ops.filter(op => op.op === 'comment')).toEqual([]);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
+  });
+
+  it('fails closed when the live PR head cannot be verified', async () => {
+    await seedCodeReview();
+    driver.prView = new Error('platform offline');
+
+    await expect(manager.submitCodeVerdict('task-1', 'pass'))
+      .rejects.toMatchObject({ status: 503 });
+
+    expect(driver.ops.filter(op => op.op === 'comment')).toEqual([]);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
+  });
+
+  it('requires comments for a human request-changes verdict', async () => {
+    await seedCodeReview();
+
+    await expect(manager.submitCodeVerdict('task-1', 'request-changes', '   '))
+      .rejects.toMatchObject({ status: 400 });
+
+    expect(driver.ops).toEqual([]);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
+  });
+
+  it('rejects review markers embedded in human comments', async () => {
+    await seedCodeReview();
+
+    await expect(manager.submitCodeVerdict(
+      'task-1',
+      'pass',
+      buildReviewTokenLine({ kind: 'fail', anchorSha: SHA1, token: '123456abcdef' }),
+    )).rejects.toMatchObject({ status: 400 });
+
+    expect(driver.ops).toEqual([]);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
+  });
+
+  it('rejects an oversized code verdict before recording or writing it', async () => {
+    await seedCodeReview();
+
+    await expect(manager.submitCodeVerdict(
+      'task-1',
+      'pass',
+      'x'.repeat(COMMENT_BODY_MAX_BYTES),
+    )).rejects.toMatchObject({ status: 400 });
+
+    expect(driver.ops).toEqual([]);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
+  });
+
+  it('rejects a verdict when both current tokens are already live', async () => {
+    await seedCodeReview();
+    driver.comments['issue-comments'] = [
+      comment('existing-pass', buildReviewTokenLine({
+        kind: 'pass',
+        anchorSha: SHA1,
+        token: 'abcdef123456',
+      })),
+      comment('existing-fail', buildReviewTokenLine({
+        kind: 'fail',
+        anchorSha: SHA1,
+        token: '123456abcdef',
+      })),
+    ];
+
+    await expect(manager.submitCodeVerdict('task-1', 'pass'))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(driver.ops.filter(op => op.op === 'comment')).toEqual([]);
+  });
+
+  it('requires a new review pass when the selected token was dismissed', async () => {
+    await seedCodeReview();
+    driver.comments.reviews = [
+      comment('dismissed-pass', buildReviewTokenLine({
+        kind: 'pass',
+        anchorSha: SHA1,
+        token: 'abcdef123456',
+      }), { reviewState: 'DISMISSED' }),
+    ];
+
+    await expect(manager.submitCodeVerdict('task-1', 'pass'))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(driver.ops.filter(op => op.op === 'comment')).toEqual([]);
+  });
+
+  it('does not reconcile a verdict from a system-authored marker carrier', async () => {
+    await seedCodeReview();
+    const body = [
+      'Human code verdict: pass',
+      '',
+      buildReviewTokenLine({ kind: 'pass', anchorSha: SHA1, token: 'abcdef123456' }),
+    ].join('\n');
+    driver.comments['issue-comments'] = [
+      comment('system-pass', body, { system: true }),
+    ];
+    driver.commentVisibleAfterWrite = false;
+
+    await expect(manager.submitCodeVerdict('task-1', 'pass'))
+      .rejects.toMatchObject({ status: 503 });
+
+    expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeDefined();
+  });
+
+  it('persists an uncertain write and reconciles it without a duplicate comment', async () => {
+    await seedCodeReview();
+    driver.commentVisibleAfterWrite = false;
+
+    await expect(manager.submitCodeVerdict('task-1', 'request-changes', 'fix the race'))
+      .rejects.toMatchObject({ status: 503 });
+
+    const pendingTask = (await taskStore.get('task-1'))!;
+    const pending = pendingCodeVerdict(pendingTask)!;
+    expect(pending).toMatchObject({
+      key: '123456abcdef',
+      data: {
+        kind: 'fail',
+        anchorSha: SHA1,
+        comments: 'fix the race',
+        writeAttemptedAt: expect.any(String),
+      },
+    });
+    const body = [
+      'Human code verdict: request changes',
+      '',
+      'fix the race',
+      '',
+      buildReviewTokenLine({ kind: 'fail', anchorSha: SHA1, token: '123456abcdef' }),
+    ].join('\n');
+    driver.comments['issue-comments'] = [comment('human-code-1', body)];
+
+    await manager.flushTaskOutboxes();
+
+    expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toEqual(pending);
+  });
+
+  it('retires an uncertain verdict if the PR head changes before recovery', async () => {
+    await seedCodeReview();
+    driver.commentVisibleAfterWrite = false;
+
+    await expect(manager.submitCodeVerdict('task-1', 'pass'))
+      .rejects.toMatchObject({ status: 503 });
+    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+
+    await manager.flushTaskOutboxes();
+
+    expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
+  });
+
+  it('drops a pending human verdict when a new review pass rotates the token pair', async () => {
+    await seedCodeReview({
+      outbox: [{
+        key: 'abcdef123456',
+        type: 'git.code-verdict',
+        data: {
+          prNumber: 42,
+          kind: 'pass',
+          anchorSha: SHA1,
+          token: 'abcdef123456',
+          comments: '',
+        },
+      }],
+    });
+
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'],
+      headSha: 'b'.repeat(40),
+      bumpRound: true,
+    });
+
+    expect(begun?.task.outbox).toBeUndefined();
+    expect(begun?.task.passToken).not.toBe('abcdef123456');
+    expect((await taskStore.get('task-1'))?.outbox).toBeUndefined();
+  });
+
+  it('keeps the current review pass fenced until the poller consumes the human verdict', async () => {
+    await seedCodeReview({
+      outbox: [{
+        key: 'abcdef123456',
+        type: 'git.code-verdict',
+        data: {
+          prNumber: 42,
+          kind: 'pass',
+          anchorSha: SHA1,
+          token: 'abcdef123456',
+          comments: '',
+          writeAttemptedAt: TS,
+        },
+      }],
+    });
+
+    const sameHead = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'],
+      headSha: SHA1,
+      bumpRound: true,
+    });
+
+    expect(sameHead).toBeNull();
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeDefined();
+
+    await manager.transitionTaskStatus(
+      'task-1',
+      'fixing',
+      { fromStatus: ['review'], expectSignalToken: 'aaaa11112222' },
+    );
+
+    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
   });
 });
 
@@ -1833,6 +2102,44 @@ describe('git review lease outcomes', () => {
     });
   });
 
+  it('retires an old-head code verdict before confirming an uncertain dispatch on a new head', async () => {
+    await seed({ status: 'in_progress', reviewRound: 0 });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
+    });
+    const start = vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
+      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
+    );
+    await expect(manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    })).rejects.toMatchObject({ reason: 'ack_unknown' });
+    const uncertain = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...uncertain,
+      outbox: [{
+        key: uncertain.passToken!,
+        type: 'git.code-verdict',
+        data: {
+          prNumber: uncertain.prNumber!,
+          kind: 'pass',
+          anchorSha: SHA1,
+          token: uncertain.passToken!,
+          comments: '',
+        },
+      }],
+    });
+    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    start.mockResolvedValue(true);
+
+    const confirmed = await manager.dispatchReviewToQa('task-1', {
+      confirmUncertainNotDelivered: true,
+    });
+
+    expect(confirmed.latestHeadSha).toBe('b'.repeat(40));
+    expect(confirmed.reviewHeadAnchorSha).toBe('b'.repeat(40));
+    expect(pendingCodeVerdict(confirmed)).toBeUndefined();
+  });
+
   it('keeps the QA hold when persisting the confirmed pending lease fails', async () => {
     await seed({ status: 'in_progress', reviewRound: 0 });
     const begun = await manager.beginGitReviewPass('task-1', {
@@ -2134,6 +2441,38 @@ describe('git review lease outcomes', () => {
     expect(approved?.reviewDispatch).toBeUndefined();
     expect((await taskStore.get('task-1'))?.postApproveGeneration).toMatch(/^[0-9a-f]{12}$/);
   });
+
+  it('clears an uncertain-recovery attention after the matching review dispatch completes', async () => {
+    await seed({ status: 'review', reviewRound: 1, signalToken: 'ffff00001111' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const claimed = await manager.claimGitReviewDispatch(
+      'task-1',
+      begun!.task.reviewDispatch!.generation,
+    );
+    const current = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...current,
+      attention: {
+        reason: 'git-review-dispatch-recovery-uncertain',
+        runbook: 'Confirm whether the claimed dispatch landed.',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(current),
+      },
+    });
+    const internal = manager as unknown as {
+      completeGitReviewDispatch: (
+        taskId: string,
+        lease: NonNullable<TaskState['reviewDispatch']>,
+      ) => Promise<boolean>;
+    };
+
+    await expect(internal.completeGitReviewDispatch('task-1', claimed!.lease)).resolves.toBe(true);
+
+    expect((await taskStore.get('task-1'))?.attention).toBeUndefined();
+  });
 });
 
 describe('confirm merge recovery routing', () => {
@@ -2321,6 +2660,77 @@ describe('manual dispatch binding recheck', () => {
     expect(result.specReviewRound ?? 0).toBe(0);
     expect(result.pendingPrSignalToken).toBeUndefined();
     expect(verify).toHaveBeenCalledTimes(2);
+  });
+
+  it('repairs a missing delivery confirmation before redispatching an existing review', async () => {
+    await seed({
+      status: 'review',
+      phase: 'code',
+      deliveryConfirmation: undefined,
+      reviewRound: 1,
+      signalToken: 'ffff00001111',
+      replyActorId: '99',
+      replyActorStatus: 'provisional',
+    });
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true,
+      headSha: SHA1,
+      branch: 'bx/task-1',
+      targetBranch: 'main',
+    });
+    vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
+      (await taskStore.get('task-1'))!);
+
+    const result = await manager.dispatchReviewToQa('task-1', {
+      stage: 'code',
+      actorId: '77',
+    });
+
+    expect(result).toMatchObject({
+      status: 'review',
+      phase: 'code',
+      deliveryConfirmation: { phase: 'code', source: 'human' },
+      replyActorId: '77',
+      replyActorStatus: 'verified',
+      reviewDispatch: { phase: 'pending', effectiveRound: 2 },
+    });
+    expect(verify).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not repair delivery confirmation after the review generation changes', async () => {
+    await seed({
+      status: 'review',
+      phase: 'code',
+      deliveryConfirmation: undefined,
+      reviewRound: 1,
+      signalToken: 'ffff00001111',
+      replyActorId: '99',
+      replyActorStatus: 'provisional',
+    });
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockImplementationOnce(async () => {
+      await manager.updateTask('task-1', { signalToken: 'eeee99990000' });
+      return {
+        ok: true,
+        headSha: SHA1,
+        branch: 'bx/task-1',
+        targetBranch: 'main',
+      };
+    });
+
+    await expect(manager.dispatchReviewToQa('task-1', {
+      stage: 'code',
+      actorId: '77',
+    })).rejects.toMatchObject({
+      status: 409,
+      code: 'dispatch-superseded',
+    });
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      signalToken: 'eeee99990000',
+      replyActorId: '99',
+      replyActorStatus: 'provisional',
+    });
+    expect((await taskStore.get('task-1'))?.deliveryConfirmation).toBeUndefined();
   });
 
   it('binds an explicit PR on the task custom branch when the initial pane signal was lost', async () => {
@@ -2739,9 +3149,64 @@ describe('ensureGitBaseSnapshot binding guard', () => {
     await expect(m.ensureGitBaseSnapshot(task, 'develop')).rejects.toThrow(/platform binding mismatch/);
     expect((await taskStore.get('task-1'))?.baseBranch).toBeUndefined();
   });
+
+  it('queues a detached binding intervention before later task mutations', async () => {
+    const m = createManager({ platformDefaultBranchOf: () => 'main' });
+    const task = await seed({ baseBranch: undefined, status: 'in_progress' });
+    await taskStore.set({
+      ...task,
+      platformBinding: { mode: 'git', repoKey: 'github.com/owner/other-repo', tool: 'gh' },
+    });
+    const bus = (m as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockImplementation(event => m.recordTaskAttention(event));
+    const realSet = taskStore.set.bind(taskStore);
+    let releaseAttention!: () => void;
+    const attentionRelease = new Promise<void>((resolve) => {
+      releaseAttention = resolve;
+    });
+    let markAttentionStarted!: () => void;
+    const attentionStarted = new Promise<void>((resolve) => {
+      markAttentionStarted = resolve;
+    });
+    let blocked = false;
+    vi.spyOn(taskStore, 'set').mockImplementation(async (next) => {
+      if (!blocked && next.attention?.reason === 'platform-binding-mismatch') {
+        blocked = true;
+        markAttentionStarted();
+        await attentionRelease;
+      }
+      await realSet(next);
+    });
+
+    await expect(m.ensureGitBaseSnapshot(task, 'develop')).rejects.toThrow(/platform binding mismatch/);
+    await attentionStarted;
+    const revision = m.noteReviewConversationRevision('task-1');
+    try {
+      const settledEarly = await Promise.race([
+        revision.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 30)),
+      ]);
+      expect(settledEarly).toBe(false);
+    } finally {
+      releaseAttention();
+    }
+    await revision;
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      attention: { reason: 'platform-binding-mismatch' },
+      reviewConversationUpdatedAt: expect.any(String),
+    });
+  });
 });
 
 describe('noteReviewConversationRevision', () => {
+  const injectCache = (): PrConversationCache => {
+    const cache = new PrConversationCache();
+    (manager as unknown as { prConversationCache?: PrConversationCache }).prConversationCache = cache;
+    return cache;
+  };
+  const payloadOf = (body: string) => ({ items: [{ kind: 'issue-comment' as const, id: 'c1', body }] });
+
   it('stamps the display revision on a live task', async () => {
     await seed({ status: 'review' });
     await manager.noteReviewConversationRevision('task-1');
@@ -2753,6 +3218,65 @@ describe('noteReviewConversationRevision', () => {
     await manager.noteReviewConversationRevision('task-1');
     expect((await taskStore.get('task-1'))?.reviewConversationUpdatedAt).toBeUndefined();
     await expect(manager.noteReviewConversationRevision('task-404')).resolves.toBeUndefined();
+  });
+
+  it('warms the conversation cache under the post-bump revision before persisting the task', async () => {
+    await seed({ status: 'review' });
+    const cache = injectCache();
+    let entriesWhenTaskPersisted = -1;
+    const originalSet = taskStore.set.bind(taskStore);
+    const setSpy = vi.spyOn(taskStore, 'set').mockImplementation(async (task) => {
+      entriesWhenTaskPersisted = cache.stats().entries;
+      return originalSet(task);
+    });
+    await manager.noteReviewConversationRevision('task-1', { prNumber: 42, payload: payloadOf('warm body') });
+    setSpy.mockRestore();
+    expect(entriesWhenTaskPersisted).toBe(1);
+
+    const updated = await taskStore.get('task-1');
+    const revision = prReviewCacheRevision(updated!, updated!.platformBinding!.repoKey);
+    const served = await cache.get(updated!.id, revision, () => Promise.reject(new Error('must not build')));
+    expect(served.items[0]?.body).toBe('warm body');
+  });
+
+  it('a force that read the pre-bump snapshot and lands after the warm write cannot evict it', async () => {
+    const before = await seed({ status: 'review' });
+    const cache = injectCache();
+    await manager.noteReviewConversationRevision('task-1', { prNumber: 42, payload: payloadOf('warm body') });
+
+    const after = await taskStore.get('task-1');
+    const repoKey = after!.platformBinding!.repoKey;
+    const staleRevision = prReviewCacheRevision(before, repoKey);
+    const staleResult = await cache.force(
+      before.id,
+      staleRevision,
+      async () => payloadOf('stale fetch'),
+      before.reviewConversationUpdatedAt ?? '',
+    );
+    expect(staleResult.items[0]?.body).toBe('stale fetch');
+
+    const served = await cache.get(
+      after!.id,
+      prReviewCacheRevision(after!, repoKey),
+      () => Promise.reject(new Error('must not build')),
+      after!.reviewConversationUpdatedAt ?? '',
+    );
+    expect(served.items[0]?.body).toBe('warm body');
+  });
+
+  it('bumps the revision but skips the cache write when the scanned PR no longer matches', async () => {
+    await seed({ status: 'review', prNumber: 43 });
+    const cache = injectCache();
+    await manager.noteReviewConversationRevision('task-1', { prNumber: 42, payload: payloadOf('stale pr') });
+    expect((await taskStore.get('task-1'))?.reviewConversationUpdatedAt).toMatch(/^\d{4}-/);
+    expect(cache.stats().entries).toBe(0);
+  });
+
+  it('does not warm the cache for a terminal task', async () => {
+    await seed({ status: 'merged' });
+    const cache = injectCache();
+    await manager.noteReviewConversationRevision('task-1', { prNumber: 42, payload: payloadOf('late') });
+    expect(cache.stats().entries).toBe(0);
   });
 });
 

@@ -56,8 +56,8 @@ export async function bootstrapAutoRepos(deps: BootstrapDeps): Promise<void> {
 export function autoBootstrapAgentIds(config: BaxianConfig): Set<string> {
   const ids = new Set<string>();
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) {
+    for (const team of project.agent) {
+      for (const agent of team) {
         if (agent.workdir) continue;
         ids.add(agent.id);
       }
@@ -69,8 +69,8 @@ export function autoBootstrapAgentIds(config: BaxianConfig): Set<string> {
 export function collectTargets(config: BaxianConfig): BootstrapTarget[] {
   const targets: BootstrapTarget[] = [];
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) {
+    for (const team of project.agent) {
+      for (const agent of team) {
         if (agent.workdir) continue;
         const resolvedHost = resolveAgentHost(config.host, agent.host);
         targets.push({ project, agents: [agent], representativeAgent: agent, resolvedHost });

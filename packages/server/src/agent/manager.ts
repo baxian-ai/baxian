@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { join, normalize } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createSignalToken, PASSIVE_VERDICT_WATCH } from './phase-signal.js';
@@ -10,12 +11,14 @@ import type {
   AgentRuntimeConfig,
   AgentBindingFacts,
   BaxianEvent,
+  CodeVerdictOutboxEntry,
   HostConfig,
   ProjectConfig,
   ReviewDispatchLease,
   RemoteCleanupState,
   SpecVerdictOutboxEntry,
   TaskOutboxEntry,
+  TaskOperation,
   TaskPhase,
   TaskGenerationGuard,
   TaskState,
@@ -33,6 +36,7 @@ import {
   isSpecStagePhase,
   isTaskOpen,
   repoIdentityKey,
+  taskAttentionGeneration,
   taskGenerationGuard,
   taskReviewRound,
   taskMatchesGeneration,
@@ -41,10 +45,11 @@ import { buildProjectDriver, makeDriverExec } from '../platform/driver-host.js';
 import { DriverOpError, buildDriverRunContext, GitDriver, safeDriverErrorText } from '../platform/git-driver.js';
 import type { DriverExec } from '../platform/git-driver.js';
 import type { PluginRegistry } from '../platform/plugin-registry.js';
-import type { NormalizedRow } from '../platform/row-schema.js';
+import { versionTimeOf, type NormalizedRow } from '../platform/row-schema.js';
 import { checkOpenPrBinding, checkPrBinding, type PrRejection } from '../platform/pr-binding.js';
 import { collectPendingFeedback, scanCommentSourcesOnce, type PendingFeedbackResult } from '../platform/feedback.js';
-import { recheckPassProvenance, type VerdictSourceScan } from '../platform/verdict-engine.js';
+import { prReviewCacheRevision, type PrConversationCache, type PrConversationPayload } from '../platform/pr-conversation-cache.js';
+import { deadTokens, recheckPassProvenance, type VerdictSourceScan } from '../platform/verdict-engine.js';
 import {
   platformBindingMismatch,
   taskNeedsPlatformBindingAudit,
@@ -110,6 +115,7 @@ import { resolveProjectTool } from '../config/validator.js';
 import { SHA_HEX_SOURCE } from '../platform/types.js';
 import { bodyDigest } from '../platform/body-digest.js';
 import { validateCommentBody } from '../platform/command-renderer.js';
+import { buildReviewTokenLine, extractReviewTokens, rowTokens } from '../platform/markers.js';
 
 const BENIGN_DISPATCH_CONFLICT_CODES = new Set(['dispatch-superseded', 'dispatch-in-flight']);
 
@@ -126,6 +132,20 @@ function requireTaskQaAgentId(
 ): string {
   if (!task.qaAgentId) throw new Error(`${operation}: task ${task.id} has no QA participant`);
   return task.qaAgentId;
+}
+
+function samePassProvenance(
+  left: TaskState['passProvenance'],
+  right: TaskState['passProvenance'],
+): boolean {
+  return left !== undefined
+    && right !== undefined
+    && left.sourceKey === right.sourceKey
+    && left.id === right.id
+    && left.bodyDigest === right.bodyDigest
+    && left.token === right.token
+    && left.failToken === right.failToken
+    && left.anchorSha === right.anchorSha;
 }
 
 export interface EnsureSessionResult {
@@ -325,6 +345,7 @@ export interface AgentManagerDeps {
   paneStreamerManager?: PaneStreamerManager;
   pluginRegistry?: PluginRegistry;
   platformDefaultBranchOf?: (projectId: string) => string | undefined;
+  prConversationCache?: PrConversationCache;
   phaseSignalWatcher?: PhaseSignalWatcher;
   errorRecordStore?: ErrorRecordStore;
   bootstrapTimeoutsMs?: {
@@ -430,6 +451,24 @@ export interface PendingDispatchRetry {
   budgetAlerted?: boolean;
 }
 
+export interface AdvanceTaskOptions {
+  executor?: 'dev' | 'qa';
+  agentId?: string;
+  stage?: TaskPhase;
+  actorId?: string;
+  prNumber?: number;
+  confirmRevoked?: boolean;
+  note?: string;
+}
+
+export type TaskVerdictAction =
+  | 'approve'
+  | 'request-changes'
+  | 'pass'
+  | 'continue'
+  | 'complete'
+  | 'confirm-merge';
+
 const CANCEL_CLEANUP_HOLD_PHASES = new Set<string>(['cancel-clearing', 'cancel-interrupt-failed']);
 
 function isCancelCleanupHold(binding: { awaitingPhase?: string } | null | undefined): boolean {
@@ -496,6 +535,7 @@ export class AgentManager {
   protected paneStreamerManager?: PaneStreamerManager;
   protected pluginRegistry?: PluginRegistry;
   private platformDefaultBranchOf?: (projectId: string) => string | undefined;
+  private readonly prConversationCache?: PrConversationCache;
   private readonly platformDriverExec: DriverExec;
   protected phaseSignalWatcher?: PhaseSignalWatcher;
   protected errorRecordStore?: ErrorRecordStore;
@@ -505,6 +545,7 @@ export class AgentManager {
   protected dispatchAckResendIntervalMs = 3_000;
 
   private taskMutationQueue: Promise<unknown> = Promise.resolve();
+  private readonly taskMutationScope = new AsyncLocalStorage<{ active: boolean }>();
   private agentOperationQueues = new Map<string, Promise<void>>();
   private agentIndex: Map<string, AgentConfig & { projectId: string }>;
   private platformRunner: CommandRunner;
@@ -525,6 +566,8 @@ export class AgentManager {
   protected cancelInterruptGuardWaitMs = DEFAULT_DISPATCH_ACK_TIMEOUT_MS + 5_000;
   private markCompleteInFlight = new Set<string>();
   private specVerdictInFlight = new Set<string>();
+  private codeVerdictInFlight = new Set<string>();
+  private retryTaskInFlight = new Set<string>();
   private cancelCleanupInFlight = new Map<string, number>();
   private deletionInFlight = new Set<string>();
   private divergedAgents = new Set<string>();
@@ -545,6 +588,7 @@ export class AgentManager {
     this.paneStreamerManager = deps.paneStreamerManager;
     this.pluginRegistry = deps.pluginRegistry;
     this.platformDefaultBranchOf = deps.platformDefaultBranchOf;
+    this.prConversationCache = deps.prConversationCache;
     this.errorRecordStore = deps.errorRecordStore;
     this.phaseSignalWatcher = deps.phaseSignalWatcher
       ?? (deps.paneStreamerManager
@@ -572,9 +616,24 @@ export class AgentManager {
   }
 
   private withTaskLock<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.taskMutationQueue.then(fn);
+    const inherited = this.taskMutationScope.getStore();
+    if (inherited?.active) return fn();
+    const next = this.taskMutationQueue.then(() => {
+      const scope = { active: true };
+      return this.taskMutationScope.run(scope, async () => {
+        try {
+          return await fn();
+        } finally {
+          scope.active = false;
+        }
+      });
+    });
     this.taskMutationQueue = next.catch(() => undefined);
     return next;
+  }
+
+  private outsideTaskMutationScope<T>(fn: () => T): T {
+    return this.taskMutationScope.exit(fn);
   }
 
   private withAgentOperationLease<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
@@ -652,7 +711,7 @@ export class AgentManager {
       return true;
     } catch (err) {
       console.warn(
-        `[AgentManager] safeEmit ${event.type} failed (audit log loss; state machine unaffected):`,
+        `[AgentManager] safeEmit ${event.type} failed; persistence or handler delivery may be incomplete:`,
         err,
       );
       return false;
@@ -1364,7 +1423,9 @@ export class AgentManager {
           }
         }
         await this.markDialogPending(agentId, creationToken);
-        void this.slowPollDialogPending(agentId, creationToken).catch((pollErr) => {
+        void this.outsideTaskMutationScope(
+          () => this.slowPollDialogPending(agentId, creationToken),
+        ).catch((pollErr) => {
           console.warn(`[bootstrap] slowPoll for ${agentId} crashed:`, pollErr);
         });
         return;
@@ -1644,10 +1705,14 @@ export class AgentManager {
     err.partial.handled = true;
     const snapshotPaneId = state.paneId;
     const snapshotTaskId = state.taskId;
-    void this.slowPollDialogPending(agentId, state.creationToken, {
-      ...(snapshotPaneId !== undefined ? { expectedPaneId: snapshotPaneId } : {}),
-      expectedTaskId: snapshotTaskId,
-    }).catch((pollErr) => {
+    void this.outsideTaskMutationScope(() => this.slowPollDialogPending(
+      agentId,
+      state.creationToken,
+      {
+        ...(snapshotPaneId !== undefined ? { expectedPaneId: snapshotPaneId } : {}),
+        expectedTaskId: snapshotTaskId,
+      },
+    )).catch((pollErr) => {
       console.warn(`[runtime] slowPoll for ${agentId} crashed:`, pollErr);
     });
     return true;
@@ -1714,6 +1779,7 @@ export class AgentManager {
       if (generationMismatch(preFresh)) return;
       const now = new Date().toISOString();
       let projectIdForEmit = '';
+      let taskIdForEmit: string | undefined;
       let wrote = false;
       const isBootstrapPath = creationToken !== undefined;
       if (isBootstrapPath && !(await this.runGreetingHandshake(agentId, cfg, pane))) {
@@ -1727,6 +1793,7 @@ export class AgentManager {
           return AGENT_STORE_NOOP;
         }
         projectIdForEmit = fresh.projectId;
+        taskIdForEmit = fresh.taskId;
         wrote = true;
         if (isBootstrapPath) {
           return {
@@ -1740,11 +1807,15 @@ export class AgentManager {
             updatedAt: now,
           };
         }
+        const awaitingReason = fresh.taskId
+          ? `Runtime dialog resolved; agent REPL ready. Open task ${fresh.taskId}: cancel it if it is still active, ` +
+            'otherwise Resume can release the binding; Delete the agent if the binding cannot be recovered.'
+          : 'Runtime dialog resolved; agent REPL ready. Click Resume to release the binding and let baxian pick the next task.';
         return {
           ...fresh,
           paneId,
           awaitingPhase: 'agent_dialog_resolved_runtime',
-          awaitingReason: 'Runtime dialog resolved; agent REPL ready. Click Resume to release the binding and let baxian pick the next task.',
+          awaitingReason,
           updatedAt: now,
         };
       });
@@ -1759,9 +1830,13 @@ export class AgentManager {
           data: { paneId, phase: 'session_dialog_resolved' },
         });
       } else {
-        await this.emitIntervention(projectIdForEmit, agentId, undefined, {
+        const note = taskIdForEmit
+          ? `Runtime dialog resolved; agent REPL ready. Open task ${taskIdForEmit}: cancel it if it is still active, ` +
+            'otherwise Resume can release the binding; Delete the agent if the binding cannot be recovered.'
+          : 'Runtime dialog resolved; agent REPL ready. Click Resume to continue.';
+        await this.emitIntervention(projectIdForEmit, agentId, taskIdForEmit, {
           phase: 'agent_dialog_resolved_runtime',
-          note: 'Runtime dialog resolved; agent REPL ready. Click Resume to continue.',
+          note,
         });
       }
       return;
@@ -1772,7 +1847,9 @@ export class AgentManager {
     if (this.runtimeMenuWatchers.has(agentId)) return;
     const controller = new AbortController();
     this.runtimeMenuWatchers.set(agentId, controller);
-    void this.runtimeMenuWatchLoop(agentId, controller.signal)
+    void this.outsideTaskMutationScope(
+      () => this.runtimeMenuWatchLoop(agentId, controller.signal),
+    )
       .catch((err) => {
         console.warn(`[runtimeMenuWatch] ${agentId} loop crashed:`, err);
       })
@@ -1833,6 +1910,10 @@ export class AgentManager {
         });
       } else if (!onMenu && pendingMenu) {
         pendingMenu = false;
+        await this.emitIntervention(fresh.projectId, agentId, fresh.taskId, {
+          phase: 'agent_runtime_menu_resolved',
+          previousPhase: 'agent_runtime_menu_pending',
+        });
       }
     }
   }
@@ -2894,7 +2975,7 @@ export class AgentManager {
     }
     if (this.needInputRetryTimer) return;
     this.needInputRetryTimer = setInterval(() => {
-      void this.needInputRetryPass();
+      void this.outsideTaskMutationScope(() => this.needInputRetryPass());
     }, this.needInputRetryIntervalMs);
     this.needInputRetryTimer.unref?.();
   }
@@ -3094,13 +3175,13 @@ export class AgentManager {
     if (wm !== null && bumped && mode === 'restore') {
       const delta = this.collectPredecessorNeedInputDelta(args.agentId, args.taskId, wm.epoch);
       if (delta) {
-        void this.commitNeedInputWatermark({
+        void this.outsideTaskMutationScope(() => this.commitNeedInputWatermark({
           agentId: args.agentId,
           taskId: args.taskId,
           epoch: wm.epoch,
           askSeq: Math.max(delta.askSeq, wm.askSeq),
           answeredSeq: Math.max(delta.answeredSeq, wm.answeredSeq),
-        });
+        }));
       }
     }
     try {
@@ -4595,8 +4676,8 @@ export class AgentManager {
     const project = this.getProjectConfig(cfg.projectId);
     if (!project) throw new Error(`Unknown project: ${cfg.projectId}`);
 
-    const group = this.findAgentGroup(agentId);
-    return { targets: group?.map(agent => agent.id) ?? [agentId] };
+    const team = this.findAgentTeam(agentId);
+    return { targets: team?.map(agent => agent.id) ?? [agentId] };
   }
 
   async cleanupRemovedAgentRuntime(targets: string[]): Promise<void> {
@@ -4713,12 +4794,12 @@ export class AgentManager {
     const workdirGuess = workdirForEstimate ?? '/'.padEnd(64, 'x');
     const now = new Date().toISOString();
     if (cfg.role !== 'dev') throw new Error(`Agent ${cfg.id} is not a dev agent`);
-    const group = this.findAgentGroup(cfg.id);
+    const team = this.findAgentTeam(cfg.id);
     const devAgentId = cfg.id;
     const qaAgentId = input.preferredAgentId === ''
       ? '_unassigned_preview_qa'
-      : group?.find(agent => agent.role === 'qa')?.id;
-    if (!qaAgentId) throw new Error(`Agent ${cfg.id} has no qa agent in its group`);
+      : team?.find(agent => agent.role === 'qa')?.id;
+    if (!qaAgentId) throw new Error(`Agent ${cfg.id} has no qa agent in its Agent Team`);
     const fakeTask: TaskState = {
       id: 'task-9999999999',
       projectId,
@@ -4762,10 +4843,10 @@ export class AgentManager {
     return buildProjectDriver(project, this.pluginRegistry, this.platformDriverExec);
   }
 
-  private findAgentGroup(anchorAgentId: string): AgentConfig[] | undefined {
+  private findAgentTeam(anchorAgentId: string): AgentConfig[] | undefined {
     for (const project of this.config.project) {
-      for (const group of project.agent) {
-        if (group.some(agent => agent.id === anchorAgentId)) return group;
+      for (const team of project.agent) {
+        if (team.some(agent => agent.id === anchorAgentId)) return team;
       }
     }
     return undefined;
@@ -4776,8 +4857,8 @@ export class AgentManager {
     if (!project) return undefined;
     let longest: string | undefined;
     let longestBytes = -1;
-    for (const pair of project.agent) {
-      for (const a of pair) {
+    for (const team of project.agent) {
+      for (const a of team) {
         if (a.role !== 'dev' || !a.workdir) continue;
         const bytes = Buffer.byteLength(a.workdir, 'utf8');
         if (bytes > longestBytes) {
@@ -4791,6 +4872,90 @@ export class AgentManager {
 
   async getTask(taskId: string): Promise<TaskState | null> {
     return this.taskStore.get(taskId);
+  }
+
+  async recordTaskAttention(event: BaxianEvent): Promise<void> {
+    if (!event.taskId) return;
+    await this.withTaskLock(async () => {
+      const task = await this.taskStore.get(event.taskId!);
+      if (!task) return;
+      const reasonValue = typeof event.data.phase === 'string'
+        ? event.data.phase
+        : typeof event.data.reason === 'string'
+          ? event.data.reason
+          : 'human-intervention';
+      const reason = reasonValue.trim() || 'human-intervention';
+      const previousPhase = typeof event.data.previousPhase === 'string'
+        ? event.data.previousPhase.trim()
+        : '';
+      const clearedReason = reason === 'mr-reopened'
+        ? 'mr-closed-unmerged'
+        : reason === 'resumed'
+          || reason === 'git-review-dispatch-hold-cleared'
+          || reason === 'agent_runtime_menu_resolved'
+          ? previousPhase
+          : '';
+      if (clearedReason) {
+        if (task.attention?.reason !== clearedReason
+          || Date.parse(event.timestamp) < Date.parse(task.attention.occurredAt)) return;
+        const next = { ...task, updatedAt: new Date().toISOString() };
+        delete next.attention;
+        await this.taskStore.set(next);
+        return;
+      }
+      if (reason === 'resumed'
+        || reason === 'git-review-dispatch-hold-cleared'
+        || reason === 'agent_runtime_menu_resolved') return;
+      const runbookValue = [
+        event.data.note,
+        event.data.recommendation,
+        event.data.message,
+        event.data.error,
+        ...(typeof event.data.phase === 'string' ? [event.data.reason] : []),
+      ]
+        .find(value => typeof value === 'string' && value.trim() !== '');
+      const runbook = typeof runbookValue === 'string'
+        ? runbookValue.trim()
+        : `Task ${task.id} requires human intervention for ${reason}. Inspect the task and its linked agent before choosing an action.`;
+      const occurredAt = Number.isFinite(Date.parse(event.timestamp))
+        ? event.timestamp
+        : new Date().toISOString();
+      const generation = taskAttentionGeneration(task);
+      let recommendedActions: TaskOperation[];
+      if (task.status === 'max_rounds') {
+        recommendedActions = ['verdict', 'cancel'];
+      } else if (TERMINAL_STATUSES.includes(task.status)) {
+        recommendedActions = task.remoteCleanup !== undefined
+          && task.remoteCleanup.stage !== 'manual'
+          ? ['cancel']
+          : ['retry'];
+      } else if (task.status === 'review') {
+        recommendedActions = isSpecStagePhase(task.phase)
+          ? ['advance', 'cancel']
+          : ['advance', 'verdict', 'cancel'];
+      } else if (task.status === 'spec-ready' || task.status === 'merge-ready') {
+        recommendedActions = ['verdict', 'cancel'];
+      } else {
+        recommendedActions = ['advance', 'cancel'];
+      }
+      if (task.attention
+        && Date.parse(task.attention.occurredAt) > Date.parse(occurredAt)) return;
+      if (task.attention
+        && task.attention.reason === reason
+        && task.attention.runbook === runbook
+        && Date.parse(task.attention.occurredAt) >= Date.parse(occurredAt)) return;
+      await this.taskStore.set({
+        ...task,
+        attention: {
+          reason,
+          runbook,
+          occurredAt,
+          recommendedActions,
+          generation,
+        },
+        updatedAt: new Date().toISOString(),
+      });
+    });
   }
 
   async getAgentState(agentId: string): Promise<AgentBindingFacts | null> {
@@ -4912,12 +5077,28 @@ export class AgentManager {
       delete next.reviewDispatch;
       delete next.reviewRoundPending;
     }
-    if (nextStatus !== task.status && next.outbox) {
-      const outbox = next.outbox.filter(entry => entry.type !== 'git.spec-verdict');
-      if (outbox.length > 0) next.outbox = outbox;
-      else delete next.outbox;
-    }
+    if (nextStatus !== task.status) this.stripGitVerdictOutbox(next);
     return next;
+  }
+
+  private stripGitVerdictOutbox(task: TaskState): void {
+    if (!task.outbox) return;
+    const outbox = task.outbox.filter(
+      entry => entry.type !== 'git.spec-verdict' && entry.type !== 'git.code-verdict',
+    );
+    if (outbox.length > 0) task.outbox = outbox;
+    else delete task.outbox;
+  }
+
+  private stripCodeVerdictOutboxForAnchor(task: TaskState, anchorSha: string): void {
+    if (!task.outbox) return;
+    const normalizedAnchor = anchorSha.toLowerCase();
+    const outbox = task.outbox.filter(
+      entry => entry.type !== 'git.code-verdict'
+        || entry.data.anchorSha.toLowerCase() === normalizedAnchor,
+    );
+    if (outbox.length > 0) task.outbox = outbox;
+    else delete task.outbox;
   }
 
   async confirmPostApprovePromptDelivered(
@@ -5137,6 +5318,12 @@ export class AgentManager {
     );
   }
 
+  private codeVerdictOutbox(task: Pick<TaskState, 'outbox'>): CodeVerdictOutboxEntry | undefined {
+    return task.outbox?.find(
+      (entry): entry is CodeVerdictOutboxEntry => entry.type === 'git.code-verdict',
+    );
+  }
+
   private async mutateTaskOutboxEntry(
     taskId: string,
     key: string,
@@ -5165,6 +5352,10 @@ export class AgentManager {
       try {
         if (entry.type === 'git.spec-verdict') {
           await this.deliverSpecVerdictOutbox(taskId, entry.key);
+          continue;
+        }
+        if (entry.type === 'git.code-verdict') {
+          await this.deliverCodeVerdictOutbox(taskId, entry.key);
           continue;
         }
         await this.eventBus.emit({
@@ -5306,6 +5497,9 @@ export class AgentManager {
       if (current.reviewDispatch?.phase === 'uncertain') return null;
       if (Object.hasOwn(opts, 'expectSignalToken') && current.signalToken !== opts.expectSignalToken) return null;
       if (Object.hasOwn(opts, 'expectPhase') && current.phase !== opts.expectPhase) return null;
+      if (current.status === 'review'
+        && current.reviewHeadAnchorSha?.toLowerCase() === opts.headSha.toLowerCase()
+        && this.codeVerdictOutbox(current) !== undefined) return null;
       if (opts.patch?.branch && opts.patch.branch !== current.branch) {
         const existing = await this.findTaskByBranch(opts.patch.branch, current.projectId);
         if (existing && existing.id !== taskId) return null;
@@ -5330,6 +5524,7 @@ export class AgentManager {
           : 'recheck'
       );
       const next = this.stripPostApproveEpisodeFields(current);
+      this.stripGitVerdictOutbox(next);
       delete next.passProvenance;
       Object.assign(next, opts.patch ?? {}, {
         status: 'review' as const,
@@ -5411,6 +5606,7 @@ export class AgentManager {
       if (current.reviewDispatch && !this.gitReviewLeaseMatches(current, current.reviewDispatch)) return null;
       const now = new Date().toISOString();
       const next = this.stripPostApproveEpisodeFields(current);
+      this.stripGitVerdictOutbox(next);
       delete next.reviewDispatch;
       delete next.reviewRoundPending;
       const postApproveGeneration = createSignalToken();
@@ -5518,6 +5714,7 @@ export class AgentManager {
         },
         updatedAt: now,
       };
+      this.stripCodeVerdictOutboxForAnchor(next, verifiedHeadSha);
       await this.taskStore.set(next);
       if (qaHold !== undefined) {
         const cleared = await this.clearAwaitingHuman(qaId, {
@@ -5564,6 +5761,9 @@ export class AgentManager {
       }
       next.reviewDispatchedAt = now;
       delete next.reviewDispatch;
+      if (next.attention?.reason === 'git-review-dispatch-recovery-uncertain') {
+        delete next.attention;
+      }
       await this.taskStore.set(next);
       return true;
     });
@@ -6088,19 +6288,39 @@ export class AgentManager {
     });
   }
 
-  async noteReviewConversationRevision(taskId: string): Promise<void> {
+  async noteReviewConversationRevision(
+    taskId: string,
+    conversation?: { prNumber: number; payload: PrConversationPayload },
+  ): Promise<void> {
     await this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task || TERMINAL_STATUSES.includes(task.status)) return;
       const now = new Date().toISOString();
-      await this.taskStore.set({ ...task, reviewConversationUpdatedAt: now, updatedAt: now });
+      const next = { ...task, reviewConversationUpdatedAt: now, updatedAt: now };
+      const repoKey = next.platformBinding?.repoKey;
+      if (
+        conversation !== undefined
+        && this.prConversationCache !== undefined
+        && repoKey !== undefined
+        && next.prNumber === conversation.prNumber
+      ) {
+        this.prConversationCache.put(
+          next.id,
+          prReviewCacheRevision(next, repoKey),
+          conversation.payload,
+          next.reviewConversationUpdatedAt ?? '',
+        );
+      }
+      await this.taskStore.set(next);
     });
   }
 
   private assertPlatformBinding(task: TaskState): void {
     const mismatch = platformBindingMismatch(this.config, task);
     if (mismatch === undefined) return;
-    void this.emitPlatformBindingIntervention(task, mismatch);
+    void this.outsideTaskMutationScope(
+      () => this.emitPlatformBindingIntervention(task, mismatch),
+    );
     if (mismatch.reason === 'missing-binding-snapshot') {
       throw new Error(`platform binding missing for task ${task.id}; refusing platform operations`);
     }
@@ -6695,8 +6915,12 @@ export class AgentManager {
         && (!taskMatchesGeneration(task, expected.task)
           || task.latestHeadSha !== expected.latestHeadSha)) return null;
       if (task.prNumber !== undefined && task.prNumber !== observation.prNumber) return null;
+      const repairsDeliveryConfirmation = confirmation?.source === 'human'
+        && (task.status === 'review' || task.status === 'fixing')
+        && Object.hasOwn(confirmation, 'expectedSignalToken');
       if (confirmation !== undefined) {
         if (task.status !== 'in_progress'
+          && !repairsDeliveryConfirmation
           && (task.phase !== confirmation.phase
             || task.deliveryConfirmation?.phase !== confirmation.phase)) return null;
         if (Object.hasOwn(confirmation, 'expectedSignalToken')
@@ -6719,7 +6943,7 @@ export class AgentManager {
         ...(confirmation !== undefined
           ? {
               phase: confirmation.phase,
-              deliveryConfirmation: task.status === 'in_progress'
+              deliveryConfirmation: task.status === 'in_progress' || repairsDeliveryConfirmation
                 ? { phase: confirmation.phase, source: confirmation.source, at: now }
                 : task.deliveryConfirmation,
               ...(confirmation.branch !== undefined ? { branch: confirmation.branch } : {}),
@@ -7050,11 +7274,11 @@ export class AgentManager {
 
       const genAtEntry = this.deletionGenerationOf(input.preferredAgentId);
       const target = await this.pickAgent(projectId, input.preferredAgentId);
-      const group = this.findAgentGroup(input.preferredAgentId);
-      const dev = group?.find(agent => agent.role === 'dev');
-      if (!dev) throw new ApiError(409, `Agent ${input.preferredAgentId} has no dev agent in its group`);
-      const qa = group?.find(agent => agent.role === 'qa');
-      if (!qa) throw new ApiError(409, `Agent ${input.preferredAgentId} has no qa agent in its group`);
+      const team = this.findAgentTeam(input.preferredAgentId);
+      const dev = team?.find(agent => agent.role === 'dev');
+      if (!dev) throw new ApiError(409, `Agent ${input.preferredAgentId} has no dev agent in its Agent Team`);
+      const qa = team?.find(agent => agent.role === 'qa');
+      if (!qa) throw new ApiError(409, `Agent ${input.preferredAgentId} has no qa agent in its Agent Team`);
       const participantGens = new Map<string, number>(
         [dev.id, qa.id]
           .map(id => [id, this.deletionGenerationOf(id)] as const),
@@ -7073,7 +7297,7 @@ export class AgentManager {
       };
       const persistQueuedOrReject = (reason: 'preferred_agent_busy' | 'agent_locked'): Promise<TaskState> => {
         if (!participantsFresh()) {
-          throw new ApiError(409, `Agent ${input.preferredAgentId} or a group member is being deleted or recreated during task creation; please retry`);
+          throw new ApiError(409, `Agent ${input.preferredAgentId} or an Agent Team member is being deleted or recreated during task creation; please retry`);
         }
         return this.persistQueuedTask(queued, reason, input.preferredAgentId);
       };
@@ -7188,6 +7412,13 @@ export class AgentManager {
     opts: { background?: boolean } = {},
   ): Promise<TaskState> {
     const task = await this.createTask(projectId, input);
+    return this.startCreatedTask(task, opts);
+  }
+
+  private async startCreatedTask(
+    task: TaskState,
+    opts: { background?: boolean } = {},
+  ): Promise<TaskState> {
     if (task.status === 'in_progress' && task.agentId) {
       const signalToken = createSignalToken();
       await this.updateTask(task.id, this.dispatchTokenFields(signalToken));
@@ -7383,7 +7614,9 @@ export class AgentManager {
       await tmux.sendKeysLiteral(pane, command);
       await tmux.sendEnter(pane);
       guardHandedOff = true;
-      void this.waitForReplPromptReady(tmux, pane, cfg.runtime, this.compactIdleWaitMs)
+      void this.outsideTaskMutationScope(
+        () => this.waitForReplPromptReady(tmux, pane, cfg.runtime, this.compactIdleWaitMs),
+      )
         .catch(err => {
           console.warn(`[AgentManager] sendSlashCommand(${agentId}, ${command}) post idle wait failed:`, err);
         })
@@ -7433,6 +7666,16 @@ export class AgentManager {
 
   clearPendingDispatchRetry(taskId: string): void {
     this.pendingDispatchRetryByTask.delete(taskId);
+  }
+
+  resetPendingDispatchRetryBudget(taskId: string): void {
+    const entry = this.pendingDispatchRetryByTask.get(taskId);
+    if (!entry) return;
+    this.pendingDispatchRetryByTask.set(taskId, {
+      ...entry,
+      since: Date.now(),
+      budgetAlerted: undefined,
+    });
   }
 
   clearPendingDispatchRetryIfMatches(
@@ -7650,20 +7893,20 @@ export class AgentManager {
 
       const now = new Date().toISOString();
       const initiallyUnassigned = fresh.preferredAgentId === '';
-      const group = initiallyUnassigned ? this.findAgentGroup(agentId) : undefined;
+      const team = initiallyUnassigned ? this.findAgentTeam(agentId) : undefined;
       const devId = initiallyUnassigned
-        ? group?.find(agent => agent.role === 'dev')?.id
+        ? team?.find(agent => agent.role === 'dev')?.id
         : fresh.devAgentId;
       if (!devId) {
         await this.lockManager.releaseIfOwner(agentId, taskId, lockToken);
-        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} has no dev agent in its group` };
+        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} has no dev agent in its Agent Team` };
       }
       const qaId = initiallyUnassigned
-        ? group?.find(agent => agent.role === 'qa')?.id
+        ? team?.find(agent => agent.role === 'qa')?.id
         : fresh.qaAgentId;
       if (!qaId) {
         await this.lockManager.releaseIfOwner(agentId, taskId, lockToken);
-        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} has no qa agent in its group` };
+        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} has no qa agent in its Agent Team` };
       }
       const participantGens = new Map<string, number>(
         [devId, qaId]
@@ -9213,10 +9456,14 @@ export class AgentManager {
         if (err instanceof EnsureSessionError && err.partial.dialogPending) {
           if (await this.rollbackUndeliveredBootstrap(state)) continue;
           await this.markDialogPending(state.id, state.creationToken);
-          void this.slowPollDialogPending(state.id, state.creationToken, {
-            ...(state.paneId !== undefined ? { expectedPaneId: state.paneId } : {}),
-            expectedTaskId: state.taskId,
-          }).catch((pollErr) => {
+          void this.outsideTaskMutationScope(() => this.slowPollDialogPending(
+            state.id,
+            state.creationToken,
+            {
+              ...(state.paneId !== undefined ? { expectedPaneId: state.paneId } : {}),
+              expectedTaskId: state.taskId,
+            },
+          )).catch((pollErr) => {
             console.warn(`[recover] slowPoll for ${state.id} crashed:`, pollErr);
           });
           continue;
@@ -9922,6 +10169,172 @@ export class AgentManager {
     }
   }
 
+  async advanceTask(taskId: string, opts: AdvanceTaskOptions = {}): Promise<TaskState> {
+    let task = await this.taskStore.get(taskId);
+    if (!task) throw new ApiError(404, `Task ${taskId} not found`);
+    const executor = opts.executor ?? (task.status === 'review' ? 'qa' : 'dev');
+    let updated: TaskState;
+    if (task.status === 'pending') {
+      if (executor !== 'dev') throw new ApiError(409, 'Pending tasks can only advance to Dev');
+      const result = await this.dispatchPendingTask(taskId, opts.agentId);
+      if (result.errorCode !== undefined) throw new ApiError(result.errorCode, result.error ?? 'Dispatch failed');
+      if (!result.task) throw new ApiError(404, `Task ${taskId} disappeared during dispatch`);
+      updated = result.task;
+    } else if (executor === 'qa') {
+      if (task.status !== 'in_progress' && task.status !== 'fixing' && task.status !== 'review') {
+        throw new ApiError(409, `Task ${taskId} cannot advance to QA from ${task.status}`);
+      }
+      updated = await this.dispatchReviewToQa(taskId, {
+        fromStatus: [task.status],
+        confirmUncertainNotDelivered: true,
+        ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+        ...(opts.actorId !== undefined ? { actorId: opts.actorId } : {}),
+        ...(opts.prNumber !== undefined ? { prNumber: opts.prNumber } : {}),
+      });
+    } else if (task.status === 'review') {
+      throw new ApiError(
+        409,
+        'Review cannot advance to Dev without a request-changes verdict',
+      );
+    } else if (task.status === 'in_progress' || task.status === 'fixing') {
+      if (!task.devAgentId) throw new ApiError(409, `Task ${taskId} has no Dev participant`);
+      const replayed = await this.redispatchTaskPromptAfterReplRestart(task.devAgentId, taskId);
+      if (!replayed) throw new ApiError(409, `Task ${taskId} changed or its Dev prompt could not be replayed`);
+      updated = (await this.taskStore.get(taskId)) ?? task;
+    } else if (task.status === 'approved') {
+      if (!task.devAgentId) throw new ApiError(409, `Task ${taskId} has no Dev participant`);
+      if (task.postApproveRevoked) {
+        if (opts.confirmRevoked !== true) {
+          throw new ApiError(
+            409,
+            `Task ${taskId} post-approve replay is revoked; confirmRevoked=true is required`,
+          );
+        }
+        task = await this.restoreRevokedPostApprove(task);
+      }
+      const replayed = await this.redispatchTaskPromptAfterReplRestart(task.devAgentId, taskId);
+      if (!replayed) throw new ApiError(409, `Task ${taskId} changed or its post-approve prompt could not be replayed`);
+      updated = (await this.taskStore.get(taskId)) ?? task;
+    } else {
+      throw new ApiError(409, `Task ${taskId} cannot be advanced from ${task.status}`);
+    }
+    await this.auditHumanTaskOperation(updated, 'advance', executor, opts.note);
+    return updated;
+  }
+
+  private async restoreRevokedPostApprove(task: TaskState): Promise<TaskState> {
+    if (!task.postApproveRevoked || task.prNumber === undefined) {
+      throw new ApiError(409, `Task ${task.id} has no revoked post-approve episode`);
+    }
+    const [binding, accepted] = await Promise.all([
+      this.platformVerifyPrBinding(task.id, task.prNumber),
+      this.platformVerifyAcceptedPass(task.id),
+    ]);
+    if (!binding.ok) {
+      throw new ApiError(409, `Cannot restore task ${task.id}: PR binding ${binding.reason}`);
+    }
+    if (accepted.kind !== 'valid') {
+      throw new ApiError(409, `Cannot restore task ${task.id}: ${accepted.reason}`);
+    }
+    if (accepted.pendingCount > 0) {
+      throw new ApiError(409, `Cannot restore task ${task.id}: the accepted pass has pending feedback`);
+    }
+    const reviewedPass = task.passProvenance;
+    if (!reviewedPass || binding.headSha.toLowerCase() !== reviewedPass.anchorSha.toLowerCase()) {
+      throw new ApiError(409, `Cannot restore task ${task.id}: the current PR head is not the accepted head`);
+    }
+    return this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(task.id);
+      if (!fresh || fresh.status !== 'approved'
+        || fresh.postApproveRevoked?.generation !== task.postApproveRevoked!.generation
+        || fresh.prNumber !== task.prNumber
+        || !samePassProvenance(fresh.passProvenance, reviewedPass)) {
+        throw new ApiError(409, `Task ${task.id} changed while restoring post-approve replay`);
+      }
+      const generation = createSignalToken();
+      const token = createSignalTokenExcluding(generation);
+      const next = {
+        ...this.stripPostApproveEpisodeFields(fresh),
+        postApproveGeneration: generation,
+        postApproveHeadSha: binding.headSha,
+        postApproveToken: token,
+        postApprovePhase: 'installed' as const,
+        pendingRedispatch: true,
+        redispatchCount: 0,
+        updatedAt: new Date().toISOString(),
+      };
+      await this.taskStore.set(next);
+      return next;
+    });
+  }
+
+  async submitTaskVerdict(
+    taskId: string,
+    action: TaskVerdictAction,
+    comments?: string,
+    note?: string,
+  ): Promise<TaskState> {
+    const task = await this.taskStore.get(taskId);
+    if (!task) throw new ApiError(404, `Task ${taskId} not found`);
+    let updated: TaskState;
+    if (task.status === 'spec-ready'
+      || (task.status === 'max_rounds' && isSpecStagePhase(task.phase))) {
+      if (action !== 'approve' && action !== 'request-changes') {
+        throw new ApiError(409, `Task ${taskId} requires a spec approve or request-changes verdict`);
+      }
+      updated = await this.submitSpecVerdict(taskId, action, comments);
+    } else if (task.status === 'review' && !isSpecStagePhase(task.phase)) {
+      if (action !== 'pass' && action !== 'request-changes') {
+        throw new ApiError(409, `Task ${taskId} requires a code pass or request-changes verdict`);
+      }
+      updated = await this.submitCodeVerdict(taskId, action, comments);
+    } else if (task.status === 'max_rounds') {
+      if (action === 'continue') updated = await this.continueDevRound(taskId);
+      else if (action === 'complete') updated = await this.markTaskComplete(taskId);
+      else throw new ApiError(409, `Task ${taskId} requires continue or complete at code max_rounds`);
+    } else if (task.status === 'merge-ready') {
+      if (action !== 'confirm-merge') {
+        throw new ApiError(409, `Task ${taskId} requires confirm-merge`);
+      }
+      updated = await this.markTaskComplete(taskId);
+    } else {
+      throw new ApiError(409, `Task ${taskId} cannot accept a verdict from ${task.status}`);
+    }
+    await this.auditHumanTaskOperation(updated, 'verdict', action, note);
+    return updated;
+  }
+
+  async auditHumanTaskOperation(
+    task: TaskState,
+    operation: 'advance' | 'verdict' | 'cancel' | 'retry',
+    action: string,
+    note?: string,
+    details: Record<string, unknown> = {},
+  ): Promise<void> {
+    const emitted = await this.safeEmit({
+      id: '',
+      type: 'task.updated',
+      timestamp: new Date().toISOString(),
+      projectId: task.projectId,
+      ...(task.agentId ? { agentId: task.agentId } : {}),
+      taskId: task.id,
+      data: {
+        ...details,
+        operation,
+        action,
+        actor: 'human',
+        provenance: 'human',
+        note: note?.trim() || `${operation}:${action}`,
+      },
+    });
+    if (!emitted) {
+      throw new ApiError(
+        500,
+        `Task ${task.id} ${operation} completed, but its audit event could not be persisted; verify the task state before retrying`,
+      );
+    }
+  }
+
   async dispatchGitFixToDev(taskId: string): Promise<boolean> {
     const task = await this.taskStore.get(taskId);
     if (!task || task.status !== 'fixing') return false;
@@ -10032,7 +10445,7 @@ export class AgentManager {
       throw new ApiError(
         409,
         `Dev ${devAgentId} no longer holds task ${taskId}'s Workdir (cannot continue); ` +
-        `use mark-complete to merge the PR as-is, or cancel the task`,
+        `submit a complete verdict to merge the PR as-is, or cancel the task`,
       );
     }
 
@@ -10156,35 +10569,59 @@ export class AgentManager {
     const old = await this.withTaskLock(async () => {
       const t = await this.taskStore.get(taskId);
       if (!t) throw new ApiError(404, 'Task not found');
-      const retryable =
-        TERMINAL_STATUSES.includes(t.status)
-        || (t.status === 'max_rounds' && isSpecStagePhase(t.phase));
-      if (!retryable) {
+      if (!TERMINAL_STATUSES.includes(t.status)) {
         throw new ApiError(
           409,
           `Task ${taskId} cannot be retried in status "${t.status}"; cancel it first or wait for completion`,
         );
       }
+      if (t.replacementTaskId !== undefined) {
+        throw new ApiError(409, `Task ${taskId} was already retried as ${t.replacementTaskId}`);
+      }
+      if (this.retryTaskInFlight.has(taskId)) {
+        throw new ApiError(409, `Task ${taskId} retry is already in progress`);
+      }
+      this.retryTaskInFlight.add(taskId);
       return t;
     });
-    const input: {
-      title: string;
-      description: string;
-      preferredAgentId: string;
-      images?: { bytes: Buffer; ext: string }[];
-    } = {
-      title: old.title,
-      description: old.description,
-      preferredAgentId: this.resolveRetryPreferredAgentId(old),
-    };
-    if (old.images?.length) {
-      input.images = await this.readStagedImages(old.id, old.images);
+    try {
+      const input: {
+        title: string;
+        description: string;
+        preferredAgentId: string;
+        images?: { bytes: Buffer; ext: string }[];
+      } = {
+        title: old.title,
+        description: old.description,
+        preferredAgentId: this.resolveRetryPreferredAgentId(old),
+      };
+      if (old.images?.length) {
+        input.images = await this.readStagedImages(old.id, old.images);
+      }
+      await this.validateTaskDispatch(old.projectId, input);
+      const replacement = await this.createTask(old.projectId, input);
+      await this.withTaskLock(async () => {
+        const source = await this.taskStore.get(taskId);
+        if (!source) throw new ApiError(404, `Task ${taskId} disappeared while recording its retry`);
+        if (source.replacementTaskId !== undefined && source.replacementTaskId !== replacement.id) {
+          throw new ApiError(409, `Task ${taskId} was already retried as ${source.replacementTaskId}`);
+        }
+        const next = {
+          ...source,
+          replacementTaskId: replacement.id,
+          updatedAt: new Date().toISOString(),
+        };
+        if (old.attention !== undefined
+          && source.attention?.reason === old.attention.reason
+          && source.attention.occurredAt === old.attention.occurredAt) {
+          delete next.attention;
+        }
+        await this.taskStore.set(next);
+      });
+      return this.startCreatedTask(replacement);
+    } finally {
+      this.retryTaskInFlight.delete(taskId);
     }
-    await this.validateTaskDispatch(old.projectId, input);
-    if (!TERMINAL_STATUSES.includes(old.status)) {
-      await this.cancelTask(old.id);
-    }
-    return this.createAndStartTask(old.projectId, input);
   }
 
   private resolveRetryPreferredAgentId(task: TaskState): string {
@@ -10197,7 +10634,7 @@ export class AgentManager {
         .filter((agentId): agentId is string => typeof agentId === 'string' && agentId !== ''),
     );
     for (const anchor of anchors) {
-      const dev = this.findAgentGroup(anchor)?.find(agent => TASK_OWNER_ROLES.has(agent.role));
+      const dev = this.findAgentTeam(anchor)?.find(agent => TASK_OWNER_ROLES.has(agent.role));
       const current = dev ? this.getAgentConfig(dev.id) : undefined;
       if (current?.projectId === task.projectId) return current.id;
     }
@@ -10236,11 +10673,11 @@ export class AgentManager {
             throw new ApiError(400, `Agent not in project ${task.projectId}`);
           }
           if (!TASK_OWNER_ROLES.has(cfg.role)) throw new ApiError(400, 'Agent is not a dev agent');
-          const group = this.findAgentGroup(cfg.id);
-          const dev = group?.find(agent => agent.role === 'dev');
-          if (!dev) throw new ApiError(409, `Agent ${cfg.id} has no dev agent in its group`);
-          const qa = group?.find(agent => agent.role === 'qa');
-          if (!qa) throw new ApiError(409, `Agent ${cfg.id} has no qa agent in its group`);
+          const team = this.findAgentTeam(cfg.id);
+          const dev = team?.find(agent => agent.role === 'dev');
+          if (!dev) throw new ApiError(409, `Agent ${cfg.id} has no dev agent in its Agent Team`);
+          const qa = team?.find(agent => agent.role === 'qa');
+          if (!qa) throw new ApiError(409, `Agent ${cfg.id} has no qa agent in its Agent Team`);
           task.preferredAgentId = patch.preferredAgentId;
           task.devAgentId = dev.id;
           task.qaAgentId = qa.id;
@@ -10281,10 +10718,10 @@ export class AgentManager {
         throw new ApiError(409, `Task ${taskId} is not at max_rounds (status=${task.status})`);
       }
       if (isSpecStagePhase(task.phase)) {
-        throw new ApiError(409, `Mark complete is only supported for code-phase tasks`);
+        throw new ApiError(409, `Complete verdict is only supported for code-phase tasks`);
       }
       if (!task.prNumber || !task.branch) {
-        throw new ApiError(400, `Task ${taskId} has no PR/branch; cannot mark complete`);
+        throw new ApiError(400, `Task ${taskId} has no PR/branch; cannot complete`);
       }
       for (const agentId of [task.agentId, task.qaAgentId]) {
         if (!agentId) continue;
@@ -10292,7 +10729,7 @@ export class AgentManager {
         if (state?.status === 'awaiting_human' && state.taskId === taskId) {
           throw new ApiError(
             409,
-            `Agent ${agentId} is awaiting human intervention on this task; resume/restart/delete it before marking complete`,
+            `Agent ${agentId} is awaiting human intervention on this task; resume/restart/delete it before completing`,
           );
         }
       }
@@ -10303,7 +10740,7 @@ export class AgentManager {
         { fromStatus: ['max_rounds'] },
       );
       if (!claimed) {
-        throw new ApiError(409, `Task ${taskId} changed status during mark-complete; aborted`);
+        throw new ApiError(409, `Task ${taskId} changed status during complete verdict; aborted`);
       }
 
       try {
@@ -10927,6 +11364,297 @@ export class AgentManager {
       });
     }
     return parked;
+  }
+
+  async submitCodeVerdict(
+    taskId: string,
+    verdict: 'pass' | 'request-changes',
+    comments?: string,
+  ): Promise<TaskState> {
+    const trimmed = comments?.trim() ?? '';
+    if (verdict === 'request-changes' && !trimmed) {
+      throw new ApiError(400, 'comments is required for request-changes');
+    }
+    if (extractReviewTokens(trimmed).length > 0) {
+      throw new ApiError(400, 'comments must not contain baxian review markers');
+    }
+    const task = await this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh) throw new ApiError(404, `Task ${taskId} not found`);
+      const pending = this.codeVerdictOutbox(fresh);
+      const kind = verdict === 'pass' ? 'pass' : 'fail';
+      if (pending !== undefined
+        && (pending.data.kind !== kind || pending.data.comments !== trimmed)) {
+        throw new ApiError(409, `Task ${taskId} has a different code verdict already in progress`);
+      }
+      if (pending === undefined && (fresh.status !== 'review' || isSpecStagePhase(fresh.phase))) {
+        throw new ApiError(409, `Task ${taskId} is not awaiting a code review verdict`);
+      }
+      if (this.codeVerdictInFlight.has(taskId)) {
+        throw new ApiError(409, `Task ${taskId} code verdict is already being processed`);
+      }
+      this.codeVerdictInFlight.add(taskId);
+      return fresh;
+    });
+    try {
+      return await this.executeCodeVerdict(task, verdict, trimmed);
+    } finally {
+      this.codeVerdictInFlight.delete(taskId);
+    }
+  }
+
+  private codeVerdictCommentBody(entry: CodeVerdictOutboxEntry): string {
+    const lines = [
+      entry.data.kind === 'pass'
+        ? 'Human code verdict: pass'
+        : 'Human code verdict: request changes',
+    ];
+    if (entry.data.comments) lines.push('', entry.data.comments);
+    lines.push('', buildReviewTokenLine({
+      kind: entry.data.kind,
+      anchorSha: entry.data.anchorSha,
+      token: entry.data.token,
+    }));
+    const body = lines.join('\n');
+    try {
+      validateCommentBody(body);
+    } catch (err) {
+      throw new ApiError(
+        400,
+        `Invalid code verdict comment: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return body;
+  }
+
+  private async scanCodeVerdictMarker(
+    driver: GitDriver,
+    entry: CodeVerdictOutboxEntry,
+    oppositeToken: string,
+  ): Promise<'present' | 'opposite' | 'dead' | 'absent' | 'unknown'> {
+    const scans = await this.platformScanComments(driver, entry.data.prNumber);
+    if (scans.some(scan => !scan.ok)) return 'unknown';
+    const dead = deadTokens(scans);
+    if (dead.has(entry.data.token)) return 'dead';
+    let present = false;
+    let opposite = false;
+    for (const scan of scans) {
+      for (const row of scan.rows) {
+        if (row.system === true || versionTimeOf(row) === undefined) continue;
+        for (const marker of rowTokens(row)) {
+          if (dead.has(marker.token)) continue;
+          if (marker.anchorSha.toLowerCase() !== entry.data.anchorSha.toLowerCase()) continue;
+          if (marker.kind === entry.data.kind && marker.token === entry.data.token) present = true;
+          if (marker.kind !== entry.data.kind && marker.token === oppositeToken) opposite = true;
+        }
+      }
+    }
+    if (opposite) return 'opposite';
+    return present ? 'present' : 'absent';
+  }
+
+  private async reconcileCodeVerdictComment(
+    driver: GitDriver,
+    entry: CodeVerdictOutboxEntry,
+  ): Promise<'present' | 'dead' | 'absent' | 'unknown'> {
+    const expectedDigest = bodyDigest(this.codeVerdictCommentBody(entry));
+    const scans = await this.platformScanComments(driver, entry.data.prNumber);
+    if (scans.some(scan => !scan.ok)) return 'unknown';
+    if (deadTokens(scans).has(entry.data.token)) return 'dead';
+    if (scans.some(scan => scan.rows.some(row =>
+      row.system !== true
+      && versionTimeOf(row) !== undefined
+      && row.bodyDigest === expectedDigest))) return 'present';
+    return 'absent';
+  }
+
+  private async verifyCodeVerdictHead(
+    taskId: string,
+    prNumber: number,
+    anchorSha: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      const binding = await this.platformVerifyPrBinding(taskId, prNumber);
+      if (!binding.ok) return { ok: false, reason: `the PR binding is ${binding.reason}` };
+      if (binding.headSha.toLowerCase() !== anchorSha.toLowerCase()) {
+        return { ok: false, reason: 'the PR head changed' };
+      }
+      return { ok: true };
+    } catch (err) {
+      throw new ApiError(
+        503,
+        `Cannot verify code verdict head for task ${taskId}: ${safeDriverErrorText(err)}`,
+      );
+    }
+  }
+
+  private async deliverCodeVerdictOutbox(taskId: string, key: string): Promise<void> {
+    let task = await this.taskStore.get(taskId);
+    let entry = task ? this.codeVerdictOutbox(task) : undefined;
+    if (!task || !entry || entry.key !== key) return;
+    const driver = this.platformDriverFor(task.projectId);
+    if (!driver) throw new ApiError(503, `Git driver unavailable for task ${task.id}`);
+    const binding = await this.verifyCodeVerdictHead(
+      task.id,
+      entry.data.prNumber,
+      entry.data.anchorSha,
+    );
+    if (!binding.ok) {
+      await this.mutateTaskOutboxEntry(
+        task.id, key, current => current.type === 'git.code-verdict' ? undefined : null,
+      );
+      throw new ApiError(409, `Cannot write code verdict for task ${task.id}: ${binding.reason}`);
+    }
+
+    if (entry.data.writeAttemptedAt !== undefined) {
+      const reconciled = await this.reconcileCodeVerdictComment(driver, entry);
+      if (reconciled === 'dead') {
+        await this.mutateTaskOutboxEntry(
+          task.id, key, current => current.type === 'git.code-verdict' ? undefined : null,
+        );
+        throw new ApiError(
+          409,
+          `Code verdict token for task ${task.id} was dismissed; advance QA to create a new review pass`,
+        );
+      }
+      if (reconciled === 'present') {
+        return;
+      }
+      if (reconciled === 'unknown'
+        || Date.now() - Date.parse(entry.data.writeAttemptedAt) < driver.visibilityLagMs) {
+        throw new ApiError(503, `Code verdict comment outcome is still being reconciled for task ${task.id}`);
+      }
+    }
+
+    const expectedAttempt = entry.data.writeAttemptedAt;
+    const claimed = await this.mutateTaskOutboxEntry(task.id, entry.key, current =>
+      current.type === 'git.code-verdict' && current.data.writeAttemptedAt === expectedAttempt
+        ? { ...current, data: { ...current.data, writeAttemptedAt: new Date().toISOString() } }
+        : null);
+    const claimedEntry = claimed ? this.codeVerdictOutbox(claimed) : undefined;
+    if (!claimed || claimedEntry?.key !== entry.key) {
+      throw new ApiError(503, `Code verdict comment write is already claimed for task ${task.id}`);
+    }
+    task = claimed;
+    entry = claimedEntry;
+    let writeFailure: { error: unknown } | undefined;
+    try {
+      await driver.runOp('comment', {
+        prNumber: entry.data.prNumber,
+        body: this.codeVerdictCommentBody(entry),
+      });
+    } catch (error) {
+      writeFailure = { error };
+    }
+    const reconciled = await this.reconcileCodeVerdictComment(driver, entry);
+    if (reconciled === 'dead') {
+      await this.mutateTaskOutboxEntry(
+        task.id, key, current => current.type === 'git.code-verdict' ? undefined : null,
+      );
+      throw new ApiError(
+        409,
+        `Code verdict token for task ${task.id} was dismissed; advance QA to create a new review pass`,
+      );
+    }
+    if (writeFailure !== undefined && reconciled !== 'present') {
+      const { error } = writeFailure;
+      const uncertain = !(error instanceof DriverOpError)
+        || error.info.exitCode === 255
+        || isTransientNetworkFailure(error.info.stderrTail ?? '')
+        || isTransientNetworkFailure(error.message);
+      if (reconciled === 'unknown' || uncertain) {
+        throw new ApiError(
+          503,
+          `Code verdict comment outcome is unknown for task ${task.id}; the persisted outbox will reconcile it`,
+        );
+      }
+      await this.mutateTaskOutboxEntry(
+        task.id, key, current => current.type === 'git.code-verdict' ? undefined : null,
+      );
+      throw new ApiError(
+        502,
+        `Code verdict comment was rejected for task ${task.id}: ${safeDriverErrorText(error)}`,
+      );
+    }
+    if (reconciled !== 'present') {
+      throw new ApiError(
+        503,
+        `Code verdict comment is not yet visible for task ${task.id}; the persisted outbox will reconcile it`,
+      );
+    }
+  }
+
+  private async executeCodeVerdict(
+    task: TaskState,
+    verdict: 'pass' | 'request-changes',
+    comments: string,
+  ): Promise<TaskState> {
+    if (task.status !== 'review' || isSpecStagePhase(task.phase)
+      || task.prNumber === undefined || task.reviewHeadAnchorSha === undefined
+      || task.passToken === undefined || task.failToken === undefined) {
+      throw new ApiError(409, `Task ${task.id} has no complete code review generation`);
+    }
+    const kind = verdict === 'pass' ? 'pass' : 'fail';
+    const token = kind === 'pass' ? task.passToken : task.failToken;
+    const existingEntry = this.codeVerdictOutbox(task);
+    const entry = existingEntry ?? {
+      key: token,
+      type: 'git.code-verdict' as const,
+      data: {
+        prNumber: task.prNumber,
+        kind,
+        anchorSha: task.reviewHeadAnchorSha,
+        token,
+        comments,
+      },
+    };
+    this.codeVerdictCommentBody(entry);
+    const driver = this.platformDriverFor(task.projectId);
+    if (!driver) throw new ApiError(503, `Git driver unavailable for task ${task.id}`);
+    const binding = await this.verifyCodeVerdictHead(
+      task.id,
+      task.prNumber,
+      task.reviewHeadAnchorSha,
+    );
+    if (!binding.ok) {
+      throw new ApiError(409, `Cannot submit code verdict for task ${task.id}: ${binding.reason}`);
+    }
+    if (existingEntry === undefined) {
+      const marker = await this.scanCodeVerdictMarker(
+        driver,
+        entry,
+        kind === 'pass' ? task.failToken : task.passToken,
+      );
+      if (marker === 'present') return task;
+      if (marker === 'opposite') {
+        throw new ApiError(409, `Task ${task.id} already has the opposite verdict on the current review head`);
+      }
+      if (marker === 'dead') {
+        throw new ApiError(
+          409,
+          `Code verdict token for task ${task.id} was dismissed; advance QA to create a new review pass`,
+        );
+      }
+      if (marker === 'unknown') {
+        throw new ApiError(503, `Cannot safely check existing code verdict comments for task ${task.id}`);
+      }
+      const created = await this.withTaskLock(async () => {
+        const fresh = await this.taskStore.get(task.id);
+        if (!fresh || !taskMatchesGeneration(fresh, taskGenerationGuard(task))
+          || this.codeVerdictOutbox(fresh) !== undefined) return null;
+        const next = {
+          ...fresh,
+          outbox: [...(fresh.outbox ?? []), entry!],
+          updatedAt: new Date().toISOString(),
+        };
+        await this.taskStore.set(next);
+        return next;
+      });
+      if (!created) throw new ApiError(409, `Task ${task.id} changed while recording the code verdict`);
+      task = created;
+    }
+    await this.deliverCodeVerdictOutbox(task.id, entry.key);
+    return (await this.taskStore.get(task.id)) ?? task;
   }
 
   async submitSpecVerdict(
@@ -11716,8 +12444,8 @@ function buildAgentIndex(
 ): Map<string, AgentConfig & { projectId: string }> {
   const index = new Map<string, AgentConfig & { projectId: string }>();
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) {
+    for (const team of project.agent) {
+      for (const agent of team) {
         index.set(agent.id, { ...agent, projectId: project.id });
       }
     }

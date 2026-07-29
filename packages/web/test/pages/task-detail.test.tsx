@@ -66,10 +66,8 @@ import { TaskDetail } from '../../src/pages/task-detail.tsx';
 
 const tasksRetryMock = vi.mocked(api.tasks.retry);
 const tasksUpdateMock = vi.mocked(api.tasks.update);
-const tasksReviewMock = vi.mocked(api.tasks.review);
-const tasksCompleteMock = vi.mocked(api.tasks.complete);
-const tasksContinueMock = vi.mocked(api.tasks.continue);
-const tasksSpecMock = vi.mocked(api.tasks.spec);
+const tasksAdvanceMock = vi.mocked(api.tasks.advance);
+const tasksVerdictMock = vi.mocked(api.tasks.verdict);
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   const task = makeTaskFixture({
@@ -183,10 +181,8 @@ beforeEach(() => {
   setProjects([PROJECT]);
   tasksRetryMock.mockReset();
   tasksUpdateMock.mockReset();
-  tasksReviewMock.mockReset();
-  tasksCompleteMock.mockReset();
-  tasksContinueMock.mockReset();
-  tasksSpecMock.mockReset();
+  tasksAdvanceMock.mockReset();
+  tasksVerdictMock.mockReset();
   toastShowMock.mockReset();
 });
 
@@ -394,7 +390,7 @@ describe('TaskDetail page — layout & agent cards', () => {
     expect(screen.queryByTestId('agent-card')).toBeNull();
   });
 
-  it('shows a placeholder for an unassigned task with no participant group', () => {
+  it('shows a placeholder for an unassigned task with no participant team', () => {
     setTask(makeTask({ agentId: '', devAgentId: 'unassigned', preferredAgentId: '', qaAgentId: undefined }));
     renderPage();
     expect(screen.getByText('No linked agent')).toBeTruthy();
@@ -450,6 +446,12 @@ describe('TaskDetail page — actions & states', () => {
 
     expect(tasksRetryMock).toHaveBeenCalledWith('task-010');
     expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-011');
+  });
+
+  it('does not offer another Retry after the terminal task records its replacement', () => {
+    open({ status: 'failed', replacementTaskId: 'task-011' });
+
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
   });
 
   it('Cancel confirms and calls the update api', async () => {
@@ -535,46 +537,56 @@ describe('TaskDetail page — actions & states', () => {
       open({ status: 'max_rounds', reviewRound: 10, ...overrides });
     }
 
-    it('code-phase shows Mark complete / Continue another round / Call review and the warning, hides Retry', () => {
+    it('code-phase shows the two human verdicts and the warning without legacy actions', () => {
       openMaxRounds();
-      expect(screen.getByRole('button', { name: 'Mark complete' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Continue another round' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Call review' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Pass and merge' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Fix another round' })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
       expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
       expect(screen.getByText(/Review round limit reached \(round 10\)/)).toBeTruthy();
     });
 
     it.each([
-      { button: 'Continue another round', mock: tasksContinueMock, resolved: makeTask({ status: 'fixing', reviewRound: 11 }) },
-      { button: 'Mark complete', mock: tasksCompleteMock, resolved: makeTask({ status: 'merged' }) },
-    ])('$button confirms and calls its api', async ({ button, mock, resolved }) => {
-      mock.mockResolvedValue(resolved);
+      {
+        button: 'Fix another round',
+        confirm: 'Fix another round',
+        action: 'continue',
+        resolved: makeTask({ status: 'fixing', reviewRound: 11 }),
+      },
+      {
+        button: 'Pass and merge',
+        confirm: 'Pass and merge',
+        action: 'complete',
+        resolved: makeTask({ status: 'merged' }),
+      },
+    ] as const)('$button confirms and submits a unified verdict', async ({ button, confirm, action, resolved }) => {
+      tasksVerdictMock.mockResolvedValue(resolved);
       openMaxRounds();
 
       fireEvent.click(screen.getByRole('button', { name: button }));
-      await settleConfirmDialog(button);
-      expect(mock).toHaveBeenCalledWith('task-010');
+      await settleConfirmDialog(confirm);
+      expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action });
     });
 
-    it('spec-phase shows Retry, hides the code actions, and keeps PR review available', () => {
+    it('spec-phase hides code and legacy review actions', () => {
       openMaxRounds({ phase: 'spec' });
-      expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
-      expect(screen.queryByRole('button', { name: 'Mark complete' })).toBeNull();
-      expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(false);
+      expect(screen.queryByRole('button', { name: 'Pass and merge' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
       expect(screen.getByText(/Spec review round limit reached \(round 0\)/)).toBeTruthy();
     });
 
     it('spec-phase renders the verdict controls: approve starts coding', async () => {
-      tasksSpecMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
+      tasksVerdictMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openMaxRounds({ phase: 'spec', specReviewRound: 10 });
 
       fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
       await settleConfirmDialog('Approve Spec');
-      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'approve' });
+      expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'approve' });
     });
 
     it('spec-phase reject submits request-changes for one more round', async () => {
-      tasksSpecMock.mockResolvedValue(makeTask({ status: 'fixing', phase: 'spec', maxRoundsContinues: 1 }));
+      tasksVerdictMock.mockResolvedValue(makeTask({ status: 'fixing', phase: 'spec', maxRoundsContinues: 1 }));
       openMaxRounds({ phase: 'spec', specReviewRound: 10 });
 
       const reject = screen.getByRole('button', { name: 'Reject Spec' }) as HTMLButtonElement;
@@ -584,7 +596,10 @@ describe('TaskDetail page — actions & states', () => {
         fireEvent.click(screen.getByRole('button', { name: 'Reject Spec' }));
       });
 
-      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '按分歧点再收敛一轮' });
+      expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
+        action: 'request-changes',
+        comments: '按分歧点再收敛一轮',
+      });
     });
 
   });
@@ -606,7 +621,7 @@ describe('TaskDetail page — actions & states', () => {
     });
 
     it('Approve Spec confirms and submits an approve verdict', async () => {
-      tasksSpecMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
+      tasksVerdictMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openSpecReady();
 
       fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
@@ -617,12 +632,12 @@ describe('TaskDetail page — actions & states', () => {
         fireEvent.click(within(dialog).getByRole('button', { name: 'Approve Spec' }));
       });
 
-      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'approve' });
+      expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'approve' });
       expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec approved; coding started' });
     });
 
     it('Reject Spec submits request-changes with the comments', async () => {
-      tasksSpecMock.mockResolvedValue(makeTask({ status: 'fixing' }));
+      tasksVerdictMock.mockResolvedValue(makeTask({ status: 'fixing' }));
       openSpecReady();
 
       fireEvent.change(screen.getByPlaceholderText(/[Rr]ejection comments/), { target: { value: ' 边界场景没有覆盖 ' } });
@@ -630,12 +645,15 @@ describe('TaskDetail page — actions & states', () => {
         fireEvent.click(screen.getByRole('button', { name: 'Reject Spec' }));
       });
 
-      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '边界场景没有覆盖' });
+      expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
+        action: 'request-changes',
+        comments: '边界场景没有覆盖',
+      });
       expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec rejected; Dev agent is revising' });
     });
 
     it('verdict failure surfaces an error toast', async () => {
-      tasksSpecMock.mockRejectedValue(new Error('task-010 is fixing'));
+      tasksVerdictMock.mockRejectedValue(new Error('task-010 is fixing'));
       openSpecReady();
 
       fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
@@ -647,31 +665,35 @@ describe('TaskDetail page — actions & states', () => {
 
 });
 
-describe('TaskDetail page — call review', () => {
-  it('confirms with the active-task prompt, dispatches, and reports the new round', async () => {
-    tasksReviewMock.mockResolvedValue(makeTask({ status: 'review', reviewRound: 2, updatedAt: '2026-05-11T00:00:00.000Z' }));
-    open({ status: 'review' });
+describe('TaskDetail page — advance', () => {
+  it('dispatches a pending task to its selected Dev agent through the unified endpoint', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'in_progress' }));
+    open({ status: 'pending' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
-    const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Start a QA re-review?')).toBeTruthy();
-    expect(within(dialog).getByText(/QA agent will immediately start a new review round for task task-010/)).toBeTruthy();
-    expect(within(dialog).getByText(/continue only after verifying the QA pane did not receive it/)).toBeTruthy();
-    await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Start re-review' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+    await settleConfirmDialog('Advance');
+
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
+      executor: 'dev',
+      agentId: 'bx-dev',
     });
-
-    expect(tasksReviewMock).toHaveBeenCalledWith('task-010');
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Task advanced' });
   });
 
-  it('collects the stage and platform actor when recovering an unconfirmed git delivery', async () => {
-    tasksReviewMock.mockResolvedValue(makeTask({
-      status: 'review',
-      phase: 'code',
-      reviewRound: 1,
-      updatedAt: '2026-05-11T00:00:00.000Z',
-    }));
+  it('replays a review instruction to QA through the unified endpoint', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', reviewRound: 2 }));
+    open({ status: 'review' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText(/current review instruction to QA/)).toBeTruthy();
+    await settleConfirmDialog('Advance');
+
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', { executor: 'qa' });
+  });
+
+  it('collects delivery proof before advancing an unconfirmed delivery to QA', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', phase: 'code' }));
     open({
       status: 'in_progress',
       phase: undefined,
@@ -680,8 +702,8 @@ describe('TaskDetail page — call review', () => {
       replyActorStatus: 'provisional',
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Recover PR delivery' });
+    fireEvent.click(screen.getByRole('button', { name: 'Advance to QA' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Advance to QA with delivery proof' });
     const stage = within(dialog).getByLabelText('Delivered stage (required)') as HTMLSelectElement;
     const actor = within(dialog).getByLabelText('Platform actor ID (required)') as HTMLInputElement;
     expect(stage.value).toBe('spec');
@@ -689,20 +711,17 @@ describe('TaskDetail page — call review', () => {
     fireEvent.change(stage, { target: { value: 'code' } });
     fireEvent.change(actor, { target: { value: ' 77 ' } });
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Recover and start review' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm delivery and advance' }));
     });
 
-    expect(tasksReviewMock).toHaveBeenCalledWith('task-010', {
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
+      executor: 'qa',
       stage: 'code',
       actorId: '77',
     });
-    expect(toastShowMock).toHaveBeenCalledWith({
-      kind: 'success',
-      title: 'QA re-review started (round 1)',
-    });
   });
 
-  it('does not submit manual recovery without a platform actor', async () => {
+  it('does not submit delivery recovery without a platform actor', async () => {
     open({
       status: 'in_progress',
       phase: undefined,
@@ -711,29 +730,23 @@ describe('TaskDetail page — call review', () => {
       replyActorStatus: undefined,
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Recover PR delivery' });
+    fireEvent.click(screen.getByRole('button', { name: 'Advance to QA' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Advance to QA with delivery proof' });
     const submit = within(dialog).getByRole('button', {
-      name: 'Recover and start review',
+      name: 'Confirm delivery and advance',
     }) as HTMLButtonElement;
-    const actor = within(dialog).getByLabelText('Platform actor ID (required)');
     expect(submit.disabled).toBe(true);
-    fireEvent.change(actor, { target: { value: '   ' } });
+    fireEvent.change(within(dialog).getByLabelText('Platform actor ID (required)'), {
+      target: { value: '   ' },
+    });
     expect(submit.disabled).toBe(true);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
 
-    expect(tasksReviewMock).not.toHaveBeenCalled();
+    expect(tasksAdvanceMock).not.toHaveBeenCalled();
   });
 
-  it('collects and forwards a PR number when a custom-branch task lost its initial signal', async () => {
-    tasksReviewMock.mockResolvedValue(makeTask({
-      status: 'review',
-      prNumber: 73,
-      prUrl: undefined,
-      branch: 'feature/manual-review',
-      phase: 'code',
-      updatedAt: '2026-05-11T00:00:00.000Z',
-    }));
+  it('collects a PR number when a custom-branch task lost its initial signal', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', prNumber: 73, phase: 'code' }));
     open({
       status: 'in_progress',
       prNumber: undefined,
@@ -745,98 +758,69 @@ describe('TaskDetail page — call review', () => {
       replyActorStatus: undefined,
     });
 
-    const callReview = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-    expect(callReview.disabled).toBe(false);
-    fireEvent.click(callReview);
-    const dialog = await screen.findByRole('dialog', { name: 'Recover PR delivery' });
+    fireEvent.click(screen.getByRole('button', { name: 'Advance to QA' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Advance to QA with delivery proof' });
     const submit = within(dialog).getByRole('button', {
-      name: 'Recover and start review',
+      name: 'Confirm delivery and advance',
     }) as HTMLButtonElement;
-    expect(submit.disabled).toBe(true);
-    fireEvent.change(within(dialog).getByLabelText('PR number (required)'), {
-      target: { value: '73' },
-    });
-    fireEvent.change(within(dialog).getByLabelText('Delivered stage (required)'), {
-      target: { value: 'code' },
-    });
-    fireEvent.change(within(dialog).getByLabelText('Platform actor ID (required)'), {
-      target: { value: '77' },
-    });
+    fireEvent.change(within(dialog).getByLabelText('PR number (required)'), { target: { value: '73' } });
+    fireEvent.change(within(dialog).getByLabelText('Delivered stage (required)'), { target: { value: 'code' } });
+    fireEvent.change(within(dialog).getByLabelText('Platform actor ID (required)'), { target: { value: '77' } });
     await act(async () => {
       fireEvent.click(submit);
     });
 
-    expect(tasksReviewMock).toHaveBeenCalledWith('task-010', {
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
+      executor: 'qa',
       prNumber: 73,
       stage: 'code',
       actorId: '77',
     });
   });
 
-  it('keeps Call review disabled for a pending task that already has its assigned branch', () => {
+  it('requires an explicit confirmation before lifting a revoked post-approve gate', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'approved' }));
     open({
-      status: 'pending',
-      prNumber: undefined,
-      prUrl: undefined,
-      branch: 'bx/task-010',
-      phase: undefined,
-      deliveryConfirmation: undefined,
+      status: 'approved',
+      postApproveRevoked: {
+        generation: 'post-approve-1',
+        reason: 'request-changes',
+        at: '2026-05-10T13:00:00.000Z',
+      },
     });
 
-    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-    fireEvent.click(button);
-    expect(screen.queryByRole('dialog')).toBeNull();
-    expect(tasksReviewMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('Lift the post-approve gate and advance?')).toBeTruthy();
+    await settleConfirmDialog('Advance');
+
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
+      executor: 'dev',
+      confirmRevoked: true,
+    });
+  });
+
+  it('shows an error toast when advance fails', async () => {
+    tasksAdvanceMock.mockRejectedValue(new Error('qa is busy'));
+    open({ status: 'review' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+    await settleConfirmDialog('Advance');
+
+    expect(toastShowMock).toHaveBeenCalledWith({
+      kind: 'error',
+      title: 'Failed to advance',
+      body: 'qa is busy',
+    });
   });
 
   it.each(['merged', 'done', 'failed', 'cancelled'] as const)(
-    'keeps Call review disabled for terminal status %s even without delivery confirmation',
+    'does not offer Advance for terminal status %s',
     (status) => {
-      open({
-        status,
-        phase: undefined,
-        deliveryConfirmation: undefined,
-        replyActorStatus: undefined,
-      });
-
-      const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-      expect(button.disabled).toBe(true);
-      expect(button.title).toBe('Finished tasks cannot start another PR review');
-      fireEvent.click(button);
-      expect(screen.queryByRole('dialog')).toBeNull();
-      expect(tasksReviewMock).not.toHaveBeenCalled();
+      open({ status });
+      expect(screen.queryByRole('button', { name: 'Advance' })).toBeNull();
     },
   );
-
-  it('shows an error toast when review dispatch fails', async () => {
-    tasksReviewMock.mockRejectedValue(new Error('qa is busy'));
-    open({ status: 'review' });
-
-    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
-    await settleConfirmDialog('Start re-review');
-
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start review', body: 'qa is busy' });
-  });
-
-  it('spec-phase task reports the spec round in the toast', async () => {
-    tasksReviewMock.mockResolvedValue(makeTask({ phase: 'spec', status: 'review', specReviewRound: 2, reviewRound: 0 }));
-    open({ phase: 'spec', status: 'review', specReviewRound: 1 });
-
-    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-    expect(button.disabled).toBe(false);
-    fireEvent.click(button);
-    await settleConfirmDialog('Start re-review');
-
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
-  });
-
-  it('a task without a PR or bound branch keeps Call review disabled with the no-PR tooltip', () => {
-    open({ status: 'review', prNumber: undefined, prUrl: undefined, branch: undefined });
-    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-    expect(button.title).toBe('This task has no PR yet; cannot start a review');
-  });
 });
 
 describe('TaskDetail page — action failures surface error toasts', () => {
@@ -867,55 +851,55 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-010');
   });
 
-  it('Mark complete failure shows Failed to mark complete', async () => {
-    tasksCompleteMock.mockRejectedValue(new Error('merge conflict'));
+  it('Pass and merge failure reports the verdict action', async () => {
+    tasksVerdictMock.mockRejectedValue(new Error('merge conflict'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Mark complete' }));
-    await settleConfirmDialog('Mark complete');
+    fireEvent.click(screen.getByRole('button', { name: 'Pass and merge' }));
+    await settleConfirmDialog('Pass and merge');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to mark complete', body: 'merge conflict' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to pass and merge', body: 'merge conflict' });
   });
 
-  it('Continue another round failure shows Failed to continue', async () => {
-    tasksContinueMock.mockRejectedValue(new Error('dev is gone'));
+  it('Fix another round failure reports the verdict action', async () => {
+    tasksVerdictMock.mockRejectedValue(new Error('dev is gone'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Continue another round' }));
-    await settleConfirmDialog('Continue another round');
+    fireEvent.click(screen.getByRole('button', { name: 'Fix another round' }));
+    await settleConfirmDialog('Fix another round');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to continue', body: 'dev is gone' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start another fix round', body: 'dev is gone' });
   });
 });
 
 describe('TaskDetail page — human confirmation gates', () => {
-  it('merge-ready gate renders the PR banner and Confirm completes the task', async () => {
-    tasksCompleteMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
+  it('merge-ready gate renders the PR banner and submits a confirm-merge verdict', async () => {
+    tasksVerdictMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
     open({ status: 'merge-ready' });
 
     expect(screen.getByText('PR ready · Awaiting your confirmation')).toBeTruthy();
     expect(screen.getByRole('link', { name: 'View PR #55' })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm merge' }));
     const dialog = await findConfirmDialog();
     expect(within(dialog).getByText('Confirm task task-010 is complete?')).toBeTruthy();
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm complete' }));
     });
 
-    expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
+    expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'confirm-merge' });
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Confirmed (done)' });
   });
 
   it('Confirm is skipped when the confirm dialog is cancelled and reports failures', async () => {
     open({ status: 'merge-ready' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm merge' }));
     await settleConfirmDialog('Cancel');
-    expect(tasksCompleteMock).not.toHaveBeenCalled();
+    expect(tasksVerdictMock).not.toHaveBeenCalled();
 
-    tasksCompleteMock.mockRejectedValue(new Error('gate says no'));
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    tasksVerdictMock.mockRejectedValue(new Error('gate says no'));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm merge' }));
     await settleConfirmDialog('Confirm complete');
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to confirm', body: 'gate says no' });
@@ -923,17 +907,44 @@ describe('TaskDetail page — human confirmation gates', () => {
 
 });
 
-describe('TaskDetail page — review verdict watchdog', () => {
-  it('flags a review dispatched over 10 minutes ago with the missing-verdict banner', () => {
-    open({ status: 'review', reviewDispatchedAt: '2026-05-10T12:00:00.000Z' });
+describe('TaskDetail page — human attention and code verdict', () => {
+  it('renders persisted attention with the recommended task operations', () => {
+    open({
+      status: 'review',
+      attention: {
+        reason: 'review-verdict-overdue',
+        runbook: 'Inspect the QA review and submit a verdict.',
+        occurredAt: '2026-05-10T12:00:00.000Z',
+        recommendedActions: ['verdict', 'cancel'],
+      },
+    });
 
-    expect(screen.getByText('Review verdict overdue')).toBeTruthy();
-    expect(screen.getByText(/with no verdict submitted after 10 minutes/)).toBeTruthy();
+    expect(screen.getByText('review-verdict-overdue')).toBeTruthy();
+    expect(screen.getByText('Inspect the QA review and submit a verdict.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Verdict' })).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Cancel' }).length).toBeGreaterThan(0);
   });
 
-  it('keeps the banner hidden for a freshly dispatched review', () => {
-    open({ status: 'review', reviewDispatchedAt: new Date().toISOString() });
-    expect(screen.queryByText('Review verdict overdue')).toBeNull();
+  it('submits a code-review pass with the optional comments through the unified endpoint', async () => {
+    tasksVerdictMock.mockResolvedValue(makeTask({ status: 'review' }));
+    open({ status: 'review' });
+
+    fireEvent.change(screen.getByPlaceholderText(/Change request/), {
+      target: { value: 'Validated the edge case' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Pass' }));
+    await settleConfirmDialog('Pass');
+
+    expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
+      action: 'pass',
+      comments: 'Validated the edge case',
+    });
+  });
+
+  it('requires comments before submitting code-review changes', () => {
+    open({ status: 'review' });
+    expect((screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(tasksVerdictMock).not.toHaveBeenCalled();
   });
 });
 
@@ -1007,7 +1018,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     expect(card.getAttribute('data-terminal-loading')).toBe('true');
   });
 
-  it('shows the QA slot placeholder when the snapshotted QA no longer belongs to the group', () => {
+  it('shows the QA slot placeholder when the snapshotted QA no longer belongs to the team', () => {
     setProjects([{
       ...PROJECT,
       agent: [[
@@ -1021,7 +1032,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
   });
 
-  it('does not attach a group QA that was not snapshotted on the task', () => {
+  it('does not attach a team QA that was not snapshotted on the task', () => {
     setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
     expect(screen.getByText('No QA agent')).toBeTruthy();

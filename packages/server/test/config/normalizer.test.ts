@@ -97,8 +97,8 @@ describe('normalizeConfig', () => {
         }],
       });
       const proj = (result.project as Record<string, unknown>[])[0];
-      const pair = (proj.agent as Record<string, unknown>[][])[0];
-      expect(pair[0].yolo).toBe(true);
+      const team = (proj.agent as Record<string, unknown>[][])[0];
+      expect(team[0].yolo).toBe(true);
     });
 
     it('passes yolo: false through unchanged', () => {
@@ -109,8 +109,8 @@ describe('normalizeConfig', () => {
         }],
       });
       const proj = (result.project as Record<string, unknown>[])[0];
-      const pair = (proj.agent as Record<string, unknown>[][])[0];
-      expect(pair[0].yolo).toBe(false);
+      const team = (proj.agent as Record<string, unknown>[][])[0];
+      expect(team[0].yolo).toBe(false);
     });
 
     it('leaves yolo undefined for legacy configs', () => {
@@ -121,8 +121,8 @@ describe('normalizeConfig', () => {
         }],
       });
       const proj = (result.project as Record<string, unknown>[])[0];
-      const pair = (proj.agent as Record<string, unknown>[][])[0];
-      expect(pair[0].yolo).toBeUndefined();
+      const team = (proj.agent as Record<string, unknown>[][])[0];
+      expect(team[0].yolo).toBeUndefined();
     });
   });
 });

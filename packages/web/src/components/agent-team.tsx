@@ -9,8 +9,8 @@ import { useToast } from './toast.tsx';
 import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { useT } from '../i18n/index.tsx';
 
-interface AgentGroupProps {
-  group: AgentConfig[];
+interface AgentTeamProps {
+  team: AgentConfig[];
   projectId: string;
   agentsById: Map<string, AgentSnapshot>;
   agentsLoaded: boolean;
@@ -20,8 +20,8 @@ interface AgentGroupProps {
   terminalMode?: TerminalMode;
 }
 
-export function AgentGroup({
-  group,
+export function AgentTeam({
+  team,
   projectId,
   agentsById,
   agentsLoaded,
@@ -29,17 +29,17 @@ export function AgentGroup({
   tasks,
   onDeleted,
   terminalMode = 'activity-preview',
-}: AgentGroupProps) {
+}: AgentTeamProps) {
   const t = useT();
-  const dev = group.find(agent => agent.role === 'dev') ?? group[0];
-  const activeTasks = tasks.filter(task => taskBelongsToGroup(task, dev?.id));
+  const dev = team.find(agent => agent.role === 'dev') ?? team[0];
+  const activeTasks = tasks.filter(task => taskBelongsToTeam(task, dev?.id));
   const claimableTasks = dev
     ? tasks
-        .filter(task => claimableForGroup(task, projectId, dev.id))
+        .filter(task => claimableForTeam(task, projectId, dev.id))
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     : [];
 
-  const label = `Agent group ${group.map(agent => agent.id).join(' / ')}`;
+  const label = `Agent Team ${team.map(agent => agent.id).join(' / ')}`;
   const navigate = useNavigate();
 
   const selectableTerminals = terminalMode === 'embedded-full';
@@ -48,11 +48,11 @@ export function AgentGroup({
   });
 
   const agentGridCols = terminalMode === 'embedded-full'
-    ? group.length <= 1
+    ? team.length <= 1
       ? 'lg:grid-cols-1'
-      : group.length === 2
+      : team.length === 2
         ? 'lg:grid-cols-2'
-        : group.length === 3
+        : team.length === 3
           ? 'lg:grid-cols-3'
           : 'lg:grid-cols-4'
     : 'sm:grid-cols-2';
@@ -102,7 +102,7 @@ export function AgentGroup({
         </div>
       )}
       <div className={`grid grid-cols-1 ${agentGridCols} gap-4`}>
-        {group.map(cfg => {
+        {team.map(cfg => {
           const snapshot = agentsById.get(cfg.id);
           const state: AgentSnapshot = snapshot ?? {
             id: cfg.id,
@@ -163,7 +163,7 @@ function ClaimableList({ tasks, devId, agentsById, label }: ClaimableListProps) 
   const handleDispatch = async (taskId: string, targetId: string) => {
     setBusyTaskId(taskId);
     try {
-      await api.tasks.dispatch(taskId, { agentId: targetId });
+      await api.tasks.advance(taskId, { executor: 'dev', agentId: targetId });
       show({ kind: 'success', title: t.agents.taskHandedTo(taskId, targetId) });
     } catch (err) {
       show({
@@ -217,12 +217,12 @@ function ClaimableList({ tasks, devId, agentsById, label }: ClaimableListProps) 
   );
 }
 
-function taskBelongsToGroup(task: TaskState, devId: string | undefined): boolean {
+function taskBelongsToTeam(task: TaskState, devId: string | undefined): boolean {
   if (!devId || !TASK_ACTIVE_STATUS_SET.has(task.status)) return false;
   return task.devAgentId === devId;
 }
 
-function claimableForGroup(
+function claimableForTeam(
   task: TaskState,
   projectId: string,
   devId: string,

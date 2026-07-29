@@ -1043,6 +1043,10 @@ export function registerEventHandlers(
   bus: EventBus,
   manager: AgentManager,
 ): void {
+  bus.on('human.intervention', async (event) => {
+    await manager.recordTaskAttention(event);
+  });
+
   const handleGitPrDelivery = async (
     event: BaxianEvent,
     deliveryPhase: TaskState['phase'] | undefined,

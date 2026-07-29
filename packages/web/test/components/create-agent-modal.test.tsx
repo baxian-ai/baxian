@@ -15,7 +15,7 @@ import { makeRuntimes } from '../helpers/fixtures.ts';
 const configGetMock = vi.mocked(api.config.get);
 const probeMock = vi.mocked(api.agents.probe);
 const installTmuxMock = vi.mocked(api.agents.installTmux);
-const addAgentGroupMock = vi.mocked(api.projects.addAgentGroup);
+const addAgentTeamMock = vi.mocked(api.projects.addAgentTeam);
 
 function cfg(hosts: BaxianConfig['host']): BaxianConfig {
   return {
@@ -40,7 +40,7 @@ beforeEach(() => {
     message: 'tmux 3.4 installed via apt-get',
     tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
   });
-  addAgentGroupMock.mockReset().mockResolvedValue({
+  addAgentTeamMock.mockReset().mockResolvedValue({
     agents: [
       { id: 'dev-new', runtime: 'claude-code', role: 'dev', mode: 'local' },
       { id: 'qa-new', runtime: 'codex', role: 'qa', mode: 'local' },
@@ -61,7 +61,7 @@ function cfgWithAgents(agent: ProjectConfig['agent']): BaxianConfig {
 }
 
 function submitButton(): HTMLButtonElement {
-  return screen.getByRole('button', { name: /Continue to QA|Add group|Adding group/ }) as HTMLButtonElement;
+  return screen.getByRole('button', { name: /Continue to QA|Add Agent Team|Adding Agent Team/ }) as HTMLButtonElement;
 }
 
 async function renderReady(config?: BaxianConfig): Promise<{ onClose: ReturnType<typeof vi.fn>; onCreated: ReturnType<typeof vi.fn> }> {
@@ -82,7 +82,7 @@ async function fillValidForm(id: string, runtime: 'Claude Code' | 'Codex' = 'Cla
 async function continueWithDev(id = 'dev-new'): Promise<void> {
   await fillValidForm(id);
   fireEvent.click(submitButton());
-  expect(addAgentGroupMock).not.toHaveBeenCalled();
+  expect(addAgentTeamMock).not.toHaveBeenCalled();
   await waitFor(() => expect(screen.getByText('QA agent (step 2 of 2)')).toBeTruthy());
 }
 
@@ -144,7 +144,7 @@ it('hides Workdir/Model/Additional Dirs behind a collapsed Advanced options togg
   expect(screen.queryByLabelText(/Workdir/)).toBeNull();
 });
 
-it('collects a complete Dev + QA group and submits it once', async () => {
+it('collects a complete Dev + QA team and submits it once', async () => {
   const { onClose, onCreated } = await renderReady();
   await continueWithDev('dev-new');
   await fillValidForm('qa-new', 'Codex');
@@ -153,8 +153,8 @@ it('collects a complete Dev + QA group and submits it once', async () => {
     fireEvent.click(submitButton());
   });
 
-  expect(addAgentGroupMock).toHaveBeenCalledTimes(1);
-  expect(addAgentGroupMock).toHaveBeenCalledWith('baxian', {
+  expect(addAgentTeamMock).toHaveBeenCalledTimes(1);
+  expect(addAgentTeamMock).toHaveBeenCalledWith('baxian', {
     agents: [
       {
         id: 'dev-new',
@@ -174,7 +174,7 @@ it('collects a complete Dev + QA group and submits it once', async () => {
   });
   expect(toastShowMock).toHaveBeenCalledWith({
     kind: 'success',
-    title: 'Agent group dev-new + qa-new added to baxian',
+    title: 'Agent Team dev-new + qa-new added to baxian',
   });
   expect(onCreated).toHaveBeenCalledTimes(1);
   expect(onClose).toHaveBeenCalledTimes(1);
@@ -182,7 +182,7 @@ it('collects a complete Dev + QA group and submits it once', async () => {
 });
 
 it('flags a pending server restart when the API reports restartRequired', async () => {
-  addAgentGroupMock.mockResolvedValue({
+  addAgentTeamMock.mockResolvedValue({
     agents: [
       { id: 'dev-new', runtime: 'claude-code', role: 'dev', mode: 'local' },
       { id: 'qa-new', runtime: 'codex', role: 'qa', mode: 'local' },
@@ -201,13 +201,13 @@ it('flags a pending server restart when the API reports restartRequired', async 
   expect(flagDirtyMock).toHaveBeenCalledTimes(1);
   expect(toastShowMock).toHaveBeenCalledWith({
     kind: 'warn',
-    title: 'Agent group dev-new + qa-new added to baxian',
+    title: 'Agent Team dev-new + qa-new added to baxian',
     body: 'in-memory config switch failed after disk commit; restart the server',
   });
 });
 
 it('surfaces post-commit initialization warnings without flagging a restart', async () => {
-  addAgentGroupMock.mockResolvedValue({
+  addAgentTeamMock.mockResolvedValue({
     agents: [
       { id: 'dev-new', runtime: 'claude-code', role: 'dev', mode: 'local' },
       { id: 'qa-new', runtime: 'codex', role: 'qa', mode: 'local' },
@@ -229,12 +229,12 @@ it('surfaces post-commit initialization warnings without flagging a restart', as
   expect(flagDirtyMock).not.toHaveBeenCalled();
   expect(toastShowMock).toHaveBeenCalledWith({
     kind: 'warn',
-    title: 'Agent group dev-new + qa-new added to baxian',
+    title: 'Agent Team dev-new + qa-new added to baxian',
     body: 'agent qa-new state initialization failed after config commit: disk full\nbootstrap will retry',
   });
 });
 
-it('trims the QA advanced options before submitting the complete group', async () => {
+it('trims the QA advanced options before submitting the complete team', async () => {
   await renderReady();
   await continueWithDev('dev-a');
   await fillValidForm('qa-a', 'Codex');
@@ -249,7 +249,7 @@ it('trims the QA advanced options before submitting the complete group', async (
     fireEvent.click(submitButton());
   });
 
-  expect(addAgentGroupMock).toHaveBeenCalledWith('baxian', {
+  expect(addAgentTeamMock).toHaveBeenCalledWith('baxian', {
     agents: [
       {
         id: 'dev-a',
@@ -275,17 +275,17 @@ it('trims the QA advanced options before submitting the complete group', async (
 it('Back restores the Dev draft without mutating the server', async () => {
   await renderReady();
   await continueWithDev('dev-back');
-  expect(screen.getByText('Paired with Dev agent dev-back')).toBeTruthy();
+  expect(screen.getByText('In the same Agent Team as Dev agent dev-back')).toBeTruthy();
 
   fireEvent.click(screen.getByRole('button', { name: /Back/ }));
 
   expect(screen.getByText('Dev agent (step 1 of 2)')).toBeTruthy();
   expect((screen.getByLabelText('Agent ID') as HTMLInputElement).value).toBe('dev-back');
-  expect(addAgentGroupMock).not.toHaveBeenCalled();
+  expect(addAgentTeamMock).not.toHaveBeenCalled();
 });
 
-it('surfaces an addAgentGroup failure inline and keeps the modal open', async () => {
-  addAgentGroupMock.mockRejectedValue(new Error('id already used\nsomewhere else'));
+it('surfaces an addAgentTeam failure inline and keeps the modal open', async () => {
+  addAgentTeamMock.mockRejectedValue(new Error('id already used\nsomewhere else'));
   const { onClose, onCreated } = await renderReady();
   await continueWithDev();
   await fillValidForm('qa-new', 'Codex');
@@ -299,12 +299,12 @@ it('surfaces an addAgentGroup failure inline and keeps the modal open', async ()
   expect(banner.classList.contains('whitespace-pre-line')).toBe(true);
   expect(onClose).not.toHaveBeenCalled();
   expect(onCreated).not.toHaveBeenCalled();
-  expect(submitButton().textContent).toBe('Add group');
+  expect(submitButton().textContent).toBe('Add Agent Team');
 });
 
 it('Cancel closes the modal, but dismissal is blocked while a submit is in flight', async () => {
   let resolveAdd: ((value: { agents: AgentConfig[]; restartRequired: boolean }) => void) | undefined;
-  addAgentGroupMock.mockReturnValue(new Promise((resolve) => { resolveAdd = resolve; }));
+  addAgentTeamMock.mockReturnValue(new Promise((resolve) => { resolveAdd = resolve; }));
   const { onClose } = await renderReady();
   await continueWithDev();
   await fillValidForm('qa-new', 'Codex');
@@ -315,7 +315,7 @@ it('Cancel closes the modal, but dismissal is blocked while a submit is in fligh
   await act(async () => {
     fireEvent.click(submitButton());
   });
-  expect(submitButton().textContent).toBe('Adding group…');
+  expect(submitButton().textContent).toBe('Adding Agent Team…');
   fireEvent.keyDown(document, { key: 'Escape' });
   expect(onClose).toHaveBeenCalledTimes(1);
 
@@ -416,7 +416,7 @@ it('renders the SSH ✓ line and tmux install success in green (text-probe-ok)',
   expect(installMsg.className).toContain('text-probe-ok');
 });
 
-it('prefills the Agent ID placeholder for each group-creation step', async () => {
+it('prefills the Agent ID placeholder for each team-creation step', async () => {
   await renderReady();
   expect((screen.getByLabelText('Agent ID') as HTMLInputElement).placeholder).toBe('baxian-dev');
 
@@ -468,7 +468,7 @@ it('rejects a QA id that duplicates the Dev draft id', async () => {
 
   expect(screen.getByText('This ID is already in use (must be globally unique)')).toBeTruthy();
   expect(submitButton().disabled).toBe(true);
-  expect(addAgentGroupMock).not.toHaveBeenCalled();
+  expect(addAgentTeamMock).not.toHaveBeenCalled();
 });
 
 it('Re-probe re-runs the probe on demand', async () => {

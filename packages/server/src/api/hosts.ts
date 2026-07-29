@@ -88,8 +88,8 @@ function sameConnection(a: HostConfig, b: HostConfig): boolean {
 async function liveAgentsReferencingHost(app: FastifyInstance, hostId: string): Promise<string[]> {
   const live: string[] = [];
   for (const project of app.ctx.config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) {
+    for (const team of project.agent) {
+      for (const agent of team) {
         if (agent.host !== hostId) continue;
         if (await agentIsLive(app.ctx, agent.id)) {
           live.push(agent.id);
@@ -135,8 +135,8 @@ async function invalidateStreamersForHost(app: FastifyInstance, hostId: string):
   const mgr = app.ctx.paneStreamerManager;
   if (mgr) {
     for (const project of app.ctx.config.project) {
-      for (const pair of project.agent) {
-        for (const agent of pair) {
+      for (const team of project.agent) {
+        for (const agent of team) {
           if (agent.host === hostId && mgr.has(agent.id)) {
             await mgr.destroy(agent.id);
           }
@@ -299,8 +299,8 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
       }
       const referencing: string[] = [];
       for (const project of app.ctx.config.project) {
-        for (const pair of project.agent) {
-          for (const agent of pair) {
+        for (const team of project.agent) {
+          for (const agent of team) {
             if (agent.host === id) referencing.push(agent.id);
           }
         }

@@ -35,8 +35,8 @@ export function gitBindingBlockerDetails(
 function agentSeats(config: BaxianConfig): Map<string, { projectId: string; role: string }> {
   const seats = new Map<string, { projectId: string; role: string }>();
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) seats.set(agent.id, { projectId: project.id, role: agent.role });
+    for (const team of project.agent) {
+      for (const agent of team) seats.set(agent.id, { projectId: project.id, role: agent.role });
     }
   }
   return seats;

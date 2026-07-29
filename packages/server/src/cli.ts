@@ -260,8 +260,8 @@ export function buildCli(): Command {
         };
         const cfgRes = await apiGet<CfgRes>('/config', ctx);
         for (const proj of cfgRes?.project ?? []) {
-          for (const pair of proj.agent ?? []) {
-            for (const a of pair) {
+          for (const team of proj.agent ?? []) {
+            for (const a of team) {
               if (a.id === agentId) {
                 agent = a;
                 resolvedHost = resolveAgentHost(cfgRes?.host, a.host);

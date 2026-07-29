@@ -71,6 +71,18 @@ function gitTask(over: Partial<TaskState> = {}): TaskState {
   return task;
 }
 
+function workflowState(task: TaskState | null): Omit<TaskState, 'attention' | 'updatedAt'> | null {
+  if (!task) return null;
+  const { attention: _attention, updatedAt: _updatedAt, ...rest } = task;
+  return JSON.parse(JSON.stringify(rest)) as Omit<TaskState, 'attention' | 'updatedAt'>;
+}
+
+async function expectOnlyAttentionChanged(before: TaskState, reason: string): Promise<void> {
+  const after = await taskStore.get(before.id);
+  expect(workflowState(after)).toEqual(workflowState(before));
+  expect(after?.attention?.reason).toBe(reason);
+}
+
 function prCreated(data: Record<string, unknown>): BaxianEvent {
   return {
     id: '', type: 'pr.created', timestamp: new Date().toISOString(),
@@ -102,6 +114,187 @@ function paneSpecDone(data: Record<string, unknown> = {}): BaxianEvent {
     },
   };
 }
+
+describe('human intervention attention', () => {
+  function intervention(task: TaskState, phase: string): BaxianEvent {
+    return {
+      id: '',
+      type: 'human.intervention',
+      timestamp: '2026-07-28T08:00:00.000Z',
+      projectId: task.projectId,
+      agentId: task.agentId,
+      taskId: task.id,
+      data: { phase },
+    };
+  }
+
+  it('persists task-scoped interventions with actionable runbook and generation', async () => {
+    const task = gitTask({ id: 'task-attention', status: 'in_progress' });
+    await taskStore.set(task);
+
+    await eventBus.emit({
+      id: '',
+      type: 'human.intervention',
+      timestamp: '2026-07-28T08:00:00.000Z',
+      projectId: task.projectId,
+      agentId: task.agentId,
+      taskId: task.id,
+      data: {
+        phase: 'initial-dispatch-stalled',
+        note: 'Replay Dev or confirm delivery to QA.',
+      },
+    });
+
+    await vi.waitFor(async () => {
+      expect((await taskStore.get(task.id))?.attention).toMatchObject({
+        reason: 'initial-dispatch-stalled',
+        runbook: 'Replay Dev or confirm delivery to QA.',
+        recommendedActions: ['advance', 'cancel'],
+        generation: {
+          status: 'in_progress',
+          signalToken: task.signalToken,
+        },
+      });
+    });
+  });
+
+  it('clears only the closed-unmerged attention when the PR reopens', async () => {
+    const task = gitTask({ id: 'task-reopen-attention', status: 'review' });
+    await taskStore.set(task);
+
+    await eventBus.emit(intervention(task, 'mr-closed-unmerged'));
+    expect((await taskStore.get(task.id))?.attention?.reason).toBe('mr-closed-unmerged');
+    await eventBus.emit(intervention(task, 'mr-reopened'));
+    expect((await taskStore.get(task.id))?.attention).toBeUndefined();
+
+    await eventBus.emit(intervention(task, 'dispatch-reconcile-attempts-exhausted'));
+    await eventBus.emit(intervention(task, 'mr-reopened'));
+    expect((await taskStore.get(task.id))?.attention?.reason)
+      .toBe('dispatch-reconcile-attempts-exhausted');
+  });
+
+  it('clears a matching hold attention on recovery without clearing an unrelated reason', async () => {
+    const task = gitTask({ id: 'task-recovered-attention', status: 'in_progress' });
+    await taskStore.set(task);
+
+    await eventBus.emit(intervention(task, 'agent_runtime_menu_pending'));
+    await eventBus.emit({
+      ...intervention(task, 'agent_runtime_menu_resolved'),
+      timestamp: '2026-07-28T08:01:00.000Z',
+      data: {
+        phase: 'agent_runtime_menu_resolved',
+        previousPhase: 'agent_runtime_menu_pending',
+      },
+    });
+    expect((await taskStore.get(task.id))?.attention).toBeUndefined();
+
+    await eventBus.emit(intervention(task, 'initial-dispatch-stalled'));
+    await eventBus.emit({
+      ...intervention(task, 'resumed'),
+      timestamp: '2026-07-28T08:02:00.000Z',
+      data: { phase: 'resumed', previousPhase: 'dirty-workdir' },
+    });
+    expect((await taskStore.get(task.id))?.attention?.reason).toBe('initial-dispatch-stalled');
+  });
+
+  it('uses explanatory reason text as the runbook and ignores an older intervention', async () => {
+    const task = gitTask({ id: 'task-ordered-attention', status: 'in_progress' });
+    await taskStore.set(task);
+
+    await eventBus.emit({
+      ...intervention(task, 'branch-cleanup-pending'),
+      timestamp: '2026-07-28T09:00:00.000Z',
+      data: {
+        phase: 'branch-cleanup-pending',
+        reason: 'Restore the remote branch proof, then advance or cancel.',
+      },
+    });
+    await eventBus.emit({
+      ...intervention(task, 'initial-dispatch-stalled'),
+      timestamp: '2026-07-28T08:00:00.000Z',
+    });
+
+    expect((await taskStore.get(task.id))?.attention).toMatchObject({
+      reason: 'branch-cleanup-pending',
+      runbook: 'Restore the remote branch proof, then advance or cancel.',
+      occurredAt: '2026-07-28T09:00:00.000Z',
+    });
+  });
+
+  it('does not recommend a verdict while a spec review is still running', async () => {
+    const task = gitTask({ id: 'task-spec-attention', status: 'review', phase: 'spec' });
+    await taskStore.set(task);
+
+    await eventBus.emit(intervention(task, 'review-verdict-overdue'));
+
+    expect((await taskStore.get(task.id))?.attention?.recommendedActions)
+      .toEqual(['advance', 'cancel']);
+  });
+
+  it('keeps verdict and cancel as the only exits at max rounds', async () => {
+    const task = gitTask({ id: 'task-max-attention', status: 'max_rounds', phase: 'code' });
+    await taskStore.set(task);
+
+    await eventBus.emit(intervention(task, 'review-rounds-exhausted'));
+
+    expect((await taskStore.get(task.id))?.attention?.recommendedActions)
+      .toEqual(['verdict', 'cancel']);
+  });
+
+  it.each([
+    'cancel-published-artifact-cleanup-failed',
+    'remote-cleanup-failed',
+    'remote-cleanup-persist-failed',
+  ])('recommends cancel while remote cleanup remains retryable for %s', async (reason) => {
+    const task = gitTask({
+      id: `task-cleanup-attention-${reason}`,
+      status: 'cancelled',
+      phase: 'code',
+      remoteCleanup: {
+        generation: 'abc123abc123',
+        stage: 'close-pending',
+        prNumber: 42,
+        branch: 'bx/task-cleanup',
+        expectedHeadSha: SHA1,
+        updatedAt: '2026-07-28T08:00:00.000Z',
+      },
+    });
+    await taskStore.set(task);
+
+    await eventBus.emit(intervention(task, reason));
+
+    expect((await taskStore.get(task.id))?.attention).toMatchObject({
+      recommendedActions: ['cancel'],
+      generation: { remoteCleanupGeneration: 'abc123abc123' },
+    });
+  });
+
+  it('keeps retry for cleanup that requires manual ownership', async () => {
+    const task = gitTask({
+      id: 'task-cleanup-attention-manual',
+      status: 'cancelled',
+      phase: 'code',
+      remoteCleanup: {
+        generation: 'abc123abc123',
+        stage: 'manual',
+        prNumber: 42,
+        branch: 'bx/task-cleanup',
+        expectedHeadSha: SHA1,
+        failure: {
+          kind: 'tip-changed',
+          message: 'branch ownership changed',
+          at: '2026-07-28T08:00:00.000Z',
+        },
+        updatedAt: '2026-07-28T08:00:00.000Z',
+      },
+    });
+    await taskStore.set(task);
+
+    await eventBus.emit(intervention(task, 'remote-cleanup-manual'));
+
+    expect((await taskStore.get(task.id))?.attention?.recommendedActions).toEqual(['retry']);
+  });
+});
 
 function asReturned(
   result: { kind: string } | { kind: string; task: TaskState },
@@ -960,6 +1153,44 @@ describe('review.submitted (git)', () => {
     });
   });
 
+  it('consumes a human pass outbox before approving and preserves unrelated outbox work', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+      replyActorId: '77', replyActorStatus: 'verified',
+      outbox: [
+        {
+          key: 'abcdef123456',
+          type: 'git.code-verdict',
+          data: {
+            prNumber: 42,
+            kind: 'pass',
+            anchorSha: SHA1,
+            token: 'abcdef123456',
+            comments: '',
+            writeAttemptedAt: '2026-07-21T12:00:00.000Z',
+          },
+        },
+        {
+          key: 'attention-1',
+          type: 'human.intervention',
+          data: { phase: 'review-verdict-overdue' },
+        },
+      ],
+    }));
+
+    await eventBus.emit(reviewSubmitted(gitVerdict({})));
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'approved',
+      outbox: [{
+        key: 'attention-1',
+        type: 'human.intervention',
+      }],
+    });
+  });
+
   it('keeps review unchanged when an approval was issued for a stale head', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
@@ -1657,13 +1888,13 @@ describe('post-approve feedback consumption (git)', () => {
     expect(emitted.find(event => event.type === 'human.intervention')).toBeUndefined();
   });
 
-  it('rejects malformed feedback revisions before mutating the task', async () => {
+  it('rejects malformed feedback revisions without mutating workflow state', async () => {
     const before = gitTask({ status: 'fixing', prNumber: 42, latestHeadSha: SHA1 });
     await taskStore.set(before);
     await eventBus.emit(commentEvent({
       sourceKey: 'issue-comments', id: 'bad:id', bodyDigest: 'a'.repeat(64), versionTime: 1700,
     }, { prUrl: 'https://x/pull/42' }));
-    expect(await taskStore.get('task-1')).toEqual(before);
+    await expectOnlyAttentionChanged(before, 'git-feedback-revision-invalid');
     expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
       phase: 'git-feedback-revision-invalid',
     });
@@ -2455,7 +2686,7 @@ describe('git review state transition guards', () => {
           id: '', type: 'review.submitted', timestamp: new Date().toISOString(),
           projectId: 'proj', agentId: 'qa-1', taskId: 'task-1', data,
         });
-        expect(await taskStore.get('task-1')).toEqual(before);
+        await expectOnlyAttentionChanged(before, 'git-verdict-payload-invalid');
         expect(transition).not.toHaveBeenCalled();
         expect(approve).not.toHaveBeenCalled();
         expect(acquire).not.toHaveBeenCalled();
@@ -2483,7 +2714,7 @@ describe('git review state transition guards', () => {
       projectId: 'proj', agentId: 'qa-1', taskId: 'task-1',
       data: gitVerdict({ action: 'REQUEST_CHANGES', verdictToken: 'aaaa00000000' }),
     });
-    expect(await taskStore.get('task-1')).toEqual(before);
+    await expectOnlyAttentionChanged(before, 'git-verdict-payload-invalid');
     expect(emitted.find(event => event.type === 'human.intervention')?.data)
       .toMatchObject({ phase: 'git-verdict-payload-invalid' });
   });
@@ -2506,7 +2737,7 @@ describe('git review state transition guards', () => {
       }),
     });
 
-    expect(await taskStore.get('task-1')).toEqual(before);
+    await expectOnlyAttentionChanged(before, 'stale-verdict-wrong-pass');
     expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
       phase: 'stale-verdict-wrong-pass', verdictPassToken: 'eeeeeeeeeeee',
     });

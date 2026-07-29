@@ -63,11 +63,11 @@ function seedAgent(id: string, projectId: string, extra: Partial<AgentFacts> = {
 
 function seedTask(id: string, projectId: string, extra: Partial<TaskFacts> = {}): Promise<void> {
   const devAgentId = extra.devAgentId ?? extra.agentId ?? extra.preferredAgentId ?? '';
-  const group = app.ctx.config.project
+  const team = app.ctx.config.project
     .find(project => project.id === projectId)
     ?.agent.find(candidate => candidate.some(agent => agent.id === devAgentId));
   const qaAgentId = extra.qaAgentId
-    ?? group?.find(agent => agent.role === 'qa')?.id
+    ?? team?.find(agent => agent.role === 'qa')?.id
     ?? (devAgentId === '' ? undefined : qaIdFor(devAgentId));
   return app.ctx.taskStore.set({
     id, projectId, title: 't', description: 'd', reviewRound: 0,
@@ -197,7 +197,7 @@ describe('POST /api/projects', () => {
   });
 
   it.each([
-    ['non-github repo without gitCli driver → 400', { id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git' }, 400],
+    ['non-github repo without gitCli driver → 400', { id: 'gitlabproj', repo: 'https://gitlab.example.com/team/proj.git' }, 400],
     ['duplicate project id → 409', { id: 'proj', repo: 'a/b' }, 409],
     ['invalid repo format → 400', { id: 'badrepo', repo: 'not-a-valid-repo' }, 400],
     ['empty id → 400', { id: '', repo: 'a/b' }, 400],
@@ -232,8 +232,8 @@ describe('POST /api/projects', () => {
 
   it('creates a project from a non-github git URL (stored verbatim, incl. subgroup paths)', async () => {
     for (const [id, repo] of [
-      ['glproj', 'https://gitlab.example.com/group/proj.git'],
-      ['glsub', 'https://gitlab.example.com/group/sub/proj.git'],
+      ['glproj', 'https://gitlab.example.com/team/proj.git'],
+      ['glsub', 'https://gitlab.example.com/team/sub/proj.git'],
     ] as const) {
       const response = await post('/api/projects', {
         id,
@@ -249,7 +249,7 @@ describe('POST /api/projects', () => {
   it('rejects a non-github SSH repo because its platform driver needs an HTTP API endpoint', async () => {
     const response = await post('/api/projects', {
       id: 'glssh',
-      repo: 'ssh://git@gitlab.example.com:2222/group/other.git',
+      repo: 'ssh://git@gitlab.example.com:2222/team/other.git',
       merge: null,
       gitCli: { tool: 'glab' },
     });
@@ -481,7 +481,7 @@ describe('POST /api/projects/:id/checks', () => {
 });
 
 describe('POST /api/projects/:projectId/agents', () => {
-  it('appends one complete Dev + QA group in a single request', async () => {
+  it('appends one complete Dev + QA team in a single request', async () => {
     await createProject('empty');
 
     const response = await addAgent('empty', devAgent('new-dev'));
@@ -520,7 +520,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(await app.ctx.agentStore.get('rr1-dev')).not.toBeNull();
   });
 
-  it('commits the complete group and reports restartRequired when the in-memory switch fails', async () => {
+  it('commits the complete team and reports restartRequired when the in-memory switch fails', async () => {
     await createProject('add-switch-fail');
     vi.spyOn(app.ctx.agentManager, 'replaceConfig').mockImplementationOnce(() => {
       throw new Error('switch exploded');
@@ -558,7 +558,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(bootstrap).not.toHaveBeenCalled();
   });
 
-  it('initializes both member states before exposing the group to task dispatch', async () => {
+  it('initializes both member states before exposing the team to task dispatch', async () => {
     await createProject('add-state-order');
     const sequence: string[] = [];
     const originalSet = app.ctx.agentStore.set.bind(app.ctx.agentStore);
@@ -586,7 +586,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     ]);
   });
 
-  it('rolls back both member states and leaves the group uncommitted when state initialization fails', async () => {
+  it('rolls back both member states and leaves the team uncommitted when state initialization fails', async () => {
     await createProject('add-state-fail');
     const originalSet = app.ctx.agentStore.set.bind(app.ctx.agentStore);
     vi.spyOn(app.ctx.agentStore, 'set').mockImplementation(async facts => {
@@ -602,7 +602,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     );
 
     expect(response.statusCode).toBe(500);
-    expect(JSON.parse(response.body).error).toMatch(/group was not committed.*state disk full/);
+    expect(JSON.parse(response.body).error).toMatch(/Agent Team was not committed.*state disk full/);
     expect(findProject('add-state-fail').agent).toEqual([]);
     const persisted = JSON.parse(await readFile(configPath, 'utf8')) as BaxianConfig;
     expect(persisted.project.find(project => project.id === 'add-state-fail')?.agent).toEqual([]);
@@ -635,7 +635,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(await app.ctx.agentStore.get('add-save-fail-qa')).toBeNull();
   });
 
-  it('accepts the complete group in either request order and stores Dev before QA', async () => {
+  it('accepts the complete team in either request order and stores Dev before QA', async () => {
     await createProject('pp3');
     const response = await addAgentsRaw('pp3', {
       agents: [qaAgent('pp3-qa'), devAgent('pp3-dev')],
@@ -688,7 +688,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     app.ctx.agentManager.releaseDeletionClaim(['td-dev']);
   });
 
-  it('returns 400 for an incomplete group', async () => {
+  it('returns 400 for an incomplete team', async () => {
     await createProject('pq');
     const response = await addAgentsRaw('pq', { agents: [devAgent('pq-dev')] });
     expect(response.statusCode).toBe(400);
@@ -806,7 +806,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(findProject('pdp').agent).toEqual([]);
   });
 
-  it('adding a group leaves unrelated groups untouched', async () => {
+  it('adding a team leaves unrelated teams untouched', async () => {
     await createProject('mp');
     await addAgent('mp', devAgent('mp-dev1'));
     await addAgent('mp', devAgent('mp-dev2'));
@@ -855,14 +855,14 @@ describe('POST /api/projects/:projectId/agents', () => {
 });
 
 describe('PUT /api/projects/:projectId/agents/:agentId', () => {
-  it('replaces one QA member while preserving a complete group in memory and on disk', async () => {
+  it('replaces one QA member while preserving a complete team in memory and on disk', async () => {
     await projectWithDev('replace-qa', 'replace-qa-dev');
     const cleanup = vi.mocked(app.ctx.agentManager.cleanupRemovedAgentRuntime);
     const realSave = loaderModule.saveConfig;
-    const persistedGroups: string[][] = [];
+    const persistedTeams: string[][] = [];
     vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
-      const group = config.project.find(project => project.id === 'replace-qa')?.agent[0];
-      if (group) persistedGroups.push(group.map(agent => agent.id));
+      const team = config.project.find(project => project.id === 'replace-qa')?.agent[0];
+      if (team) persistedTeams.push(team.map(agent => agent.id));
       return realSave(path, config);
     });
 
@@ -881,7 +881,7 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     expect(cleanup).toHaveBeenCalledWith(['replace-qa-qa']);
     expect(findProject('replace-qa').agent[0].map(agent => agent.id))
       .toEqual(['replace-qa-dev', 'replace-qa-next']);
-    expect(persistedGroups).toEqual([['replace-qa-dev', 'replace-qa-next']]);
+    expect(persistedTeams).toEqual([['replace-qa-dev', 'replace-qa-next']]);
     expect(await app.ctx.agentStore.get('replace-qa-qa')).toBeNull();
     expect(await app.ctx.agentStore.get('replace-qa-next')).toMatchObject({
       id: 'replace-qa-next',
@@ -953,7 +953,7 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     expect(JSON.parse(response.body).error).toMatch(/must not share a directory/);
   });
 
-  it('rejects replacement while either group participant is referenced by an active task', async () => {
+  it('rejects replacement while either team participant is referenced by an active task', async () => {
     await projectWithDev('replace-active', 'replace-active-dev');
     await seedTask('replace-active-task', 'replace-active', {
       preferredAgentId: 'replace-active-dev',
@@ -1020,7 +1020,7 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     expect(await app.ctx.lockManager.claimOf('replace-cleanup-qa')).toBeNull();
   });
 
-  it('keeps the original complete group when config persistence fails', async () => {
+  it('keeps the original complete team when config persistence fails', async () => {
     await projectWithDev('replace-save', 'replace-save-dev');
     const realSave = loaderModule.saveConfig;
     vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
@@ -1108,7 +1108,7 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
 });
 
 describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
-  it('deleting the Dev removes the complete group', async () => {
+  it('deleting the Dev removes the complete team', async () => {
     await projectWithDev('da1', 'da1-dev');
 
     const response = await del('/api/projects/da1/agents/da1-dev');
@@ -1148,7 +1148,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(await app.ctx.petStore!.getAssignment('petdel-dev')).toBeNull();
   });
 
-  it('removes paired dev together with its qa', async () => {
+  it('removes the teamed dev together with its qa', async () => {
     await projectWithDev('da2', 'da2-dev');
 
     const response = await del('/api/projects/da2/agents/da2-dev');
@@ -1159,7 +1159,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(findProject('da2').agent).toEqual([]);
   });
 
-  it('deleting the QA also removes the complete group', async () => {
+  it('deleting the QA also removes the complete team', async () => {
     await projectWithDev('da3', 'da3-dev');
 
     const response = await del('/api/projects/da3/agents/da3-qa');
@@ -1182,17 +1182,17 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(findProject('da-busy').agent[0][0].id).toBe('da-busy-dev');
   });
 
-  it('cascading dev delete is blocked if its paired qa is active', async () => {
-    await projectWithDev('da-pair-busy', 'da-pair-dev');
-    await seedAgent('da-pair-qa', 'da-pair-busy', { taskId: 'task-da-pair' });
-    await seedTask('task-da-pair', 'da-pair-busy', {
-      preferredAgentId: 'da-pair-dev', agentId: 'da-pair-dev', qaAgentId: 'da-pair-qa', status: 'review',
+  it('cascading dev delete is blocked if its Agent Team qa is active', async () => {
+    await projectWithDev('da-team-busy', 'da-team-dev');
+    await seedAgent('da-team-qa', 'da-team-busy', { taskId: 'task-da-team' });
+    await seedTask('task-da-team', 'da-team-busy', {
+      preferredAgentId: 'da-team-dev', agentId: 'da-team-dev', qaAgentId: 'da-team-qa', status: 'review',
     });
 
-    const response = await del('/api/projects/da-pair-busy/agents/da-pair-dev');
+    const response = await del('/api/projects/da-team-busy/agents/da-team-dev');
     expect(response.statusCode).toBe(409);
 
-    expect(findProject('da-pair-busy').agent[0]).toHaveLength(2);
+    expect(findProject('da-team-busy').agent[0]).toHaveLength(2);
   });
 
   it('fresh-bootstrap dialog_pending agent can be DELETEd without waiting for slowPoll timeout', async () => {
@@ -1369,7 +1369,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(await app.ctx.agentStore.get('da-terminal-dev')).toBeNull();
   });
 
-  it('preserves other pairs when deleting from a multi-pair project', async () => {
+  it('preserves other teams when deleting from a multi-team project', async () => {
     await createProject('da4');
     await addAgent('da4', devAgent('da4-dev1'));
     await addAgent('da4', devAgent('da4-dev2'));
@@ -1484,7 +1484,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     await app.ctx.lockManager.releaseIfOwner('lk1-dev', 'test:foreign', token!);
   });
 
-  it('releases locks it already acquired when a later pair member is locked', async () => {
+  it('releases locks it already acquired when a later team member is locked', async () => {
     await projectWithDev('lk2', 'lk2-dev');
     await seedAgent('lk2-qa', 'lk2', { status: 'idle' });
     const token = await app.ctx.lockManager.acquire('lk2-qa', 'test:foreign');
@@ -1786,7 +1786,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(app.ctx.agentManager.isDeletionInFlight('be2-dev')).toBe(false);
   });
 
-  it('pair delete with a post-commit second state-delete failure → 200 + warning; first state gone, second orphaned', async () => {
+  it('team delete with a post-commit second state-delete failure → 200 + warning; first state gone, second orphaned', async () => {
     await projectWithDev('be3', 'be3-dev');
     await seedAgent('be3-dev', 'be3', { workdir: '/tmp/be3', paneId: '%7' });
     const realDelete = app.ctx.agentStore.delete.bind(app.ctx.agentStore);

@@ -1,5 +1,5 @@
 import type { BaxianConfig, TaskState } from '../shared/index.js';
-import { taskReviewRound } from '../shared/index.js';
+import { REVIEW_VERDICT_TIMEOUT_MS, taskReviewRound } from '../shared/index.js';
 import type { EventBus } from '../event/bus.js';
 import type { AgentStore } from '../state/agent-store.js';
 import type { TaskStore } from '../state/task-store.js';
@@ -76,7 +76,14 @@ export class DispatchReconciler {
     await this.periodicRunner.runOnce();
   }
 
+  resetTask(taskId: string): void {
+    this.attempts.delete(taskId);
+    this.unboundSeen.delete(taskId);
+    this.opts.manager.resetPendingDispatchRetryBudget(taskId);
+  }
+
   private async reconcile(): Promise<void> {
+    await this.opts.manager.flushTaskOutboxes();
     const tasks = await this.opts.taskStore.list({});
     const protectedIds = new Set<string>();
     for (const task of tasks) {
@@ -89,6 +96,8 @@ export class DispatchReconciler {
           await this.reconcileReview(task);
         } else if (task.status === 'fixing') {
           await this.reconcileFix(task);
+        } else if (task.status === 'in_progress') {
+          await this.reconcileInitialDispatch(task);
         }
       } catch (err) {
         console.warn(`[dispatch-reconciler] task ${task.id} reconcile failed:`, err);
@@ -128,7 +137,21 @@ export class DispatchReconciler {
     if (!task.qaAgentId) {
       throw new Error(`review task ${task.id} has no QA participant`);
     }
+    if (task.outbox?.some(entry => entry.type === 'git.code-verdict')) return;
     const qaId = task.qaAgentId;
+    const reviewStartedAt = task.reviewDispatchedAt ? Date.parse(task.reviewDispatchedAt) : Number.NaN;
+    if (Number.isFinite(reviewStartedAt)
+      && Date.now() - reviewStartedAt >= REVIEW_VERDICT_TIMEOUT_MS
+      && task.attention === undefined) {
+      const recovery = task.phase === 'spec'
+        ? `QA has not completed the spec review for task ${task.id} within the review deadline. Advance to re-dispatch QA, or cancel the task.`
+        : `QA has not submitted a verdict for task ${task.id} within the review deadline. Advance to re-dispatch QA, or submit a human verdict after inspecting the PR.`;
+      await this.emitIntervention(task, qaId, {
+        phase: 'review-verdict-overdue',
+        reviewDispatchedAt: task.reviewDispatchedAt,
+        note: recovery,
+      });
+    }
     if (!task.prNumber) return;
     const anchor = task.reviewHeadAnchorSha?.toLowerCase();
     const head = task.latestHeadSha?.toLowerCase();
@@ -180,6 +203,25 @@ export class DispatchReconciler {
     ) {
       await this.redispatchReview(task, qaId, 'stalled-idle');
     }
+  }
+
+  private async reconcileInitialDispatch(task: TaskState): Promise<void> {
+    const devId = task.agentId;
+    if (!devId || task.attention !== undefined) return;
+    const [devState, observation] = await Promise.all([
+      this.opts.agentStore.get(devId),
+      Promise.resolve(this.opts.statusStore.get(devId)),
+    ]);
+    if (devState?.taskId !== task.id
+      || devState.status === 'awaiting_human'
+      || devState.needInput?.at !== undefined
+      || observation.reason !== 'PENDING_IDLE'
+      || !canInjectObservation(observation)
+      || !observedAfter(observation, task.updatedAt)) return;
+    await this.emitIntervention(task, devId, {
+      phase: 'initial-dispatch-stalled',
+      note: `The dev agent is idle while task ${task.id} is still in progress. Advance with Dev to replay the persisted instruction, or choose QA to confirm an already completed delivery.`,
+    });
   }
 
   private async reconcileFix(task: TaskState): Promise<void> {
@@ -269,10 +311,10 @@ export class DispatchReconciler {
     if (rec.count >= this.opts.maxAttempts) {
       if (!rec.alerted) {
         const recovery = action === 'dev-fix-unbound'
-          ? `the dev agent is no longer bound to this task, so the queued fix has no deliverable target; re-assign the dev to task ${task.id} (or cancel/retry it). Do NOT use POST /tasks/:id/review — that routes to QA and would skip the requested changes.`
+          ? `the dev agent is no longer bound to this task, so the queued fix has no deliverable target; restore the Dev binding, then use Advance with Dev (or cancel the task). Do not advance to QA because that would skip the requested changes.`
           : action.startsWith('dev-fix')
-            ? 'the dev is not on an awaiting_human hold, so use Restart REPL on the dev agent (it replays the persisted fix prompt) or cancel/retry the task; do NOT use POST /tasks/:id/review — that routes to QA and would skip the requested changes.'
-            : 'inspect the QA agent and redispatch manually (Resume the agent or POST /tasks/:id/review).';
+            ? 'use Advance with Dev to replay the persisted fix prompt, or cancel the task. Do not advance to QA because that would skip the requested changes.'
+            : 'inspect the QA agent, then use Advance with QA to re-dispatch the review.';
         const emitted = await this.emitIntervention(task, agentId, {
           phase: 'dispatch-reconcile-attempts-exhausted',
           action,

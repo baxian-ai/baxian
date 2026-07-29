@@ -1,12 +1,14 @@
 import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { TaskPhase, TaskState, TaskStatus } from '../shared/index.js';
+import type { TaskAttentionGeneration, TaskPhase, TaskState, TaskStatus } from '../shared/index.js';
 import {
   effectiveTaskReviewRound,
   isRecord,
   mapWithConcurrency,
   FS_READ_CONCURRENCY,
   TASK_PHASE_SET,
+  TASK_TERMINAL_STATUS_SET,
+  taskMatchesAttentionGeneration,
 } from '../shared/index.js';
 
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
@@ -27,9 +29,9 @@ const TASK_FIELDS = [
   'reviewDispatchedAt', 'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'reviewRound', 'reviewRoundPending', 'specReviewRound', 'phase', 'deliveryConfirmation', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
   'maxRoundsContinues',
-  'postApproveRevoked', 'postApproveHeadSha', 'verdictOverdue',
+  'postApproveRevoked', 'postApproveHeadSha', 'attention',
   'passToken', 'failToken', 'pendingPrSignalToken', 'postApproveToken', 'postApproveGeneration', 'postApprovePhase', 'reviewDispatch', 'platformBinding', 'baseBranch', 'replyActorId', 'replyActorStatus',
-  'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'pendingRedispatch', 'redispatchCount',
+  'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'replacementTaskId', 'pendingRedispatch', 'redispatchCount',
 ] as const;
 
 const REVIEW_TOKEN_RE = /^[0-9a-f]{12}$/;
@@ -39,6 +41,7 @@ const TASK_STATUSES = new Set<TaskStatus>([
   'merged', 'done', 'max_rounds', 'failed', 'cancelled',
 ]);
 const HEAD_SHA_RE = /^[0-9a-f]{7,64}$/i;
+const TASK_OPERATIONS = new Set(['advance', 'verdict', 'cancel', 'retry']);
 const REMOTE_FAILURE_KINDS = new Set([
   'config', 'binding', 'close', 'persist', 'delete', 'probe', 'tip-changed',
 ]);
@@ -138,8 +141,12 @@ function validateTask(raw: Record<string, unknown>): void {
   for (const field of [
     'prUrl', 'branch', 'latestHeadSha', 'reviewHeadAnchorSha', 'reviewDispatchedAt',
     'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'signalToken',
-    'postApproveHeadSha',
+    'postApproveHeadSha', 'replacementTaskId',
   ]) optionalString(raw, field);
+  if (raw.replacementTaskId !== undefined
+    && (!SAFE_ID.test(raw.replacementTaskId as string) || raw.replacementTaskId === raw.id)) {
+    throw taskSchemaError('replacementTaskId', 'a different safe task id when present');
+  }
   if (!Number.isInteger(raw.reviewRound) || (raw.reviewRound as number) < 0) {
     throw taskSchemaError('reviewRound', 'an integer >= 0');
   }
@@ -163,10 +170,14 @@ function validateTask(raw: Record<string, unknown>): void {
   if (typeof raw.status !== 'string' || !TASK_STATUSES.has(raw.status as TaskStatus)) {
     throw taskSchemaError('status', 'a known task status');
   }
+  if (raw.replacementTaskId !== undefined
+    && !TASK_TERMINAL_STATUS_SET.has(raw.status as TaskStatus)) {
+    throw taskSchemaError('replacementTaskId', 'present only on a terminal source task');
+  }
   optionalInteger(raw, 'prNumber', 1);
   optionalInteger(raw, 'specReviewRound', 0);
   optionalInteger(raw, 'maxRoundsContinues', 0);
-  for (const field of ['branchCreatedByBaxian', 'verdictOverdue', 'reviewRoundPending']) optionalBoolean(raw, field);
+  for (const field of ['branchCreatedByBaxian', 'reviewRoundPending']) optionalBoolean(raw, field);
   if (raw.images !== undefined && (
     !Array.isArray(raw.images)
     || raw.images.some(image => typeof image !== 'string' || image.trim() === '')
@@ -176,6 +187,7 @@ function validateTask(raw: Record<string, unknown>): void {
   validateCleanupPending(raw, 'branchCleanupPending');
   validateCleanupPending(raw, 'branchCleanupSkipped');
   validateRemoteCleanup(raw);
+  validateAttention(raw);
   if (raw.branchLocalCleaned !== undefined) {
     const cleaned = raw.branchLocalCleaned;
     if (!isRecord(cleaned)
@@ -192,10 +204,56 @@ function validateTask(raw: Record<string, unknown>): void {
     throw taskSchemaError('participants', 'distinct dev and qa agent ids');
   }
   if ((raw.devAgentId === '') !== (raw.qaAgentId === undefined)) {
-    throw taskSchemaError('participants', 'a complete dev and qa pair, or neither when unassigned');
+    throw taskSchemaError('participants', 'a complete dev and qa Agent Team, or neither when unassigned');
   }
   if (raw.agentId !== '' && raw.agentId !== raw.devAgentId) {
     throw taskSchemaError('agentId', 'the task dev agent id');
+  }
+}
+
+function validateAttention(raw: Record<string, unknown>): void {
+  const attention = raw.attention;
+  if (attention === undefined) return;
+  if (!isRecord(attention)) throw taskSchemaError('attention', 'an object when present');
+  for (const field of ['reason', 'runbook', 'occurredAt']) {
+    if (typeof attention[field] !== 'string' || attention[field].trim() === '') {
+      throw taskSchemaError(`attention.${field}`, 'a non-empty string');
+    }
+  }
+  if (!Number.isFinite(Date.parse(attention.occurredAt as string))) {
+    throw taskSchemaError('attention.occurredAt', 'an ISO timestamp');
+  }
+  if (!Array.isArray(attention.recommendedActions)
+    || attention.recommendedActions.length === 0
+    || new Set(attention.recommendedActions).size !== attention.recommendedActions.length
+    || attention.recommendedActions.some(action => typeof action !== 'string' || !TASK_OPERATIONS.has(action))) {
+    throw taskSchemaError('attention.recommendedActions', 'unique task operations');
+  }
+  const generation = attention.generation;
+  if (!isRecord(generation)) throw taskSchemaError('attention.generation', 'an object');
+  if (typeof generation.status !== 'string' || !TASK_STATUSES.has(generation.status as TaskStatus)) {
+    throw taskSchemaError('attention.generation.status', 'a known task status');
+  }
+  requireString(generation, 'agentId', true);
+  if (!Number.isInteger(generation.reviewRound) || (generation.reviewRound as number) < 0) {
+    throw taskSchemaError('attention.generation.reviewRound', 'an integer >= 0');
+  }
+  if (generation.phase !== undefined
+    && (typeof generation.phase !== 'string' || !TASK_PHASE_SET.has(generation.phase as TaskPhase))) {
+    throw taskSchemaError('attention.generation.phase', 'spec or code when present');
+  }
+  optionalString(generation, 'signalToken');
+  optionalInteger(generation, 'specReviewRound', 0);
+  if (generation.postApproveGeneration !== undefined
+    && (typeof generation.postApproveGeneration !== 'string'
+      || !REVIEW_TOKEN_RE.test(generation.postApproveGeneration))) {
+    throw taskSchemaError('attention.generation.postApproveGeneration', 'a 12-hex token when present');
+  }
+  optionalString(generation, 'postApproveToken');
+  if (generation.remoteCleanupGeneration !== undefined
+    && (typeof generation.remoteCleanupGeneration !== 'string'
+      || !REVIEW_TOKEN_RE.test(generation.remoteCleanupGeneration))) {
+    throw taskSchemaError('attention.generation.remoteCleanupGeneration', 'a 12-hex token when present');
   }
 }
 
@@ -336,6 +394,7 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
     if (!Array.isArray(outbox)) throw taskSchemaError('outbox', 'an array of pending operation entries when present');
     const keys = new Set<string>();
     let hasSpecVerdict = false;
+    let hasCodeVerdict = false;
     for (const entry of outbox) {
       if (!isRecord(entry) || typeof entry.key !== 'string' || entry.key.trim() === ''
         || keys.has(entry.key) || !isRecord(entry.data)) {
@@ -343,8 +402,31 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
       }
       keys.add(entry.key);
       if (entry.type === 'human.intervention') continue;
+      if (entry.type === 'git.code-verdict') {
+        if (hasCodeVerdict) throw taskSchemaError('outbox', 'at most one git.code-verdict entry');
+        hasCodeVerdict = true;
+        const data = entry.data;
+        const expectedToken = data.kind === 'pass' ? raw.passToken : data.kind === 'fail' ? raw.failToken : undefined;
+        if (!REVIEW_TOKEN_RE.test(entry.key)
+          || entry.key !== data.token
+          || !Number.isInteger(data.prNumber) || (data.prNumber as number) < 1
+          || (data.kind !== 'pass' && data.kind !== 'fail')
+          || typeof data.anchorSha !== 'string' || !HEAD_SHA_RE.test(data.anchorSha)
+          || typeof data.token !== 'string' || !REVIEW_TOKEN_RE.test(data.token)
+          || typeof data.comments !== 'string'
+          || (data.writeAttemptedAt !== undefined
+            && (typeof data.writeAttemptedAt !== 'string'
+              || !Number.isFinite(Date.parse(data.writeAttemptedAt))))
+          || raw.status !== 'review' || raw.phase === 'spec'
+          || raw.prNumber !== data.prNumber
+          || raw.reviewHeadAnchorSha !== data.anchorSha
+          || expectedToken !== data.token) {
+          throw taskSchemaError('outbox', 'a valid current code-phase git verdict operation');
+        }
+        continue;
+      }
       if (entry.type !== 'git.spec-verdict') {
-        throw taskSchemaError('outbox.type', 'human.intervention or git.spec-verdict');
+        throw taskSchemaError('outbox.type', 'human.intervention, git.spec-verdict, or git.code-verdict');
       }
       if (hasSpecVerdict) throw taskSchemaError('outbox', 'at most one git.spec-verdict entry');
       hasSpecVerdict = true;
@@ -353,7 +435,8 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
         || !Number.isInteger(data.prNumber) || (data.prNumber as number) < 1
         || typeof data.comments !== 'string' || data.comments.trim() === ''
         || (data.writeAttemptedAt !== undefined
-          && (typeof data.writeAttemptedAt !== 'string' || data.writeAttemptedAt.trim() === ''))
+          && (typeof data.writeAttemptedAt !== 'string'
+            || !Number.isFinite(Date.parse(data.writeAttemptedAt))))
         || raw.phase !== 'spec' || raw.prNumber !== data.prNumber
         || (raw.status !== 'spec-ready' && raw.status !== 'max_rounds')
         || !Number.isInteger(raw.specReviewRound) || (raw.specReviewRound as number) < 1) {
@@ -377,6 +460,13 @@ function sanitizeTask(state: unknown): TaskState {
     }
   }
   validateTask(out as Record<string, unknown>);
+  if (out.attention
+    && !taskMatchesAttentionGeneration(
+      out as TaskState,
+      out.attention.generation as TaskAttentionGeneration,
+    )) {
+    delete out.attention;
+  }
   return out as TaskState;
 }
 

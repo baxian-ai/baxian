@@ -681,7 +681,7 @@ describe('AgentManager.ensureSession', () => {
     expect(killCalled).toBe(true);
   });
 
-  it('prepareRemoveTargets returns the whole group for either member', async () => {
+  it('prepareRemoveTargets returns the whole team for either member', async () => {
     manager.replaceConfig(expandedConfig());
     expect(manager.prepareRemoveTargets('dev-1').targets).toEqual(['dev-1', 'qa-1']);
     expect(manager.prepareRemoveTargets('qa-1').targets).toEqual(['dev-1', 'qa-1']);

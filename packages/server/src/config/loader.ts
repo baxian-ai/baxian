@@ -185,15 +185,15 @@ function validateProjectShapes(project: unknown): ValidationError[] {
     }
     if (proj.agent === undefined) return;
     if (!Array.isArray(proj.agent)) {
-      errors.push({ path: `project[${i}].agent`, message: `project[${i}].agent must be an array of pairs` });
+      errors.push({ path: `project[${i}].agent`, message: `project[${i}].agent must be an array of Agent Teams` });
       return;
     }
-    proj.agent.forEach((pair, j) => {
-      if (!Array.isArray(pair)) {
+    proj.agent.forEach((team, j) => {
+      if (!Array.isArray(team)) {
         errors.push({ path: `project[${i}].agent[${j}]`, message: `project[${i}].agent[${j}] must be an array of agents` });
         return;
       }
-      pair.forEach((agent, k) => {
+      team.forEach((agent, k) => {
         if (!isRecord(agent)) {
           errors.push({ path: `project[${i}].agent[${j}][${k}]`, message: `project[${i}].agent[${j}][${k}] must be an object` });
         }
@@ -256,7 +256,7 @@ function applyProjectDefaults(p: Record<string, unknown>): ProjectConfig {
       : {}),
     ...(p.gitCli !== undefined ? { gitCli: p.gitCli as ProjectConfig['gitCli'] } : {}),
     agent: Array.isArray(p.agent)
-      ? (p.agent as Record<string, unknown>[][]).map(pair => pair.map(applyAgentDefaults))
+      ? (p.agent as Record<string, unknown>[][]).map(team => team.map(applyAgentDefaults))
       : [],
   };
   return project;

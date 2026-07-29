@@ -62,13 +62,13 @@ export function collectUnknownConfigWarnings(config: Record<string, unknown>): V
     const projectPath = `project[${projectIndex}]`;
     warnings.push(...unknownKeyWarnings(project, PROJECT_FIELDS, projectPath));
     if (!isRecord(project) || !Array.isArray(project.agent)) return;
-    project.agent.forEach((group, groupIndex) => {
-      if (!Array.isArray(group)) return;
-      group.forEach((agent, agentIndex) => {
+    project.agent.forEach((team, teamIndex) => {
+      if (!Array.isArray(team)) return;
+      team.forEach((agent, agentIndex) => {
         warnings.push(...unknownKeyWarnings(
           agent,
           AGENT_FIELDS,
-          `${projectPath}.agent[${groupIndex}][${agentIndex}]`,
+          `${projectPath}.agent[${teamIndex}][${agentIndex}]`,
         ));
       });
     });
@@ -100,7 +100,7 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateAgentFields(config, errors);
   validateAgentIds(config, errors);
   validateAgentWorkdirUniqueness(config, errors);
-  validateAgentPairs(config, errors);
+  validateAgentTeams(config, errors);
   validateRemoteHosts(config, errors);
 
   return errors;
@@ -335,7 +335,7 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
       errors.push({ path: `${path}.specApproval`, message: 'project.specApproval must be "human" or null' });
     }
     if (!Array.isArray(project.agent)) {
-      errors.push({ path: `${path}.agent`, message: 'project.agent must be an array of agent groups' });
+      errors.push({ path: `${path}.agent`, message: 'project.agent must be an array of Agent Teams' });
     }
     validateGitCliShape(project, path, errors);
   }
@@ -378,10 +378,10 @@ function validateAgentFields(config: BaxianConfig, errors: ValidationError[]): v
   for (const project of config.project) {
     if (!Array.isArray(project.agent)) continue;
     for (let i = 0; i < project.agent.length; i++) {
-      const pair = project.agent[i];
-      if (!Array.isArray(pair)) continue;
-      for (let j = 0; j < pair.length; j++) {
-        const agent = pair[j];
+      const team = project.agent[i];
+      if (!Array.isArray(team)) continue;
+      for (let j = 0; j < team.length; j++) {
+        const agent = team[j];
         const path = `project.${project.id}.agent[${i}][${j}]`;
         if (!nonEmptyString(agent.id)) {
           errors.push({ path: `${path}.id`, message: 'agent.id must be a non-empty string' });
@@ -454,8 +454,8 @@ function validateAgentFields(config: BaxianConfig, errors: ValidationError[]): v
 function validateAgentIds(config: BaxianConfig, errors: ValidationError[]): void {
   const seen = new Set<string>();
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) {
+    for (const team of project.agent) {
+      for (const agent of team) {
         if (seen.has(agent.id)) {
           errors.push({
             path: `project.${project.id}.agent.${agent.id}`,
@@ -479,10 +479,10 @@ function validateAgentWorkdirUniqueness(config: BaxianConfig, errors: Validation
   for (const project of config.project) {
     if (!Array.isArray(project.agent)) continue;
     for (let i = 0; i < project.agent.length; i++) {
-      const pair = project.agent[i];
-      if (!Array.isArray(pair)) continue;
-      for (let j = 0; j < pair.length; j++) {
-        const agent = pair[j];
+      const team = project.agent[i];
+      if (!Array.isArray(team)) continue;
+      for (let j = 0; j < team.length; j++) {
+        const agent = team[j];
         if (
           !VALID_MODES.includes(agent.mode)
           || !nonEmptyString(agent.workdir)
@@ -509,31 +509,31 @@ function validateAgentWorkdirUniqueness(config: BaxianConfig, errors: Validation
   }
 }
 
-function validateAgentPairs(config: BaxianConfig, errors: ValidationError[]): void {
+function validateAgentTeams(config: BaxianConfig, errors: ValidationError[]): void {
   for (const project of config.project) {
     if (!Array.isArray(project.agent)) continue;
     for (let i = 0; i < project.agent.length; i++) {
-      const group = project.agent[i];
+      const team = project.agent[i];
       const path = `project.${project.id}.agent[${i}]`;
 
-      if (!Array.isArray(group)) {
-        errors.push({ path, message: 'Agent group must be an array' });
+      if (!Array.isArray(team)) {
+        errors.push({ path, message: 'Agent Team must be an array' });
         continue;
       }
-      if (group.length === 0) {
-        errors.push({ path, message: 'Agent group cannot be empty' });
+      if (team.length === 0) {
+        errors.push({ path, message: 'Agent Team cannot be empty' });
         continue;
       }
-      if (group.length > 2) {
-        errors.push({ path, message: 'Agent group can have at most 2 agents' });
+      if (team.length > 2) {
+        errors.push({ path, message: 'Agent Team can have at most 2 agents' });
       }
       const counts = new Map<AgentRole, number>();
-      for (const agent of group) counts.set(agent.role, (counts.get(agent.role) ?? 0) + 1);
+      for (const agent of team) counts.set(agent.role, (counts.get(agent.role) ?? 0) + 1);
       if (counts.get('dev') !== 1) {
-        errors.push({ path, message: 'Agent group must contain exactly one dev agent' });
+        errors.push({ path, message: 'Agent Team must contain exactly one dev agent' });
       }
       if (counts.get('qa') !== 1) {
-        errors.push({ path, message: 'Agent group must contain exactly one qa agent' });
+        errors.push({ path, message: 'Agent Team must contain exactly one qa agent' });
       }
     }
   }
@@ -580,8 +580,8 @@ function validateRemoteHosts(config: BaxianConfig, errors: ValidationError[]): v
       .filter((id): id is string => typeof id === 'string'),
   );
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) {
+    for (const team of project.agent) {
+      for (const agent of team) {
         if (agent.mode !== 'remote') continue;
         const base = `project.${project.id}.agent.${agent.id}`;
         if (agent.host === undefined || agent.host === null) {

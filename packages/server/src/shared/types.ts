@@ -212,15 +212,44 @@ export interface ReviewDispatchLease {
   updatedAt: string;
 }
 
+export type TaskOperation = 'advance' | 'verdict' | 'cancel' | 'retry';
+
+export interface TaskAttentionGeneration extends TaskGenerationGuard {
+  postApproveGeneration?: string;
+  postApproveToken?: string;
+  remoteCleanupGeneration?: string;
+}
+
+export interface TaskAttention {
+  reason: string;
+  runbook: string;
+  occurredAt: string;
+  recommendedActions: TaskOperation[];
+  generation: TaskAttentionGeneration;
+}
+
 export type TaskOutboxEntry =
   | { key: string; type: 'human.intervention'; data: Record<string, unknown> }
   | {
       key: string;
       type: 'git.spec-verdict';
       data: { prNumber: number; comments: string; writeAttemptedAt?: string };
-  };
+    }
+  | {
+      key: string;
+      type: 'git.code-verdict';
+      data: {
+        prNumber: number;
+        kind: 'pass' | 'fail';
+        anchorSha: string;
+        token: string;
+        comments: string;
+        writeAttemptedAt?: string;
+      };
+    };
 
 export type SpecVerdictOutboxEntry = Extract<TaskOutboxEntry, { type: 'git.spec-verdict' }>;
+export type CodeVerdictOutboxEntry = Extract<TaskOutboxEntry, { type: 'git.code-verdict' }>;
 
 export interface TaskState {
   id: string;
@@ -281,12 +310,13 @@ export interface TaskState {
   passProvenance?: { sourceKey: string; id: string; bodyDigest: string; token: string; failToken: string; anchorSha: string };
   consumedFeedback?: Record<string, number>;
   outbox?: TaskOutboxEntry[];
+  attention?: TaskAttention;
+  replacementTaskId?: string;
   pendingRedispatch?: boolean;
   redispatchCount?: number;
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
-  verdictOverdue?: boolean;
 }
 
 export interface TaskGenerationGuard {
@@ -316,6 +346,25 @@ export function taskMatchesGeneration(task: TaskState, expected: TaskGenerationG
     && task.agentId === expected.agentId
     && task.reviewRound === expected.reviewRound
     && task.specReviewRound === expected.specReviewRound;
+}
+
+export function taskAttentionGeneration(task: TaskState): TaskAttentionGeneration {
+  return {
+    ...taskGenerationGuard(task),
+    postApproveGeneration: task.postApproveGeneration,
+    postApproveToken: task.postApproveToken,
+    remoteCleanupGeneration: task.remoteCleanup?.generation,
+  };
+}
+
+export function taskMatchesAttentionGeneration(
+  task: TaskState,
+  expected: TaskAttentionGeneration,
+): boolean {
+  return taskMatchesGeneration(task, expected)
+    && task.postApproveGeneration === expected.postApproveGeneration
+    && task.postApproveToken === expected.postApproveToken
+    && task.remoteCleanup?.generation === expected.remoteCleanupGeneration;
 }
 
 export type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment';

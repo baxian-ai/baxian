@@ -103,7 +103,7 @@ describe('Dashboard layout', () => {
     expect(h1.className).toContain('sr-only');
   });
 
-  it('renders each project\'s agent groups in a full-width vertical stack (no xl:grid-cols-2 split)', () => {
+  it('renders each project\'s Agent Teams in a full-width vertical stack (no xl:grid-cols-2 split)', () => {
     seed([
       makeProject({
         id: 'demo',
@@ -119,11 +119,11 @@ describe('Dashboard layout', () => {
 
     const { container } = renderDashboard();
 
-    const groupWrapper = container.querySelector('[role="group"]')?.parentElement;
-    expect(groupWrapper).toBeTruthy();
-    expect(groupWrapper!.className).toContain('space-y-3');
-    expect(groupWrapper!.className).not.toContain('xl:grid-cols-2');
-    expect(groupWrapper!.className).not.toContain('grid-cols-1');
+    const teamWrapper = container.querySelector('[role="group"]')?.parentElement;
+    expect(teamWrapper).toBeTruthy();
+    expect(teamWrapper!.className).toContain('space-y-3');
+    expect(teamWrapper!.className).not.toContain('xl:grid-cols-2');
+    expect(teamWrapper!.className).not.toContain('grid-cols-1');
   });
 
   it('project header row exposes two narrow click targets (project id + Details) and the surrounding row is not clickable, to avoid mis-taps', () => {
@@ -184,7 +184,7 @@ describe('Dashboard layout', () => {
     expect(repoSpan.getAttribute('title')).toBe('/some/very/long/repo/path/that/should/not/wrap');
   });
 
-  it('multi-group project lays groups out in a 2-column grid at xl so one row holds up to 2 task areas', () => {
+  it('multi-team project lays teams out in a 2-column grid at xl so one row holds up to 2 task areas', () => {
     seed([
       makeProject({
         id: 'demo',
@@ -204,14 +204,14 @@ describe('Dashboard layout', () => {
 
     const { container } = renderDashboard();
 
-    const groups = container.querySelectorAll('[role="group"]');
-    expect(groups.length).toBe(2);
-    const groupWrapper = groups[0].parentElement!;
-    expect(groupWrapper.className).toContain('grid');
-    expect(groupWrapper.className).toContain('grid-cols-1');
-    expect(groupWrapper.className).toContain('xl:grid-cols-2');
-    expect(groupWrapper.className).toContain('gap-3');
-    expect(groupWrapper.className).not.toContain('space-y-3');
+    const teamRegions = container.querySelectorAll('[role="group"]');
+    expect(teamRegions.length).toBe(2);
+    const teamWrapper = teamRegions[0].parentElement!;
+    expect(teamWrapper.className).toContain('grid');
+    expect(teamWrapper.className).toContain('grid-cols-1');
+    expect(teamWrapper.className).toContain('xl:grid-cols-2');
+    expect(teamWrapper.className).toContain('gap-3');
+    expect(teamWrapper.className).not.toContain('space-y-3');
   });
 
   it('renders "+ New task" as a low-key text-style button and demotes "New project" into the right-edge "More actions" kebab menu', () => {
@@ -384,10 +384,10 @@ describe('Dashboard "Project created" follow-up modal', () => {
     return screen.findByRole('dialog', { name: 'Project created' });
   }
 
-  it('pins both follow-up buttons in the footer region and "Continue adding an agent group" enters the add-agent flow', async () => {
+  it('pins both follow-up buttons in the footer region and "Continue adding an Agent Team" enters the add-agent flow', async () => {
     const dialog = await reachContinueDialog();
 
-    const continueBtn = within(dialog).getByRole('button', { name: 'Continue adding an agent group' });
+    const continueBtn = within(dialog).getByRole('button', { name: 'Continue adding an Agent Team' });
     const laterBtn = within(dialog).getByRole('button', { name: 'Later' });
     const footer = continueBtn.parentElement!;
     expect(footer.className).toContain('border-t');

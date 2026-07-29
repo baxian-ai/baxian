@@ -139,8 +139,8 @@ function omitAgentsFromProject(config: BaxianConfig, projectId: string, removed:
       return {
         ...p,
         agent: p.agent
-          .map(pair => pair.filter(a => !removedSet.has(a.id)))
-          .filter(pair => pair.length > 0),
+          .map(team => team.filter(a => !removedSet.has(a.id)))
+          .filter(team => team.length > 0),
       };
     }),
   };
@@ -493,8 +493,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const entries: CheckEntry[] = [];
       const checks: Promise<CheckRun>[] = [];
       const gitPlatform = app.ctx.agentManager.agentGitPreflightContext(project.id);
-      for (const pair of project.agent) {
-        for (const agent of pair) {
+      for (const team of project.agent) {
+        for (const agent of team) {
           const host = resolveAgentHost(app.ctx.config.host, agent.host);
           const runner = createRunner(agent.mode, host);
           entries.push({ agent, hostGroup: hostGroupKey(agent.mode, host), runner });
@@ -683,7 +683,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'both agent ids are required' });
     }
     if (dev.id === qa.id) {
-      return reply.status(409).send({ error: `Agent id "${dev.id}" is duplicated within the group` });
+      return reply.status(409).send({ error: `Agent id "${dev.id}" is duplicated within the Agent Team` });
     }
 
     const creationTokens = new Map<string, string>();
@@ -699,7 +699,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       let workdirConfig = app.ctx.config;
       for (const agentInput of [dev, qa]) {
         const existsGlobally = app.ctx.config.project.some(p =>
-          p.agent.some(group => group.some(agent => agent.id === agentInput.id)),
+          p.agent.some(team => team.some(agent => agent.id === agentInput.id)),
         );
         if (existsGlobally) {
           return reply.status(409).send({ error: `Agent id "${agentInput.id}" already exists` });
@@ -775,7 +775,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         }
         return reply.status(500).send({
           error:
-            `agent state initialization failed; the group was not committed: ${
+            `agent state initialization failed; the Agent Team was not committed: ${
               err instanceof Error ? err.message : String(err)
             }`,
         });
@@ -797,7 +797,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         }
         return reply.status(500).send({
           error:
-            `failed to persist agent group config; staged agent state was restored: ${
+            `failed to persist Agent Team config; staged agent state was restored: ${
               err instanceof Error ? err.message : String(err)
             }`,
         });
@@ -829,9 +829,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const storedProject = app.ctx.config.project.find(p => p.id === projectId)!;
-    const storedGroup = storedProject.agent.find(group => group.some(agent => agent.id === dev.id))!;
+    const storedTeam = storedProject.agent.find(team => team.some(agent => agent.id === dev.id))!;
     return reply.status(201).send({
-      agents: storedGroup,
+      agents: storedTeam,
       runtimeStatus: 'pending',
       restartRequired,
       ...(warnings.length ? { warnings } : {}),
@@ -870,14 +870,14 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (!project) {
         return reply.status(404).send({ error: `Project "${projectId}" not found` });
       }
-      const group = project.agent.find(candidate => candidate.some(agent => agent.id === agentId));
-      const current = group?.find(agent => agent.id === agentId);
-      if (!group || !current) {
+      const team = project.agent.find(candidate => candidate.some(agent => agent.id === agentId));
+      const current = team?.find(agent => agent.id === agentId);
+      if (!team || !current) {
         return reply.status(404).send({ error: `Agent "${agentId}" not found in project "${projectId}"` });
       }
       if (replacement.role !== current.role) {
         return reply.status(400).send({
-          error: `replacement role must remain "${current.role}" so the group keeps one dev and one qa`,
+          error: `replacement role must remain "${current.role}" so the Agent Team keeps one dev and one qa`,
         });
       }
       const existsGlobally = app.ctx.config.project.some(p =>

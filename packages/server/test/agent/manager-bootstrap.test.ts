@@ -698,6 +698,7 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
       awaitingReason: 'startup dialog',
       awaitingSince: NOW,
       paneId: '%1',
+      taskId: 'task-1',
       updatedAt: NOW,
     });
 
@@ -759,15 +760,19 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
           token: string | undefined,
           opts: { expectedPaneId?: string; expectedTaskId?: string },
         ) => Promise<void>;
-      }).slowPollDialogPending('dev-1', undefined, { expectedPaneId: '%1', expectedTaskId: undefined });
+      }).slowPollDialogPending('dev-1', undefined, { expectedPaneId: '%1', expectedTaskId: 'task-1' });
 
       const state = await realGet('dev-1');
       expect(state?.awaitingPhase).toBe('agent_dialog_resolved_runtime');
       expect(state?.paneId).toBe('%2');
-      expect(events.some(e =>
+      expect(state?.awaitingReason).toContain('cancel it if it is still active');
+      const intervention = events.find(e =>
         e.type === 'human.intervention'
+        && e.taskId === 'task-1'
         && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',
-      )).toBe(true);
+      );
+      expect(intervention?.data.note).toContain('cancel it if it is still active');
+      expect(intervention?.data.note).not.toBe('Runtime dialog resolved; agent REPL ready. Click Resume to continue.');
     } finally {
       globalThis.setTimeout = realSetTimeout;
       getSpy.mockRestore();

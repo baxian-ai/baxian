@@ -11,6 +11,7 @@ import {
   type PrReviewRound,
 } from '../shared/pr-review.js';
 import { usePrReview } from '../hooks/use-pr-review.ts';
+import { ReviewFreshness } from './review-freshness.tsx';
 import { TurnRow } from './review-turn-row.tsx';
 import { useT, type Messages } from '../i18n/index.tsx';
 
@@ -72,7 +73,7 @@ export function PrReviewEntry({ task }: Props) {
   const t = useT();
   const navigate = useNavigate();
   const revision = prReviewRevision(task);
-  const { data, loaded, error } = usePrReview(task.id, revision);
+  const { data, loaded, error, refresh, refreshing, refreshError } = usePrReview(task.id, revision);
   const heading = isSpecStagePhase(task.phase)
     ? t.prReview.specReviewHeading
     : t.prReview.codeReviewHeading;
@@ -106,9 +107,14 @@ export function PrReviewEntry({ task }: Props) {
     );
   }
 
+  const freshness = (
+    <ReviewFreshness data={data} onRefresh={refresh} refreshing={refreshing} refreshError={refreshError} />
+  );
+
   if (data.items.length === 0) {
     return (
       <ReviewGroup title={heading}>
+        {freshness}
         {data.truncated ? (
           <div className="text-sm text-accent">{t.prReview.listTruncated}</div>
         ) : data.error ? (
@@ -124,6 +130,7 @@ export function PrReviewEntry({ task }: Props) {
 
   return (
     <ReviewGroup title={heading}>
+      {freshness}
       {data.error && (
         <div className="text-xs text-accent">{t.prReview.partialFetchFailed(data.error)}</div>
       )}

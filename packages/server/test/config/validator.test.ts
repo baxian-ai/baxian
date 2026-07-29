@@ -16,7 +16,7 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   };
 }
 
-function makeAgentGroup(
+function makeAgentTeam(
   devOverrides: Partial<AgentConfig> = {},
   qaOverrides: Partial<AgentConfig> = {},
 ): [AgentConfig, AgentConfig] {
@@ -55,7 +55,7 @@ function withProject(project: ProjectConfig, rest: Partial<BaxianConfig> = {}): 
 function devProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
   return {
     id: 'pp', repo: 'u/r', merge: null,
-    agent: [makeAgentGroup()],
+    agent: [makeAgentTeam()],
     ...overrides,
   };
 }
@@ -88,19 +88,19 @@ describe('validateConfig', () => {
     expect(validateConfig(makeConfig())).toEqual([]);
   });
 
-  it('rejects an incomplete group without QA', () => {
+  it('rejects an incomplete team without QA', () => {
     const config = withProject(devProject({ id: 'pp', agent: [[makeAgent({ id: 'd1', role: 'dev' })]] }));
     expect(validateConfig(config)).toContainEqual({
       path: 'project.pp.agent[0]',
-      message: 'Agent group must contain exactly one qa agent',
+      message: 'Agent Team must contain exactly one qa agent',
     });
   });
 
   it('detects duplicate agent ids across projects', () => {
     const config = makeConfig({
       project: [
-        { id: 'p1', repo: 'u/r1', merge: null, agent: [makeAgentGroup({ id: 'dup' }, { id: 'q1' })] },
-        { id: 'p2', repo: 'u/r2', merge: null, agent: [makeAgentGroup({ id: 'dup' }, { id: 'q2' })] },
+        { id: 'p1', repo: 'u/r1', merge: null, agent: [makeAgentTeam({ id: 'dup' }, { id: 'q1' })] },
+        { id: 'p2', repo: 'u/r2', merge: null, agent: [makeAgentTeam({ id: 'dup' }, { id: 'q2' })] },
       ],
     });
     const errors = validateConfig(config);
@@ -110,15 +110,15 @@ describe('validateConfig', () => {
   it('detects duplicate agent ids within same project', () => {
     const config = withProject(devProject({
       agent: [
-        makeAgentGroup({ id: 'dup' }, { id: 'q1' }),
-        makeAgentGroup({ id: 'dup' }, { id: 'q2' }),
+        makeAgentTeam({ id: 'dup' }, { id: 'q1' }),
+        makeAgentTeam({ id: 'dup' }, { id: 'q2' }),
       ],
     }));
     const errors = validateConfig(config);
     expect(errors.some(e => e.message.includes('Duplicate'))).toBe(true);
   });
 
-  it('accepts a dev and qa group in any order', () => {
+  it('accepts a dev and qa team in any order', () => {
     const config = withProject(devProject({ agent: [[
       makeAgent({ id: 'q1', role: 'qa' }),
       makeAgent({ id: 'd1', role: 'dev' }),
@@ -139,12 +139,12 @@ describe('validateConfig', () => {
   });
 
   it.each<[string, AgentConfig[][], string]>([
-    ['detects a group without dev', [[makeAgent({ id: 'q1', role: 'qa' })]], 'exactly one dev'],
+    ['detects a team without dev', [[makeAgent({ id: 'q1', role: 'qa' })]], 'exactly one dev'],
     ['detects multiple dev agents', [[
       makeAgent({ id: 'd1', role: 'dev' }),
       makeAgent({ id: 'd2', role: 'dev' }),
     ]], 'exactly one dev'],
-    ['detects more than 2 agents in a group', [[
+    ['detects more than 2 agents in a team', [[
       makeAgent({ id: 'd1', role: 'dev' }),
       makeAgent({ id: 'q1', role: 'qa' }),
       makeAgent({ id: 'q2', role: 'qa' }),
@@ -154,7 +154,7 @@ describe('validateConfig', () => {
       makeAgent({ id: 'q1', role: 'qa' }),
       makeAgent({ id: 'q2', role: 'qa' }),
     ]], 'exactly one qa'],
-    ['detects empty agent group', [[]], 'empty'],
+    ['detects empty Agent Team', [[]], 'empty'],
   ])('%s', (_label, agent, messagePart) => {
     const config = withProject(devProject({ agent }));
     expect(validateConfig(config).some(e => e.message.includes(messagePart))).toBe(true);
@@ -167,7 +167,7 @@ describe('validateConfig', () => {
 
   it('accepts remote agent with host config', () => {
     const config = withProject(devProject({
-      agent: [makeAgentGroup({
+      agent: [makeAgentTeam({
         id: 'd1',
         mode: 'remote',
         host: { hostname: 'server', user: 'rock' },
@@ -179,8 +179,8 @@ describe('validateConfig', () => {
   it('detects duplicate project ids', () => {
     const config = makeConfig({
       project: [
-        { id: 'same', repo: 'u/r1', merge: null, agent: [makeAgentGroup({ id: 'd1' }, { id: 'q1' })] },
-        { id: 'same', repo: 'u/r2', merge: null, agent: [makeAgentGroup({ id: 'd2' }, { id: 'q2' })] },
+        { id: 'same', repo: 'u/r1', merge: null, agent: [makeAgentTeam({ id: 'd1' }, { id: 'q1' })] },
+        { id: 'same', repo: 'u/r2', merge: null, agent: [makeAgentTeam({ id: 'd2' }, { id: 'q2' })] },
       ],
     });
     expect(validateConfig(config).some(e => e.message.includes('Duplicate project id'))).toBe(true);
@@ -261,11 +261,11 @@ describe('validateConfig', () => {
     }
   });
 
-  it('accepts a non-github project with a complete agent group', () => {
+  it('accepts a non-github project with a complete Agent Team', () => {
     const cfg = withProject(devProject({
       id: 'gl', repo: 'https://gitlab.example.com/group/proj.git',
       gitCli: { tool: 'glab' },
-      agent: [makeAgentGroup({ id: 'gldev' }, { id: 'glqa' })],
+      agent: [makeAgentTeam({ id: 'gldev' }, { id: 'glqa' })],
     }));
     expect(validateConfig(cfg)).toEqual([]);
   });
@@ -274,7 +274,7 @@ describe('validateConfig', () => {
     const errors = validateConfig(withProject(devProject({
       id: 'gl',
       repo: 'https://gitlab.example.com/group/proj.git',
-      agent: [makeAgentGroup({ id: 'gldev' }, { id: 'glqa' })],
+      agent: [makeAgentTeam({ id: 'gldev' }, { id: 'glqa' })],
     })));
     expect(errors).toContainEqual(expect.objectContaining({
       path: 'project[0].gitCli',
@@ -416,7 +416,7 @@ describe('validateConfig', () => {
     ['rejects host.user when set to an empty string', { hostname: 'box', user: '   ' }, 'host.user'],
   ])('%s', (_label, host, suffix) => {
     const cfg = withProject(devProject({
-      agent: [makeAgentGroup({ id: 'dd', mode: 'remote', host })],
+      agent: [makeAgentTeam({ id: 'dd', mode: 'remote', host })],
     }));
     if (suffix === null) {
       expect(validateConfig(cfg)).toEqual([]);
@@ -427,7 +427,7 @@ describe('validateConfig', () => {
 
   it('accepts agent without workdir (auto mode)', () => {
     const config = withProject(devProject({
-      agent: [makeAgentGroup({ id: 'd1', workdir: undefined })],
+      agent: [makeAgentTeam({ id: 'd1', workdir: undefined })],
     }));
     expect(validateConfig(config)).toEqual([]);
   });
@@ -547,12 +547,12 @@ describe('validateConfig', () => {
 
 describe('agent.yolo field', () => {
   it('accepts yolo: true', () => {
-    const config = withProject(devProject({ agent: [makeAgentGroup({ yolo: true })] }));
+    const config = withProject(devProject({ agent: [makeAgentTeam({ yolo: true })] }));
     expect(validateConfig(config)).toEqual([]);
   });
 
   it('accepts yolo: false (runtime launches in its default permission mode)', () => {
-    const config = withProject(devProject({ agent: [makeAgentGroup({ yolo: false })] }));
+    const config = withProject(devProject({ agent: [makeAgentTeam({ yolo: false })] }));
     expect(validateConfig(config)).toEqual([]);
   });
 
@@ -570,7 +570,7 @@ describe('agent.model field', () => {
     ['rejects empty-string model', '   ', false],
     ['rejects non-string model', 42 as unknown as string, false],
   ] as const)('%s', (_label, model, valid) => {
-    const config = withProject(devProject({ agent: [makeAgentGroup({ model })] }));
+    const config = withProject(devProject({ agent: [makeAgentTeam({ model })] }));
     if (valid) {
       expect(validateConfig(config)).toEqual([]);
     } else {
@@ -593,7 +593,7 @@ describe('agent.addDirs field', () => {
       expect(hasPathEndingWith(config, '.addDirs')).toBe(true);
     }],
   ])('%s', (_label, addDirs, check) => {
-    check(withProject(devProject({ agent: [makeAgentGroup({ addDirs })] })));
+    check(withProject(devProject({ agent: [makeAgentTeam({ addDirs })] })));
   });
 });
 
@@ -604,13 +604,13 @@ describe('opencode/qodercli runtime', () => {
   });
 
   it('accepts an opencode agent without addDirs', () => {
-    const cfg = withProject(devProject({ agent: [makeAgentGroup({ runtime: 'opencode' })] }));
+    const cfg = withProject(devProject({ agent: [makeAgentTeam({ runtime: 'opencode' })] }));
     expect(validateConfig(cfg)).toEqual([]);
   });
 
   it('accepts a qodercli agent with addDirs', () => {
     const cfg = withProject(devProject({
-      agent: [makeAgentGroup({ runtime: 'qodercli', addDirs: ['/a'] })],
+      agent: [makeAgentTeam({ runtime: 'qodercli', addDirs: ['/a'] })],
     }));
     expect(validateConfig(cfg)).toEqual([]);
   });
@@ -707,7 +707,7 @@ describe('remote agent host references', () => {
         id: 'proj',
         repo: 'u/r',
         merge: null,
-        agent: [makeAgentGroup({ id: 'rdev', mode: 'remote', host, workdir: undefined })],
+        agent: [makeAgentTeam({ id: 'rdev', mode: 'remote', host, workdir: undefined })],
       },
       rest,
     );

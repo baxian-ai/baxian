@@ -98,6 +98,13 @@ describe('getMessages', () => {
     syncLocaleFromConfig('zh-CN');
     expect(getMessages().settings.entry).toBe('系统设置');
   });
+
+  it('describes Advance as sending the current instruction again', () => {
+    syncLocaleFromConfig('zh-CN');
+    const taskDetail = getMessages().taskDetail;
+    expect(taskDetail.advanceDevConfirmBody('task-1')).toContain('重新发送给 Dev');
+    expect(taskDetail.advanceQaConfirmBody('task-1')).toContain('重新发送给 QA');
+  });
 });
 
 describe('provider side effects', () => {

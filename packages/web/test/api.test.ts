@@ -147,24 +147,22 @@ describe('request contract per endpoint', () => {
       body: { title: 'new', status: 'cancelled' },
     },
     { name: 'tasks.retry', run: () => api.tasks.retry('t-1'), url: '/api/tasks/t-1/retry', method: 'POST' },
-    { name: 'tasks.review', run: () => api.tasks.review('t-1'), url: '/api/tasks/t-1/review', method: 'POST' },
+    { name: 'tasks.advance', run: () => api.tasks.advance('t-1'), url: '/api/tasks/t-1/advance', method: 'POST' },
     {
-      name: 'tasks.review recovery',
-      run: () => api.tasks.review('t-1', { stage: 'spec', actorId: '77', prNumber: 73 }),
-      url: '/api/tasks/t-1/review',
+      name: 'tasks.advance recovery',
+      run: () => api.tasks.advance('t-1', { executor: 'qa', stage: 'spec', actorId: '77', prNumber: 73 }),
+      url: '/api/tasks/t-1/advance',
       method: 'POST',
-      body: { stage: 'spec', actorId: '77', prNumber: 73 },
+      body: { executor: 'qa', stage: 'spec', actorId: '77', prNumber: 73 },
     },
-    { name: 'tasks.complete', run: () => api.tasks.complete('t-1'), url: '/api/tasks/t-1/complete', method: 'POST' },
-    { name: 'tasks.continue', run: () => api.tasks.continue('t-1'), url: '/api/tasks/t-1/continue', method: 'POST' },
+    {
+      name: 'tasks.verdict',
+      run: () => api.tasks.verdict('t-1', { action: 'request-changes', comments: 'fix it' }),
+      url: '/api/tasks/t-1/verdict',
+      method: 'POST',
+      body: { action: 'request-changes', comments: 'fix it' },
+    },
     { name: 'tasks.prReview', run: () => api.tasks.prReview('t-1'), url: '/api/tasks/t-1/pr-review' },
-    {
-      name: 'tasks.dispatch',
-      run: () => api.tasks.dispatch('t-1', { agentId: 'dev-2' }),
-      url: '/api/tasks/t-1/dispatch',
-      method: 'POST',
-      body: { agentId: 'dev-2' },
-    },
     { name: 'projects.list', run: () => api.projects.list(), url: '/api/projects' },
     { name: 'projects.get', run: () => api.projects.get('p-1'), url: '/api/projects/p-1' },
     {
@@ -176,9 +174,9 @@ describe('request contract per endpoint', () => {
     },
     { name: 'projects.delete', run: () => api.projects.delete('p-1'), url: '/api/projects/p-1', method: 'DELETE' },
     {
-      name: 'projects.addAgentGroup',
+      name: 'projects.addAgentTeam',
       run: () =>
-        api.projects.addAgentGroup('p-1', {
+        api.projects.addAgentTeam('p-1', {
           agents: [
             { id: 'dev-3', runtime: 'claude-code', role: 'dev', mode: 'local' },
             { id: 'qa-3', runtime: 'codex', role: 'qa', mode: 'local' },

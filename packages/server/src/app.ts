@@ -19,6 +19,7 @@ import type { RestartCoordinator } from './lifecycle/restart.js';
 import type { EventBroker } from './event/broker.js';
 import type { ErrorRecordStore } from './state/error-record-store.js';
 import type { PetStore } from './state/pet-store.js';
+import type { PrConversationCache } from './platform/pr-conversation-cache.js';
 import { agentRoutes } from './api/agents.js';
 import { petRoutes } from './api/pets.js';
 import { taskRoutes } from './api/tasks.js';
@@ -55,6 +56,7 @@ export interface AppContext {
   eventBroker?: EventBroker;
   errorRecordStore?: ErrorRecordStore;
   petStore?: PetStore;
+  prConversationCache?: PrConversationCache;
 }
 
 declare module 'fastify' {

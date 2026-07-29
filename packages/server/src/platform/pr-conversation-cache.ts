@@ -1,6 +1,5 @@
 import type { PrReviewItem, TaskState } from '../shared/index.js';
 
-export const PR_CONVERSATION_CACHE_TTL_MS = 60_000;
 export const PR_CONVERSATION_RATE_LIMIT_TTL_MS = 60_000;
 const RATE_LIMIT_STRIKE_MEMORY_MS = 10 * 60_000;
 const RATE_LIMIT_MAX_WAIT_MS = 900_000;
@@ -13,12 +12,19 @@ export interface PrConversationPayload {
   error?: string;
   rateLimited?: boolean;
   truncated?: boolean;
+  fetchedAt?: string;
 }
 
 type RevisionTask = Pick<
   TaskState,
-  'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber' | 'reviewConversationUpdatedAt'
+  'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber' | 'reviewConversationUpdatedAt' | 'closedUnmergedAnchor'
 >;
+
+export function closedUnmergedAnchorSlot(task: Pick<TaskState, 'closedUnmergedAnchor'>): string {
+  const anchor = task.closedUnmergedAnchor;
+  if (anchor === undefined) return '';
+  return `${anchor.generation}/${anchor.cleared === true ? 'reopened' : 'closed'}`;
+}
 
 export function prReviewCacheRevision(task: RevisionTask, repoKey: string): string {
   return [
@@ -29,6 +35,7 @@ export function prReviewCacheRevision(task: RevisionTask, repoKey: string): stri
     task.prFeedbackReceivedAt ?? '',
     task.prNumber ?? '',
     task.reviewConversationUpdatedAt ?? '',
+    closedUnmergedAnchorSlot(task),
     repoKey,
   ].join(':');
 }
@@ -54,7 +61,6 @@ interface InflightBuild {
 }
 
 export interface PrConversationCacheOpts {
-  ttlMs?: number;
   maxEntries?: number;
   maxPayloadBytes?: number;
   maxTotalBytes?: number;
@@ -62,7 +68,6 @@ export interface PrConversationCacheOpts {
 }
 
 export class PrConversationCache {
-  private readonly ttlMs: number;
   private readonly maxEntries: number;
   private readonly maxPayloadBytes: number;
   private readonly maxTotalBytes: number;
@@ -70,10 +75,11 @@ export class PrConversationCache {
   private readonly entries = new Map<string, CacheEntry>();
   private readonly rateLimited = new Map<string, RateLimitBackoff>();
   private readonly inflight = new Map<string, InflightBuild>();
+  // put() 建立的 conversationTime 下限：任务快照早于最后一次 poller 写入的 build 不得落盘
+  private readonly putFloors = new Map<string, string>();
   private totalBytes = 0;
 
   constructor(opts: PrConversationCacheOpts = {}) {
-    this.ttlMs = opts.ttlMs ?? PR_CONVERSATION_CACHE_TTL_MS;
     this.maxEntries = opts.maxEntries ?? PR_CONVERSATION_CACHE_MAX_ENTRIES;
     this.maxPayloadBytes = opts.maxPayloadBytes ?? PR_CONVERSATION_CACHE_MAX_PAYLOAD_BYTES;
     this.maxTotalBytes = opts.maxTotalBytes ?? PR_CONVERSATION_CACHE_MAX_TOTAL_BYTES;
@@ -84,12 +90,48 @@ export class PrConversationCache {
     key: string,
     revision: string,
     build: () => Promise<PrConversationPayload>,
+    conversationTime = '',
   ): Promise<PrConversationPayload> {
-    this.sweepExpired();
+    this.sweepRateLimited();
     const entry = this.entries.get(key);
-    if (entry && entry.revision === revision && !this.expired(entry)) {
-      return entry.payload;
+    if (entry && entry.revision === revision) {
+      return this.stamped(entry);
     }
+    return this.buildThrough(key, revision, build, conversationTime);
+  }
+
+  async force(
+    key: string,
+    revision: string,
+    build: () => Promise<PrConversationPayload>,
+    conversationTime = '',
+  ): Promise<PrConversationPayload> {
+    this.sweepRateLimited();
+    return this.buildThrough(key, revision, build, conversationTime);
+  }
+
+  put(key: string, revision: string, payload: PrConversationPayload, conversationTime = ''): void {
+    if (payload.error !== undefined || payload.rateLimited === true) return;
+    this.sweepRateLimited();
+    this.setPutFloor(key, conversationTime);
+    this.inflight.delete(key);
+    this.rateLimited.delete(key);
+    this.store(key, revision, payload);
+  }
+
+  stats(): { entries: number; totalBytes: number } {
+    return {
+      entries: this.entries.size + this.rateLimited.size,
+      totalBytes: this.totalBytes + this.rateLimitedBytes(),
+    };
+  }
+
+  private async buildThrough(
+    key: string,
+    revision: string,
+    build: () => Promise<PrConversationPayload>,
+    conversationTime: string,
+  ): Promise<PrConversationPayload> {
     const throttled = this.rateLimited.get(key);
     if (throttled !== undefined) {
       if (this.now() < throttled.until) {
@@ -116,7 +158,12 @@ export class PrConversationCache {
           if (payload.rateLimited) this.noteRateLimited(key, revision, payload);
           else {
             this.rateLimited.delete(key);
-            if (!payload.error) this.store(key, revision, payload);
+            if (!payload.error) {
+              if (!this.fencedByPut(key, conversationTime)) {
+                this.store(key, revision, payload);
+              }
+              return { ...payload, fetchedAt: new Date(this.now()).toISOString() };
+            }
           }
         }
         return payload;
@@ -129,21 +176,26 @@ export class PrConversationCache {
     return reg.promise;
   }
 
-  stats(): { entries: number; totalBytes: number } {
-    return {
-      entries: this.entries.size + this.rateLimited.size,
-      totalBytes: this.totalBytes + this.rateLimitedBytes(),
-    };
+  private stamped(entry: CacheEntry): PrConversationPayload {
+    return { ...entry.payload, fetchedAt: new Date(entry.fetchedAt).toISOString() };
   }
 
-  private expired(entry: CacheEntry): boolean {
-    return this.now() - entry.fetchedAt >= this.ttlMs;
-  }
-
-  private sweepExpired(): void {
-    for (const [key, entry] of this.entries) {
-      if (this.expired(entry)) this.remove(key);
+  private setPutFloor(key: string, conversationTime: string): void {
+    this.putFloors.delete(key);
+    this.putFloors.set(key, conversationTime);
+    while (this.putFloors.size > this.maxEntries) {
+      const oldest = this.putFloors.keys().next().value;
+      if (oldest === undefined) break;
+      this.putFloors.delete(oldest);
     }
+  }
+
+  private fencedByPut(key: string, conversationTime: string): boolean {
+    const floor = this.putFloors.get(key);
+    return floor !== undefined && conversationTime < floor;
+  }
+
+  private sweepRateLimited(): void {
     const now = this.now();
     for (const [key, backoff] of this.rateLimited) {
       if (now >= backoff.until + RATE_LIMIT_STRIKE_MEMORY_MS) this.rateLimited.delete(key);
@@ -202,13 +254,14 @@ export class PrConversationCache {
   }
 
   private store(key: string, revision: string, payload: PrConversationPayload): void {
-    const payloadBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+    const { fetchedAt: _stale, ...bare } = payload;
+    const payloadBytes = Buffer.byteLength(JSON.stringify(bare), 'utf8');
     if (payloadBytes > this.maxPayloadBytes) {
       this.remove(key);
       return;
     }
     this.remove(key);
-    this.entries.set(key, { revision, fetchedAt: this.now(), payloadBytes, payload });
+    this.entries.set(key, { revision, fetchedAt: this.now(), payloadBytes, payload: bare });
     this.totalBytes += payloadBytes;
     this.evict();
   }

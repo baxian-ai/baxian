@@ -5,7 +5,6 @@ import type {
   AgentSnapshot,
   TaskState,
 } from '../shared/index.js';
-import { REVIEW_VERDICT_TIMEOUT_MS } from '../shared/index.js';
 import type { TmuxSessionObservation } from '../agent/tmux-probe-poller.js';
 import type { ErrorRecord } from './error-record-store.js';
 
@@ -204,16 +203,4 @@ export async function buildAgentSnapshotById(
     latestBootstrapError,
     petId,
   );
-}
-
-export function enrichTaskSnapshot(task: TaskState): TaskState {
-  if (task.status !== 'review' || !task.reviewDispatchedAt || !task.signalToken) {
-    return task;
-  }
-  if (!task.qaAgentId) {
-    throw new Error(`enrichTaskSnapshot: review task ${task.id} has no QA participant`);
-  }
-  const elapsed = Date.now() - Date.parse(task.reviewDispatchedAt);
-  if (!Number.isFinite(elapsed) || elapsed < REVIEW_VERDICT_TIMEOUT_MS) return task;
-  return { ...task, verdictOverdue: true };
 }

@@ -571,8 +571,8 @@ function uniqueAgents(config: BaxianConfig): AgentConfig[] {
 function buildInstanceIndex(config: BaxianConfig): Map<string, AgentConfig> {
   const byId = new Map<string, AgentConfig>();
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      for (const agent of pair) {
+    for (const team of project.agent) {
+      for (const agent of team) {
         byId.set(agent.id, agent);
       }
     }
@@ -582,8 +582,8 @@ function buildInstanceIndex(config: BaxianConfig): Map<string, AgentConfig> {
 
 function projectIdForAgent(config: BaxianConfig, agentId: string): string | undefined {
   for (const project of config.project) {
-    for (const pair of project.agent) {
-      if (pair.some(agent => agent.id === agentId)) return project.id;
+    for (const team of project.agent) {
+      if (team.some(agent => agent.id === agentId)) return project.id;
     }
   }
   return undefined;

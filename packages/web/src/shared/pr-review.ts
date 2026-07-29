@@ -48,7 +48,8 @@ export function prReviewRoundKey(round: PrReviewRound, fallback: string): string
   return `round-in-progress-${round.items[0] ? prReviewItemKey(round.items[0], fallback) : fallback}`;
 }
 
-export function prReviewRevision(task: Pick<TaskState, 'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber' | 'reviewConversationUpdatedAt'>): string {
+export function prReviewRevision(task: Pick<TaskState, 'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber' | 'reviewConversationUpdatedAt' | 'closedUnmergedAnchor'>): string {
+  const anchor = task.closedUnmergedAnchor;
   return [
     task.reviewRound,
     task.latestHeadSha ?? '',
@@ -57,5 +58,6 @@ export function prReviewRevision(task: Pick<TaskState, 'reviewRound' | 'latestHe
     task.prFeedbackReceivedAt ?? '',
     task.prNumber ?? '',
     task.reviewConversationUpdatedAt ?? '',
+    anchor === undefined ? '' : `${anchor.generation}/${anchor.cleared === true ? 'reopened' : 'closed'}`,
   ].join(':');
 }

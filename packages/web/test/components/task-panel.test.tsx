@@ -1,13 +1,13 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor, within, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { TaskState } from '../../src/shared/index.js';
-import { REVIEW_VERDICT_TIMEOUT_MS } from '../../src/shared/index.js';
 
 const { navigateMock } = vi.hoisted(() => ({
   navigateMock: vi.fn(),
 }));
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
 vi.mock('react-router-dom', async (orig) => ({
   ...(await orig<typeof import('react-router-dom')>()),
@@ -19,6 +19,7 @@ import { TaskPanel } from '../../src/components/task-panel.tsx';
 import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
 
 const pageMock = vi.mocked(api.tasks.page);
+const advanceMock = vi.mocked(api.tasks.advance);
 
 const NOW = '2026-05-16T00:00:00.000Z';
 
@@ -73,6 +74,7 @@ beforeEach(() => {
   localStorage.clear();
   pageMock.mockReset();
   pageMock.mockResolvedValue(emptyPage());
+  advanceMock.mockReset();
   navigateMock.mockReset();
 });
 
@@ -349,41 +351,63 @@ describe('TaskPanel', () => {
     expect(within(active).queryByText('task-042')).toBeNull();
   });
 
-  describe('verdict overdue indicator', () => {
-    beforeEach(() => { vi.useFakeTimers(); });
-    afterEach(() => { vi.useRealTimers(); });
-
-    function renderVerdictTask(dispatchOffset: number, overrides: Partial<TaskState>): void {
-      const now = new Date('2026-06-19T12:00:00Z').getTime();
-      vi.setSystemTime(now);
-      renderPanel([task({
-        ...overrides,
-        reviewDispatchedAt: new Date(now + dispatchOffset).toISOString(),
-      })]);
+  describe('persistent attention', () => {
+    function attentiveTask(actions: NonNullable<TaskState['attention']>['recommendedActions']) {
+      return task({
+        id: 'task-100',
+        status: 'review',
+        title: 'stuck',
+        prNumber: 42,
+        deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+        replyActorId: '77',
+        replyActorStatus: 'verified',
+        attention: {
+          reason: 'review-verdict-overdue',
+          runbook: 'Inspect the current QA review.',
+          occurredAt: '2026-06-19T12:00:00Z',
+          recommendedActions: actions,
+        },
+      });
     }
 
-    it('shows ! after the timeout threshold elapses via interval tick', () => {
-      renderVerdictTask(-REVIEW_VERDICT_TIMEOUT_MS + 60_000, {
-        id: 'task-100', status: 'review', title: 'stuck', qaAgentId: 'qa-1',
-      });
+    it('renders the durable reason, runbook and recommended operations', () => {
+      renderPanel([attentiveTask(['advance', 'verdict', 'cancel', 'retry'])]);
 
-      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
-
-      act(() => { vi.advanceTimersByTime(90_000); });
-
-      expect(screen.getByTitle('Review verdict missing')).toBeTruthy();
+      expect(screen.getByText(/review-verdict-overdue/)).toBeTruthy();
+      expect(screen.getByTitle('Inspect the current QA review.')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Advance' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Verdict' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
     });
 
-    it.each([
-      { name: 'within the timeout window', dispatchOffset: -60_000, overrides: { id: 'task-101', status: 'review', title: 'fresh', qaAgentId: 'qa-1' } },
-      { name: 'non-review status even if dispatched long ago', dispatchOffset: -REVIEW_VERDICT_TIMEOUT_MS - 60_000, overrides: { id: 'task-102', status: 'in_progress', title: 'not reviewing', qaAgentId: 'qa-1' } },
-      { name: 'qaAgentId is missing', dispatchOffset: -REVIEW_VERDICT_TIMEOUT_MS - 60_000, overrides: { id: 'task-103', status: 'review', title: 'no qa' } },
-    ])('stays hidden when $name', ({ dispatchOffset, overrides }) => {
-      renderVerdictTask(dispatchOffset, overrides as Partial<TaskState>);
+    it('runs Advance directly and keeps the task detail route for the other operations', async () => {
+      advanceMock.mockResolvedValue(attentiveTask(['advance', 'verdict']));
+      renderPanel([attentiveTask(['advance', 'verdict'])]);
 
-      act(() => { vi.advanceTimersByTime(30_000); });
+      fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+      await waitFor(() => expect(advanceMock).toHaveBeenCalledWith('task-100'));
+      expect(navigateMock).not.toHaveBeenCalled();
 
-      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Verdict' }));
+      expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
+    });
+
+    it('opens task detail when Advance requires revoked-pass confirmation', () => {
+      renderPanel([{
+        ...attentiveTask(['advance']),
+        status: 'approved',
+        postApproveRevoked: {
+          generation: 'feedfeedfeed',
+          reason: 'redispatch-cap',
+          at: NOW,
+        },
+      }]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+
+      expect(advanceMock).not.toHaveBeenCalled();
+      expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
     });
   });
 });

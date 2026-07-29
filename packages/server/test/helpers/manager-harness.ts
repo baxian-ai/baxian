@@ -92,8 +92,8 @@ export async function createManagerHarness(
 
   const deps = overrides.deps ?? {};
   const defaultConfig = makeConfig();
-  defaultConfig.project[0]!.agent = defaultConfig.project[0]!.agent.map(group => (
-    group.map(agent => ({ ...agent, workdir: join(tempDir, agent.id) }))
+  defaultConfig.project[0]!.agent = defaultConfig.project[0]!.agent.map(team => (
+    team.map(agent => ({ ...agent, workdir: join(tempDir, agent.id) }))
   ));
   const config = makeConfig(overrides.config ?? deps.config ?? defaultConfig);
   const agentStore = deps.agentStore ?? new AgentStore(join(tempDir, 'state', 'agents'));

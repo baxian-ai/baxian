@@ -11,7 +11,8 @@ import {
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
 import { buildDriverReviewTimeline } from '../platform/review-timeline.js';
 import { PrConversationCache, prReviewCacheRevision } from '../platform/pr-conversation-cache.js';
-import { enrichTaskSnapshot } from '../state/snapshot.js';
+import type { TaskVerdictAction } from '../agent/manager.js';
+import { ApiError } from '../errors.js';
 
 const TITLE_MAX_LEN = 200;
 const DESCRIPTION_MAX_LEN = 16_000;
@@ -49,7 +50,7 @@ function compareByUpdatedDesc(a: TaskState, b: TaskState): number {
 function paginate(pool: TaskState[], rawOffset: string | undefined): TaskPage {
   const parsed = Number.parseInt(rawOffset ?? '0', 10);
   const offset = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-  const page = pool.slice(offset, offset + TASK_LIST_PAGE_SIZE).map(enrichTaskSnapshot);
+  const page = pool.slice(offset, offset + TASK_LIST_PAGE_SIZE);
   return {
     tasks: page,
     hasMore: offset + page.length < pool.length,
@@ -91,12 +92,33 @@ interface UpdateTaskBody {
   status?: string;
 }
 
-interface DispatchTaskBody {
+interface AdvanceTaskBody {
+  executor?: string;
   agentId?: string;
+  stage?: string;
+  actorId?: string;
+  prNumber?: number;
+  confirmRevoked?: boolean;
+  note?: string;
 }
 
+interface TaskVerdictBody {
+  action?: string;
+  comments?: string;
+  note?: string;
+}
+
+const TASK_VERDICT_ACTIONS = new Set<TaskVerdictAction>([
+  'approve',
+  'request-changes',
+  'pass',
+  'continue',
+  'complete',
+  'confirm-merge',
+]);
+
 export async function taskRoutes(app: FastifyInstance): Promise<void> {
-  const prConversationCache = new PrConversationCache();
+  const prConversationCache = app.ctx.prConversationCache ?? new PrConversationCache();
   app.get<{ Querystring: TaskQuery }>('/tasks', async (request, reply) => {
     const projectId = typeof request.query.projectId === 'string' ? request.query.projectId.trim() : '';
     if (projectId.length === 0) {
@@ -122,7 +144,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     if (!task) {
       return reply.status(404).send({ error: 'Task not found' });
     }
-    return enrichTaskSnapshot(task);
+    return task;
   });
 
   app.post<{ Body: CreateTaskBody }>(
@@ -212,8 +234,8 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(201).send(task);
   });
 
-  app.post<{ Params: { id: string }; Body: DispatchTaskBody }>(
-    '/tasks/:id/dispatch',
+  app.post<{ Params: { id: string }; Body: AdvanceTaskBody }>(
+    '/tasks/:id/advance',
     async (request, reply) => {
       const taskId = request.params.id;
       const rawBody = request.body;
@@ -222,60 +244,94 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(400).send({ error: 'request body must be a JSON object' });
       }
       const body = rawBody ?? {};
+      if (body.executor !== undefined && body.executor !== 'dev' && body.executor !== 'qa') {
+        return reply.status(400).send({ error: 'executor must be "dev" or "qa" when provided' });
+      }
       if (body.agentId !== undefined && typeof body.agentId !== 'string') {
         return reply.status(400).send({ error: 'agentId must be a string when provided' });
+      }
+      if (body.stage !== undefined && body.stage !== 'spec' && body.stage !== 'code') {
+        return reply.status(400).send({ error: 'stage must be "spec" or "code" when provided' });
+      }
+      if (body.actorId !== undefined && (typeof body.actorId !== 'string' || body.actorId.trim() === '')) {
+        return reply.status(400).send({ error: 'actorId must be a non-empty string when provided' });
+      }
+      if (body.prNumber !== undefined && (!Number.isSafeInteger(body.prNumber) || body.prNumber < 1)) {
+        return reply.status(400).send({ error: 'prNumber must be a positive safe integer when provided' });
+      }
+      if (body.confirmRevoked !== undefined && typeof body.confirmRevoked !== 'boolean') {
+        return reply.status(400).send({ error: 'confirmRevoked must be a boolean when provided' });
+      }
+      if (body.note !== undefined && typeof body.note !== 'string') {
+        return reply.status(400).send({ error: 'note must be a string when provided' });
       }
       const requestedAgentId = typeof body.agentId === 'string' && body.agentId.trim() !== ''
         ? body.agentId.trim()
         : undefined;
-
-      const result = await app.ctx.agentManager.dispatchPendingTask(taskId, requestedAgentId);
-      if (result.errorCode !== undefined) {
-        return reply.status(result.errorCode).send({ error: result.error });
-      }
-      return reply.status(200).send(result.task);
+      const updated = await app.ctx.agentManager.advanceTask(taskId, {
+        ...(body.executor !== undefined ? { executor: body.executor } : {}),
+        ...(requestedAgentId !== undefined ? { agentId: requestedAgentId } : {}),
+        ...(body.stage !== undefined ? { stage: body.stage } : {}),
+        ...(body.actorId !== undefined ? { actorId: body.actorId.trim() } : {}),
+        ...(body.prNumber !== undefined ? { prNumber: body.prNumber } : {}),
+        ...(body.confirmRevoked !== undefined ? { confirmRevoked: body.confirmRevoked } : {}),
+        ...(body.note?.trim() ? { note: body.note.trim() } : {}),
+      });
+      app.ctx.dispatchReconciler?.resetTask(taskId);
+      return reply.status(202).send(updated);
     },
   );
 
   app.post<{ Params: { id: string } }>('/tasks/:id/retry', async (request, reply) => {
+    const source = await app.ctx.agentManager.getTask(request.params.id);
+    if (!source) throw new ApiError(404, 'Task not found');
     const fresh = await app.ctx.agentManager.retryTask(request.params.id);
+    await app.ctx.agentManager.auditHumanTaskOperation(
+      source,
+      'retry',
+      'retry',
+      undefined,
+      { replacementTaskId: fresh.id },
+    );
     return reply.status(201).send(fresh);
   });
 
-  app.post<{
-    Params: { id: string };
-    Body: { stage?: string; actorId?: string; prNumber?: number };
-  }>('/tasks/:id/review', async (request, reply) => {
-    const { stage, actorId, prNumber } = request.body ?? {};
-    if (stage !== undefined && stage !== 'spec' && stage !== 'code') {
-      return reply.status(400).send({ error: 'stage must be "spec" or "code" when provided' });
-    }
-    if (actorId !== undefined && (typeof actorId !== 'string' || actorId.trim() === '')) {
-      return reply.status(400).send({ error: 'actorId must be a non-empty string when provided' });
-    }
-    if (prNumber !== undefined && (!Number.isSafeInteger(prNumber) || prNumber < 1)) {
-      return reply.status(400).send({ error: 'prNumber must be a positive safe integer when provided' });
-    }
-    const updated = await app.ctx.agentManager.dispatchReviewToQa(request.params.id, {
-      confirmUncertainNotDelivered: true,
-      ...(stage !== undefined ? { stage } : {}),
-      ...(typeof actorId === 'string' ? { actorId: actorId.trim() } : {}),
-      ...(prNumber !== undefined ? { prNumber } : {}),
-    });
-    return reply.status(202).send(updated);
-  });
+  app.post<{ Params: { id: string }; Body: TaskVerdictBody }>(
+    '/tasks/:id/verdict',
+    async (request, reply) => {
+      const rawBody = request.body;
+      if (rawBody === null || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+        return reply.status(400).send({ error: 'request body must be a JSON object' });
+      }
+      const body = rawBody;
+      if (typeof body.action !== 'string' || !TASK_VERDICT_ACTIONS.has(body.action as TaskVerdictAction)) {
+        return reply.status(400).send({ error: 'action is not a supported task verdict' });
+      }
+      if (body.comments !== undefined && typeof body.comments !== 'string') {
+        return reply.status(400).send({ error: 'comments must be a string when provided' });
+      }
+      if (body.note !== undefined && typeof body.note !== 'string') {
+        return reply.status(400).send({ error: 'note must be a string when provided' });
+      }
+      const updated = await app.ctx.agentManager.submitTaskVerdict(
+        request.params.id,
+        body.action as TaskVerdictAction,
+        body.comments,
+        body.note,
+      );
+      return reply.status(202).send(updated);
+    },
+  );
 
-  app.post<{ Params: { id: string } }>('/tasks/:id/complete', async (request, reply) => {
-    const updated = await app.ctx.agentManager.markTaskComplete(request.params.id);
-    return reply.status(202).send(updated);
-  });
-
-  app.get<{ Params: { id: string } }>('/tasks/:id/pr-review', async (request, reply) => {
-    const task = await app.ctx.taskStore.get(request.params.id);
-    if (!task) return reply.status(404).send({ error: 'task not found' });
+  const prReviewTimeline = async (
+    taskId: string,
+    mode: 'get' | 'force',
+  ): Promise<{ status: number; body: Record<string, unknown> }> => {
+    const task = await app.ctx.taskStore.get(taskId);
+    if (!task) return { status: 404, body: { error: 'task not found' } };
     const empty: PrReviewItem[] = [];
     if (task.prNumber === undefined) {
-      return reply.send({ available: false, reason: 'no-pr', items: empty });
+      return { status: 200, body: { available: false, reason: 'no-pr', items: empty } };
     }
     const binding = task.platformBinding;
     const live = app.ctx.agentManager.getProjectConfig(task.projectId) === undefined
@@ -285,44 +341,42 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       && binding.mode === live.mode && binding.repoKey === live.repoKey && binding.tool === live.tool;
     const driver = bindingIntact ? app.ctx.agentManager.platformDriverFor(task.projectId) : undefined;
     if (!driver || binding === undefined) {
-      return reply.send({ available: false, reason: 'driver-unavailable', items: empty });
+      return { status: 200, body: { available: false, reason: 'driver-unavailable', items: empty } };
     }
     const prNumber = task.prNumber;
-    const timeline = await prConversationCache.get(
-      task.id,
-      prReviewCacheRevision(task, binding.repoKey),
-      () => buildDriverReviewTimeline(driver, prNumber),
-    );
-    return reply.send({
-      available: true,
-      prNumber: task.prNumber,
-      ...(task.prUrl ? { prUrl: task.prUrl } : {}),
-      items: timeline.items,
-      ...(timeline.error ? { error: timeline.error } : {}),
-      ...(timeline.rateLimited ? { rateLimited: true } : {}),
-      ...(timeline.truncated ? { truncated: true } : {}),
-    });
+    const revision = prReviewCacheRevision(task, binding.repoKey);
+    const build = () => buildDriverReviewTimeline(driver, prNumber);
+    const timeline = mode === 'force'
+      ? await prConversationCache.force(task.id, revision, build, task.reviewConversationUpdatedAt ?? '')
+      : await prConversationCache.get(task.id, revision, build, task.reviewConversationUpdatedAt ?? '');
+    const prClosedUnmerged = task.closedUnmergedAnchor !== undefined && task.closedUnmergedAnchor.cleared !== true;
+    const autoRefresh = !TASK_TERMINAL_STATUS_SET.has(task.status) && !prClosedUnmerged;
+    return {
+      status: 200,
+      body: {
+        available: true,
+        prNumber: task.prNumber,
+        ...(task.prUrl ? { prUrl: task.prUrl } : {}),
+        items: timeline.items,
+        ...(timeline.error ? { error: timeline.error } : {}),
+        ...(timeline.rateLimited ? { rateLimited: true } : {}),
+        ...(timeline.truncated ? { truncated: true } : {}),
+        ...(timeline.fetchedAt ? { fetchedAt: timeline.fetchedAt } : {}),
+        autoRefresh,
+        ...(autoRefresh ? { autoRefreshIntervalMs: app.ctx.config.server.githubPollIntervalMs } : {}),
+      },
+    };
+  };
+
+  app.get<{ Params: { id: string } }>('/tasks/:id/pr-review', async (request, reply) => {
+    const result = await prReviewTimeline(request.params.id, 'get');
+    return reply.status(result.status).send(result.body);
   });
 
-  app.post<{ Params: { id: string } }>('/tasks/:id/continue', async (request, reply) => {
-    const updated = await app.ctx.agentManager.continueDevRound(request.params.id);
-    return reply.status(202).send(updated);
+  app.post<{ Params: { id: string } }>('/tasks/:id/pr-review/refresh', async (request, reply) => {
+    const result = await prReviewTimeline(request.params.id, 'force');
+    return reply.status(result.status).send(result.body);
   });
-
-  app.post<{ Params: { id: string }; Body: { verdict?: string; comments?: string } }>(
-    '/tasks/:id/spec',
-    async (request, reply) => {
-      const { verdict, comments } = request.body ?? {};
-      if (verdict !== 'approve' && verdict !== 'request-changes') {
-        return reply.status(400).send({ error: 'verdict must be "approve" or "request-changes"' });
-      }
-      if (comments !== undefined && typeof comments !== 'string') {
-        return reply.status(400).send({ error: 'comments must be a string' });
-      }
-      const updated = await app.ctx.agentManager.submitSpecVerdict(request.params.id, verdict, comments);
-      return reply.status(202).send(updated);
-    },
-  );
 
   app.patch<{ Params: { id: string }; Body: UpdateTaskBody }>(
     '/tasks/:id',
@@ -352,6 +406,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
 
       if (hasStatus) {
         const task = await app.ctx.agentManager.cancelTask(taskId);
+        await app.ctx.agentManager.auditHumanTaskOperation(task, 'cancel', 'cancel');
         return reply.status(200).send(task);
       }
 

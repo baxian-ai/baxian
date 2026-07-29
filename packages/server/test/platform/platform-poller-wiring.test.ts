@@ -58,10 +58,11 @@ describe('createPlatformPollerOptions', () => {
     expect(await options.task(owned.id)).toEqual(platformTaskView(owned));
     expect(await options.task('missing')).toBeNull();
     await options.onCursorCommitted!(owned.id, 42, 'reviews', 123);
-    await options.onConversationRevision!(owned.id);
+    const conversation = { prNumber: 42, payload: { items: [] } };
+    await options.onConversationRevision!(owned.id, conversation);
     expect(manager.listTasksForPlatformEntry).toHaveBeenCalledWith('entry-project');
     expect(manager.pruneConsumedFeedback).toHaveBeenCalledWith(owned.id, 'reviews', 123);
-    expect(manager.noteReviewConversationRevision).toHaveBeenCalledWith(owned.id);
+    expect(manager.noteReviewConversationRevision).toHaveBeenCalledWith(owned.id, conversation);
   });
 });
 

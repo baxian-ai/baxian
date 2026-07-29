@@ -10,8 +10,8 @@ export function Terminal() {
   const runtime = useMemo<AgentRuntime | undefined>(() => {
     if (!agentId) return undefined;
     for (const project of projects ?? []) {
-      for (const group of project.agent) {
-        const found = group.find(agent => agent.id === agentId);
+      for (const team of project.agent) {
+        const found = team.find(agent => agent.id === agentId);
         if (found) return found.runtime;
       }
     }

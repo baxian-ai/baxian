@@ -29,24 +29,35 @@ export interface CommentSourceReader {
   ): Promise<NormalizedRow[]>;
 }
 
+export interface ScanRowCollector {
+  admitPage(source: CommentSourceOp, pageRows: readonly NormalizedRow[]): void;
+  noteFailure(sourceKey: string, error: unknown): void;
+}
+
 export async function scanCommentSourcesOnce(
   driver: CommentSourceReader,
   prNumber: number,
   now: () => number,
   onFailure?: (key: string, error: unknown) => void,
+  collector?: ScanRowCollector,
 ): Promise<VerdictSourceScan[]> {
   const scans: VerdictSourceScan[] = [];
   for (const source of driver.commentSources) {
     const sourceClass = classifyCommentSource(source);
     const scanStartedAt = now();
     try {
+      let pagedInline = false;
       const rows = await driver.runCommentSource(source, { prNumber }, pageRows => {
+        pagedInline = true;
+        collector?.admitPage(source, pageRows);
         for (const row of pageRows) projectCommentRow(row);
         return pageRows;
       });
+      if (!pagedInline && collector !== undefined) collector.admitPage(source, rows);
       scans.push({ key: source.key, sourceClass, ok: true, scanStartedAt, rows: rows.filter(r => r.system !== true) });
     } catch (error) {
       scans.push({ key: source.key, sourceClass, ok: false, scanStartedAt, rows: [] });
+      collector?.noteFailure(source.key, error);
       onFailure?.(source.key, error);
     }
   }

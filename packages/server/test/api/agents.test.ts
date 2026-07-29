@@ -229,12 +229,18 @@ describe('DELETE /api/agents/:id/session', () => {
       updatedAt: now,
     });
     await setAgent({ id: 'dev-1', taskId: 'task-001' });
+    const audit = vi.spyOn(app.ctx.agentManager, 'auditHumanTaskOperation');
 
     const response = await del('/api/agents/dev-1/session');
     expect(response.statusCode).toBe(204);
 
     const task = await app.ctx.taskStore.get('task-001');
     expect(task?.status).toBe('cancelled');
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'task-001', status: 'cancelled' }),
+      'cancel',
+      'cancel',
+    );
   });
 
   it('with no active task → returns 204 (no-op)', async () => {
@@ -243,12 +249,12 @@ describe('DELETE /api/agents/:id/session', () => {
     expect(response.statusCode).toBe(204);
   });
 
-  it('cancelTask failure is logged and swallowed → still 204', async () => {
+  it('surfaces cancelTask failure and does not report a successful cancellation', async () => {
     await setAgent({ id: 'dev-1', taskId: 'task-broken' });
     const spy = vi.spyOn(app.ctx.agentManager, 'cancelTask').mockRejectedValue(new Error('tmux gone'));
     try {
       const response = await del('/api/agents/dev-1/session');
-      expect(response.statusCode).toBe(204);
+      expect(response.statusCode).toBe(500);
       expect(spy).toHaveBeenCalledWith('task-broken');
     } finally {
       spy.mockRestore();

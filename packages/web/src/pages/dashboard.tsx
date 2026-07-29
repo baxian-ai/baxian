@@ -1,7 +1,7 @@
 import {useState} from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { KebabMenu, MenuItem } from '../components/kebab-menu.tsx';
-import { AgentGroup } from '../components/agent-group.tsx';
+import { AgentTeam } from '../components/agent-team.tsx';
 import { CreateProjectModal } from '../components/create-project-modal.tsx';
 import { CreateAgentModal } from '../components/create-agent-modal.tsx';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
@@ -201,10 +201,10 @@ function DashboardProject({
               : 'grid grid-cols-1 gap-3 xl:grid-cols-2'
           }
         >
-          {project.agent.map((group, index) => (
-            <AgentGroup
-              key={group.map(agent => agent.id).join(':') || index}
-              group={group}
+          {project.agent.map((team, index) => (
+            <AgentTeam
+              key={team.map(agent => agent.id).join(':') || index}
+              team={team}
               projectId={project.id}
               agentsById={agentsById}
               agentsLoaded={agentsLoaded}

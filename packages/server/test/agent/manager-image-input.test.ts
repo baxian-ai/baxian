@@ -68,7 +68,7 @@ beforeEach(async () => {
     ...CONFIG,
     project: CONFIG.project.map(p => ({
       ...p,
-      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
+      agent: p.agent.map(team => team.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
     })),
   };
 

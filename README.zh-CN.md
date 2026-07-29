@@ -4,7 +4,7 @@
 
 # baxian
 
-**你的 AI agent 团队——Dev agent 负责实现，QA agent 负责评审，每处改动过审后才交付。**
+**你的 AI Agent Team——Dev agent 负责实现，QA agent 负责评审，每处改动过审后才交付。**
 
 [English](https://github.com/baxian-ai/baxian/blob/main/README.md) · **简体中文**
 
@@ -86,7 +86,7 @@ baxian
 然后在控制台里：
 
 1. **新建项目** —— 指向一个 git 仓库。
-2. **添加 agent** —— 一对 Dev/QA（例如 Claude Code 当 Dev、Codex 当 QA），各自的工作目录里放一份仓库的 clone。
+2. **添加 agent** —— 一个 Agent Team（例如 Claude Code 当 Dev、Codex 当 QA），各自的工作目录里放一份仓库的 clone。
 3. **新建任务** —— 描述你要做什么；Dev agent 接手后，评审循环自动接管。
 
 ### CLI
@@ -127,7 +127,7 @@ baxian 优先读取工作目录下的 `./baxian.json`，找不到时回退到 `~
 }
 ```
 
-`agent` 里的每个内层数组是一个分组——协作同一仓库的一对 Dev/QA；`host` 只在使用远程 agent 时需要。更完整的示例（含远程 agent）见 [`baxian.json.example`](https://github.com/baxian-ai/baxian/blob/main/baxian.json.example)。这些配置也都能在 Web 控制台里修改（项目、agent、主机、语言、通知）——需要重启 server 的改动，界面会明确提示。
+`agent` 里的每个内层数组是一个 Agent Team——协作同一仓库的一个 Dev agent 加一个 QA agent；`host` 只在使用远程 agent 时需要。更完整的示例（含远程 agent）见 [`baxian.json.example`](https://github.com/baxian-ai/baxian/blob/main/baxian.json.example)。这些配置也都能在 Web 控制台里修改（项目、agent、主机、语言、通知）——需要重启 server 的改动，界面会明确提示。
 
 常用配置项：
 

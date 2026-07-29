@@ -86,7 +86,7 @@ Open <http://localhost:3000>. The first run creates `~/.baxian/config.json` for 
 Then, in the console:
 
 1. **New project** — point it at a git repository.
-2. **Add agents** — a Dev/QA pair (for example Claude Code as Dev, Codex as QA), each with a working directory containing a clone of the repo.
+2. **Add agents** — an Agent Team (for example Claude Code as Dev, Codex as QA), each with a working directory containing a clone of the repo.
 3. **New task** — describe what you want; the Dev agent picks it up and the review loop takes over.
 
 ### CLI
@@ -127,7 +127,7 @@ baxian reads `./baxian.json` from the working directory first, then falls back t
 }
 ```
 
-Each inner array in `agent` is one group — a Dev/QA pair that works the repo together. `host` is only needed for remote agents. See [`baxian.json.example`](https://github.com/baxian-ai/baxian/blob/main/baxian.json.example) for a fuller example including remote agents. Everything is also editable from the web console (projects, agents, hosts, language, notifications) — the UI tells you when a change needs a server restart.
+Each inner array in `agent` is one Agent Team — a Dev agent and a QA agent that work the repo together. `host` is only needed for remote agents. See [`baxian.json.example`](https://github.com/baxian-ai/baxian/blob/main/baxian.json.example) for a fuller example including remote agents. Everything is also editable from the web console (projects, agents, hosts, language, notifications) — the UI tells you when a change needs a server restart.
 
 Useful options:
 

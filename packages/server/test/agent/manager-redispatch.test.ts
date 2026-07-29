@@ -3,6 +3,8 @@ import { AgentManager } from '../../src/agent/manager.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
+const SHA1 = 'a'.repeat(40);
+const SHA2 = 'b'.repeat(40);
 
 const harness = useManagerSuiteHarness();
 
@@ -861,5 +863,178 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-spec-ready')).toBe(false);
     expect(continueSpy).not.toHaveBeenCalled();
     expect(holdSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentManager.advanceTask', () => {
+  async function seedRevokedTask(id: string): Promise<void> {
+    await harness.seedTask({
+      id,
+      status: 'approved',
+      phase: 'code',
+      prNumber: 42,
+      latestHeadSha: SHA1,
+      passProvenance: {
+        sourceKey: 'issue-comments',
+        id: 'pass-1',
+        bodyDigest: 'digest',
+        token: 'abcdef123456',
+        failToken: '123456abcdef',
+        anchorSha: SHA1,
+      },
+      postApproveRevoked: {
+        generation: 'feedfeedfeed',
+        reason: 'redispatch-cap',
+        at: NOW,
+      },
+    });
+  }
+
+  it('replays the persisted Dev instruction for an in-progress task', async () => {
+    const m = harness.manager;
+    await harness.seedTask({
+      id: 'task-advance-dev',
+      status: 'in_progress',
+      phase: 'code',
+      signalToken: 'advance-token',
+    });
+    const replay = vi.spyOn(m, 'redispatchTaskPromptAfterReplRestart').mockResolvedValue(true);
+
+    const result = await m.advanceTask('task-advance-dev', { executor: 'dev', note: 'manual replay' });
+
+    expect(result.status).toBe('in_progress');
+    expect(replay).toHaveBeenCalledWith('dev-1', 'task-advance-dev');
+    expect(harness.events.at(-1)).toMatchObject({
+      type: 'task.updated',
+      taskId: 'task-advance-dev',
+      data: {
+        operation: 'advance',
+        action: 'dev',
+        actor: 'human',
+        provenance: 'human',
+        note: 'manual replay',
+      },
+    });
+  });
+
+  it('routes a QA advance through the existing delivery and review guard', async () => {
+    const m = harness.manager;
+    const task = await harness.seedTask({
+      id: 'task-advance-qa',
+      status: 'fixing',
+      phase: 'code',
+      signalToken: 'advance-qa-token',
+    });
+    const dispatch = vi.spyOn(m, 'dispatchReviewToQa').mockResolvedValue({
+      ...task,
+      status: 'review',
+    });
+
+    await m.advanceTask(task.id, {
+      executor: 'qa',
+      stage: 'code',
+      actorId: '77',
+      prNumber: 42,
+    });
+
+    expect(dispatch).toHaveBeenCalledWith(task.id, {
+      fromStatus: ['fixing'],
+      confirmUncertainNotDelivered: true,
+      stage: 'code',
+      actorId: '77',
+      prNumber: 42,
+    });
+    expect(harness.events.at(-1)).toMatchObject({
+      type: 'task.updated',
+      taskId: task.id,
+      data: {
+        operation: 'advance',
+        action: 'qa',
+        actor: 'human',
+        provenance: 'human',
+        note: 'advance:qa',
+      },
+    });
+  });
+
+  it('rejects Review to Dev because only a request-changes verdict may start fixing', async () => {
+    const m = harness.manager;
+    await harness.seedTask({
+      id: 'task-review-to-dev',
+      status: 'review',
+      phase: 'code',
+      signalToken: 'review-token',
+    });
+    const replay = vi.spyOn(m, 'redispatchTaskPromptAfterReplRestart');
+
+    await expect(m.advanceTask('task-review-to-dev', { executor: 'dev' }))
+      .rejects.toMatchObject({ status: 409 });
+    expect(replay).not.toHaveBeenCalled();
+  });
+
+  it('requires explicit confirmation before restoring a revoked post-approve episode', async () => {
+    const m = harness.manager;
+    await seedRevokedTask('task-revoked-advance');
+
+    await expect(m.advanceTask('task-revoked-advance', { executor: 'dev' }))
+      .rejects.toMatchObject({ status: 409 });
+  });
+
+  it('revalidates the accepted head before restoring a revoked post-approve episode', async () => {
+    const m = harness.manager;
+    await seedRevokedTask('task-restore-revoked');
+    vi.spyOn(m, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true,
+      prUrl: 'https://github.com/user/repo/pull/42',
+      headSha: SHA1,
+      branch: 'bx/task-restore-revoked',
+      targetBranch: 'main',
+    });
+    vi.spyOn(m, 'platformVerifyAcceptedPass').mockResolvedValue({
+      kind: 'valid',
+      pendingCount: 0,
+    });
+    const replay = vi.spyOn(m, 'redispatchTaskPromptAfterReplRestart').mockResolvedValue(true);
+
+    const result = await m.advanceTask('task-restore-revoked', {
+      executor: 'dev',
+      confirmRevoked: true,
+    });
+
+    expect(result.postApproveRevoked).toBeUndefined();
+    expect(result.postApproveGeneration).toMatch(/^[0-9a-f]{12}$/);
+    expect(result.postApproveToken).toMatch(/^[0-9a-f]{12}$/);
+    expect(replay).toHaveBeenCalledWith('dev-1', 'task-restore-revoked');
+  });
+
+  it('refuses restoration when accepted-pass provenance changes during remote verification', async () => {
+    const m = harness.manager;
+    await seedRevokedTask('task-racing-revoked');
+    vi.spyOn(m, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true,
+      prUrl: 'https://github.com/user/repo/pull/42',
+      headSha: SHA1,
+      branch: 'bx/task-racing-revoked',
+      targetBranch: 'main',
+    });
+    vi.spyOn(m, 'platformVerifyAcceptedPass').mockImplementation(async () => {
+      const fresh = (await harness.taskStore.get('task-racing-revoked'))!;
+      await harness.taskStore.set({
+        ...fresh,
+        passProvenance: { ...fresh.passProvenance!, bodyDigest: `changed-${SHA2}` },
+        updatedAt: new Date().toISOString(),
+      });
+      return { kind: 'valid', pendingCount: 0 };
+    });
+    const replay = vi.spyOn(m, 'redispatchTaskPromptAfterReplRestart');
+
+    await expect(m.advanceTask('task-racing-revoked', {
+      executor: 'dev',
+      confirmRevoked: true,
+    })).rejects.toMatchObject({ status: 409 });
+
+    expect(replay).not.toHaveBeenCalled();
+    expect((await harness.taskStore.get('task-racing-revoked'))?.postApproveRevoked)
+      .toBeDefined();
   });
 });

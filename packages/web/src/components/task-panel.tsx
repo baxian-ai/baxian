@@ -3,11 +3,12 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api.ts';
 import { TaskStatusDot, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { useT } from '../i18n/index.tsx';
+import { useToast } from './toast.tsx';
 import {
   TASK_ACTIVE_STATUS_SET,
-  REVIEW_VERDICT_TIMEOUT_MS,
   TASK_LIST_PAGE_SIZE,
   isSpecStagePhase,
+  needsGitReviewRecovery,
   type TaskState,
 } from '../shared/index.js';
 
@@ -227,40 +228,70 @@ function DoneBody({ state }: { state: DoneState }) {
   );
 }
 
-function useVerdictOverdue(task: TaskState): boolean {
-  const [overdue, setOverdue] = useState(false);
-  useEffect(() => {
-    function check() {
-      if (task.status !== 'review' || !task.reviewDispatchedAt || !task.qaAgentId) {
-        setOverdue(false);
-        return;
-      }
-      setOverdue(Date.now() - Date.parse(task.reviewDispatchedAt) >= REVIEW_VERDICT_TIMEOUT_MS);
-    }
-    check();
-    const id = setInterval(check, 30_000);
-    return () => clearInterval(id);
-  }, [task.status, task.reviewDispatchedAt, task.qaAgentId]);
-  return overdue;
-}
-
 function TaskRow({ task }: { task: TaskState }) {
   const t = useT();
   const navigate = useNavigate();
+  const { show } = useToast();
+  const [advancing, setAdvancing] = useState(false);
   const round = isSpecStagePhase(task.phase) ? (task.specReviewRound ?? 0) : task.reviewRound;
-  const overdue = useVerdictOverdue(task);
+  const openTask = () => navigate(taskDetailPath(task.projectId, task.id));
+  const advance = async () => {
+    if (task.postApproveRevoked
+      || (task.status === 'review' && needsGitReviewRecovery(task))) {
+      openTask();
+      return;
+    }
+    setAdvancing(true);
+    try {
+      await api.tasks.advance(task.id);
+      show({ kind: 'success', title: t.taskDetail.advanceSucceededTitle });
+    } catch (err) {
+      show({
+        kind: 'error',
+        title: t.taskDetail.advanceFailedTitle,
+        body: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setAdvancing(false);
+    }
+  };
   return (
-    <button
-      type="button"
-      onClick={() => navigate(taskDetailPath(task.projectId, task.id))}
-      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-og-50/60"
-    >
-      <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
-      <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
-      {isSpecStagePhase(task.phase) && <span className="pill pill-review shrink-0">{task.phase}</span>}
-      {overdue && <span className="pill pill-warn shrink-0" title="Review verdict missing">!</span>}
-      <span aria-label={t.agents.round(round)} className="shrink-0 text-xs text-og-400">R{round}</span>
-      <TaskStatusDot status={task.status} />
-    </button>
+    <div className="px-3 py-2">
+      <div className="flex items-center gap-2 text-sm">
+        <button type="button" onClick={openTask} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+          <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
+          <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
+          {isSpecStagePhase(task.phase) && <span className="pill pill-review shrink-0">{task.phase}</span>}
+          <span aria-label={t.agents.round(round)} className="shrink-0 text-xs text-og-400">R{round}</span>
+          <TaskStatusDot status={task.status} />
+        </button>
+      </div>
+      {task.attention && (
+        <div className="mt-2 rounded border border-accent/25 bg-accent-soft/60 px-2 py-1.5 text-xs text-accent">
+          <button type="button" onClick={openTask} className="block w-full truncate text-left" title={task.attention.runbook}>
+            <span className="font-mono">{task.attention.reason}</span> · {task.attention.runbook}
+          </button>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {task.attention.recommendedActions.map(action => (
+              <button
+                key={action}
+                type="button"
+                disabled={action === 'advance' && advancing}
+                onClick={() => action === 'advance' ? void advance() : openTask()}
+                className={action === 'advance' ? 'btn-primary' : 'btn-secondary'}
+              >
+                {action === 'advance'
+                  ? advancing ? t.taskDetail.advancing : t.taskDetail.advance
+                  : action === 'verdict'
+                    ? t.taskDetail.verdict
+                    : action === 'cancel'
+                      ? t.common.cancel
+                      : t.common.retry}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

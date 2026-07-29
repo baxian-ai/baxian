@@ -18,13 +18,8 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { id: string } }>('/agents/:id/session', async (request, reply) => {
     const state = await app.ctx.agentStore.get(request.params.id);
     if (state?.taskId) {
-      try {
-        await app.ctx.agentManager.cancelTask(state.taskId);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        app.log.warn({ err: message, agentId: request.params.id, taskId: state.taskId },
-          'DELETE /agents/:id/session: cancelTask failed; proceeding with idle response');
-      }
+      const task = await app.ctx.agentManager.cancelTask(state.taskId);
+      await app.ctx.agentManager.auditHumanTaskOperation(task, 'cancel', 'cancel');
     }
     return reply.status(204).send();
   });

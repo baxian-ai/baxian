@@ -1343,6 +1343,27 @@ describe('PlatformPoller: conversation projection revision', () => {
     expect(revisions).toEqual(['task-1', 'task-1']);
   });
 
+  it('delivers the assembled conversation payload (with bodies) alongside the revision bump', async () => {
+    driver.comments['issue-comments'] = [comment('c1', 'top feedback')];
+    driver.comments['reviews'] = [comment('r1', 'looks good', OLD_TS, { reviewState: 'COMMENTED' })];
+    const conversations: Array<{ prNumber: number; payload: { items: Array<Record<string, unknown>>; error?: string } } | undefined> = [];
+    const poller = makePoller({
+      onConversationRevision: (taskId, conversation) => {
+        revisions.push(taskId);
+        conversations.push(conversation);
+      },
+    });
+    await poller.poll();
+    expect(revisions).toEqual(['task-1']);
+    expect(conversations).toHaveLength(1);
+    const conversation = conversations[0]!;
+    expect(conversation.prNumber).toBe(42);
+    expect(conversation.payload.error).toBeUndefined();
+    const bodies = conversation.payload.items.map(item => [item.kind, item.body]);
+    expect(bodies).toContainEqual(['issue-comment', 'top feedback']);
+    expect(bodies).toContainEqual(['review', 'looks good']);
+  });
+
   it('ignores pure row reordering across rescans', async () => {
     const a = comment('a1', 'first');
     const b = comment('b2', 'second');

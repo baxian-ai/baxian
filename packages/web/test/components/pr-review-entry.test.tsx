@@ -332,4 +332,29 @@ describe('PrReviewEntry', () => {
     renderEntry(task());
     expect(await screen.findByText(/Failed to load review records: gh failed/)).toBeTruthy();
   });
+
+  it('shows freshness metadata and reloads through the manual refresh button', async () => {
+    const refreshMock = vi.mocked(api.tasks.prReviewRefresh);
+    refreshMock.mockReset();
+    ghMock.mockResolvedValue({
+      available: true,
+      items: [{ kind: 'issue-comment', id: 'c1', author: 'dev', body: 'before refresh' }],
+      fetchedAt: '2026-07-29T00:00:00.000Z',
+      autoRefresh: false,
+    } as PrReviewConversation);
+    refreshMock.mockResolvedValue({
+      available: true,
+      items: [{ kind: 'issue-comment', id: 'c2', author: 'dev', body: 'after refresh' }],
+      fetchedAt: '2026-07-29T00:05:00.000Z',
+      autoRefresh: false,
+    } as PrReviewConversation);
+    renderEntry(task({ status: 'merged' }));
+    expect(await screen.findByText(/before refresh/)).toBeTruthy();
+    expect(screen.getByText('Auto-refresh stopped')).toBeTruthy();
+    expect(screen.getByText(/Fetched at/)).toBeTruthy();
+
+    fireEvent.click(screen.getByText('Refresh'));
+    expect(refreshMock).toHaveBeenCalledWith('task-9');
+    expect(await screen.findByText(/after refresh/)).toBeTruthy();
+  });
 });

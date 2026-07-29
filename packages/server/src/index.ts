@@ -26,6 +26,7 @@ import { EventPublisher } from './event/publish.js';
 import { autoBootstrapAgentIds, bootstrapAutoRepos } from './agent/bootstrap.js';
 import { registerEventHandlers, recoverGitPostApprovePending } from './event/handlers.js';
 import { PlatformPoller, platformTaskView, type PlatformPollerOptions } from './platform/platform-poller.js';
+import { PrConversationCache } from './platform/pr-conversation-cache.js';
 import { platformPollerStatePath } from './platform/comment-cursor.js';
 import { buildProjectDriver, makeDriverExec } from './platform/driver-host.js';
 import { createRunner, resolveAgentHost } from './agent/runner.js';
@@ -80,7 +81,8 @@ export function createPlatformPollerOptions(
     },
     onCursorCommitted: (taskId, _prNumber, sourceKey, watermarkTime) =>
       agentManager.pruneConsumedFeedback(taskId, sourceKey, watermarkTime),
-    onConversationRevision: (taskId) => agentManager.noteReviewConversationRevision(taskId),
+    onConversationRevision: (taskId, conversation) =>
+      agentManager.noteReviewConversationRevision(taskId, conversation),
   };
 }
 
@@ -184,6 +186,7 @@ export async function startServer(configPath?: string): Promise<void> {
       statePathFor: (repoUrl) => platformPollerStatePath(stateDir, repoUrl),
     };
     let defaultBranchOf: (projectId: string) => string | undefined = () => undefined;
+    const prConversationCache = new PrConversationCache();
     const agentManager: AgentManager = new AgentManager({
       config,
       agentStore,
@@ -196,6 +199,7 @@ export async function startServer(configPath?: string): Promise<void> {
       errorRecordStore,
       imageStagingRoot: `${stateDir}/state/task-images`,
       platformDefaultBranchOf: (projectId) => defaultBranchOf(projectId),
+      prConversationCache,
     });
     resolveHostRef = (agent) => resolveAgentHost(agentManager.getConfig().host, agent.host);
 
@@ -331,6 +335,7 @@ export async function startServer(configPath?: string): Promise<void> {
         eventBroker,
         errorRecordStore,
         petStore,
+        prConversationCache,
       },
       {
         ...(httpsOpts ? { https: httpsOpts } : {}),

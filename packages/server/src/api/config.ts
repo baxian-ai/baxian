@@ -19,8 +19,8 @@ function hostRefKey(host: unknown): string {
 function agentHostRefs(projects: ProjectConfig[] | undefined): Map<string, string> {
   const refs = new Map<string, string>();
   for (const project of projects ?? []) {
-    for (const pair of project?.agent ?? []) {
-      for (const agent of pair ?? []) {
+    for (const team of project?.agent ?? []) {
+      for (const agent of team ?? []) {
         if (agent && typeof agent.id === 'string') refs.set(agent.id, hostRefKey(agent.host));
       }
     }
@@ -31,8 +31,8 @@ function agentHostRefs(projects: ProjectConfig[] | undefined): Map<string, strin
 function agentWorkdirRefs(projects: ProjectConfig[] | undefined): Map<string, string> {
   const refs = new Map<string, string>();
   for (const project of projects ?? []) {
-    for (const pair of project?.agent ?? []) {
-      for (const agent of pair ?? []) {
+    for (const team of project?.agent ?? []) {
+      for (const agent of team ?? []) {
         if (agent && typeof agent.id === 'string') {
           refs.set(agent.id, agent.workdir === undefined ? '' : normalize(agent.workdir));
         }
@@ -45,8 +45,8 @@ function agentWorkdirRefs(projects: ProjectConfig[] | undefined): Map<string, st
 function agentPermissionRefs(projects: ProjectConfig[] | undefined): Map<string, string> {
   const refs = new Map<string, string>();
   for (const project of projects ?? []) {
-    for (const pair of project?.agent ?? []) {
-      for (const agent of pair ?? []) {
+    for (const team of project?.agent ?? []) {
+      for (const agent of team ?? []) {
         if (!agent || typeof agent.id !== 'string') continue;
         const addDirs = [...new Set((agent.addDirs ?? []).map(path => normalize(path)))].sort();
         refs.set(agent.id, JSON.stringify([agent.yolo !== false, addDirs]));
@@ -91,7 +91,7 @@ export function redactHosts(hosts: HostConfig[]): HostConfig[] {
 export function redactProjects(projects: ProjectConfig[]): ProjectConfig[] {
   return projects.map(p => ({
     ...p,
-    agent: p.agent.map(pair => pair.map(a => ({ ...a, host: redactAgentHostRef(a.host) }))),
+    agent: p.agent.map(team => team.map(a => ({ ...a, host: redactAgentHostRef(a.host) }))),
   }));
 }
 

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BaxianConfig, BaxianEvent, TaskState, AgentBindingFacts } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG, taskAttentionGeneration } from '../../src/shared/index.js';
 import { AgentManager } from '../../src/agent/manager.js';
 import { DispatchReconciler } from '../../src/agent/dispatch-reconciler.js';
 import { TmuxSessionStatusStore, type TmuxSessionObservation } from '../../src/agent/tmux-probe-poller.js';
@@ -107,7 +107,7 @@ async function seedTask(over: Partial<TaskState> = {}): Promise<TaskState> {
     signalToken: 'tok-current1',
     reviewHeadAnchorSha: SHA,
     latestHeadSha: SHA,
-    reviewDispatchedAt: NOW,
+    reviewDispatchedAt: new Date().toISOString(),
     fixDispatchedAt: NOW,
     createdAt: NOW,
     updatedAt: NOW,
@@ -150,6 +150,172 @@ function audits(): BaxianEvent[] {
   return events.filter(e => e.type === 'agent.recovered'
     && (e.data as { reason?: string }).reason === 'dispatch-reconciled');
 }
+
+describe('DispatchReconciler attention and manual reset', () => {
+  it('retries a durable code-verdict outbox on every reconciliation cycle', async () => {
+    await seedTask({
+      passToken: '111111111111',
+      failToken: '222222222222',
+      outbox: [{
+        key: '111111111111',
+        type: 'git.code-verdict',
+        data: {
+          prNumber: 7,
+          kind: 'pass',
+          anchorSha: SHA,
+          token: '111111111111',
+          comments: '',
+        },
+      }],
+    });
+    await seedQa();
+    obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
+    const deliver = vi.spyOn(manager, 'deliverTaskOutbox').mockResolvedValue();
+    const dispatch = vi.spyOn(manager, 'dispatchReviewToQa');
+    const reconciler = mkReconciler();
+
+    await reconciler.pollOnce();
+    await reconciler.pollOnce();
+
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliver).toHaveBeenNthCalledWith(1, 'task-1');
+    expect(deliver).toHaveBeenNthCalledWith(2, 'task-1');
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('does not replace a human verdict generation while its QA binding is absent', async () => {
+    await seedTask({
+      passToken: '111111111111',
+      failToken: '222222222222',
+      outbox: [{
+        key: '111111111111',
+        type: 'git.code-verdict',
+        data: {
+          prNumber: 7,
+          kind: 'pass',
+          anchorSha: SHA,
+          token: '111111111111',
+          comments: '',
+          writeAttemptedAt: NOW,
+        },
+      }],
+    });
+    await seedQa({ taskId: undefined });
+    const deliver = vi.spyOn(manager, 'deliverTaskOutbox').mockResolvedValue();
+    const dispatch = vi.spyOn(manager, 'dispatchReviewToQa');
+    const reconciler = mkReconciler();
+
+    await reconciler.pollOnce();
+    await reconciler.pollOnce();
+
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('emits a persistent-attention source event when a review verdict is overdue', async () => {
+    await seedTask({
+      reviewDispatchedAt: new Date(Date.now() - 11 * 60_000).toISOString(),
+    });
+    await seedQa();
+
+    await mkReconciler().pollOnce();
+
+    expect(interventions()).toContainEqual(expect.objectContaining({
+      taskId: 'task-1',
+      data: expect.objectContaining({
+        phase: 'review-verdict-overdue',
+        note: expect.stringContaining('Advance to re-dispatch QA'),
+      }),
+    }));
+  });
+
+  it('does not overwrite an existing attention with a recurring overdue alert', async () => {
+    const task = await seedTask({
+      reviewDispatchedAt: new Date(Date.now() - 11 * 60_000).toISOString(),
+    });
+    await taskStore.set({
+      ...task,
+      attention: {
+        reason: 'platform-binding-mismatch',
+        runbook: 'Restore the configured repository binding.',
+        occurredAt: new Date().toISOString(),
+        recommendedActions: ['cancel'],
+        generation: taskAttentionGeneration(task),
+      },
+    });
+    await seedQa();
+
+    await mkReconciler().pollOnce();
+
+    expect(interventions()).toEqual([]);
+  });
+
+  it('does not recommend an unavailable human verdict while spec QA is overdue', async () => {
+    await seedTask({
+      phase: 'spec',
+      deliveryConfirmation: { phase: 'spec', source: 'signal', at: NOW },
+      reviewDispatchedAt: new Date(Date.now() - 11 * 60_000).toISOString(),
+    });
+    await seedQa();
+
+    await mkReconciler().pollOnce();
+
+    const alert = interventions().find(event => event.data.phase === 'review-verdict-overdue');
+    expect(alert?.data.note).toContain('Advance to re-dispatch QA');
+    expect(alert?.data.note).not.toContain('human verdict');
+  });
+
+  it('surfaces an idle in_progress delivery as an actionable intervention', async () => {
+    const task = await seedTask({
+      status: 'in_progress',
+      phase: 'code',
+      updatedAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    await agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj',
+      taskId: task.id,
+      workdir: '/tmp/repo',
+      paneId: '%0',
+      startedAt: NOW,
+      updatedAt: NOW,
+    });
+    statusStore.set('dev-1', {
+      tmuxSessionStatus: 'present',
+      paneState: 'live-runtime',
+      runtimeStatusHint: 'pending',
+      reason: 'PENDING_IDLE',
+      observedAt: new Date().toISOString(),
+    });
+
+    await mkReconciler().pollOnce();
+
+    expect(interventions()).toContainEqual(expect.objectContaining({
+      data: expect.objectContaining({
+        phase: 'initial-dispatch-stalled',
+        note: expect.stringContaining('Advance with Dev'),
+      }),
+    }));
+  });
+
+  it('manual reset clears trackers and restarts the pending busy budget', async () => {
+    const task = await seedTask();
+    manager.registerPendingDispatchRetry(task.id, {
+      kind: 'qa-recheck',
+      agentId: 'qa-1',
+      signalToken: task.signalToken!,
+    }, { since: 1, budgetAlerted: true });
+    const reconciler = mkReconciler();
+
+    reconciler.resetTask(task.id);
+
+    expect(manager.getPendingDispatchRetry(task.id)).toMatchObject({
+      budgetAlerted: undefined,
+      since: expect.any(Number),
+    });
+    expect(manager.getPendingDispatchRetry(task.id)!.since).toBeGreaterThan(1);
+  });
+});
 
 describe('DispatchReconciler review 侧补派', () => {
   it('review 任务缺少 QA 时明确报告不变量破坏', async () => {
@@ -880,9 +1046,9 @@ describe('DispatchReconciler fixing 侧 re-continue', () => {
     expect(continueSpy).toHaveBeenCalledTimes(2);
     const alerts = interventions();
     expect(alerts).toHaveLength(1);
-    expect(String(alerts[0].data.note)).toContain('Restart REPL');
-    expect(String(alerts[0].data.note)).toContain('do NOT use POST /tasks/:id/review');
-    expect(String(alerts[0].data.note)).not.toContain('Resume the agent or POST /tasks/:id/review');
+    expect(String(alerts[0].data.note)).toContain('Advance with Dev');
+    expect(String(alerts[0].data.note)).toContain('Do not advance to QA');
+    expect(String(alerts[0].data.note)).not.toContain('POST /tasks/:id/review');
   });
 
   it('pending dev-fix 但 dev 已进入 awaiting_human → 不得覆盖 hold，pane 不投递', async () => {

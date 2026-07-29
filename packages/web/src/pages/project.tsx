@@ -2,7 +2,7 @@ import {useCallback, useEffect, useRef, useState} from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { KebabMenu, MenuItem } from '../components/kebab-menu.tsx';
 import { api } from '../api.ts';
-import { AgentGroup } from '../components/agent-group.tsx';
+import { AgentTeam } from '../components/agent-team.tsx';
 import { TaskPanel } from '../components/task-panel.tsx';
 import { CreateAgentModal } from '../components/create-agent-modal.tsx';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
@@ -155,10 +155,10 @@ export function Project() {
             </div>
           ) : (
             <div className="mb-8 space-y-5">
-              {project.agent.map((group, index) => (
-                <AgentGroup
-                  key={group.map(agent => agent.id).join(':') || index}
-                  group={group}
+              {project.agent.map((team, index) => (
+                <AgentTeam
+                  key={team.map(agent => agent.id).join(':') || index}
+                  team={team}
                   projectId={project.id}
                   agentsById={agentsById}
                   agentsLoaded={agentsLoaded}

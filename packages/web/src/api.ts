@@ -182,7 +182,7 @@ export interface TmuxInstallResponse {
   tmux: ProbeStatus;
 }
 
-export interface AddAgentGroupBody {
+export interface AddAgentTeamBody {
   agents: AgentConfig[];
 }
 
@@ -283,19 +283,31 @@ export const api = {
       },
     ) => patch<TaskState>(`/tasks/${enc(id)}`, body),
     retry: (id: string) => post<TaskState>(`/tasks/${enc(id)}/retry`),
-    review: (
+    advance: (
       id: string,
-      body?: { stage?: 'spec' | 'code'; actorId?: string; prNumber?: number },
+      body?: {
+        executor?: 'dev' | 'qa';
+        agentId?: string;
+        stage?: 'spec' | 'code';
+        actorId?: string;
+        prNumber?: number;
+        confirmRevoked?: boolean;
+        note?: string;
+      },
     ) =>
-      post<TaskState>(`/tasks/${enc(id)}/review`, body),
-    complete: (id: string) => post<TaskState>(`/tasks/${enc(id)}/complete`),
-    continue: (id: string) => post<TaskState>(`/tasks/${enc(id)}/continue`),
-    spec: (id: string, body: { verdict: 'approve' | 'request-changes'; comments?: string }) =>
-      post<TaskState>(`/tasks/${enc(id)}/spec`, body),
+      post<TaskState>(`/tasks/${enc(id)}/advance`, body),
+    verdict: (
+      id: string,
+      body: {
+        action: 'approve' | 'request-changes' | 'pass' | 'continue' | 'complete' | 'confirm-merge';
+        comments?: string;
+        note?: string;
+      },
+    ) => post<TaskState>(`/tasks/${enc(id)}/verdict`, body),
     prReview: (id: string) =>
       get<PrReviewConversation>(`/tasks/${enc(id)}/pr-review`),
-    dispatch: (id: string, body: { agentId: string }) =>
-      post<TaskState>(`/tasks/${enc(id)}/dispatch`, body),
+    prReviewRefresh: (id: string) =>
+      post<PrReviewConversation>(`/tasks/${enc(id)}/pr-review/refresh`),
   },
   projects: {
     list: () => get<ProjectConfig[]>('/projects'),
@@ -304,7 +316,7 @@ export const api = {
       post<{ project: ProjectConfig; restartRequired: boolean }>('/projects', body),
     delete: (id: string) =>
       del<{ removed: string; restartRequired: boolean }>(`/projects/${enc(id)}`),
-    addAgentGroup: (projectId: string, body: AddAgentGroupBody) =>
+    addAgentTeam: (projectId: string, body: AddAgentTeamBody) =>
       post<{ agents: AgentConfig[]; restartRequired: boolean; warnings?: string[] }>(
         `/projects/${enc(projectId)}/agents`,
         body,

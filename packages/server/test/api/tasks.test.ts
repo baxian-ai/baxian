@@ -433,68 +433,84 @@ describe('POST /api/tasks', () => {
   });
 });
 
-describe('POST /api/tasks/:id/review', () => {
-  it('treats the operator action as explicit confirmation that an uncertain prior dispatch was not delivered', async () => {
-    const updated = makeTask({ id: 'task-001', status: 'review' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa').mockResolvedValue(updated);
-
-    const response = await post('/api/tasks/task-001/review');
-
-    expect(response.statusCode).toBe(202);
-    expect(spy).toHaveBeenCalledWith('task-001', { confirmUncertainNotDelivered: true });
-  });
-
-  it('preserves a manager rejection when the uncertain episode cannot be confirmed safely', async () => {
-    vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa')
-      .mockRejectedValue(new ApiError(409, 'review dispatch generation changed'));
-
-    const response = await post('/api/tasks/task-001/review');
-
-    expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toContain('generation changed');
-  });
-
-  it('forwards the explicit PR number, review stage, and trimmed actor identity for git delivery recovery', async () => {
+describe('POST /api/tasks/:id/advance', () => {
+  it('forwards an explicit QA delivery recovery and trims human inputs', async () => {
     const updated = makeTask({ id: 'task-001', status: 'review', phase: 'spec' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa').mockResolvedValue(updated);
+    const spy = vi.spyOn(app.ctx.agentManager, 'advanceTask').mockResolvedValue(updated);
+    const resetTask = vi.fn();
+    app.ctx.dispatchReconciler = { resetTask, stop: vi.fn() } as never;
 
-    const response = await post('/api/tasks/task-001/review', {
+    const response = await post('/api/tasks/task-001/advance', {
+      executor: 'qa',
       prNumber: 73,
       stage: 'spec',
       actorId: '  77  ',
+      note: '  verified delivery  ',
     });
 
     expect(response.statusCode).toBe(202);
     expect(spy).toHaveBeenCalledWith('task-001', {
-      confirmUncertainNotDelivered: true,
+      executor: 'qa',
       prNumber: 73,
       stage: 'spec',
       actorId: '77',
+      note: 'verified delivery',
+    });
+    expect(resetTask).toHaveBeenCalledWith('task-001');
+  });
+
+  it('supports explicit confirmation for a revoked post-approve pass', async () => {
+    const updated = makeTask({ id: 'task-001', status: 'approved' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'advanceTask').mockResolvedValue(updated);
+
+    const response = await post('/api/tasks/task-001/advance', {
+      executor: 'dev',
+      confirmRevoked: true,
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(spy).toHaveBeenCalledWith('task-001', {
+      executor: 'dev',
+      confirmRevoked: true,
     });
   });
 
   it.each([
+    [{ executor: 'ops' }, 'executor must be'],
     [{ stage: 'design' }, 'stage must be'],
     [{ actorId: '' }, 'actorId must be'],
     [{ actorId: 77 }, 'actorId must be'],
     [{ prNumber: 0 }, 'prNumber must be'],
-    [{ prNumber: 1.5 }, 'prNumber must be'],
-    [{ prNumber: '73' }, 'prNumber must be'],
-  ])('rejects an invalid manual review selector %# without dispatching', async (body, message) => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa');
-
-    const response = await post('/api/tasks/task-001/review', body);
-
+    [{ confirmRevoked: 'yes' }, 'confirmRevoked must be'],
+    [{ note: 7 }, 'note must be'],
+  ])('rejects invalid selector %# before advancing', async (body, message) => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'advanceTask');
+    const response = await post('/api/tasks/task-001/advance', body);
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toContain(message);
     expect(spy).not.toHaveBeenCalled();
   });
+
+  it('does not reset reconciler budgets when the advance is rejected', async () => {
+    vi.spyOn(app.ctx.agentManager, 'advanceTask')
+      .mockRejectedValue(new ApiError(409, 'Task cannot advance'));
+    const resetTask = vi.fn();
+    app.ctx.dispatchReconciler = { resetTask, stop: vi.fn() } as never;
+
+    const response = await post('/api/tasks/task-001/advance', { executor: 'dev' });
+
+    expect(response.statusCode).toBe(409);
+    expect(resetTask).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /api/tasks/:id/retry', () => {
-  it('terminal task → 201 with fresh task body; manager.retryTask invoked with the original id', async () => {
+  it('terminal task → 201 and audits the original task with the replacement id', async () => {
+    const source = makeTask({ id: 'task-001', status: 'failed' });
     const fresh = makeTask({ id: 'task-fresh', status: 'in_progress' });
+    vi.spyOn(app.ctx.agentManager, 'getTask').mockResolvedValue(source);
     const spy = vi.spyOn(app.ctx.agentManager, 'retryTask').mockResolvedValue(fresh);
+    const audit = vi.spyOn(app.ctx.agentManager, 'auditHumanTaskOperation').mockResolvedValue();
 
     const response = await post('/api/tasks/task-001/retry');
 
@@ -502,9 +518,18 @@ describe('POST /api/tasks/:id/retry', () => {
     const body = JSON.parse(response.body) as TaskState;
     expect(body.id).toBe('task-fresh');
     expect(spy).toHaveBeenCalledWith('task-001');
+    expect(audit).toHaveBeenCalledWith(
+      source,
+      'retry',
+      'retry',
+      undefined,
+      { replacementTaskId: 'task-fresh' },
+    );
   });
 
   it('non-terminal task → 409 (ApiError pass-through from manager.retryTask)', async () => {
+    vi.spyOn(app.ctx.agentManager, 'getTask')
+      .mockResolvedValue(makeTask({ id: 'task-001', status: 'in_progress' }));
     vi.spyOn(app.ctx.agentManager, 'retryTask')
       .mockRejectedValue(new ApiError(409, 'Task task-001 cannot be retried in status "in_progress"'));
 
@@ -515,161 +540,58 @@ describe('POST /api/tasks/:id/retry', () => {
   });
 
   it('unknown task → 404', async () => {
-    vi.spyOn(app.ctx.agentManager, 'retryTask')
-      .mockRejectedValue(new ApiError(404, 'Task not found'));
+    const retry = vi.spyOn(app.ctx.agentManager, 'retryTask');
 
     const response = await post('/api/tasks/task-missing/retry');
 
     expect(response.statusCode).toBe(404);
+    expect(retry).not.toHaveBeenCalled();
   });
 });
 
-describe('POST /api/tasks/:id/complete', () => {
-  it('202 with updated task; manager.markTaskComplete invoked with the id', async () => {
-    const updated = makeTask({ id: 'task-001', status: 'merged' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'markTaskComplete').mockResolvedValue(updated);
-
-    const response = await post('/api/tasks/task-001/complete');
-
+describe('POST /api/tasks/:id/verdict', () => {
+  it.each([
+    ['approve', undefined],
+    ['request-changes', '补充回滚方案'],
+    ['pass', 'checked locally'],
+    ['continue', undefined],
+    ['complete', undefined],
+    ['confirm-merge', undefined],
+  ] as const)('accepts %s and routes it through the unified manager entry', async (action, comments) => {
+    const updated = makeTask({ id: 'task-001', status: 'review' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitTaskVerdict').mockResolvedValue(updated);
+    const response = await post('/api/tasks/task-001/verdict', {
+      action,
+      ...(comments ? { comments } : {}),
+      note: 'operator decision',
+    });
     expect(response.statusCode).toBe(202);
-    expect(spy).toHaveBeenCalledWith('task-001');
-  });
-
-  it('merge failure → 409 pass-through', async () => {
-    vi.spyOn(app.ctx.agentManager, 'markTaskComplete')
-      .mockRejectedValue(new ApiError(409, 'Merge failed for task task-001: not approved'));
-
-    const response = await post('/api/tasks/task-001/complete');
-
-    expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/Merge failed/);
-  });
-});
-
-describe('POST /api/tasks/:id/spec', () => {
-  it('202 approve; manager.submitSpecVerdict invoked with verdict and no comments', async () => {
-    const updated = makeTask({ id: 'task-001', status: 'in_progress', phase: 'code' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict').mockResolvedValue(updated);
-
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
-
-    expect(response.statusCode).toBe(202);
-    expect(spy).toHaveBeenCalledWith('task-001', 'approve', undefined);
-  });
-
-  it('202 request-changes passes comments through', async () => {
-    const updated = makeTask({ id: 'task-001', status: 'fixing' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict').mockResolvedValue(updated);
-
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '补充回滚方案' });
-
-    expect(response.statusCode).toBe(202);
-    expect(spy).toHaveBeenCalledWith('task-001', 'request-changes', '补充回滚方案');
-  });
-
-  it('invalid verdict → 400 without touching the manager', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict');
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'reject' });
-    expect(response.statusCode).toBe(400);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('non-string comments → 400 without touching the manager', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict');
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: 123 });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/comments must be a string/);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('wrong status → 409 pass-through', async () => {
-    vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict')
-      .mockRejectedValue(new ApiError(409, 'Task task-001 is review; spec verdict requires spec-ready'));
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
-    expect(response.statusCode).toBe(409);
-  });
-
-});
-
-describe('POST /api/tasks/:id/continue', () => {
-  it('202 with updated task; manager.continueDevRound invoked with the id', async () => {
-    const updated = makeTask({ id: 'task-001', status: 'fixing', reviewRound: 3 });
-    const spy = vi.spyOn(app.ctx.agentManager, 'continueDevRound').mockResolvedValue(updated);
-
-    const response = await post('/api/tasks/task-001/continue');
-
-    expect(response.statusCode).toBe(202);
-    expect(JSON.parse(response.body).reviewRound).toBe(3);
-    expect(spy).toHaveBeenCalledWith('task-001');
-  });
-
-  it('non-max_rounds task → 409 pass-through', async () => {
-    vi.spyOn(app.ctx.agentManager, 'continueDevRound')
-      .mockRejectedValue(new ApiError(409, 'Task task-001 is not at max_rounds (status=review)'));
-
-    const response = await post('/api/tasks/task-001/continue');
-
-    expect(response.statusCode).toBe(409);
-  });
-});
-
-describe('POST /api/tasks/:id/dispatch', () => {
-  beforeEach(async () => {
-    await seedTask(app.ctx.taskStore, { id: 'task-pending', status: 'pending', preferredAgentId: 'dev-1', agentId: '' });
-    await seedTask(app.ctx.taskStore, { id: 'task-unassigned', status: 'pending', preferredAgentId: '', agentId: '' });
-  });
-
-  it('200: pending task + agentId in body → dispatch ok', async () => {
-    const dispatched = makeTask({ id: 'task-pending', status: 'in_progress', agentId: 'dev-1' });
-    vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue({ task: dispatched });
-
-    const response = await post('/api/tasks/task-pending/dispatch', { agentId: 'dev-1' });
-
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).id).toBe('task-pending');
-  });
-
-  it('200: agentId omitted → dispatchPendingTask receives undefined and resolves fallback inside its own lock (race-free)', async () => {
-    const dispatched = makeTask({ id: 'task-pending', status: 'in_progress', agentId: 'dev-1' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue({ task: dispatched });
-
-    const response = await post('/api/tasks/task-pending/dispatch', {});
-
-    expect(response.statusCode).toBe(200);
-    expect(spy).toHaveBeenCalledWith('task-pending', undefined);
+    expect(spy).toHaveBeenCalledWith('task-001', action, comments, 'operator decision');
   });
 
   it.each([
-    ['unassigned task, no agentId → 400', 'task-unassigned', {},
-      { task: null, errorCode: 400, error: 'Task task-unassigned has no preferredAgentId; agentId is required in request body' }, 400, /agentId is required/],
-    ['errorCode=400 (unknown agent)', 'task-pending', { agentId: 'ghost' },
-      { task: null, errorCode: 400, error: 'Unknown agent: ghost' }, 400, undefined],
-    ['errorCode=409 (agent busy)', 'task-pending', { agentId: 'dev-1' },
-      { task: null, errorCode: 409, error: 'Agent dev-1 is busy or awaiting human' }, 409, undefined],
-  ] as const)('manager %s', async (_label, taskId, body, managerResult, status, errorMatch) => {
-    vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue(managerResult);
-    const response = await post(`/api/tasks/${taskId}/dispatch`, body);
-    expectStatus(response, status, errorMatch);
-  });
-
-  it('404: task does not exist', async () => {
-    const response = await post('/api/tasks/task-missing/dispatch', { agentId: 'dev-1' });
-    expect(response.statusCode).toBe(404);
-  });
-
-  it.each([
-    ['primitive number body → 400', 123 as unknown, undefined, 400, /JSON object/],
-    ['array body → 400', ['dev-1'] as unknown, undefined, 400, undefined],
-    ['explicit JSON null body → 400', 'null', { headers: { 'content-type': 'application/json' } }, 400, /JSON object/],
-    ['agentId number → 400', { agentId: 123 }, undefined, 400, /agentId must be a string/],
-    ['agentId null → 400', { agentId: null }, undefined, 400, undefined],
-    ['agentId object → 400', { agentId: { id: 'dev-1' } }, undefined, 400, undefined],
-  ] as const)('guard %s', async (_label, body, opts, status, errorMatch) => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask');
-    const response = await post('/api/tasks/task-pending/dispatch', body, opts);
-    expectStatus(response, status, errorMatch);
+    [{}, 'action'],
+    [[], 'JSON object'],
+    [{ action: 'reject' }, 'action'],
+    [{ action: 'pass', comments: 123 }, 'comments'],
+    [{ action: 'pass', note: 123 }, 'note'],
+  ])('rejects invalid payload %#', async (body, message) => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitTaskVerdict');
+    const response = await post('/api/tasks/task-001/verdict', body);
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toContain(message);
     expect(spy).not.toHaveBeenCalled();
   });
+});
+
+describe('removed task operation endpoints', () => {
+  it.each(['dispatch', 'review', 'continue', 'complete', 'spec'])(
+    'does not retain a /%s compatibility alias',
+    async (operation) => {
+      const response = await post(`/api/tasks/task-001/${operation}`, {});
+      expect(response.statusCode).toBe(404);
+    },
+  );
 });
 
 describe('PATCH /api/tasks/:id', () => {
@@ -1004,5 +926,131 @@ describe('GET /api/tasks/:id/pr-review', () => {
     expect(JSON.parse(res.body).prNumber).toBe(9);
     spy.mockRestore();
     bindingSpy.mockRestore();
+  });
+
+  it('an active task reports fetchedAt, autoRefresh:true and the poll interval', async () => {
+    const { driver } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask(app.ctx.taskStore, { id: 'git-fresh', prNumber: 7, platformBinding: GIT_BINDING });
+    const body = JSON.parse((await get('/api/tasks/git-fresh/pr-review')).body);
+    expect(body.fetchedAt).toMatch(/^\d{4}-/);
+    expect(body.autoRefresh).toBe(true);
+    expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.githubPollIntervalMs);
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+
+  it('a terminal task reports autoRefresh:false without an interval', async () => {
+    const { driver } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask(app.ctx.taskStore, { id: 'git-done', prNumber: 7, status: 'merged', platformBinding: GIT_BINDING });
+    const body = JSON.parse((await get('/api/tasks/git-done/pr-review')).body);
+    expect(body.autoRefresh).toBe(false);
+    expect(body.autoRefreshIntervalMs).toBeUndefined();
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+
+  it('a live task whose PR is closed-unmerged reports autoRefresh:false (poller skips it)', async () => {
+    const { driver } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask(app.ctx.taskStore, {
+      id: 'git-closed', prNumber: 7, status: 'review', platformBinding: GIT_BINDING,
+      closedUnmergedAnchor: { prNumber: 7, generation: 1 },
+    });
+    const body = JSON.parse((await get('/api/tasks/git-closed/pr-review')).body);
+    expect(body.autoRefresh).toBe(false);
+    expect(body.autoRefreshIntervalMs).toBeUndefined();
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+
+  it('a reopened PR (cleared anchor) resumes autoRefresh:true', async () => {
+    const { driver } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask(app.ctx.taskStore, {
+      id: 'git-reopened', prNumber: 7, status: 'review', platformBinding: GIT_BINDING,
+      closedUnmergedAnchor: { prNumber: 7, generation: 1, cleared: true },
+    });
+    const body = JSON.parse((await get('/api/tasks/git-reopened/pr-review')).body);
+    expect(body.autoRefresh).toBe(true);
+    expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.githubPollIntervalMs);
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+});
+
+describe('POST /api/tasks/:id/pr-review/refresh', () => {
+  const GIT_BINDING = { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' };
+
+  function spyLiveBinding() {
+    return vi.spyOn(app.ctx.agentManager, 'platformBindingFields')
+      .mockReturnValue({ platformBinding: GIT_BINDING });
+  }
+
+  function countingDriver(): { driver: unknown; calls: number[] } {
+    const calls: number[] = [];
+    const driver = {
+      commentSources: [{ key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } }],
+      runCommentSource: async (_src: unknown, vars: { prNumber: number }) => {
+        calls.push(vars.prNumber);
+        return [{ id: 'c1', body: 'hi', createdAt: '2026-07-19T01:00:00Z' }];
+      },
+    };
+    return { driver, calls };
+  }
+
+  it('404 when the task does not exist', async () => {
+    const res = await post('/api/tasks/missing/pr-review/refresh');
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('forces a rebuild past a warm same-revision cache entry', async () => {
+    const { driver, calls } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask(app.ctx.taskStore, { id: 'git-force', prNumber: 7, platformBinding: GIT_BINDING });
+    await get('/api/tasks/git-force/pr-review');
+    const res = await post('/api/tasks/git-force/pr-review/refresh');
+    expect(calls).toEqual([7, 7]);
+    const body = JSON.parse(res.body);
+    expect(body.available).toBe(true);
+    expect(body.items).toHaveLength(1);
+    expect(body.fetchedAt).toMatch(/^\d{4}-/);
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+
+  it('refreshes the entry the next GET is served from', async () => {
+    const calls: number[] = [];
+    let label = 'before';
+    const driver = {
+      commentSources: [{ key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } }],
+      runCommentSource: async (_src: unknown, vars: { prNumber: number }) => {
+        calls.push(vars.prNumber);
+        return [{ id: 'c1', body: label, createdAt: '2026-07-19T01:00:00Z' }];
+      },
+    };
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask(app.ctx.taskStore, { id: 'git-swr', prNumber: 7, platformBinding: GIT_BINDING });
+    await get('/api/tasks/git-swr/pr-review');
+    label = 'after';
+    await post('/api/tasks/git-swr/pr-review/refresh');
+    const body = JSON.parse((await get('/api/tasks/git-swr/pr-review')).body);
+    expect(calls).toEqual([7, 7]);
+    expect(body.items[0].body).toBe('after');
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+
+  it('available:false (no-pr) when the task has no PR', async () => {
+    await seedTask(app.ctx.taskStore, { id: 'force-nopr' });
+    const res = await post('/api/tasks/force-nopr/pr-review/refresh');
+    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'no-pr' });
   });
 });

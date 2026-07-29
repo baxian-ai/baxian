@@ -11,6 +11,11 @@ function convo(label: string, error?: string): PrConversationPayload {
   return { items, ...(error ? { error } : {}) };
 }
 
+const iso = (ms: number): string => new Date(ms).toISOString();
+
+const stamped = (payload: PrConversationPayload, ms: number): PrConversationPayload =>
+  ({ ...payload, fetchedAt: iso(ms) });
+
 function deferred<T>() {
   let resolve!: (v: T) => void;
   let reject!: (e: unknown) => void;
@@ -45,12 +50,21 @@ describe('prReviewCacheRevision (server)', () => {
       },
       'owner/repo',
     );
-    expect(rev).toBe('3:abc123:review:2026-07-01T10:00:00Z:2026-07-02T11:00:00Z:7::owner/repo');
+    expect(rev).toBe('3:abc123:review:2026-07-01T10:00:00Z:2026-07-02T11:00:00Z:7:::owner/repo');
   });
 
   it('renders absent optional fields as empty slots', () => {
     const rev = prReviewCacheRevision({ reviewRound: 0, status: 'pending' }, 'o/r');
-    expect(rev).toBe('0::pending:::::o/r');
+    expect(rev).toBe('0::pending::::::o/r');
+  });
+
+  it('changes on every closed-unmerged anchor transition, including re-close after reopen', () => {
+    const base = { reviewRound: 1, status: 'review' as const, prNumber: 7 };
+    const open = prReviewCacheRevision(base, 'o/r');
+    const closed1 = prReviewCacheRevision({ ...base, closedUnmergedAnchor: { prNumber: 7, generation: 1 } }, 'o/r');
+    const reopened1 = prReviewCacheRevision({ ...base, closedUnmergedAnchor: { prNumber: 7, generation: 1, cleared: true } }, 'o/r');
+    const closed2 = prReviewCacheRevision({ ...base, closedUnmergedAnchor: { prNumber: 7, generation: 2 } }, 'o/r');
+    expect(new Set([open, closed1, reopened1, closed2]).size).toBe(4);
   });
 
   it('changes when only prNumber changes', () => {
@@ -67,13 +81,23 @@ describe('prReviewCacheRevision (server)', () => {
 });
 
 describe('PrConversationCache', () => {
-  it('serves a fresh same-revision entry without rebuilding', async () => {
+  it('serves a same-revision entry without rebuilding, keeping the original fetchedAt', async () => {
+    let now = 5_000;
+    const cache = new PrConversationCache({ now: () => now });
+    const b = counting(convo('a'));
+    expect(await cache.get('t1', 'r1', b.build)).toEqual(stamped(convo('a'), 5_000));
+    now += 1_000;
+    expect(await cache.get('t1', 'r1', b.build)).toEqual(stamped(convo('a'), 5_000));
+    expect(b.calls()).toBe(1);
+  });
+
+  it('has no TTL: a same-revision entry stays valid across days', async () => {
     let now = 0;
     const cache = new PrConversationCache({ now: () => now });
     const b = counting(convo('a'));
-    expect(await cache.get('t1', 'r1', b.build)).toEqual(convo('a'));
-    now += 1_000;
-    expect(await cache.get('t1', 'r1', b.build)).toEqual(convo('a'));
+    await cache.get('t1', 'r1', b.build);
+    now += 3 * 24 * 60 * 60 * 1000;
+    expect(await cache.get('t1', 'r1', b.build)).toEqual(stamped(convo('a'), 0));
     expect(b.calls()).toBe(1);
   });
 
@@ -82,22 +106,11 @@ describe('PrConversationCache', () => {
     const b1 = counting(convo('a'));
     const b2 = counting(convo('b'));
     await cache.get('t1', 'r1', b1.build);
-    expect(await cache.get('t1', 'r2', b2.build)).toEqual(convo('b'));
+    expect(await cache.get('t1', 'r2', b2.build)).toEqual(stamped(convo('b'), 0));
     expect(b2.calls()).toBe(1);
   });
 
-  it('rebuilds after the TTL expires', async () => {
-    let now = 0;
-    const cache = new PrConversationCache({ ttlMs: 100, now: () => now });
-    const b1 = counting(convo('a'));
-    const b2 = counting(convo('b'));
-    await cache.get('t1', 'r1', b1.build);
-    now = 100;
-    expect(await cache.get('t1', 'r1', b2.build)).toEqual(convo('b'));
-    expect(b2.calls()).toBe(1);
-  });
-
-  it('does not cache payloads that carry an error', async () => {
+  it('does not cache payloads that carry an error and returns them unstamped', async () => {
     const cache = new PrConversationCache({ now: () => 0 });
     const failing = counting(convo('a', 'reviews: boom'));
     expect(await cache.get('t1', 'r1', failing.build)).toEqual(convo('a', 'reviews: boom'));
@@ -116,8 +129,8 @@ describe('PrConversationCache', () => {
     const p1 = cache.get('t1', 'r1', build);
     const p2 = cache.get('t1', 'r1', build);
     d.resolve(convo('a'));
-    expect(await p1).toEqual(convo('a'));
-    expect(await p2).toEqual(convo('a'));
+    expect(await p1).toEqual(stamped(convo('a'), 0));
+    expect(await p2).toEqual(stamped(convo('a'), 0));
     expect(calls).toBe(1);
   });
 
@@ -128,7 +141,7 @@ describe('PrConversationCache', () => {
     const pA = cache.get('t1', 'rA', () => dA.promise);
     const pB = cache.get('t1', 'rB', () => dB.promise);
     dB.resolve(convo('b'));
-    expect(await pB).toEqual(convo('b'));
+    expect(await pB).toEqual(stamped(convo('b'), 0));
     dA.resolve(convo('a'));
     expect(await pA).toEqual(convo('a'));
   });
@@ -149,12 +162,12 @@ describe('PrConversationCache', () => {
       return Promise.resolve(convo('x'));
     });
     dB.resolve(convo('b'));
-    expect(await pB).toEqual(convo('b'));
-    expect(await pB2).toEqual(convo('b'));
+    expect(await pB).toEqual(stamped(convo('b'), 0));
+    expect(await pB2).toEqual(stamped(convo('b'), 0));
     expect(extraCalls).toBe(0);
 
     const after = counting(convo('never'));
-    expect(await cache.get('t1', 'rB', after.build)).toEqual(convo('b'));
+    expect(await cache.get('t1', 'rB', after.build)).toEqual(stamped(convo('b'), 0));
     expect(after.calls()).toBe(0);
   });
 
@@ -164,7 +177,7 @@ describe('PrConversationCache', () => {
       cache.get('t1', 'r1', () => Promise.reject(new Error('gh exploded'))),
     ).rejects.toThrow('gh exploded');
     const ok = counting(convo('a'));
-    expect(await cache.get('t1', 'r1', ok.build)).toEqual(convo('a'));
+    expect(await cache.get('t1', 'r1', ok.build)).toEqual(stamped(convo('a'), 0));
     expect(ok.calls()).toBe(1);
   });
 
@@ -210,18 +223,176 @@ describe('PrConversationCache', () => {
     await cache.get('t1', 'r1', rebuilt.build);
     expect(rebuilt.calls()).toBe(1);
   });
+});
 
-  it('sweeps expired cold entries on any get, including other keys', async () => {
+describe('PrConversationCache.put', () => {
+  it('stores a payload that a same-revision get serves without building', async () => {
+    const cache = new PrConversationCache({ now: () => 7_000 });
+    cache.put('t1', 'r1', convo('warm'));
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r1', never.build)).toEqual(stamped(convo('warm'), 7_000));
+    expect(never.calls()).toBe(0);
+  });
+
+  it('replaces the previous entry so a revision-bumped get hits the new payload', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    await cache.get('t1', 'r1', () => Promise.resolve(convo('old')));
+    cache.put('t1', 'r2', convo('new'));
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r2', never.build)).toEqual(stamped(convo('new'), 0));
+    expect(never.calls()).toBe(0);
+  });
+
+  it('ignores payloads carrying an error or a rate-limit flag', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    cache.put('t1', 'r1', convo('bad', 'reviews: boom'));
+    cache.put('t1', 'r1', { items: [], rateLimited: true });
+    const b = counting(convo('fresh'));
+    expect(await cache.get('t1', 'r1', b.build)).toEqual(stamped(convo('fresh'), 0));
+    expect(b.calls()).toBe(1);
+  });
+
+  it('drops oversize payloads instead of storing them', async () => {
+    const cache = new PrConversationCache({ now: () => 0, maxPayloadBytes: 64 });
+    cache.put('t1', 'r1', convo('x'.repeat(200)));
+    expect(cache.stats().entries).toBe(0);
+    const b = counting(convo('a'));
+    await cache.get('t1', 'r1', b.build);
+    expect(b.calls()).toBe(1);
+  });
+
+  it('supersedes an in-flight older-revision force so its late settle cannot clobber the warmed entry', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const d = deferred<PrConversationPayload>();
+    const pForce = cache.force('t1', 'r1', () => d.promise);
+    cache.put('t1', 'r2', convo('warmed'));
+    d.resolve(convo('stale-force'));
+    expect(await pForce).toEqual(convo('stale-force'));
+
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r2', never.build)).toEqual(stamped(convo('warmed'), 0));
+    expect(never.calls()).toBe(0);
+    expect(cache.stats().entries).toBe(1);
+  });
+
+  it('supersedes an in-flight older-revision get the same way', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const d = deferred<PrConversationPayload>();
+    const pGet = cache.get('t1', 'r1', () => d.promise);
+    cache.put('t1', 'r2', convo('warmed'));
+    d.resolve(convo('stale-get'));
+    expect(await pGet).toEqual(convo('stale-get'));
+
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r2', never.build)).toEqual(stamped(convo('warmed'), 0));
+    expect(never.calls()).toBe(0);
+  });
+
+  it('fences a stale-snapshot force registered AFTER put(): its settle cannot clobber the warmed entry', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    cache.put('t1', 'r2', convo('warmed'), '2026-07-29T08:00:00.000Z');
+    const d = deferred<PrConversationPayload>();
+    const pForce = cache.force('t1', 'r1', () => d.promise, '2026-07-29T07:00:00.000Z');
+    d.resolve(convo('stale-force'));
+    expect(await pForce).toEqual(stamped(convo('stale-force'), 0));
+
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r2', never.build, '2026-07-29T08:00:00.000Z'))
+      .toEqual(stamped(convo('warmed'), 0));
+    expect(never.calls()).toBe(0);
+    expect(cache.stats().entries).toBe(1);
+  });
+
+  it('fences a post-put stale get the same way, including an empty legacy conversation time', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    cache.put('t1', 'r2', convo('warmed'), '2026-07-29T08:00:00.000Z');
+    const d = deferred<PrConversationPayload>();
+    const pGet = cache.get('t1', 'r1', () => d.promise, '');
+    d.resolve(convo('stale-get'));
+    expect(await pGet).toEqual(stamped(convo('stale-get'), 0));
+
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r2', never.build, '2026-07-29T08:00:00.000Z'))
+      .toEqual(stamped(convo('warmed'), 0));
+    expect(never.calls()).toBe(0);
+  });
+
+  it('the floor is not a lock: a revision advance carrying an equal conversation time still stores', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    cache.put('t1', 'r2', convo('warmed'), '2026-07-29T08:00:00.000Z');
+    const advanced = counting(convo('advanced'));
+    await cache.get('t1', 'r3-after-push', advanced.build, '2026-07-29T08:00:00.000Z');
+    expect(advanced.calls()).toBe(1);
+
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r3-after-push', never.build, '2026-07-29T08:00:00.000Z'))
+      .toEqual(stamped(convo('advanced'), 0));
+    expect(never.calls()).toBe(0);
+  });
+
+  it('a newer put refreshes the floor rather than leaving the first one pinned', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    cache.put('t1', 'r2', convo('warm-2'), '2026-07-29T08:00:00.000Z');
+    cache.put('t1', 'r3', convo('warm-3'), '2026-07-29T09:00:00.000Z');
+    const between = counting(convo('between'));
+    const result = await cache.force('t1', 'r2b', between.build, '2026-07-29T08:30:00.000Z');
+    expect(result).toEqual(stamped(convo('between'), 0));
+    const never = counting(convo('cold'));
+    await cache.get('t1', 'r2b', never.build, '2026-07-29T08:30:00.000Z');
+    expect(never.calls()).toBe(1);
+  });
+
+  it('clears an active rate-limit backoff for the key', async () => {
     let now = 0;
-    const cache = new PrConversationCache({ ttlMs: 100, now: () => now });
-    await cache.get('cold', 'r1', () => Promise.resolve(convo('cold')));
-    expect(cache.stats().entries).toBe(1);
-    now = 150;
-    await cache.get('hot', 'r1', () => Promise.resolve(convo('hot')));
-    expect(cache.stats().entries).toBe(1);
-    expect(cache.stats().totalBytes).toBe(
-      Buffer.byteLength(JSON.stringify(convo('hot')), 'utf8'),
-    );
+    const cache = new PrConversationCache({ now: () => now });
+    await cache.get('t1', 'r1', async () => ({ items: [], error: 'rate limited', rateLimited: true }));
+    now = 1_000;
+    cache.put('t1', 'r1', convo('warm'));
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r1', never.build)).toEqual(stamped(convo('warm'), 1_000));
+    expect(never.calls()).toBe(0);
+  });
+});
+
+describe('PrConversationCache.force', () => {
+  it('rebuilds even when a same-revision entry exists, and stores the result', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ now: () => now });
+    await cache.get('t1', 'r1', () => Promise.resolve(convo('stale')));
+    now = 9_000;
+    const b = counting(convo('fresh'));
+    expect(await cache.force('t1', 'r1', b.build)).toEqual(stamped(convo('fresh'), 9_000));
+    expect(b.calls()).toBe(1);
+    const never = counting(convo('cold'));
+    expect(await cache.get('t1', 'r1', never.build)).toEqual(stamped(convo('fresh'), 9_000));
+    expect(never.calls()).toBe(0);
+  });
+
+  it('returns the throttled payload during a rate-limit backoff window without building', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ now: () => now });
+    await cache.get('t1', 'r1', async () => ({ items: [], error: 'rate limited', rateLimited: true }));
+    now = 30_000;
+    const never = counting(convo('cold'));
+    const result = await cache.force('t1', 'r1', never.build);
+    expect(result.rateLimited).toBe(true);
+    expect(never.calls()).toBe(0);
+  });
+
+  it('shares an in-flight same-revision build instead of stacking a second fetch', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const d = deferred<PrConversationPayload>();
+    let calls = 0;
+    const build = () => {
+      calls++;
+      return d.promise;
+    };
+    const p1 = cache.get('t1', 'r1', build);
+    const p2 = cache.force('t1', 'r1', build);
+    d.resolve(convo('a'));
+    expect(await p1).toEqual(stamped(convo('a'), 0));
+    expect(await p2).toEqual(stamped(convo('a'), 0));
+    expect(calls).toBe(1);
   });
 });
 

@@ -82,4 +82,12 @@ describe('prReviewRevision', () => {
     const after = prReviewRevision({ ...base, reviewConversationUpdatedAt: '2026-07-19T02:00:00Z' });
     expect(after).not.toBe(before);
   });
+
+  it('changes on closed-unmerged and reopened transitions so the page refetches its state', () => {
+    const open = prReviewRevision(base);
+    const closed = prReviewRevision({ ...base, closedUnmergedAnchor: { prNumber: 7, generation: 1 } });
+    const reopened = prReviewRevision({ ...base, closedUnmergedAnchor: { prNumber: 7, generation: 1, cleared: true } });
+    const closedAgain = prReviewRevision({ ...base, closedUnmergedAnchor: { prNumber: 7, generation: 2 } });
+    expect(new Set([open, closed, reopened, closedAgain]).size).toBe(4);
+  });
 });

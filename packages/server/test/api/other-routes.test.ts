@@ -257,7 +257,7 @@ describe('PATCH /api/config', () => {
     });
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent =>
+      agent: project.agent.map(team => team.map(agent =>
         agent.id === 'dev-1' ? { ...agent, workdir: `${currentWorkdir}-new` } : agent)),
     }));
 
@@ -288,7 +288,7 @@ describe('PATCH /api/config', () => {
     }
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent =>
+      agent: project.agent.map(team => team.map(agent =>
         agent.id === 'dev-1' ? { ...agent, workdir: `${currentWorkdir}-new` } : agent)),
     }));
 
@@ -334,7 +334,7 @@ describe('PATCH /api/config', () => {
     });
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent =>
+      agent: project.agent.map(team => team.map(agent =>
         agent.id === 'rdev' ? { ...agent, workdir: '/srv/repo-new' } : agent)),
     }));
 
@@ -351,7 +351,7 @@ describe('PATCH /api/config', () => {
       ...app.ctx.config,
       project: app.ctx.config.project.map(project => ({
         ...project,
-        agent: project.agent.map(pair => pair.map(agent =>
+        agent: project.agent.map(team => team.map(agent =>
           agent.id === 'dev-1' ? { ...agent, addDirs: [oldAddDir] } : agent)),
       })),
     };
@@ -363,7 +363,7 @@ describe('PATCH /api/config', () => {
     });
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent =>
+      agent: project.agent.map(team => team.map(agent =>
         agent.id === 'dev-1' ? { ...agent, addDirs: [] } : agent)),
     }));
 
@@ -384,7 +384,7 @@ describe('PATCH /api/config', () => {
     });
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent =>
+      agent: project.agent.map(team => team.map(agent =>
         agent.id === 'dev-1' ? { ...agent, yolo: false } : agent)),
     }));
 
@@ -400,7 +400,7 @@ describe('PATCH /api/config', () => {
     const nextAddDir = join(tempDir, 'safe-extra');
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent =>
+      agent: project.agent.map(team => team.map(agent =>
         agent.id === 'dev-1' ? { ...agent, addDirs: [nextAddDir] } : agent)),
     }));
 
@@ -486,7 +486,7 @@ describe('PATCH /api/config', () => {
     app.ctx.agentManager.getRepoCache().owners.set('local:/qa', 'qa-1');
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent =>
+      agent: project.agent.map(team => team.map(agent =>
         agent.id === 'dev-1' ? { ...agent, workdir: nextWorkdir } : agent)),
     }));
 

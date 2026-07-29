@@ -18,6 +18,7 @@ import {
 import { useTask } from '../hooks/use-events.ts';
 import { usePrReview } from '../hooks/use-pr-review.ts';
 import { MarkdownLite } from '../components/markdown-lite.tsx';
+import { ReviewFreshness } from '../components/review-freshness.tsx';
 import { useT, type Messages } from '../i18n/index.tsx';
 
 const VERDICT_LABEL: Record<PrReviewVerdict, string> = {
@@ -52,7 +53,7 @@ export function PrReviewPage() {
   const { hash } = useLocation();
   const { data: task } = useTask(taskId);
   const revision = task ? prReviewRevision(task) : undefined;
-  const { data, loaded, error } = usePrReview(taskId, revision);
+  const { data, loaded, error, refresh, refreshing, refreshError } = usePrReview(taskId, revision);
   const [flashId, setFlashId] = useState<string | null>(null);
 
   const prNumber = data?.prNumber ?? task?.prNumber;
@@ -108,6 +109,9 @@ export function PrReviewPage() {
           <a href={prHref} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
             {t.taskDetail.viewPr(prNumber)}
           </a>
+        )}
+        {data?.available && (
+          <ReviewFreshness data={data} onRefresh={refresh} refreshing={refreshing} refreshError={refreshError} />
         )}
       </div>
 

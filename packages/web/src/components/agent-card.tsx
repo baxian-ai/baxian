@@ -1,5 +1,5 @@
 import {
-  needsGitReviewRecovery,
+  TASK_ACTIVE_STATUS_SET,
   type AgentRole,
   type AgentRuntime,
   type AgentSnapshot,
@@ -17,6 +17,7 @@ import { AgentPet } from './agent-pet.tsx';
 import { AgentPetConfigModal } from './agent-pet-config-modal.tsx';
 import { agentRuntimeLabel, agentRuntimeTitle } from '../shared/index.js';
 import { useT, type Messages } from '../i18n/index.tsx';
+import { taskDetailPath } from './task-status.tsx';
 
 export type TerminalMode = 'activity-preview' | 'embedded-full';
 
@@ -30,6 +31,28 @@ const RUNTIME_BADGE_CLASSES: Record<AgentSnapshot['runtimeStatus'], string> = {
 };
 
 const AGENT_CARD_PET_HEIGHT = 72;
+
+export type AgentHoldRecovery = 'resume' | 'restart-runtime' | 'terminal' | 'task' | 'delete-agent';
+
+export function agentHoldRecovery(
+  awaitingPhase: string | undefined,
+  role: AgentRole,
+  task?: Pick<TaskState, 'status'>,
+): AgentHoldRecovery {
+  const activeTask = task !== undefined && TASK_ACTIVE_STATUS_SET.has(task.status);
+  if (awaitingPhase === 'greeting_failed') return 'restart-runtime';
+  if (awaitingPhase === 'agent_dialog_pending') return 'terminal';
+  if (activeTask && (awaitingPhase === 'agent_dialog_resolved_runtime'
+    || awaitingPhase?.startsWith('signal-arm-failed'))) return 'task';
+  if (activeTask && (awaitingPhase === 'dispatch-failed:ack_unknown'
+    || awaitingPhase === 'dev-wait-gate-failed-after-qa-started')) return 'task';
+  if (activeTask
+    && task.status !== 'spec-ready'
+    && task.status !== 'max_rounds'
+    && (awaitingPhase === 'dirty-workdir' || awaitingPhase === 'checkout-preparation-failed')
+    && role === 'dev') return 'task';
+  return 'resume';
+}
 
 export interface AgentBadge {
   kind: 'alert' | 'runtime';
@@ -137,18 +160,16 @@ export function AgentCard({
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [compacting, setCompacting] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [reviewing, setReviewing] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [retryingBootstrap, setRetryingBootstrap] = useState(false);
   const [petModalOpen, setPetModalOpen] = useState(false);
 
   const taskId = agent.binding?.taskId;
-  const reviewNeedsRecovery = task !== undefined
-    && task.id === taskId
-    && needsGitReviewRecovery(task);
+  const boundTask = task?.id === taskId ? task : undefined;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
   const needInputAt = agent.binding?.needInput?.at;
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
+  const holdRecovery = agentHoldRecovery(agent.binding?.awaitingPhase, role, boundTask);
   const isBootstrapping = isAgentBootstrapping(agent);
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
   const badge = resolveAgentBadge(agent, t.agents);
@@ -177,26 +198,6 @@ export function AgentCard({
       setStopError(err instanceof Error ? err.message : String(err));
     } finally {
       setStopping(false);
-    }
-  };
-
-  const handleRequestReview = async () => {
-    if (!taskId) return;
-    const ok = await confirmDialog({
-      title: t.agents.confirmReReviewTitle,
-      body: t.agents.confirmReReviewBody(taskId),
-      confirmLabel: t.agents.confirmReReviewLabel,
-    });
-    if (!ok) return;
-    setReviewing(true);
-    try {
-      const updated = await api.tasks.review(taskId);
-      const round = updated.phase === 'spec' ? (updated.specReviewRound ?? 0) : updated.reviewRound;
-      show({ kind: 'success', title: t.agents.reReviewStarted(round) });
-    } catch (err) {
-      show({ kind: 'error', title: t.agents.reReviewStartFailed, body: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setReviewing(false);
     }
   };
 
@@ -295,13 +296,13 @@ export function AgentCard({
       const warningLines = [...(result?.warnings ?? [])];
       if (removed.length > 1) {
         const others = removed.filter(id => id !== agent.id).join(', ');
-        warningLines.unshift(t.agents.deletedWithPairBody(others));
+        warningLines.unshift(t.agents.deletedWithTeamBody(others));
       }
       if (warningLines.length > 0) {
         show({
           kind: 'warn',
           title: removed.length > 1
-            ? t.agents.deletedWithPairTitle(agent.id)
+            ? t.agents.deletedWithTeamTitle(agent.id)
             : t.agents.deletedTitle(agent.id),
           body: warningLines.join('\n'),
         });
@@ -394,9 +395,12 @@ export function AgentCard({
         </div>
       )}
       {isAwaitingHuman && (
-        <div className="mb-2 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
-          <span className="font-mono">{agent.binding?.awaitingPhase}</span>
-          {agent.binding?.awaitingReason && <span> · {agent.binding.awaitingReason}</span>}
+        <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
+          <div>
+            <span className="font-mono">{agent.binding?.awaitingPhase}</span>
+            {agent.binding?.awaitingReason && <span> · {agent.binding.awaitingReason}</span>}
+          </div>
+          <div className="text-og-700">{t.agents.holdRecovery[holdRecovery]}</div>
         </div>
       )}
       {!isBootstrapping && agent.runtimeStatus === 'pending' && (
@@ -503,7 +507,7 @@ export function AgentCard({
               {stopping ? t.agents.stopping : t.agents.stop}
             </button>
           )}
-          {isAwaitingHuman && (
+          {isAwaitingHuman && (holdRecovery === 'resume' || holdRecovery === 'restart-runtime') && (
             <button
               type="button"
               onClick={handleResume}
@@ -513,7 +517,26 @@ export function AgentCard({
                 : t.agents.resumeDefaultButtonTitle}
               className="btn-primary shrink-0"
             >
-              {resuming ? t.agents.resuming : t.agents.resume}
+              {resuming
+                ? t.agents.resuming
+                : holdRecovery === 'restart-runtime'
+                  ? t.agents.restartRuntime
+                  : t.agents.resume}
+            </button>
+          )}
+          {isAwaitingHuman && holdRecovery === 'terminal' && (
+            <Link to={`/terminal/${agent.id}`} className="btn-primary shrink-0">
+              {t.agents.openTerminalAction}
+            </Link>
+          )}
+          {isAwaitingHuman && holdRecovery === 'task' && taskId && (
+            <Link to={taskDetailPath(projectId, taskId)} className="btn-primary shrink-0">
+              {t.agents.openTaskActions}
+            </Link>
+          )}
+          {isAwaitingHuman && holdRecovery === 'delete-agent' && (
+            <button type="button" onClick={() => void handleDelete()} disabled={deleting} className="btn-primary shrink-0">
+              {deleting ? t.common.deleting : t.agents.deleteToRecover}
             </button>
           )}
         </div>
@@ -541,17 +564,6 @@ export function AgentCard({
               >
                 {clearing ? t.agents.clearing : t.agents.clear}
               </MenuItem>
-              {!pendingRestart && taskId && role === 'dev' && (
-                <MenuItem
-                  onClick={() => { close(); void handleRequestReview(); }}
-                  disabled={reviewing || deleting || reviewNeedsRecovery}
-                  title={reviewNeedsRecovery
-                    ? t.agents.callReviewRecoveryTaskTitle(taskId)
-                    : t.agents.callReviewMenuItemTitle(taskId)}
-                >
-                  {reviewing ? t.agents.callingReview : t.agents.callReview}
-                </MenuItem>
-              )}
               <MenuItem
                 onClick={() => { close(); void handleDelete(); }}
                 disabled={deleting || compacting || clearing}

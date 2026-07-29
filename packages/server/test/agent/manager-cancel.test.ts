@@ -36,7 +36,7 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 300): Promise<voi
 const harness = useManagerSuiteHarness();
 
 describe('AgentManager runtime menu marker', () => {
-  it('emits human.intervention once while a menu remains visible', async () => {
+  it('emits one pending intervention and one matching resolution when the menu closes', async () => {
     let captures = 0;
     const runner = fakeRunner({
       rules: [{
@@ -64,8 +64,11 @@ describe('AgentManager runtime menu marker', () => {
     await new Promise(resolve => setTimeout(resolve, 30));
 
     const interventions = harness.events.filter(e => e.type === 'human.intervention');
-    expect(interventions).toHaveLength(1);
-    expect(interventions[0].data.phase).toBe('agent_runtime_menu_pending');
+    expect(interventions.map(event => event.data.phase)).toEqual([
+      'agent_runtime_menu_pending',
+      'agent_runtime_menu_resolved',
+    ]);
+    expect(interventions[1].data.previousPhase).toBe('agent_runtime_menu_pending');
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBe('task-1');
   });
 });

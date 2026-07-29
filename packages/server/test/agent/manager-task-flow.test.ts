@@ -66,7 +66,7 @@ describe('AgentManager task binding flow', () => {
     })).rejects.toThrow(/deleted or recreated/);
   });
 
-  it('createTask queued early-return rejects when a group member (QA) is being deleted, even with the dev generation unchanged', async () => {
+  it('createTask queued early-return rejects when a team member (QA) is being deleted, even with the dev generation unchanged', async () => {
     await harness.seedAgent({ id: 'dev-1' });
     harness.manager.tryClaimDeletion(['qa-1']);
     vi.spyOn(harness.manager, 'pickAgent').mockResolvedValue(null);
@@ -87,7 +87,7 @@ describe('AgentManager task binding flow', () => {
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('createTask does not create an active task when a group participant (QA) is deleted+recreated after the snapshot', async () => {
+  it('createTask does not create an active task when a team participant (QA) is deleted+recreated after the snapshot', async () => {
     await harness.seedAgent({ id: 'dev-1' });
     const realAcquire = harness.lockManager.acquire.bind(harness.lockManager);
     vi.spyOn(harness.lockManager, 'acquire').mockImplementation(async (id: string, taskId: string) => {
@@ -183,7 +183,7 @@ describe('AgentManager task binding flow', () => {
     await harness.seedAgent({ id: 'dev-1' });
 
     const created = await harness.manager.createTask('proj', {
-      title: 'bind the group',
+      title: 'bind the team',
       description: 'details',
       preferredAgentId: 'dev-1',
     });

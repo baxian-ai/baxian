@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { buildAckCarrierRows, collectPendingFeedback, feedbackEventTarget } from '../../src/platform/feedback.js';
-import { buildAckMarker, buildReviewTokenLine, collectValidAcks, projectCommentRow } from '../../src/platform/markers.js';
+import { buildAckCarrierRows, collectPendingFeedback, feedbackEventTarget, scanCommentSourcesOnce } from '../../src/platform/feedback.js';
+import { buildAckMarker, buildReviewTokenLine, collectValidAcks, projectCommentRow, rowBodyDigest } from '../../src/platform/markers.js';
+import { TimelineCollector } from '../../src/platform/review-timeline.js';
 import { sha256Hex } from '../../src/platform/body-digest.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
+import type { CommentSourceOp } from '../../src/platform/types.js';
 import type { FeedbackSourceScan } from '../../src/platform/feedback.js';
 
 const SHA = 'a'.repeat(40);
@@ -114,6 +116,66 @@ describe('feedbackEventTarget', () => {
     const fresh = row('c3', 'new feedback', { authorId: '5' });
     expect(feedbackEventTarget(fresh, 'issue-comments', acks))
       .toEqual({ id: 'c3', digest: sha256Hex('new feedback') });
+  });
+});
+
+describe('scanCommentSourcesOnce with a timeline collector', () => {
+  const sources = [
+    { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
+    { key: 'reviews', argv: ['{binary}'], map: { id: 'id', body: 'body', reviewState: { sources: ['s'], optional: true } } },
+  ] as unknown as CommentSourceOp[];
+
+  function pagedDriver(rowsByKey: Record<string, NormalizedRow[] | Error>) {
+    return {
+      commentSources: sources,
+      async runCommentSource(
+        source: CommentSourceOp,
+        _vars: { prNumber: number },
+        projectPage?: (pageRows: NormalizedRow[]) => NormalizedRow[],
+      ): Promise<NormalizedRow[]> {
+        const rows = rowsByKey[source.key] ?? [];
+        if (rows instanceof Error) throw rows;
+        return projectPage ? projectPage(rows) : rows;
+      },
+    };
+  }
+
+  it('feeds the collector raw bodies while the scan rows stay projected for digesting', async () => {
+    const collector = new TimelineCollector(sources);
+    const scans = await scanCommentSourcesOnce(
+      pagedDriver({
+        'issue-comments': [{ id: 'c1', body: 'hello world', createdAt: TS, updatedAt: TS }],
+        reviews: [],
+      }),
+      7,
+      () => Date.now(),
+      undefined,
+      collector,
+    );
+    const payload = collector.assemble();
+    expect(payload.items).toEqual([
+      expect.objectContaining({ kind: 'issue-comment', id: 'c1', body: 'hello world' }),
+    ]);
+    expect(payload.error).toBeUndefined();
+    const scanned = scans.find(s => s.key === 'issue-comments')!.rows[0]!;
+    expect(scanned.body).toBeUndefined();
+    expect(rowBodyDigest(scanned)).toBe(sha256Hex('hello world'));
+  });
+
+  it('reports a failing source to the collector while the scan itself stays fail-closed', async () => {
+    const collector = new TimelineCollector(sources);
+    const scans = await scanCommentSourcesOnce(
+      pagedDriver({
+        'issue-comments': [{ id: 'c1', body: 'ok', createdAt: TS, updatedAt: TS }],
+        reviews: new Error('boom'),
+      }),
+      7,
+      () => Date.now(),
+      undefined,
+      collector,
+    );
+    expect(scans.find(s => s.key === 'reviews')!.ok).toBe(false);
+    expect(collector.assemble().error).toContain('reviews');
   });
 });
 

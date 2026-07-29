@@ -152,6 +152,15 @@ export interface AgentSnapshot {
   petId?: string;
 }
 
+export type TaskOperation = 'advance' | 'verdict' | 'cancel' | 'retry';
+
+export interface TaskAttention {
+  reason: string;
+  runbook: string;
+  occurredAt: string;
+  recommendedActions: TaskOperation[];
+}
+
 type PetSpritesheetExt = 'png' | 'webp';
 
 export interface PetMeta {
@@ -190,6 +199,7 @@ export interface TaskState {
   reviewDispatchedAt?: string;
   prFeedbackReceivedAt?: string;
   reviewConversationUpdatedAt?: string;
+  closedUnmergedAnchor?: { prNumber: number; generation: number; cleared?: boolean };
   reviewRound: number;
   specReviewRound?: number;
   phase?: TaskPhase;
@@ -198,10 +208,12 @@ export interface TaskState {
   maxRoundsContinues?: number;
   replyActorId?: string;
   replyActorStatus?: 'verified' | 'provisional';
+  postApproveRevoked?: { generation: string; reason: 'request-changes' | 'redispatch-cap'; at: string };
+  attention?: TaskAttention;
+  replacementTaskId?: string;
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
-  verdictOverdue?: boolean;
 }
 
 export function needsGitReviewRecovery(
@@ -245,6 +257,9 @@ export interface PrReviewConversation {
   error?: string;
   rateLimited?: boolean;
   truncated?: boolean;
+  fetchedAt?: string;
+  autoRefresh?: boolean;
+  autoRefreshIntervalMs?: number;
 }
 
 export type StreamSubMode = 'preview' | 'full';

@@ -148,7 +148,7 @@ describe('prepareConfig type guards', () => {
     expect(() => prepareConfig({ project: [null] })).toThrow(/project\[0\] must be an object/);
     expect(() => prepareConfig({ project: ['oops'] })).toThrow(/project\[0\] must be an object/);
     expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: 42 }] }))
-      .toThrow(/project\[0\]\.agent must be an array of pairs/);
+      .toThrow(/project\[0\]\.agent must be an array of Agent Teams/);
     expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: [{}] }] }))
       .toThrow(/project\[0\]\.agent\[0\] must be an array of agents/);
     expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: [[null]] }] }))
@@ -312,7 +312,7 @@ describe('prepareConfig type guards', () => {
       project: [{
         ...PROJECT,
         review: { mode: 'server' },
-        agent: PROJECT.agent.map(group => group.map(agent => ({
+        agent: PROJECT.agent.map(team => team.map(agent => ({
           ...agent,
           serverReview: true,
         }))),
@@ -337,7 +337,7 @@ describe('prepareConfig type guards', () => {
     expect((cfg.project[0].agent[0][0] as unknown as Record<string, unknown>).serverReview).toBeUndefined();
   });
 
-  it('rejects an incomplete agent group', () => {
+  it('rejects an incomplete Agent Team', () => {
     expect(() => prepareConfig({
       review: { rounds: 10 },
       project: [{

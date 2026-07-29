@@ -20,19 +20,23 @@ vi.mock('../../src/hooks/use-pets.ts', () => ({
 }));
 
 import { api } from '../../src/api.ts';
-import { AgentCard, resolveAgentBadge, type TerminalMode } from '../../src/components/agent-card.tsx';
+import {
+  AgentCard,
+  agentHoldRecovery,
+  resolveAgentBadge,
+  type TerminalMode,
+} from '../../src/components/agent-card.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { enUS } from '../../src/i18n/en-us.ts';
-import { makeTask } from '../helpers/fixtures.ts';
 import { flagDirtyMock } from '../helpers/pending-restart-mock.tsx';
 import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { makeTask } from '../helpers/fixtures.ts';
 
 const showMock = toastShowMock;
 const deleteAgentMock = vi.mocked(api.projects.deleteAgent);
 const compactMock = vi.mocked(api.agents.compact);
 const clearMock = vi.mocked(api.agents.clear);
 const stopMock = vi.mocked(api.agents.stop);
-const reviewMock = vi.mocked(api.tasks.review);
 const resumeAgentMock = vi.mocked(api.projects.resumeAgent);
 const restartReplMock = vi.mocked(api.projects.restartRepl);
 const retryAgentMock = vi.mocked(api.projects.retryAgent);
@@ -273,19 +277,65 @@ describe('resolveAgentBadge', () => {
   });
 });
 
+describe('agentHoldRecovery', () => {
+  it.each([
+    ['greeting_failed', 'dev', 'restart-runtime'],
+    ['agent_dialog_pending', 'dev', 'terminal'],
+    ['dirty-workdir', 'qa', 'resume'],
+    ['cancel-interrupt-failed', 'dev', 'resume'],
+  ] as const)('maps %s for %s to %s', (phase, role, expected) => {
+    expect(agentHoldRecovery(phase, role)).toBe(expected);
+  });
+
+  it.each([
+    ['agent_dialog_resolved_runtime', 'dev', 'task'],
+    ['signal-arm-failed:timeout', 'qa', 'task'],
+    ['dispatch-failed:ack_unknown', 'dev', 'task'],
+    ['dev-wait-gate-failed-after-qa-started', 'qa', 'task'],
+    ['dirty-workdir', 'dev', 'task'],
+    ['checkout-preparation-failed', 'dev', 'task'],
+  ] as const)('maps active-task hold %s for %s to %s', (phase, role, expected) => {
+    expect(agentHoldRecovery(phase, role, makeTask({ status: 'in_progress' }))).toBe(expected);
+  });
+
+  it('falls back to Resume once an active-task-only hold no longer owns an active task', () => {
+    expect(agentHoldRecovery('signal-arm-failed:timeout', 'dev')).toBe('resume');
+    expect(agentHoldRecovery(
+      'dirty-workdir',
+      'dev',
+      makeTask({ status: 'max_rounds' }),
+    )).toBe('resume');
+  });
+});
+
 describe('AgentCard', () => {
   beforeEach(() => {
     deleteAgentMock.mockReset();
     compactMock.mockReset();
     clearMock.mockReset();
     stopMock.mockReset();
-    reviewMock.mockReset();
     resumeAgentMock.mockReset();
     restartReplMock.mockReset();
     retryAgentMock.mockReset();
     bootstrapMock.mockReset();
     flagDirtyMock.mockReset();
     showMock.mockReset();
+  });
+
+  it('links an active runtime-recovery hold to task actions instead of agent deletion', () => {
+    const task = makeTask({ id: 'task-active', projectId: 'proj', status: 'in_progress' });
+    renderCard(makeSnapshot({
+      runtimeStatus: 'pending',
+      binding: makeBinding('dev-1', {
+        taskId: task.id,
+        status: 'awaiting_human',
+        awaitingPhase: 'agent_dialog_resolved_runtime',
+      }),
+    }), { task });
+
+    expect(screen.getByRole('link', { name: 'Open task actions' }).getAttribute('href'))
+      .toBe('/project/proj/task/task-active');
+    expect(screen.queryByRole('button', { name: 'Delete agent' })).toBeNull();
   });
 
   describe('Held recovery via Resume button', () => {
@@ -302,15 +352,15 @@ describe('AgentCard', () => {
       }));
     }
 
-    function resumeButton(): HTMLElement {
-      return screen.getByRole('button', { name: /^Resume$/ });
+    function recoveryButton(): HTMLElement {
+      return screen.getByRole('button', { name: /^(Resume|Restart \/ retry runtime)$/ });
     }
 
     it('routes Resume to restart-repl (re-greet) for a greeting_failed hold with a live session', async () => {
       restartReplMock.mockResolvedValue({ ok: true, agentId: 'dev-greet' });
       heldCard('dev-greet', 'greeting_failed', 'present');
 
-      fireEvent.click(resumeButton());
+      fireEvent.click(recoveryButton());
       const dialog = await findConfirmDialog();
       expect(within(dialog).getByText('Resume agent dev-greet?')).toBeTruthy();
       expect(within(dialog).getByText(/re-run the handshake/)).toBeTruthy();
@@ -327,7 +377,7 @@ describe('AgentCard', () => {
         retryAgentMock.mockResolvedValue({ ok: true, agentId: 'dev-gone' });
         heldCard('dev-gone', 'greeting_failed', sessionStatus);
 
-        fireEvent.click(resumeButton());
+        fireEvent.click(recoveryButton());
         await settleConfirmDialog('Resume');
 
         expect(retryAgentMock).toHaveBeenCalledWith('proj', 'dev-gone');
@@ -340,7 +390,7 @@ describe('AgentCard', () => {
       resumeAgentMock.mockResolvedValue({ agentId: 'dev-hold', resumed: true, releasedBinding: true });
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
-      fireEvent.click(resumeButton());
+      fireEvent.click(recoveryButton());
       const dialog = await findConfirmDialog();
       expect(within(dialog).getByText(/baxian will clear the awaiting_human state/)).toBeTruthy();
       await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Resume' })); });
@@ -351,24 +401,24 @@ describe('AgentCard', () => {
 
     it('gives the greeting_failed Resume button a distinct tooltip from the plain hold', () => {
       heldCard('dev-greet', 'greeting_failed');
-      expect(resumeButton().getAttribute('title')).toMatch(/greeting|Restart REPL/i);
+      expect(recoveryButton().getAttribute('title')).toMatch(/greeting|Restart REPL/i);
     });
 
     it('surfaces a Resume failure as an error toast and re-enables the button', async () => {
       resumeAgentMock.mockRejectedValue(new Error('binding busy'));
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
-      fireEvent.click(resumeButton());
+      fireEvent.click(recoveryButton());
       await settleConfirmDialog('Resume');
 
       expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Resume failed', body: 'binding busy' });
-      expect((resumeButton() as HTMLButtonElement).disabled).toBe(false);
+      expect((recoveryButton() as HTMLButtonElement).disabled).toBe(false);
     });
 
     it('does not call any resume endpoint when the confirm dialog is cancelled', async () => {
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
-      fireEvent.click(resumeButton());
+      fireEvent.click(recoveryButton());
       await settleConfirmDialog('Cancel');
 
       expect(resumeAgentMock).not.toHaveBeenCalled();
@@ -573,7 +623,7 @@ describe('AgentCard', () => {
       expect(terminal.getAttribute('data-auto-focus')).toBe('true');
     });
 
-    it('tags root with data-agent-card so group click-outside detection can find it', () => {
+    it('tags root with data-agent-card so team click-outside detection can find it', () => {
       renderSelectable(false);
       const tagged = document.querySelector('[data-agent-card="dev-sel"]');
       expect(tagged).not.toBeNull();
@@ -883,8 +933,8 @@ describe('AgentCard', () => {
 
       await clickMenuItem('Delete');
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Delete the agent group containing dev-actions?')).toBeTruthy();
-      expect(within(dialog).getByText('Both paired agents will be removed. This action cannot be undone.')).toBeTruthy();
+      expect(within(dialog).getByText('Delete the Agent Team containing dev-actions?')).toBeTruthy();
+      expect(within(dialog).getByText('All agents in this Agent Team will be removed. This action cannot be undone.')).toBeTruthy();
       await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
 
       expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-actions');
@@ -962,19 +1012,8 @@ describe('AgentCard', () => {
       }));
     }
 
-    it('shows "Call review" as a menuitem inside the kebab menu for dev agents with a task', () => {
+    it('does not expose task workflow operations in the agent menu', () => {
       renderDevWithTask();
-      expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
-
-      openMenu();
-      expect(screen.getByRole('menuitem', { name: 'Call review' })).toBeTruthy();
-    });
-
-    it('hides "Call review" from the kebab menu for QA agents', () => {
-      renderCard(makeSnapshot({
-        id: 'qa-footer',
-        binding: makeBinding('qa-footer', { taskId: 'task-1' }),
-      }), { role: 'qa' });
       openMenu();
       expect(screen.queryByRole('menuitem', { name: 'Call review' })).toBeNull();
     });
@@ -1053,98 +1092,24 @@ describe('AgentCard', () => {
       stopMock.mockResolvedValue(undefined);
       renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Stop' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancel task' })); });
 
       expect(stopMock).toHaveBeenCalledWith('dev-stop');
-      expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Cancel task' })).toBeTruthy();
     });
 
-    it('shows Stopping… while in flight and renders a failure below the actions', async () => {
+    it('shows Cancelling… while in flight and renders a failure below the actions', async () => {
       let rejectStop: ((err: Error) => void) | undefined;
       stopMock.mockReturnValue(new Promise((_resolve, reject) => { rejectStop = reject; }));
       renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
 
-      fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
-      expect((screen.getByRole('button', { name: 'Stopping…' }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
+      expect((screen.getByRole('button', { name: 'Cancelling…' }) as HTMLButtonElement).disabled).toBe(true);
 
       await act(async () => { rejectStop?.(new Error('no live pane')); });
 
       expect(screen.getByText('no live pane')).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy();
-    });
-  });
-
-  describe('Call review dispatch', () => {
-    function renderDevWithTask(): void {
-      renderCard(makeSnapshot({
-        id: 'dev-review',
-        binding: makeBinding('dev-review', { taskId: 'task-9' }),
-      }));
-    }
-
-    async function clickCallReview(): Promise<void> {
-      openMenu();
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Call review' }));
-      });
-    }
-
-    it('confirms and dispatches a QA review, reporting the new round', async () => {
-      reviewMock.mockResolvedValue(makeTask({ id: 'task-9', reviewRound: 4 }));
-      renderDevWithTask();
-
-      await clickCallReview();
-      const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Start a QA re-review?')).toBeTruthy();
-      expect(within(dialog).getByText(/task-9/)).toBeTruthy();
-      expect(within(dialog).getByText(/continue only after verifying the QA pane did not receive it/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Start re-review' })); });
-
-      expect(reviewMock).toHaveBeenCalledWith('task-9');
-      expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 4)' });
-    });
-
-    it('does nothing when the confirm dialog is cancelled', async () => {
-      renderDevWithTask();
-
-      await clickCallReview();
-      await settleConfirmDialog('Cancel');
-
-      expect(reviewMock).not.toHaveBeenCalled();
-      expect(showMock).not.toHaveBeenCalled();
-    });
-
-    it('shows an error toast when the dispatch fails', async () => {
-      reviewMock.mockRejectedValue(new Error('task has no PR'));
-      renderDevWithTask();
-
-      await clickCallReview();
-      await settleConfirmDialog('Start re-review');
-
-      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start review', body: 'task has no PR' });
-    });
-
-    it('defers an unconfirmed git delivery to the task recovery form', () => {
-      renderCard(makeSnapshot({
-        id: 'dev-review',
-        binding: makeBinding('dev-review', { taskId: 'task-9' }),
-      }), {
-        task: makeTask({
-          id: 'task-9',
-          status: 'in_progress',
-          phase: undefined,
-          prNumber: 7,
-          replyActorId: '99',
-          replyActorStatus: 'provisional',
-        }),
-      });
-
-      openMenu();
-
-      const item = screen.getByRole('menuitem', { name: 'Call review' }) as HTMLButtonElement;
-      expect(item.disabled).toBe(true);
-      expect(item.title).toContain('Open task task-9');
-      expect(reviewMock).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: 'Cancel task' })).toBeTruthy();
     });
   });
 
@@ -1216,8 +1181,8 @@ describe('AgentCard', () => {
     expect(screen.queryByRole('button', { name: 'Retry bootstrap' })).toBeNull();
   });
 
-  describe('paired deletion', () => {
-    it('warns that the paired agent was removed together and flags the restart', async () => {
+  describe('Agent Team deletion', () => {
+    it('warns that the Agent Team member was removed together and flags the restart', async () => {
       deleteAgentMock.mockResolvedValue({ removed: ['dev-actions', 'qa-actions'], restartRequired: true });
       renderCard(makeSnapshot({ id: 'dev-actions' }));
 
@@ -1230,12 +1195,12 @@ describe('AgentCard', () => {
       expect(flagDirtyMock).toHaveBeenCalled();
       expect(showMock).toHaveBeenCalledWith({
         kind: 'warn',
-        title: 'Deleted the agent group containing dev-actions',
-        body: 'The paired agent qa-actions was removed as well.',
+        title: 'Deleted the Agent Team containing dev-actions',
+        body: 'The Agent Team member qa-actions was removed as well.',
       });
     });
 
-    it('includes post-commit cleanup warnings in the paired deletion toast', async () => {
+    it('includes post-commit cleanup warnings in the Agent Team deletion toast', async () => {
       deleteAgentMock.mockResolvedValue({
         removed: ['dev-actions', 'qa-actions'],
         restartRequired: false,
@@ -1251,9 +1216,9 @@ describe('AgentCard', () => {
 
       expect(showMock).toHaveBeenCalledWith({
         kind: 'warn',
-        title: 'Deleted the agent group containing dev-actions',
+        title: 'Deleted the Agent Team containing dev-actions',
         body:
-          'The paired agent qa-actions was removed as well.\n'
+          'The Agent Team member qa-actions was removed as well.\n'
           + 'lock release for qa-actions failed: ownership changed',
       });
     });

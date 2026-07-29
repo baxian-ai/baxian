@@ -16,6 +16,8 @@ import { collectValidAcks, rowBodyDigest } from './markers.js';
 import { createHash } from 'node:crypto';
 import { buildAckCarrierRows, feedbackEventTarget, scanCommentSourcesOnce } from './feedback.js';
 import { checkPrBinding, type BindingCheck } from './pr-binding.js';
+import { TimelineCollector } from './review-timeline.js';
+import type { PrConversationPayload } from './pr-conversation-cache.js';
 
 export interface PlatformTaskView {
   taskId: string;
@@ -88,7 +90,10 @@ export interface PlatformPollerOptions {
   onCursorCommitted?: (
     taskId: string, prNumber: number, sourceKey: string, watermarkTime: number,
   ) => void | Promise<void>;
-  onConversationRevision?: (taskId: string) => void | Promise<void>;
+  onConversationRevision?: (
+    taskId: string,
+    conversation?: { prNumber: number; payload: PrConversationPayload },
+  ) => void | Promise<void>;
 }
 
 interface EntryStatus {
@@ -831,8 +836,8 @@ export class PlatformPoller {
       }
     }
 
-    const scans = await this.scanCommentSources(entry, task, base, fail);
-    await this.noteConversationProjection(entry, task.taskId, obsKey, scans);
+    const { scans, payload } = await this.scanCommentSources(entry, task, base, fail);
+    await this.noteConversationProjection(entry, task.taskId, obsKey, scans, { prNumber, payload });
 
     const anchorSha = task.anchorSha?.toLowerCase();
     const verdictEligible = task.inReview === true
@@ -890,6 +895,7 @@ export class PlatformPoller {
     taskId: string,
     obsKey: string,
     scans: VerdictSourceScan[],
+    conversation: { prNumber: number; payload: PrConversationPayload },
   ): Promise<void> {
     const notify = this.opts.onConversationRevision;
     if (notify === undefined) return;
@@ -911,7 +917,7 @@ export class PlatformPoller {
     const digest = h.digest('hex');
     if (entry.conversationDigest.get(obsKey) === digest) return;
     try {
-      await notify(taskId);
+      await notify(taskId, conversation);
       entry.conversationDigest.set(obsKey, digest);
     } catch (e) {
       console.warn('[PlatformPoller] onConversationRevision failed:', e instanceof Error ? e.message : e);
@@ -923,9 +929,10 @@ export class PlatformPoller {
     task: PlatformTaskView,
     base: { prNumber: number; prUrl: string; branch: string },
     fail: (context: string, e: unknown) => void,
-  ): Promise<VerdictSourceScan[]> {
+  ): Promise<{ scans: VerdictSourceScan[]; payload: PrConversationPayload }> {
+    const collector = new TimelineCollector(entry.driver.commentSources);
     const scans = await scanCommentSourcesOnce(entry.driver, base.prNumber, this.now,
-      (key, error) => fail(`listComments[${key}] pr#${base.prNumber}`, error));
+      (key, error) => fail(`listComments[${key}] pr#${base.prNumber}`, error), collector);
 
     const ackCollection = collectValidAcks(buildAckCarrierRows(scans), {
       replyActorId: task.replyActorId,
@@ -986,7 +993,7 @@ export class PlatformPoller {
         }
       }
     }
-    return scans;
+    return { scans, payload: collector.assemble() };
   }
 
   private async emit(

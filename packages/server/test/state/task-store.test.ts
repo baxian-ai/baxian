@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { TaskSchemaError, TaskStore } from '../../src/state/task-store.js';
 import { initStateDir } from '../../src/state/init.js';
 import type { TaskState } from '../../src/shared/index.js';
+import { taskAttentionGeneration } from '../../src/shared/index.js';
 import { makeTask } from '../helpers/fixtures.js';
 
 let tempDir: string;
@@ -67,6 +68,133 @@ describe('TaskStore', () => {
     await store.set(task);
     const loaded = await store.get('task-img');
     expect(loaded?.images).toEqual(['a.png', 'b.webp']);
+  });
+
+  it('persists current attention and drops it when task generation advances', async () => {
+    const task = makeTask({
+      id: 'task-attention',
+      status: 'in_progress',
+      phase: 'code',
+      signalToken: 'abcdef123456',
+    });
+    task.attention = {
+      reason: 'initial-dispatch-stalled',
+      runbook: 'Advance with Dev or confirm delivery to QA.',
+      occurredAt: NOW,
+      recommendedActions: ['advance', 'cancel'],
+      generation: {
+        status: task.status,
+        phase: task.phase,
+        signalToken: task.signalToken,
+        agentId: task.agentId,
+        reviewRound: task.reviewRound,
+        specReviewRound: task.specReviewRound,
+      },
+    };
+    await store.set(task);
+    expect((await store.get(task.id))?.attention).toEqual(task.attention);
+
+    await store.set({ ...task, signalToken: 'fedcba654321', updatedAt: '2026-04-28T10:01:00Z' });
+    expect((await store.get(task.id))?.attention).toBeUndefined();
+    expect((await readRawTask(task.id)).attention).toBeUndefined();
+  });
+
+  it('keeps cleanup attention for its generation and drops it when cleanup completes', async () => {
+    const task = makeTask({
+      id: 'task-cleanup-attention',
+      status: 'cancelled',
+      remoteCleanup: {
+        generation: 'abc123abc123',
+        stage: 'delete-pending',
+        prNumber: 42,
+        branch: 'bx/task-cleanup-attention',
+        expectedHeadSha: 'a'.repeat(40),
+        remoteProjectId: 'R_repo',
+        updatedAt: NOW,
+      },
+    });
+    task.attention = {
+      reason: 'remote-cleanup-failed',
+      runbook: 'Retry the persisted cleanup.',
+      occurredAt: NOW,
+      recommendedActions: ['cancel'],
+      generation: taskAttentionGeneration(task),
+    };
+
+    await store.set(task);
+    expect((await store.get(task.id))?.attention?.generation.remoteCleanupGeneration)
+      .toBe('abc123abc123');
+
+    await store.set({
+      ...task,
+      remoteCleanup: {
+        ...task.remoteCleanup!,
+        failure: { kind: 'delete', message: 'still present', at: NOW },
+      },
+    });
+    expect((await store.get(task.id))?.attention?.reason).toBe('remote-cleanup-failed');
+
+    const completed = { ...task, updatedAt: '2026-04-28T10:01:00Z' };
+    delete completed.remoteCleanup;
+    await store.set(completed);
+    expect((await store.get(task.id))?.attention).toBeUndefined();
+  });
+
+  it('accepts a replacement link only on a terminal source task', async () => {
+    const source = makeTask({
+      id: 'task-retry-source',
+      status: 'failed',
+      replacementTaskId: 'task-retry-created',
+    });
+
+    await store.set(source);
+    expect((await store.get(source.id))?.replacementTaskId).toBe('task-retry-created');
+
+    await expect(store.set({ ...source, status: 'in_progress' }))
+      .rejects.toThrow('present only on a terminal source task');
+    await expect(store.set({ ...source, replacementTaskId: source.id }))
+      .rejects.toThrow('a different safe task id');
+  });
+
+  it('round-trips a code verdict outbox only for the current review tuple', async () => {
+    const task = makeTask({
+      id: 'task-code-verdict',
+      status: 'review',
+      phase: 'code',
+      prNumber: 42,
+      reviewHeadAnchorSha: 'a'.repeat(40),
+      passToken: '111111111111',
+      failToken: '222222222222',
+      outbox: [{
+        key: '111111111111',
+        type: 'git.code-verdict',
+        data: {
+          prNumber: 42,
+          kind: 'pass',
+          anchorSha: 'a'.repeat(40),
+          token: '111111111111',
+          comments: '',
+        },
+      }],
+    });
+    await store.set(task);
+    expect((await store.get(task.id))?.outbox).toEqual(task.outbox);
+
+    await expect(store.set({
+      ...task,
+      outbox: [{
+        ...task.outbox![0]!,
+        data: { ...task.outbox![0]!.data, anchorSha: 'b'.repeat(40) },
+      }],
+    })).rejects.toThrow('code-phase git verdict');
+
+    await expect(store.set({
+      ...task,
+      outbox: [{
+        ...task.outbox![0]!,
+        data: { ...task.outbox![0]!.data, writeAttemptedAt: 'not-a-timestamp' },
+      }],
+    })).rejects.toThrow('code-phase git verdict');
   });
 
   it('strips retired task fields instead of migrating them', async () => {
@@ -671,6 +799,7 @@ describe('TaskStore git review fields', () => {
       ['outbox', { outbox: { key: 'k' } }],
       ['outbox', { outbox: [{ key: 'abc123abc123', type: 'git.spec-verdict', data: { prNumber: 42, comments: 'change' } }] }],
       ['outbox', { outbox: [{ key: 'k', type: 'human.intervention', data: {} }, { key: 'k', type: 'human.intervention', data: {} }] }],
+      ['attention', { attention: { reason: 'stalled' } }],
       ['pendingRedispatch', { pendingRedispatch: 'yes' }],
       ['redispatchCount', { redispatchCount: -1 }],
     ];

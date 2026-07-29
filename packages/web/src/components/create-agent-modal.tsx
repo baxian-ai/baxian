@@ -82,7 +82,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
       if (session !== sessionRef.current) return;
       setHosts(cfg.host ?? []);
       const ids = new Set<string>();
-      cfg.project.forEach(p => p.agent.forEach(pair => pair.forEach(a => ids.add(a.id))));
+      cfg.project.forEach(p => p.agent.forEach(team => team.forEach(a => ids.add(a.id))));
       setAllAgentIds(ids);
     }).catch(() => {});
   }, [open, projectId]);
@@ -202,7 +202,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
     setSubmitting(true);
     try {
-      const result = await api.projects.addAgentGroup(projectId, {
+      const result = await api.projects.addAgentTeam(projectId, {
         agents: [devDraft.agent, agent],
       });
       if (result.restartRequired) flagDirty();
@@ -338,7 +338,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             {role === 'dev' ? t.createAgent.devStepLabel : t.createAgent.qaStepLabel}
           </div>
           {devDraft && (
-            <div className={helpCls}>{t.createAgent.pairedDevLabel(devDraft.agent.id)}</div>
+            <div className={helpCls}>{t.createAgent.teamDevLabel(devDraft.agent.id)}</div>
           )}
         </div>
 

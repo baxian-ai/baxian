@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { TaskState } from '../../src/shared/index.js';
+import { taskAttentionGeneration } from '../../src/shared/index.js';
 import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { makeTask } from '../helpers/fixtures.js';
@@ -491,7 +492,7 @@ describe('AgentManager max_rounds manual actions', () => {
       await harness.seedAgent({ id: 'dev-1', taskId: 'task-mr', workdir: '' });
       await expect(harness.manager.continueDevRound('task-mr')).rejects.toMatchObject({
         status: 409,
-        message: expect.stringMatching(/mark-complete|cancel/),
+        message: expect.stringMatching(/complete verdict|cancel/),
       });
       expect((await harness.taskStore.get('task-mr'))?.status).toBe('max_rounds');
     });
@@ -557,21 +558,19 @@ describe('AgentManager max_rounds manual actions', () => {
       await expect(harness.manager.retryTask('task-mr')).rejects.toMatchObject({ status: 409 });
     });
 
-    it('allows spec-phase max_rounds to retry AND finalizes the old task (no lingering active duplicate)', async () => {
+    it('rejects spec-phase max_rounds with 409 because active tasks must use a verdict', async () => {
       await harness.taskStore.set(maxRoundsTask({ phase: 'spec', prNumber: undefined, prUrl: undefined }));
-      vi.spyOn(harness.manager, 'validateTaskDispatch').mockResolvedValue();
       const createSpy = vi
         .spyOn(harness.manager, 'createAndStartTask')
         .mockResolvedValue(makeTask({ id: 'task-mr-retry', status: 'in_progress' }));
 
-      const fresh = await harness.manager.retryTask('task-mr');
+      await expect(harness.manager.retryTask('task-mr')).rejects.toMatchObject({ status: 409 });
 
-      expect(createSpy).toHaveBeenCalled();
-      expect(fresh.id).toBe('task-mr-retry');
-      expect((await harness.taskStore.get('task-mr'))?.status).toBe('cancelled');
+      expect(createSpy).not.toHaveBeenCalled();
+      expect((await harness.taskStore.get('task-mr'))?.status).toBe('max_rounds');
     });
 
-    it('resolves the current Dev through the surviving QA group when the historical Dev was replaced', async () => {
+    it('resolves the current Dev through the surviving QA team when the historical Dev was replaced', async () => {
       await harness.taskStore.set(makeTask({ id: 'task-retry-replaced', status: 'failed' }));
       harness.manager.replaceConfig({
         ...harness.config,
@@ -584,8 +583,8 @@ describe('AgentManager max_rounds manual actions', () => {
         }],
       });
       const validate = vi.spyOn(harness.manager, 'validateTaskDispatch').mockResolvedValue();
-      const create = vi.spyOn(harness.manager, 'createAndStartTask')
-        .mockResolvedValue(makeTask({ id: 'task-retry-created', status: 'in_progress' }));
+      const create = vi.spyOn(harness.manager, 'createTask')
+        .mockResolvedValue(makeTask({ id: 'task-retry-created', status: 'pending', agentId: '' }));
 
       await harness.manager.retryTask('task-retry-replaced');
 
@@ -595,6 +594,88 @@ describe('AgentManager max_rounds manual actions', () => {
       expect(create).toHaveBeenCalledWith('proj', expect.objectContaining({
         preferredAgentId: 'dev-next',
       }));
+    });
+
+    it('settles the source attention, records the replacement, and rejects another retry', async () => {
+      const source = makeTask({ id: 'task-retry-source', status: 'failed' });
+      source.attention = {
+        reason: 'tmux-probe-absent',
+        runbook: 'Retry the failed task.',
+        occurredAt: NOW,
+        recommendedActions: ['retry'],
+        generation: taskAttentionGeneration(source),
+      };
+      await harness.taskStore.set(source);
+      vi.spyOn(harness.manager, 'validateTaskDispatch').mockResolvedValue();
+      const create = vi.spyOn(harness.manager, 'createTask')
+        .mockResolvedValue(makeTask({ id: 'task-retry-created', status: 'pending', agentId: '' }));
+
+      await expect(harness.manager.retryTask(source.id))
+        .resolves.toMatchObject({ id: 'task-retry-created' });
+
+      expect(await harness.taskStore.get(source.id)).toMatchObject({
+        replacementTaskId: 'task-retry-created',
+      });
+      expect((await harness.taskStore.get(source.id))?.attention).toBeUndefined();
+      await expect(harness.manager.retryTask(source.id))
+        .rejects.toMatchObject({ status: 409, message: expect.stringContaining('task-retry-created') });
+      expect(create).toHaveBeenCalledTimes(1);
+    });
+
+    it('preserves an intervention that supersedes the attention captured by retry', async () => {
+      const source = makeTask({ id: 'task-retry-attention-race', status: 'failed' });
+      source.attention = {
+        reason: 'first-failure',
+        runbook: 'Retry the failed task.',
+        occurredAt: NOW,
+        recommendedActions: ['retry'],
+        generation: taskAttentionGeneration(source),
+      };
+      await harness.taskStore.set(source);
+      vi.spyOn(harness.manager, 'validateTaskDispatch').mockResolvedValue();
+      vi.spyOn(harness.manager, 'createTask').mockImplementation(async () => {
+        const current = (await harness.taskStore.get(source.id))!;
+        await harness.taskStore.set({
+          ...current,
+          attention: {
+            reason: 'newer-failure',
+            runbook: 'Inspect the newer failure.',
+            occurredAt: '2026-05-14T05:01:00.000Z',
+            recommendedActions: ['cancel'],
+            generation: taskAttentionGeneration(current),
+          },
+        });
+        return makeTask({ id: 'task-retry-race-created', status: 'pending', agentId: '' });
+      });
+
+      await harness.manager.retryTask(source.id);
+
+      expect((await harness.taskStore.get(source.id))?.attention).toMatchObject({
+        reason: 'newer-failure',
+        occurredAt: '2026-05-14T05:01:00.000Z',
+      });
+      expect((await harness.taskStore.get(source.id))?.replacementTaskId)
+        .toBe('task-retry-race-created');
+    });
+
+    it('allows only one replacement creation while concurrent retries overlap', async () => {
+      const source = makeTask({ id: 'task-retry-concurrent', status: 'failed' });
+      await harness.taskStore.set(source);
+      vi.spyOn(harness.manager, 'validateTaskDispatch').mockResolvedValue();
+      let releaseCreate!: (task: TaskState) => void;
+      const create = vi.spyOn(harness.manager, 'createTask').mockImplementation(() => (
+        new Promise<TaskState>(resolve => { releaseCreate = resolve; })
+      ));
+
+      const first = harness.manager.retryTask(source.id);
+      await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+
+      await expect(harness.manager.retryTask(source.id))
+        .rejects.toMatchObject({ status: 409, message: expect.stringContaining('in progress') });
+
+      releaseCreate(makeTask({ id: 'task-retry-concurrent-created', status: 'pending', agentId: '' }));
+      await expect(first).resolves.toMatchObject({ id: 'task-retry-concurrent-created' });
+      expect(create).toHaveBeenCalledOnce();
     });
   });
 

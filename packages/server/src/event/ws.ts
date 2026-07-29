@@ -11,7 +11,6 @@ import {
 import {
   buildAgentSnapshotById,
   buildAllAgentSnapshots,
-  enrichTaskSnapshot,
 } from '../state/snapshot.js';
 import { isTaskOpen } from '../shared/index.js';
 
@@ -181,11 +180,11 @@ async function fetchSnapshot(
   }
   if (topic.startsWith('task:')) {
     const task = await app.ctx.taskStore.get(topic.slice('task:'.length));
-    return task ? enrichTaskSnapshot(task) : null;
+    return task;
   }
   if (topic.startsWith('project-tasks:')) {
     const tasks = await app.ctx.taskStore.list({ projectId: topic.slice('project-tasks:'.length) });
-    return tasks.filter((t) => isTaskOpen(t.status)).map(enrichTaskSnapshot);
+    return tasks.filter((t) => isTaskOpen(t.status));
   }
   throw new Error(`unsupported topic: ${topic}`);
 }
