@@ -137,7 +137,7 @@ export async function createDefaultConfig(path: string): Promise<void> {
 }
 
 export async function saveConfig(configPath: string, config: BaxianConfig): Promise<void> {
-  await backupConfig(configPath);
+  await backupConfig(configPath, resolveStateDir(configPath));
   const physical = await realpathOrSelf(configPath);
   let mode = 0o600;
   try {
@@ -147,6 +147,7 @@ export async function saveConfig(configPath: string, config: BaxianConfig): Prom
   }
   const tmp = `${physical}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   const cleanupTmp = async (): Promise<void> => {
+    // Managed-dir exemption (the only one): the tmp must sit beside the target for rename() to stay atomic, and the target is the user's config path; pid+random naming keeps the blast radius to our own tmp.
     await rm(tmp, { force: true }).catch((rmErr) => {
       console.warn(`[config] failed to remove config temp ${tmp}:`, rmErr);
     });

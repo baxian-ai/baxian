@@ -38,7 +38,7 @@ export interface PlatformTaskView {
   inReview?: boolean;
 }
 
-export type PlatformTasksProvider = (projectId: string) => Promise<PlatformTaskView[]>;
+type PlatformTasksProvider = (projectId: string) => Promise<PlatformTaskView[]>;
 
 export function platformTaskView(task: TaskState): PlatformTaskView {
   return {

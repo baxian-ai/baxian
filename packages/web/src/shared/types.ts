@@ -152,9 +152,9 @@ export interface AgentSnapshot {
   petId?: string;
 }
 
-export type TaskOperation = 'advance' | 'verdict' | 'cancel' | 'retry';
+type TaskOperation = 'advance' | 'verdict' | 'cancel' | 'retry';
 
-export interface TaskAttention {
+interface TaskAttention {
   reason: string;
   runbook: string;
   occurredAt: string;

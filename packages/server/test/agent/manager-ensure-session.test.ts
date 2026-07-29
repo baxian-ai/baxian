@@ -90,7 +90,9 @@ describe('AgentManager.ensureSession', () => {
   function makeManager(_suffix: string, paneStreamerManager: unknown): AgentManager {
     return createManager({
       runnerFactory: () => runner as unknown as CommandRunner,
-      repoStoreFactory: () => ({ ensure: async () => '/tmp/repo' }) as never,
+      repoStoreFactory: () => ({
+        ensure: async () => '/tmp/repo',
+      }) as never,
       paneStreamerManager: paneStreamerManager as never,
     });
   }
@@ -259,7 +261,9 @@ describe('AgentManager.ensureSession', () => {
       deps: {
         runnerFactory: () => runner,
         platformRunner: runner,
-        repoStoreFactory: () => ({ ensure: async () => '/tmp/repo' }) as never,
+        repoStoreFactory: () => ({
+        ensure: async () => '/tmp/repo',
+      }) as never,
         bootstrapTimeoutsMs: { trustDialog: 200, waitReplReady: 400 },
       },
     });
@@ -1036,7 +1040,10 @@ describe('AgentManager.ensureSession', () => {
       vi.spyOn(
         manager as unknown as { ensureWorkdir: () => Promise<unknown> },
         'ensureWorkdir',
-      ).mockResolvedValue({ workdir: '/tmp/auto-repo', repoStore: {} });
+      ).mockResolvedValue({
+        workdir: '/tmp/auto-repo',
+        repoStore: {},
+      });
       overrideExec(
         command => command.includes('display-message') && command.includes('pane_current_path'),
         { stdout: 'BX_PANE_OK/tmp/auto-repo\n' },

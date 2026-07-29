@@ -1,23 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { lstat, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   RepoStore,
   accessMethodDiffers,
-  ancestorSymlinkGuard,
-  isUnder,
   createRepoStoreCache,
   ensureBaxianRuntimeDirsSafe,
   moveFileIntoPlace,
-  stageFileGuarded,
+  stageFile,
   sweepStrayFile,
+  trashBatchDir,
 } from '../../src/agent/repo-store.js';
 import { ExecOutcomeUnknownError } from '../../src/agent/net-exec.js';
 import { LocalRunner, shellQuote, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
 
 const PROJECT_REPO = 'https://git.example.com/group/project.git';
 const local = new LocalRunner();
+const testTrash = (home: string): string => trashBatchDir(home, 'test-agent', 'test');
 let tempDir: string;
 let origin: string;
 
@@ -175,23 +176,27 @@ describe('RepoStore per-agent Workdir', () => {
     const stat = await lstat(join(path, '.baxian'));
     expect(stat.isDirectory()).toBe(true);
     expect(stat.isSymbolicLink()).toBe(false);
+
+    await mkdir(join(path, 'sub'), { recursive: true });
+    await writeFile(join(path, 'sub', '.baxian'), 'user file');
+    expect((await local.exec(`cd ${shellQuote(path)} && git check-ignore -q -- .baxian`)).exitCode).toBe(0);
+    expect((await local.exec(`cd ${shellQuote(path)} && git check-ignore -q -- sub/.baxian`)).exitCode).toBe(1);
   });
 
-  it('rejects a symbolic-link runtime directory', async () => {
-    const relative = '.baxian';
-    const path = join(tempDir, `custom-symlink-${relative.replaceAll('/', '-')}`);
-    const outside = join(tempDir, `outside-${relative.replaceAll('/', '-')}`);
+  it('accepts a user-planted symlink runtime directory and keeps the link', async () => {
+    const path = join(tempDir, 'custom-symlink-runtime');
+    const outside = join(tempDir, 'outside-runtime');
     await cloneAt(path);
     await run(`mkdir -p ${shellQuote(outside)}`);
-    if (relative.includes('/')) await run(`mkdir -p ${shellQuote(join(path, '.baxian'))}`);
-    await symlink(outside, join(path, relative));
+    await symlink(outside, join(path, '.baxian'));
     const store = new RepoStore(
       new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
       createRepoStoreCache(), 'dev-1', path,
     );
 
-    await expect(store.ensure()).rejects.toThrow(/unsafe \.baxian runtime path/i);
-    expect((await lstat(join(path, relative))).isSymbolicLink()).toBe(true);
+    await store.ensure();
+
+    expect((await lstat(join(path, '.baxian'))).isSymbolicLink()).toBe(true);
   });
 
   it('fails fast instead of creating a missing custom Workdir', async () => {
@@ -496,6 +501,12 @@ function scriptedStore(runner: ScriptedRunner): RepoStore {
   );
 }
 
+function expectTrashMove(cmd: string | undefined, srcPattern: string): void {
+  expect(cmd).toBeDefined();
+  expect(cmd!).toMatch(new RegExp(`t='/home/u/\\.baxian/agents/dev-1/\\.baxian-trash/[^']+'/"\\$base"`));
+  expect(cmd!).toMatch(new RegExp(`mv -- '${srcPattern}' "\\$t" && printf '%s' BX_TRASHED; else false; fi`));
+}
+
 describe('RepoStore destructive-cleanup guards', () => {
   it('aborts ensure when the existence probe fails at the exec layer, without cloning or removing', async () => {
     const runner = new ScriptedRunner('/home/u', [
@@ -505,16 +516,15 @@ describe('RepoStore destructive-cleanup guards', () => {
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe workdir/);
 
     expect(runner.commands.some(c => c.includes('clone'))).toBe(false);
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('mv -- '))).toBe(false);
   });
 
-  it('clones into a unique staging name and only ever deletes that name on failure', async () => {
+  it('clones into a unique staging name and only ever trashes that name on failure', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
       [/git clone /, { stdout: '', stderr: 'fatal: unable to access remote', exitCode: 128 }],
-      [/rm -rf /, ok],
       [/rmdir /, ok],
     ]);
 
@@ -524,32 +534,112 @@ describe('RepoStore destructive-cleanup guards', () => {
     const cloneCmd = runner.commands.find(c => c.includes('git clone '));
     expect(cloneCmd).toMatch(/repo\.claim-[0-9a-f-]+'/);
     expect(cloneCmd).not.toContain(`${final}'`);
-    const removal = runner.commands.find(c => c.includes('rm -rf '));
-    expect(removal).toContain(`[ "$(cd -- '/home/u' 2>/dev/null && pwd -P)" = '/home/u' ]`);
-    expect(removal).toMatch(new RegExp(`then rm -rf '${final}\\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;`));
+    const removal = runner.commands.find(c => /mv -- '[^']*\/repo\.claim-/.test(c));
+    expectTrashMove(removal, `${final}\\.claim-[0-9a-f-]+`);
     expect(runner.commands.some(c => c.includes('rmdir '))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
-  it('discards the staging by its unique name when promotion fails, leaving nothing behind', async () => {
+  it('stops before promote when the claim write returns exit 0 with transient output', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/baxian-promote-claim'$/, { stdout: '', stderr: 'ssh: connect to host box-a port 22: Connection timed out', exitCode: 0 }],
+      [/mkdir -p /, ok],
+      [/git clone /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Promote-claim write .* outcome unknown/);
+
+    expect(runner.commands.some(c => c.includes('&& mv '))).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
+    warn.mockRestore();
+  });
+
+  it('treats a transient .baxian exclude reply as outcome unknown, not success', async () => {
+    const phys = '/home/u/.baxian/agents/dev-1/repo';
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --show-toplevel/, { stdout: `${phys}\n`, stderr: '', exitCode: 0 }],
+      [/^cd '\/home\/u\/\.baxian\/agents\/dev-1\/repo' && pwd -P$/, { stdout: `${phys}\n`, stderr: '', exitCode: 0 }],
+      [/--is-bare-repository/, { stdout: 'false\n', stderr: '', exitCode: 0 }],
+      [/remote get-url origin/, { stdout: `${PROJECT_REPO}\n`, stderr: '', exitCode: 0 }],
+      [/config --get-regexp /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/for-each-ref/, { stdout: 'refs/remotes/origin/main\n', stderr: '', exitCode: 0 }],
+      [/check-ignore/, { stdout: '', stderr: 'Connection reset by peer', exitCode: 0 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/exclude probe .* outcome unknown/);
+  });
+
+  it('flags a transient trash reply as outcome UNKNOWN even with exit 0 and marker', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/BX_TRASH_ABSENT/, { stdout: 'BX_TRASHED', stderr: 'Connection reset by peer', exitCode: 0 }],
+      [/mkdir -p /, ok],
+      [/git clone /, { stdout: '', stderr: 'fatal: unable to access remote', exitCode: 128 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/git clone .* failed/);
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trash outcome UNKNOWN'));
+    warn.mockRestore();
+  });
+
+  it('accepts an auto Workdir routed through a symlinked agents tree (physical top equals physical workdir)', async () => {
+    const phys = '/data/agents-store/dev-1/repo';
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --show-toplevel/, { stdout: `${phys}\n`, stderr: '', exitCode: 0 }],
+      [/^cd '\/data\/agents-store\/dev-1\/repo' && pwd -P$/, { stdout: `${phys}\n`, stderr: '', exitCode: 0 }],
+      [/^cd '\/home\/u\/\.baxian\/agents\/dev-1\/repo' && pwd -P$/, { stdout: `${phys}\n`, stderr: '', exitCode: 0 }],
+      [/--is-bare-repository/, { stdout: 'false\n', stderr: '', exitCode: 0 }],
+      [/remote get-url origin/, { stdout: `${PROJECT_REPO}\n`, stderr: '', exitCode: 0 }],
+      [/config --get-regexp /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/for-each-ref/, { stdout: 'refs/remotes/origin/main\n', stderr: '', exitCode: 0 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).resolves.toBe('/home/u/.baxian/agents/dev-1/repo');
+  });
+
+  it('withdraws only the staging when the promote guard fails before mv (no precheck marker)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
       [/git clone /, ok],
       [/baxian-promote-claim'$/, ok],
-      [/&& mv '/, { stdout: '', stderr: 'mv: rename failed', exitCode: 1 }],
-      [/rm -rf /, ok],
+      [/&& mv '/, { stdout: '', stderr: 'guard: final path exists', exitCode: 1 }],
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot promote staged clone/);
 
-    const removal = runner.commands.find(c => c.includes('rm -rf '));
-    expect(removal).toMatch(/then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;/);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+    const removal = runner.commands.find(c => /mv -- '[^']*\/repo\.claim-/.test(c));
+    expectTrashMove(removal, `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`);
+    expect(runner.commands.some(c => /mv -- '[^']*\/repo\/repo\.claim-/.test(c))).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
-  it('discards a nested staging by its unique name when the final path was recreated mid-promote', async () => {
+  it('trashes both staging homes when mv provably started and then failed (precheck marker present)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/mkdir -p /, ok],
+      [/git clone /, ok],
+      [/baxian-promote-claim'$/, ok],
+      [/&& mv '/, { stdout: 'BX_MV_PRECHECK', stderr: 'mv: rename failed', exitCode: 1 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot promote staged clone/);
+
+    const removals = runner.commands.filter(c => /mv -- '[^']*repo\.claim-/.test(c));
+    expect(removals.some(c => /\/repo\.claim-/.test(c) && !/\/repo\/repo\.claim-/.test(c))).toBe(true);
+    expect(removals.some(c => /\/repo\/repo\.claim-/.test(c))).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
+  });
+
+  it('trashes a nested staging by its unique name when the final path was recreated mid-promote', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
@@ -558,15 +648,14 @@ describe('RepoStore destructive-cleanup guards', () => {
       [/baxian-promote-claim'$/, ok],
       [/&& mv '[^']*claim[^']*' '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, ok],
       [/^test -e /, ok],
-      [/rm -rf /, ok],
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/recreated while promoting/);
 
-    const removal = runner.commands.find(c => c.includes('rm -rf '));
-    expect(removal).toMatch(/then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;/);
+    const removal = runner.commands.find(c => /mv -- '[^']*\/repo\/repo\.claim-/.test(c));
+    expectTrashMove(removal, `/home/u/\\.baxian/agents/dev-1/repo/repo\\.claim-[0-9a-f-]+`);
     expect(runner.commands.some(c => /^mv '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-/.test(c))).toBe(false);
-    expect(runner.commands.some(c => /rm -f '[^']*baxian-promote-claim'/.test(c))).toBe(false);
+    expect(runner.commands.some(c => /mv -- '[^']*baxian-promote-claim'/.test(c))).toBe(false);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('recreated concurrently'));
   });
 
@@ -574,35 +663,36 @@ describe('RepoStore destructive-cleanup guards', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      // The nonce-checked marker clear reports REFUSED: `final` was replaced after the mv (foreign clone).
+      // Must outrank the generic mkdir rule — the trash-move clear embeds `mkdir -p <batch>`.
+      [/then mkdir -p '[^']+' && mv -- '[^']*baxian-promote-claim'/, { stdout: 'BX_MARKER_REFUSED\n', stderr: '', exitCode: 0 }],
       [/mkdir -p /, ok],
       [/git clone /, ok],
       [/baxian-promote-claim'$/, ok],
       [/&& mv '[^']*claim[^']*' '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, ok],
       [/^test -e /, { stdout: '', stderr: '', exitCode: 1 }],
-      [/then rm -f '[^']*baxian-promote-claim'/, { stdout: 'BX_MARKER_REFUSED\n', stderr: '', exitCode: 0 }],
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/refusing to adopt/i);
     warn.mockRestore();
   });
 
-  it('discards the staging when the promote-claim stamp cannot be written', async () => {
+  it('trashes the staging when the promote-claim stamp cannot be written', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
       [/git clone /, ok],
       [/baxian-promote-claim'$/, { stdout: '', stderr: 'sh: cannot create', exitCode: 1 }],
-      [/rm -rf /, ok],
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot stamp staged clone/);
 
-    const removals = runner.commands.filter(c => c.includes('rm -rf '));
+    const removals = runner.commands.filter(c => /mv -- '[^']*\/repo\.claim-/.test(c));
     expect(removals).toHaveLength(1);
-    expect(removals[0]).toMatch(/then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;/);
-    expect(runner.commands.some(c => c.includes('&& mv '))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+    expectTrashMove(removals[0], `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`);
+    expect(runner.commands.some(c => c.includes("&& mv '"))).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('reconciles an uncertain promote mv as not-executed when the staging is still present', async () => {
@@ -614,15 +704,69 @@ describe('RepoStore destructive-cleanup guards', () => {
       [/baxian-promote-claim'$/, ok],
       [/&& mv '/, { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 }],
       [/^test -e /, ok],
-      [/rm -rf /, ok],
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/not executed; staged clone withdrawn/);
 
-    const removals = runner.commands.filter(c => c.includes('rm -rf '));
+    const removals = runner.commands.filter(c => /mv -- '[^']*\/repo\.claim-/.test(c));
     expect(removals).toHaveLength(1);
-    expect(removals[0]).toMatch(/then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;/);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+    expectTrashMove(removals[0], `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
+  });
+
+  it('keeps everything in place when the reconciliation staging probe is transient-tainted', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/mkdir -p /, ok],
+      [/git clone /, ok],
+      [/baxian-promote-claim'$/, ok],
+      [/&& mv '/, { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 }],
+      [/^test -e /, { stdout: '', stderr: 'Connection reset by peer', exitCode: 0 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/staging probe outcome unknown/);
+
+    expect(runner.commands.some(c => /mv -- '/.test(c))).toBe(false);
+    warn.mockRestore();
+  });
+
+  it('keeps everything in place when the reconciliation nested probe is transient-tainted', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/mkdir -p /, ok],
+      [/git clone /, ok],
+      [/baxian-promote-claim'$/, ok],
+      [/&& mv '/, { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 }],
+      [/^test -e '\/home\/u\/\.baxian\/agents\/dev-1\/repo\.claim-/, { stdout: '', stderr: '', exitCode: 1 }],
+      [/^cat '/, { stdout: '', stderr: '', exitCode: 1 }],
+      [/^test -e '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-/, { stdout: '', stderr: 'Connection reset by peer', exitCode: 0 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/nested probe outcome unknown/);
+
+    expect(runner.commands.some(c => /mv -- '/.test(c))).toBe(false);
+    warn.mockRestore();
+  });
+
+  it('routes an exit-0 promote mv with transient output into nonce reconciliation, not the success path', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/mkdir -p /, ok],
+      [/git clone /, ok],
+      [/baxian-promote-claim'$/, ok],
+      [/&& mv '/, { stdout: '', stderr: 'ssh: connect to host box-a port 22: Connection timed out', exitCode: 0 }],
+      [/^test -e /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/not executed; staged clone withdrawn/);
+
+    expect(runner.commands.some(c => c.startsWith('test -e ') && c.includes('repo.claim-'))).toBe(true);
+    expect(runner.commands.some(c => /^test -e '[^']*\/repo\/repo\.claim-/.test(c))).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
+    warn.mockRestore();
   });
 
   it('reconciles an uncertain promote mv as completed when the final clone holds our claim nonce', async () => {
@@ -631,6 +775,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     let nonce = '';
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, { stdout: '', stderr: '', exitCode: 1 }],
+      [/then mkdir -p '[^']+' && mv -- '[^']*baxian-promote-claim'/, { stdout: 'BX_MARKER_TRASHED\n', stderr: '', exitCode: 0 }],
       [/mkdir -p /, ok],
       [/git clone /, ok],
       [/baxian-promote-claim'$/, (c) => {
@@ -650,12 +795,30 @@ describe('RepoStore destructive-cleanup guards', () => {
     await expect(scriptedStore(runner).ensure()).resolves.toBe(final);
 
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('reconciled as already-completed'));
-    expect(runner.commands.some(c => c.includes('rm -rf '))).toBe(false);
+    expect(runner.commands.some(c => /mv -- '[^']*\/repo\.claim-/.test(c))).toBe(false);
     expect(runner.commands.some(c => c.includes('config --get-regexp '))).toBe(true);
     expect(runner.commands.some(c =>
       c.includes("cat '") && c.includes('baxian-promote-claim')
-      && c.includes('rm -f') && c.includes(nonce),
+      && c.includes('mv -- ') && c.includes(nonce),
     )).toBe(true);
+  });
+
+  it('treats a marker clear that reports no outcome marker as failed, never as removed', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, { stdout: '', stderr: '', exitCode: 1 }],
+      // exit 0 with an empty stdout must not be read as a successful clear.
+      [/then mkdir -p '[^']+' && mv -- '[^']*baxian-promote-claim'/, ok],
+      [/mkdir -p /, ok],
+      [/git clone /, ok],
+      [/baxian-promote-claim'$/, ok],
+      [/&& mv '[^']*claim[^']*' '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, ok],
+      [/^test -e /, { stdout: '', stderr: '', exitCode: 1 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/refusing to adopt/i);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('no outcome marker'));
+    warn.mockRestore();
   });
 
   it('reconcile refuses to adopt when the marker clear reports refused (final replaced after the nonce read)', async () => {
@@ -663,9 +826,11 @@ describe('RepoStore destructive-cleanup guards', () => {
     let nonce = '';
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, { stdout: '', stderr: '', exitCode: 1 }],
+      // The atomic nonce-checked clear reports REFUSED: `final` was replaced after the separate cat.
+      // Must outrank the generic mkdir rule — the trash-move clear embeds `mkdir -p <batch>`.
+      [/then mkdir -p '[^']+' && mv -- '[^']*baxian-promote-claim'/, { stdout: 'BX_MARKER_REFUSED\n', stderr: '', exitCode: 0 }],
       [/mkdir -p /, ok],
       [/git clone /, ok],
-      [/then rm -f '[^']*baxian-promote-claim'/, { stdout: 'BX_MARKER_REFUSED\n', stderr: '', exitCode: 0 }],
       [/baxian-promote-claim'$/, (c) => { nonce = /printf %s '([^']+)' >/.exec(c)![1]; return ok; }],
       [/&& mv '/, { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 }],
       [/^test -e '\/home\/u\/\.baxian\/agents\/dev-1\/repo\.claim-[0-9a-f-]+'$/, { stdout: '', stderr: '', exitCode: 1 }],
@@ -676,7 +841,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     warn.mockRestore();
   });
 
-  it('discards a nested staging by its unique name when an uncertain promote nested on a target race', async () => {
+  it('trashes a nested staging by its unique name when an uncertain promote nested on a target race', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
@@ -691,11 +856,10 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/nested on a target race/);
 
-    const removals = runner.commands.filter(c => c.includes('rm -rf '));
+    const removals = runner.commands.filter(c => /mv -- '[^']*\/repo\/repo\.claim-/.test(c));
     expect(removals).toHaveLength(1);
-    expect(removals[0]).toContain(`[ ! -L '/home/u/.baxian/agents/dev-1/repo' ]`);
-    expect(removals[0]).toMatch(/then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;/);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+    expectTrashMove(removals[0], `/home/u/\\.baxian/agents/dev-1/repo/repo\\.claim-[0-9a-f-]+`);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('keeps every location and fails loud when reconciliation probes are inconclusive', async () => {
@@ -706,16 +870,16 @@ describe('RepoStore destructive-cleanup guards', () => {
       [/git clone /, ok],
       [/baxian-promote-claim'$/, ok],
       [/&& mv '/, { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 }],
-      [/^test -e /, { stdout: '', stderr: 'Connection reset by peer', exitCode: 255 }],
+      [/^test -e /, { stdout: '', stderr: 'probe hiccup', exitCode: 2 }],
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/all locations inconclusive/);
 
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => /mv -- '[^']*\/repo\.claim-/.test(c))).toBe(false);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('outcome UNKNOWN'));
   });
 
-  it('sweeps both staging homes and fails loud when the nested probe is transport-uncertain', async () => {
+  it('keeps both staging homes when the success-path nested probe is transport-uncertain', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
@@ -724,15 +888,11 @@ describe('RepoStore destructive-cleanup guards', () => {
       [/baxian-promote-claim'$/, ok],
       [/&& mv '/, ok],
       [/^test -e /, { stdout: '', stderr: 'Connection reset by peer', exitCode: 255 }],
-      [/rm -rf /, ok],
     ]);
 
-    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot verify promoted clone/);
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/nested probe outcome unknown/);
 
-    const removals = runner.commands.filter(c => c.includes('rm -rf '));
-    expect(removals).toHaveLength(2);
-    expect(removals.some(c => /repo\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;/.test(c) && !c.includes('/repo/repo.claim'))).toBe(true);
-    expect(removals.some(c => c.includes('/repo/repo.claim'))).toBe(true);
+    expect(runner.commands.some(c => /mv -- '[^']*repo\.claim-/.test(c))).toBe(false);
   });
 
   it('treats exit 1 with transient noise as a failed existence probe, not absence', async () => {
@@ -743,7 +903,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe workdir/);
 
     expect(runner.commands.some(c => c.includes('clone'))).toBe(false);
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('mv -- '))).toBe(false);
   });
 
   it('aborts leftover-dir recovery when rmdir fails at the transport layer', async () => {
@@ -756,7 +916,7 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe leftover dir/);
 
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('mv -- '))).toBe(false);
     expect(runner.commands.some(c => c.includes('git clone'))).toBe(false);
   });
 
@@ -784,13 +944,12 @@ describe('RepoStore destructive-cleanup guards', () => {
       [/rmdir /, ok],
       [/mkdir -p /, ok],
       [/git clone /, { stdout: '', stderr: 'fatal: early EOF', exitCode: 128 }],
-      [/rm -rf /, ok],
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/git clone .* failed/);
 
     expect(runner.commands.find(c => c.includes('rmdir '))).toBe(
-      `${ancestorSymlinkGuard('/home/u', '/home/u/.baxian/agents/dev-1/repo')} && rmdir '/home/u/.baxian/agents/dev-1/repo'`,
+      `rmdir '/home/u/.baxian/agents/dev-1/repo'`,
     );
     expect(runner.commands.some(c => c.includes('git clone '))).toBe(true);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('removed leftover empty dir'));
@@ -866,7 +1025,7 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe worktree top/);
 
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('mv -- '))).toBe(false);
   });
 
   it('aborts instead of advising manual removal when the git-dir probe fails in transit', async () => {
@@ -877,7 +1036,7 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe git dir/);
 
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('mv -- '))).toBe(false);
   });
 
   it('treats transient noise on stdout as a failed git-dir probe too', async () => {
@@ -898,7 +1057,7 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe repo layout/);
 
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('mv -- '))).toBe(false);
   });
 
   it('fails closed when the bare probe dies in transit instead of advising manual removal', async () => {
@@ -911,7 +1070,7 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe repo layout/);
 
-    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('mv -- '))).toBe(false);
   });
 });
 
@@ -933,7 +1092,7 @@ describe('moveFileIntoPlace (real filesystem)', () => {
   it('replaces a plain-file target atomically', async () => {
     await write(`${dir}/tmp1`, 'new');
     await write(`${dir}/final`, 'old');
-    await moveFileIntoPlace(local, `${dir}/tmp1`, `${dir}/final`);
+    await moveFileIntoPlace(local, `${dir}/tmp1`, `${dir}/final`, { trashDir: testTrash(dir) });
     expect(await run(`cat ${shellQuote(`${dir}/final`)}`)).toBe('new');
   });
 
@@ -943,7 +1102,7 @@ describe('moveFileIntoPlace (real filesystem)', () => {
     await write(external, 'foreign');
     await symlink(external, `${dir}/tmp-link`);
 
-    await expect(moveFileIntoPlace(local, `${dir}/tmp-link`, `${dir}/final-link`))
+    await expect(moveFileIntoPlace(local, `${dir}/tmp-link`, `${dir}/final-link`, { trashDir: testTrash(dir) }))
       .rejects.toThrow(/atomic replace/);
 
     expect(await run(`cat ${shellQuote(external)}`)).toBe('foreign');
@@ -959,7 +1118,7 @@ describe('moveFileIntoPlace (real filesystem)', () => {
       execWithStdin: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
     } as CommandRunner;
 
-    await moveFileIntoPlace(runner, '/work/tmp', '/work/final');
+    await moveFileIntoPlace(runner, '/work/tmp', '/work/final', { trashDir: testTrash('/work') });
 
     expect(exec).toHaveBeenCalledOnce();
     const command = exec.mock.calls[0]![0];
@@ -972,7 +1131,7 @@ describe('moveFileIntoPlace (real filesystem)', () => {
     await run(`mkdir -p ${shellQuote(`${dir}/final`)}`);
     await write(`${dir}/tmp2`, 'payload');
 
-    await expect(moveFileIntoPlace(local, `${dir}/tmp2`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
+    await expect(moveFileIntoPlace(local, `${dir}/tmp2`, `${dir}/final`, { trashDir: testTrash(dir) })).rejects.toThrow(/atomic replace/);
 
     expect(await run(`ls -A ${shellQuote(`${dir}/final`)}`)).toBe('');
     const tmpLeft = await local.exec(`test -e ${shellQuote(`${dir}/tmp2`)}`);
@@ -986,95 +1145,75 @@ describe('moveFileIntoPlace (real filesystem)', () => {
     await symlink(`${dir}/real`, `${dir}/final`);
     await write(`${dir}/tmp3`, 'payload');
 
-    await expect(moveFileIntoPlace(local, `${dir}/tmp3`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
+    await expect(moveFileIntoPlace(local, `${dir}/tmp3`, `${dir}/final`, { trashDir: testTrash(dir) })).rejects.toThrow(/atomic replace/);
 
     expect(await run(`ls -A ${shellQuote(`${dir}/real`)}`)).toBe('');
   });
 
-  it('sweeps a tmp already nested under a directory target', async () => {
+  it('leaves a same-named file inside a directory target alone when mv never ran', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     await run(`mkdir -p ${shellQuote(`${dir}/final`)}`);
-    await write(`${dir}/final/tmp4`, 'nested-stray');
+    await write(`${dir}/final/tmp4`, 'not ours');
+    await write(`${dir}/tmp4`, 'payload');
 
-    await expect(moveFileIntoPlace(local, `${dir}/tmp4`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
+    await expect(moveFileIntoPlace(local, `${dir}/tmp4`, `${dir}/final`, { trashDir: testTrash(dir) })).rejects.toThrow(/atomic replace/);
 
-    const nested = await local.exec(`test -e ${shellQuote(`${dir}/final/tmp4`)}`);
-    expect(nested.exitCode).toBe(1);
+    expect(await run(`cat ${shellQuote(`${dir}/final/tmp4`)}`)).toBe('not ours');
+    const tmpLeft = await local.exec(`test -e ${shellQuote(`${dir}/tmp4`)}`);
+    expect(tmpLeft.exitCode).toBe(1);
   });
 
-  it('refuses to walk through a symlinked ancestor when guardRoot is set', async () => {
+  it('keeps an unrelated same-named file behind a symlinked directory target out of trash', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await run(`mkdir -p ${shellQuote(`${dir}/outside`)}`);
-    await write(`${dir}/outside/keep`, 'safe');
-    await symlink(`${dir}/outside`, `${dir}/sub`);
+    await run(`mkdir -p ${shellQuote(`${dir}/real`)}`);
+    await write(`${dir}/real/tmp5`, 'user data behind the link');
+    await symlink(`${dir}/real`, `${dir}/final5`);
     await write(`${dir}/tmp5`, 'payload');
 
-    await expect(
-      moveFileIntoPlace(local, `${dir}/tmp5`, `${dir}/sub/keep`, { guardRoot: dir }),
-    ).rejects.toThrow(/atomic replace/);
+    await expect(moveFileIntoPlace(local, `${dir}/tmp5`, `${dir}/final5`, { trashDir: testTrash(dir) })).rejects.toThrow(/atomic replace/);
 
-    expect(await run(`cat ${shellQuote(`${dir}/outside/keep`)}`)).toBe('safe');
+    expect(await run(`cat ${shellQuote(`${dir}/real/tmp5`)}`)).toBe('user data behind the link');
+    const link = await lstat(`${dir}/final5`);
+    expect(link.isSymbolicLink()).toBe(true);
   });
 
-  it('refuses when the guard root itself is a symlink — external files stay intact', async () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await run(`mkdir -p ${shellQuote(`${dir}/outside/.baxian/review`)}`);
-    await write(`${dir}/outside/.baxian/review/evidence`, 'precious');
-    const rootLink = `${dir}/work`;
-    await symlink(`${dir}/outside`, rootLink);
-    await write(`${dir}/tmp6`, 'payload');
-
-    await expect(
-      moveFileIntoPlace(local, `${dir}/tmp6`, `${rootLink}/.baxian/review/evidence`, { guardRoot: rootLink }),
-    ).rejects.toThrow(/atomic replace/);
-
-    expect(await run(`cat ${shellQuote(`${dir}/outside/.baxian/review/evidence`)}`)).toBe('precious');
-  });
-
-  it('never sweeps a nested tmp through a symlinked final — foreign same-name files survive', async () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await run(`mkdir -p ${shellQuote(`${dir}/outside`)}`);
-    await write(`${dir}/outside/tmp7`, 'foreign-precious');
-    await symlink(`${dir}/outside`, `${dir}/final`);
-    await write(`${dir}/tmp7`, 'payload');
-
-    await expect(moveFileIntoPlace(local, `${dir}/tmp7`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
-
-    expect(await run(`cat ${shellQuote(`${dir}/outside/tmp7`)}`)).toBe('foreign-precious');
-  });
-
-  it('guarded discard (clone/promote cleanup) refuses to delete through a rebound managed parent', async () => {
+  it('moves a swept file into the trash batch instead of deleting it', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await run(`mkdir -p ${shellQuote(`${dir}/agents`)} ${shellQuote(`${dir}/external/repo.claim-x`)}`);
-    await write(`${dir}/external/repo.claim-x/precious`, 'foreign');
-    await symlink(`${dir}/external`, `${dir}/agents/a1`);
-    const staging = `${dir}/agents/a1/repo.claim-x`;
+    await write(`${dir}/stray`, 'recoverable');
+    const trash = testTrash(dir);
 
-    await sweepStrayFile(local, staging, ancestorSymlinkGuard(dir, staging));
+    await sweepStrayFile(local, `${dir}/stray`, trash);
 
-    expect(await run(`cat ${shellQuote(`${dir}/external/repo.claim-x/precious`)}`)).toBe('foreign');
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('guard refused'));
-  });
-});
-
-describe('ancestorSymlinkGuard', () => {
-  it('proves the root canonical, then one symlink check per component below it', () => {
-    expect(ancestorSymlinkGuard('/wt', '/wt/.baxian/review/inbox/f.md')).toBe(
-      `[ "$(cd -- '/wt' 2>/dev/null && pwd -P)" = '/wt' ] && [ ! -L '/wt/.baxian' ] && [ ! -L '/wt/.baxian/review' ] && [ ! -L '/wt/.baxian/review/inbox' ] && [ ! -L '/wt/.baxian/review/inbox/f.md' ]`,
-    );
+    expect(await run(`cat ${shellQuote(`${trash}/stray`)}`)).toBe('recoverable');
+    warn.mockRestore();
   });
 
-  it('rejects targets outside the root', () => {
-    expect(() => ancestorSymlinkGuard('/wt', '/elsewhere/f')).toThrow(/is not under/);
+  it('gives same-named entries unique targets inside one batch', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/a`)} ${shellQuote(`${dir}/b`)}`);
+    await write(`${dir}/a/same`, 'first');
+    await write(`${dir}/b/same`, 'second');
+    const trash = testTrash(dir);
+
+    await sweepStrayFile(local, `${dir}/a/same`, trash);
+    await sweepStrayFile(local, `${dir}/b/same`, trash);
+
+    expect(await run(`cat ${shellQuote(`${trash}/same`)}`)).toBe('first');
+    expect(await run(`cat ${shellQuote(`${trash}/same.1`)}`)).toBe('second');
   });
 
-  it('keeps "/" as the root for HOME=/ hosts (no cd -- \'\' break, no // in component paths)', () => {
-    expect(ancestorSymlinkGuard('/', '/.baxian/agents/dev-1/repo')).toBe(
-      `[ "$(cd -- '/' 2>/dev/null && pwd -P)" = '/' ] && [ ! -L '/.baxian' ] && [ ! -L '/.baxian/agents' ] && [ ! -L '/.baxian/agents/dev-1' ] && [ ! -L '/.baxian/agents/dev-1/repo' ]`,
-    );
-    expect(isUnder('/', '/.baxian/x')).toBe(true);
-    expect(isUnder('/', '/')).toBe(false);
+  it('treats an absent sweep target as success without creating a batch dir', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const trash = testTrash(dir);
+
+    await sweepStrayFile(local, `${dir}/never-existed`, trash);
+
+    expect(warn).not.toHaveBeenCalled();
+    const batch = await local.exec(`test -e ${shellQuote(trash)}`);
+    expect(batch.exitCode).toBe(1);
+    warn.mockRestore();
   });
+
 });
 
 describe('ensureBaxianRuntimeDirsSafe outcome classification', () => {
@@ -1091,7 +1230,7 @@ describe('ensureBaxianRuntimeDirsSafe outcome classification', () => {
     };
   }
 
-  it('accepts an explicit clean probe and directory guard', async () => {
+  it('accepts a clean tracked probe and prepares the runtime dirs', async () => {
     await expect(ensureBaxianRuntimeDirsSafe(runnerWith([
       { stdout: '', stderr: '', exitCode: 0 },
       { stdout: '', stderr: '', exitCode: 0 },
@@ -1102,14 +1241,14 @@ describe('ensureBaxianRuntimeDirsSafe outcome classification', () => {
     ['tracked-path exit 255', [
       { stdout: '', stderr: 'ssh disconnected', exitCode: 255 },
     ]],
-    ['guard transient failure', [
+    ['mkdir transient failure', [
       { stdout: '', stderr: '', exitCode: 0 },
       { stdout: '', stderr: 'Connection timed out', exitCode: 9 },
     ]],
     ['tracked-path transient output with exit zero', [
       { stdout: '', stderr: 'Connection timed out', exitCode: 0 },
     ]],
-    ['guard transient output with exit zero', [
+    ['mkdir transient output with exit zero', [
       { stdout: '', stderr: '', exitCode: 0 },
       { stdout: '', stderr: 'Connection timed out', exitCode: 0 },
     ]],
@@ -1121,15 +1260,14 @@ describe('ensureBaxianRuntimeDirsSafe outcome classification', () => {
     )).rejects.toMatchObject({ reason: 'runtime-path-probe-failed' });
   });
 
-  it('maps only an explicit guard exit to unsafe-runtime-path', async () => {
+  it('maps tracked .baxian paths to unsafe-runtime-path', async () => {
     await expect(ensureBaxianRuntimeDirsSafe(runnerWith([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 9 },
+      { stdout: '.baxian/x\n', stderr: '', exitCode: 0 },
     ]), '/wt')).rejects.toMatchObject({ reason: 'unsafe-runtime-path' });
   });
 });
 
-describe('stageFileGuarded (real filesystem)', () => {
+describe('stageFile (real filesystem)', () => {
   let dir: string;
 
   beforeEach(async () => {
@@ -1140,50 +1278,16 @@ describe('stageFileGuarded (real filesystem)', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('writes the tmp when the ancestor chain is clean', async () => {
+  it('writes the tmp', async () => {
     await run(`mkdir -p ${shellQuote(`${dir}/sub`)}`);
-    await stageFileGuarded(local, dir, `${dir}/sub/.tmp-abc`, 'payload');
+    await stageFile(local, `${dir}/sub/.tmp-abc`, 'payload', { trashDir: testTrash(dir) });
     expect(await run(`cat ${shellQuote(`${dir}/sub/.tmp-abc`)}`)).toBe('payload');
   });
 
-  it('refuses to write through a symlinked ancestor — the victim never sees staging bytes', async () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await run(`mkdir -p ${shellQuote(`${dir}/outside`)}`);
-    await run(`printf original > ${shellQuote(`${dir}/outside/victim.baxian-tmp`)}`);
-    await symlink(`${dir}/outside`, `${dir}/skills`);
-
-    await expect(
-      stageFileGuarded(local, dir, `${dir}/skills/victim.baxian-tmp`, 'attacker-content'),
-    ).rejects.toThrow(/staged write/);
-
-    expect(await run(`cat ${shellQuote(`${dir}/outside/victim.baxian-tmp`)}`)).toBe('original');
-  });
-
-  it('refuses when the root itself has been swapped for a symlink', async () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await run(`mkdir -p ${shellQuote(`${dir}/outside/sub`)}`);
-    await run(`printf keep > ${shellQuote(`${dir}/outside/sub/f`)}`);
-    const rootLink = `${dir}/work`;
-    await symlink(`${dir}/outside`, rootLink);
-
-    await expect(
-      stageFileGuarded(local, rootLink, `${rootLink}/sub/f`, 'overwrite'),
-    ).rejects.toThrow(/staged write/);
-
-    expect(await run(`cat ${shellQuote(`${dir}/outside/sub/f`)}`)).toBe('keep');
-  });
-});
-
-describe('stageFileGuarded parent directories (real filesystem)', () => {
-  it('creates missing parent directories inside the guarded command (fresh skill dirs)', async () => {
-    const dir = await realpath(await mkdtemp(join(tmpdir(), 'bx-stage-mkdir-')));
-    try {
-      const tmp = `${dir}/.claude/skills/baxian-new/SKILL.md.baxian-tmp-abc123`;
-      await stageFileGuarded(local, dir, tmp, 'skill-body');
-      expect(await run(`cat ${shellQuote(tmp)}`)).toBe('skill-body');
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
+  it('creates missing parent directories inside the staged command (fresh skill dirs)', async () => {
+    const tmp = `${dir}/.claude/skills/baxian-new/SKILL.md.baxian-tmp-abc123`;
+    await stageFile(local, tmp, 'skill-body', { trashDir: testTrash(dir) });
+    expect(await run(`cat ${shellQuote(tmp)}`)).toBe('skill-body');
   });
 });
 
@@ -1195,7 +1299,7 @@ describe('staged file mutation outcome classification', () => {
     return {
       exec: async command => command.includes('mv -f --')
         ? results.move ?? ok
-        : { stdout: 'BX_SWEEP_REMOVED', stderr: '', exitCode: 0 },
+        : { stdout: 'BX_TRASHED', stderr: '', exitCode: 0 },
       writeFile: async () => undefined,
       execWithStdin: async () => results.stage ?? ok,
     };
@@ -1206,7 +1310,7 @@ describe('staged file mutation outcome classification', () => {
       stage: { stdout: '', stderr: 'ssh response lost', exitCode: 255 },
     });
 
-    await expect(stageFileGuarded(runner, '/wt', '/wt/.tmp-request', 'payload'))
+    await expect(stageFile(runner, '/wt/.tmp-request', 'payload', { trashDir: testTrash('/wt') }))
       .rejects.toBeInstanceOf(ExecOutcomeUnknownError);
   });
 
@@ -1218,11 +1322,62 @@ describe('staged file mutation outcome classification', () => {
       move: { stdout: '', stderr: 'permission denied', exitCode: 9 },
     });
 
-    await expect(moveFileIntoPlace(unknown, '/wt/.tmp-request', '/wt/request'))
+    await expect(moveFileIntoPlace(unknown, '/wt/.tmp-request', '/wt/request', { trashDir: testTrash('/wt') }))
       .rejects.toBeInstanceOf(ExecOutcomeUnknownError);
-    const refusal = await moveFileIntoPlace(refused, '/wt/.tmp-request', '/wt/request')
+    const refusal = await moveFileIntoPlace(refused, '/wt/.tmp-request', '/wt/request', { trashDir: testTrash('/wt') })
       .then(() => undefined, err => err);
     expect(refusal).toBeInstanceOf(Error);
     expect(refusal).not.toBeInstanceOf(ExecOutcomeUnknownError);
+  });
+});
+
+describe('sweepStrayFile real-shell outcomes', () => {
+  let dir: string;
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'bx-trash-'));
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    warn.mockRestore();
+    await chmod(join(dir, 'batch'), 0o755).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('moves an existing entry into the batch under its own name', async () => {
+    await writeFile(join(dir, 'doomed.txt'), 'keep me');
+    const batch = join(dir, 'batch');
+    await sweepStrayFile(local, join(dir, 'doomed.txt'), batch);
+    expect(existsSync(join(dir, 'doomed.txt'))).toBe(false);
+    expect(await readFile(join(batch, 'doomed.txt'), 'utf-8')).toBe('keep me');
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('treats an absent source as success without creating the batch', async () => {
+    await sweepStrayFile(local, join(dir, 'never-existed'), join(dir, 'batch'));
+    expect(warn).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, 'batch'))).toBe(false);
+  });
+
+  it('surfaces a batch mkdir failure as move-failed, not unknown, and keeps the source', async () => {
+    await writeFile(join(dir, 'blocker'), '');
+    await writeFile(join(dir, 'src.txt'), 'still here');
+    await sweepStrayFile(local, join(dir, 'src.txt'), join(dir, 'blocker', 'batch'));
+    expect(await readFile(join(dir, 'src.txt'), 'utf-8')).toBe('still here');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/move failed \(exit [1-9]/);
+    expect(String(warn.mock.calls[0][0])).not.toMatch(/UNKNOWN/);
+  });
+
+  it('surfaces an mv failure into a read-only batch and keeps the source', async () => {
+    await mkdir(join(dir, 'batch'));
+    await chmod(join(dir, 'batch'), 0o555);
+    await writeFile(join(dir, 'src.txt'), 'still here');
+    await sweepStrayFile(local, join(dir, 'src.txt'), join(dir, 'batch'));
+    expect(await readFile(join(dir, 'src.txt'), 'utf-8')).toBe('still here');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/move failed/);
   });
 });

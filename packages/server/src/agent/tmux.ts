@@ -28,7 +28,7 @@ export type KillClaimCond =
   | { kind: 'equals'; claim: string }
   | { kind: 'emptyOr'; claim: string };
 
-export const CREATION_NONCE_ENV = 'BAXIAN_CREATION_NONCE';
+const CREATION_NONCE_ENV = 'BAXIAN_CREATION_NONCE';
 const SESSION_REF_FORMAT = '#{pid}|#{start_time}|#{session_id}';
 const REFUSED_MARKER = 'BX_KILL_REFUSED';
 const TARGET_GONE_MARKER = 'BX_TARGET_GONE';
@@ -109,11 +109,6 @@ function assertPlainSessionName(name: string): void {
   if (!/^[A-Za-z0-9_@=[\]-]+$/.test(name)) {
     throw new Error(`tmux session name ${JSON.stringify(name)} contains unsupported characters`);
   }
-}
-
-export interface PaneInfo {
-  paneId: string;
-  current: string;
 }
 
 export type OwnerWriteCapability = 'full' | 'legacy' | null;

@@ -10,8 +10,8 @@ import { createHash } from 'node:crypto';
 
 export const DRIVER_MAX_BUFFER = 64 * 1024 * 1024;
 export const DRIVER_EXEC_TIMEOUT_MS = 60_000;
-export const LIST_PRS_PAGE_CAP = 10;
-export const COMMENT_SOURCE_PAGE_CAP = 100;
+const LIST_PRS_PAGE_CAP = 10;
+const COMMENT_SOURCE_PAGE_CAP = 100;
 const STDERR_TAIL_CHARS = 500;
 
 export interface DriverExecResult {

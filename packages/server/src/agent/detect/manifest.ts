@@ -4,7 +4,7 @@ import { extractRegion, type DetectionInput } from './region.js';
 
 export type DetectedState = 'idle' | 'working' | 'pending' | 'unknown';
 
-export interface ManifestRule extends Gate {
+interface ManifestRule extends Gate {
   id: string;
   state: DetectedState;
   priority: number;

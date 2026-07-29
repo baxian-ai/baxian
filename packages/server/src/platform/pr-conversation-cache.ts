@@ -1,11 +1,11 @@
 import type { PrReviewItem, TaskState } from '../shared/index.js';
 
-export const PR_CONVERSATION_RATE_LIMIT_TTL_MS = 60_000;
+const PR_CONVERSATION_RATE_LIMIT_TTL_MS = 60_000;
 const RATE_LIMIT_STRIKE_MEMORY_MS = 10 * 60_000;
 const RATE_LIMIT_MAX_WAIT_MS = 900_000;
-export const PR_CONVERSATION_CACHE_MAX_ENTRIES = 64;
-export const PR_CONVERSATION_CACHE_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
-export const PR_CONVERSATION_CACHE_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+const PR_CONVERSATION_CACHE_MAX_ENTRIES = 64;
+const PR_CONVERSATION_CACHE_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
+const PR_CONVERSATION_CACHE_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 
 export interface PrConversationPayload {
   items: PrReviewItem[];
@@ -20,7 +20,7 @@ type RevisionTask = Pick<
   'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber' | 'reviewConversationUpdatedAt' | 'closedUnmergedAnchor'
 >;
 
-export function closedUnmergedAnchorSlot(task: Pick<TaskState, 'closedUnmergedAnchor'>): string {
+function closedUnmergedAnchorSlot(task: Pick<TaskState, 'closedUnmergedAnchor'>): string {
   const anchor = task.closedUnmergedAnchor;
   if (anchor === undefined) return '';
   return `${anchor.generation}/${anchor.cleared === true ? 'reopened' : 'closed'}`;

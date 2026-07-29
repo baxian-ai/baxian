@@ -10,7 +10,7 @@ export interface VerdictSourceScan {
   rows: NormalizedRow[];
 }
 
-export interface VerdictTokenPair {
+interface VerdictTokenPair {
   passToken: string;
   failToken: string;
 }
@@ -24,7 +24,7 @@ export interface VerdictInput {
   visibilityLagMs: number;
 }
 
-export interface VerdictCarrier {
+interface VerdictCarrier {
   sourceKey: string;
   id: string;
   bodyDigest: string;

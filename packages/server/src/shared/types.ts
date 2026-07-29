@@ -38,7 +38,7 @@ export interface ProjectConfig {
   agent: AgentConfig[][];
 }
 
-export interface GitCliConfig {
+interface GitCliConfig {
   tool: string;
   binary?: string;
   notes?: string;
@@ -220,7 +220,7 @@ export interface TaskAttentionGeneration extends TaskGenerationGuard {
   remoteCleanupGeneration?: string;
 }
 
-export interface TaskAttention {
+interface TaskAttention {
   reason: string;
   runbook: string;
   occurredAt: string;
@@ -369,7 +369,7 @@ export function taskMatchesAttentionGeneration(
 
 export type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment';
 
-export type PrReviewVerdict = 'approve' | 'request-changes' | 'comment';
+type PrReviewVerdict = 'approve' | 'request-changes' | 'comment';
 
 export interface PrReviewItem {
   kind: PrReviewItemKind;

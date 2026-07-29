@@ -1,4 +1,5 @@
 import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
+import { assertInsideManagedDir } from './managed-path.js';
 import { join } from 'node:path';
 import type { AgentBindingFacts, NeedInputWatermark } from '../shared/index.js';
 
@@ -103,7 +104,7 @@ export class AgentStore {
   private async deleteLocked(id: string): Promise<void> {
     if (!SAFE_ID.test(id)) return;
     try {
-      await unlink(this.path(id));
+      await unlink(assertInsideManagedDir(this.dir, this.path(id)));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (code !== 'ENOENT') {

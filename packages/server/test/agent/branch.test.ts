@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -317,21 +317,6 @@ describe('BranchManager', () => {
       ),
     ).rejects.toThrow(/review head mismatch/i);
     expect(await new BranchManager(local).currentRef(workdir)).toBe('refs/heads/main');
-  });
-
-  it('fails closed when an intermediate Workdir ancestor is a symlink (guarded git never writes through it)', async () => {
-    const realParent = join(tempDir, 'real');
-    await mkdir(realParent, { recursive: true });
-    const realWorkdir = join(realParent, 'agent');
-    await run(`git clone -q ${shellQuote(origin)} ${shellQuote(realWorkdir)}`);
-    await symlink(realParent, join(tempDir, 'linked'));
-    const viaSymlink = join(tempDir, 'linked', 'agent');
-
-    await expect(
-      new BranchManager(local).switchToTaskBranch(viaSymlink, 'task-x', 'bx/task-x', true),
-    ).rejects.toThrow(/fetch/i);
-    const ref = await local.exec(`git -C ${shellQuote(realWorkdir)} rev-parse --verify -q refs/remotes/origin/bx/task-x`);
-    expect(ref.exitCode).not.toBe(0);
   });
 
   it('refuses an existing task branch that tracks a different upstream', async () => {

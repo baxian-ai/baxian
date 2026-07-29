@@ -235,7 +235,8 @@ describe('AgentManager skill scope', () => {
     const staged: string[] = [];
     const runner = {
       exec: vi.fn(async (cmd: string) => ({
-        stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+        stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n'
+          : cmd.includes('BX_SKILLS_SWEPT') ? 'BX_SKILLS_SWEPT' : '',
         stderr: '',
         exitCode: 0,
       })),

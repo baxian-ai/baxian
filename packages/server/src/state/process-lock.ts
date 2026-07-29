@@ -1,5 +1,6 @@
 import { writeFile, readFile, unlink } from 'node:fs/promises';
 import { readFileSync, unlinkSync } from 'node:fs';
+import { assertInsideManagedDir } from './managed-path.js';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -25,7 +26,7 @@ export class ProcessLock {
   private readonly path: string;
 
   constructor(stateDir: string, fileName: string = LOCK_FILE) {
-    this.path = join(stateDir, fileName);
+    this.path = assertInsideManagedDir(stateDir, join(stateDir, fileName));
   }
 
   async acquire(): Promise<ProcessLockInfo> {

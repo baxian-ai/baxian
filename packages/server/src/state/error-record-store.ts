@@ -1,4 +1,5 @@
 import { appendFile, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { assertInsideManagedDir } from './managed-path.js';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AgentErrorSummary } from '../shared/index.js';
@@ -155,7 +156,7 @@ export class ErrorRecordStore {
         } catch (err) {
           console.warn(`[ErrorRecordStore] rewriteFiltered: atomic rewrite failed for ${file}:`, err);
           try {
-            await unlink(tmp);
+            await unlink(assertInsideManagedDir(this.dir, tmp));
           } catch (rmErr) {
             if ((rmErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
               console.warn(`[error-record-store] failed to remove tmp ${tmp}:`, rmErr);

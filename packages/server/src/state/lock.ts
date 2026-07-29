@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { assertInsideManagedDir } from './managed-path.js';
 import { join } from 'node:path';
 
 export interface AgentLockClaim {
@@ -38,7 +39,7 @@ export class LockManager {
       const claim = await this.readClaim(agentId);
       if (!claim || claim.taskId !== taskId || claim.token !== token) return false;
       try {
-        await unlink(this.path(agentId));
+        await unlink(assertInsideManagedDir(this.dir, this.path(agentId)));
         return true;
       } catch (err) {
         if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return false;

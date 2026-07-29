@@ -110,16 +110,6 @@
     @apply border border-dashed border-current bg-transparent;
   }
 
-  .finding-dot {
-    @apply inline-block h-2 w-2 rounded-full bg-og-300 align-middle;
-  }
-  .finding-dot-critical {
-    @apply bg-danger;
-  }
-  .finding-dot-major {
-    @apply bg-warn;
-  }
-
   .card {
     @apply rounded-lg border border-hairline bg-surface transition-colors hover:border-og-100;
   }

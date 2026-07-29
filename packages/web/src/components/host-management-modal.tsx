@@ -23,7 +23,7 @@ interface FormState {
 
 const EMPTY_FORM: FormState = { hostname: '', port: '', alias: '', user: '', password: '' };
 
-export function hostLabel(h: HostConfig): string {
+function hostLabel(h: HostConfig): string {
   if (h.alias) return h.alias;
   const at = h.user ? `${h.user}@` : '';
   return `${at}${h.hostname}${h.port != null ? `:${h.port}` : ''}`;

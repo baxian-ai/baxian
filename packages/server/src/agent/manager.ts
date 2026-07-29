@@ -71,7 +71,7 @@ import {
   hostGroupKey,
   workdirHostGroupKey,
 } from './runner.js';
-import { isTransientNetworkFailure } from './net-exec.js';
+import { execOutcomeUnknown, isTransientNetworkFailure } from './net-exec.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
 import {
   TmuxManager,
@@ -91,7 +91,7 @@ import {
   type PaneRef,
 } from './tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError, isAutoDeletableTaskBranch } from './branch.js';
-import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFileGuarded, canonicalSelfGuard, type RepoStoreCache } from './repo-store.js';
+import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFile, trashBatchDirUnder, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import {
   PhaseSignalWatcher,
@@ -1033,13 +1033,15 @@ export class AgentManager {
     const subdir = skillSubdirFor(agent.runtime);
     const destRoot = `${workdir}/${subdir}`;
     await this.excludeInjectedSkills(runner, workdir, subdir);
+    // Batch inside the swept tree itself: a symlinked skills dir may live on another filesystem, where mv degrades to copy+unlink.
+    const trashDir = trashBatchDirUnder(`${destRoot}/.baxian-trash`, 'skills');
     await this.runUnderSkillDirLock(this.skillDirLockKey(agent, workdir), async () => {
       await this.ensureSkillDirSafe(runner, workdir, subdir, [
         ...this.skillRegistry.names(),
         ...this.skillRegistry.pluginSkillNames(scope),
-      ]);
+      ], trashDir);
       await this.skillRegistry.materialize(
-        (path, content) => this.atomicWriteFile(runner, workdir, path, content),
+        (path, content) => this.atomicWriteFile(runner, path, content, trashDir),
         destRoot,
         scope,
       );
@@ -1149,14 +1151,14 @@ export class AgentManager {
 
   private async atomicWriteFile(
     runner: CommandRunner,
-    workdir: string,
     finalPath: string,
     content: Buffer,
+    trashDir: string,
   ): Promise<void> {
     const tmp = `${finalPath}.baxian-tmp-${randomBytes(6).toString('hex')}`;
     try {
-      await stageFileGuarded(runner, workdir, tmp, content);
-      await moveFileIntoPlace(runner, tmp, finalPath, { guardRoot: workdir });
+      await stageFile(runner, tmp, content, { trashDir });
+      await moveFileIntoPlace(runner, tmp, finalPath, { trashDir });
     } catch (err) {
       throw new Error(`atomic skill write failed (${finalPath}): ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1167,24 +1169,40 @@ export class AgentManager {
     workdir: string,
     subdir: string,
     keepNames: string[],
+    trashDir: string,
   ): Promise<void> {
-    const top = subdir.split('/')[0];
+    const SKILLS_SWEPT = 'BX_SKILLS_SWEPT';
     const keep = keepNames.map((n) => `! -name ${shellQuote(n)}`).join(' ');
+    const batch = shellQuote(trashDir);
+    // Stale directories go first so the later link/file passes only see what stayed behind in kept dirs. -H follows a symlinked skills dir given as the start path; -exec … + propagates a mover failure into find's exit code (\; would swallow it); pruning .baxian-trash keeps the never-emptied trash out of the walk (it only grows, and one unreadable old batch would fail every sweep).
+    const prune = `-name .baxian-trash -prune -o`;
+    const findStaleDirs = `find -H ${subdir} -maxdepth 1 ${prune} -name 'baxian-*' ${keep}`;
+    const findStaleLinks = `find -H ${subdir} ${prune} -path '${subdir}/baxian-*' -type l`;
+    const findStaleFiles = `find -H ${subdir} ${prune} -path '${subdir}/baxian-*/*' -type f ! -name 'SKILL.md'`;
+    const mover =
+      `dest="$0"; for f in "$@"; do ` +
+      `mkdir -p "$dest" || exit 1; ` +
+      `base=$(basename -- "$f"); t="$dest/$base"; n=0; ` +
+      `while [ -e "$t" ] || [ -L "$t" ]; do n=$((n+1)); t="$dest/$base.$n"; done; ` +
+      `mv -- "$f" "$t" || exit 1; ` +
+      `done`;
+    const moveStale = (find: string): string => `${find} -exec sh -c '${mover}' ${batch} {} +`;
     const inner =
-      // Keep the canonical Workdir check and find/rm in one command to fail closed on a rebound ancestor.
-      `${canonicalSelfGuard(workdir)} && ` +
       `cd ${shellQuote(workdir)} && ` +
-      `for d in ${top} ${subdir}; do if [ -L "$d" ]; then ` +
-      `printf 'baxian: %s is a symlink -> %s; replace it with a real directory\\n' "$d" "$(readlink "$d")" >&2; ` +
-      `exit 3; fi; done && ` +
       `mkdir -p ${subdir} && ` +
-      `find ${subdir} -maxdepth 1 -name 'baxian-*' ${keep} -exec rm -rf {} + && ` +
-      `find ${subdir} -path '${subdir}/baxian-*' -type l -exec rm -f {} + && ` +
-      `find ${subdir} -path '${subdir}/baxian-*/*' -type f ! -name 'SKILL.md' -exec rm -f {} +`;
+      `${moveStale(findStaleDirs)} && ` +
+      `${moveStale(findStaleLinks)} && ` +
+      `${moveStale(findStaleFiles)} && ` +
+      `printf '%s' ${SKILLS_SWEPT}`;
     const res = await runner.exec(`sh -c ${shellQuote(inner)}`);
-    if (res.exitCode !== 0) {
+    if (execOutcomeUnknown(res)) {
       throw new Error(
-        `failed to prepare a symlink-safe ${subdir} in ${workdir}: ${res.stderr || 'unknown error'}`,
+        `skill sweep outcome unknown in ${workdir}/${subdir} (exit ${res.exitCode}): ${res.stderr.trim() || res.stdout.trim() || 'no output'}`,
+      );
+    }
+    if (res.exitCode !== 0 || !res.stdout.includes(SKILLS_SWEPT)) {
+      throw new Error(
+        `failed to prepare ${subdir} in ${workdir}: ${res.stderr.trim() || `exit ${res.exitCode}, no completion marker`}`,
       );
     }
   }
@@ -1211,19 +1229,28 @@ export class AgentManager {
     workdir: string,
     subdir: string,
   ): Promise<void> {
+    // cd -P first: tracked/exclude/probe all run against the skills dir's PHYSICAL owning repo, so a symlink pointing back inside a worktree keeps the tracked-content protection while one pointing outside degrades to the plain non-git path.
     const inner =
-      `${canonicalSelfGuard(workdir)} && ` +
       `cd ${shellQuote(workdir)} && ` +
+      `mkdir -p ${subdir} && cd -P ${subdir} && ` +
       `if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo BX_SKILLS_NON_GIT; exit 0; fi; ` +
-      `tracked="$(git ls-files -- ${shellQuote(`${subdir}/baxian-*`)} 2>/dev/null | head -5)"; ` +
+      `tracked="$(git ls-files -- 'baxian-*' 2>/dev/null | head -5)"; ` +
       `if [ -n "$tracked" ]; then printf 'BX_SKILLS_TRACKED %s\\n' "$tracked" | head -1; exit 0; fi; ` +
       `p="$(git rev-parse --git-path info/exclude)" || { echo BX_SKILLS_EXCLUDE_WRITE_FAILED; exit 0; }; ` +
-      `pre="$(git rev-parse --show-prefix 2>/dev/null)"; rule="\${pre}${subdir}/baxian-*"; ` +
-      `{ mkdir -p "$(dirname "$p")" && { grep -qxF "$rule" "$p" 2>/dev/null || printf '%s\\n' "$rule" >> "$p"; }; } ` +
+      // show-prefix is a literal path but lands in a gitignore pattern: escape fnmatch metacharacters or a dir like skill[dir] never matches its own rule.
+      `pre="$(git rev-parse --show-prefix 2>/dev/null | sed 's/[][\\*?]/\\\\&/g')"; rule="/\${pre}baxian-*"; trashrule="/\${pre}.baxian-trash"; ` +
+      `{ mkdir -p "$(dirname "$p")" && { grep -qxF "$rule" "$p" 2>/dev/null || printf '%s\\n' "$rule" >> "$p"; } ` +
+      `&& { grep -qxF "$trashrule" "$p" 2>/dev/null || printf '%s\\n' "$trashrule" >> "$p"; }; } ` +
       `|| { echo BX_SKILLS_EXCLUDE_WRITE_FAILED; exit 0; }; ` +
-      `if git check-ignore -q -- ${shellQuote(`${subdir}/baxian-__probe__/SKILL.md`)}; then echo BX_SKILLS_OK; ` +
+      `if git check-ignore -q -- 'baxian-__probe__/SKILL.md' ` +
+      `&& git check-ignore -q -- '.baxian-trash/__probe__'; then echo BX_SKILLS_OK; ` +
       `else echo BX_SKILLS_EXCLUDE_INEFFECTIVE; fi`;
     const res = await runner.exec(`sh -c ${shellQuote(inner)}`);
+    if (execOutcomeUnknown(res)) {
+      throw new Error(
+        `skill exclusion probe outcome unknown in ${workdir} (exit ${res.exitCode}): ${res.stderr.trim() || res.stdout.trim() || 'no output'}`,
+      );
+    }
     if (res.exitCode !== 0) {
       throw new Error(
         `skill exclusion probe failed in ${workdir}: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
@@ -4198,7 +4225,7 @@ export class AgentManager {
     if (!this.deletionGateOpen(agentId, genAtEntry)) {
       throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
     }
-    const workdir = (await this.ensureWorkdir(cfg, project, runner)).workdir;
+    const { workdir } = await this.ensureWorkdir(cfg, project, runner);
     const paneWorkdir = await tmux.getPaneCurrentPath(pane);
     if (!await sameDirOnHost(runner, paneWorkdir, workdir)) {
       throw new Error(
@@ -7080,7 +7107,7 @@ export class AgentManager {
     agent: AgentConfig,
     project: ProjectConfig,
     runner: CommandRunner,
-  ): Promise<{ workdir: string; repoStore: RepoStore | null }> {
+  ): Promise<{ workdir: string; repoStore: RepoStore }> {
     const repoStore = this.createRepoStore(agent, project, runner);
     const workdir = await repoStore.ensure();
     return { workdir, repoStore };

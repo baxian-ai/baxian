@@ -2,7 +2,6 @@ import { BRANCH_PREFIX, isValidBranchName } from '../shared/index.js';
 import { execNetwork, GIT_NET_ENV } from './net-exec.js';
 import type { CommandRunner } from './runner.js';
 import { shellQuote } from './runner.js';
-import { canonicalSelfGuard } from './repo-store.js';
 
 export interface AutoDeleteIdentity {
   taskId?: string;
@@ -151,7 +150,7 @@ export class BranchManager {
     const remoteRef = `refs/remotes/origin/${branch}`;
     const fetch = await execNetwork(
       this.runner,
-      `${canonicalSelfGuard(workdir)} && ${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
+      `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
         `${shellQuote(`+refs/heads/${branch}:${remoteRef}`)}`,
     );
     if (fetch.exitCode !== 0) throw new Error(`Failed to fetch branch ${branch}: ${fetch.stderr.trim()}`);
@@ -229,7 +228,7 @@ export class BranchManager {
     try {
       fetched = await execNetwork(
         this.runner,
-        `${canonicalSelfGuard(workdir)} && ${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
+        `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
           `${shellQuote(`+refs/heads/${identity.taskBranch}:${remoteRef}`)}`,
       );
     } catch (err) {
@@ -280,7 +279,7 @@ export class BranchManager {
     await this.switchDetached(workdir, await this.resolveCommit(workdir, 'origin/HEAD'));
     await assertOwner();
     const deleted = await this.runner.exec(
-      `${canonicalSelfGuard(workdir)} && git -C ${shellQuote(workdir)} branch -d -- ${shellQuote(identity.taskBranch)}`,
+      `git -C ${shellQuote(workdir)} branch -d -- ${shellQuote(identity.taskBranch)}`,
     );
     if (deleted.exitCode !== 0) {
       return {
@@ -352,8 +351,7 @@ export class BranchManager {
     await this.verifyUpstreamIfPresent(workdir, branch);
     if (await this.readUpstream(workdir, branch)) return;
     const configured = await this.runner.exec(
-      `${canonicalSelfGuard(workdir)} && ` +
-        `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.remote`)} origin && ` +
+      `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.remote`)} origin && ` +
         `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.merge`)} ` +
         `${shellQuote(`refs/heads/${branch}`)}`,
     );
@@ -377,8 +375,7 @@ export class BranchManager {
   private async markTaskBranch(workdir: string, branch: string, taskId: string): Promise<void> {
     const marker = shellQuote(`branch.${branch}.baxian-task-id`);
     const configured = await this.runner.exec(
-      `${canonicalSelfGuard(workdir)} && ` +
-        `git -C ${shellQuote(workdir)} config --local ${marker} ${shellQuote(taskId)} && ` +
+      `git -C ${shellQuote(workdir)} config --local ${marker} ${shellQuote(taskId)} && ` +
         `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.remote`)} origin && ` +
         `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.merge`)} ` +
         `${shellQuote(`refs/heads/${branch}`)}`,
@@ -403,13 +400,13 @@ export class BranchManager {
   private async fetch(workdir: string): Promise<void> {
     const result = await execNetwork(
       this.runner,
-      `${canonicalSelfGuard(workdir)} && ${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin --prune`,
+      `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin --prune`,
     );
     if (result.exitCode !== 0) throw new Error(`git fetch failed in ${workdir}: ${result.stderr.trim()}`);
   }
 
   private async switch(workdir: string, args: string): Promise<void> {
-    const result = await this.runner.exec(`${canonicalSelfGuard(workdir)} && git -C ${shellQuote(workdir)} switch ${args}`);
+    const result = await this.runner.exec(`git -C ${shellQuote(workdir)} switch ${args}`);
     if (result.exitCode !== 0) throw new Error(`git switch failed in ${workdir}: ${result.stderr.trim()}`);
   }
 

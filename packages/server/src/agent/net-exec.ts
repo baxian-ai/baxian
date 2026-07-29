@@ -71,12 +71,6 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-let sleepImpl: (ms: number) => Promise<void> = defaultSleep;
-
-export function __setNetExecSleepForTests(fn?: (ms: number) => Promise<void>): void {
-  sleepImpl = fn ?? defaultSleep;
-}
-
 export async function execNetwork(
   runner: CommandRunner,
   command: string,
@@ -84,7 +78,7 @@ export async function execNetwork(
 ): Promise<ExecResult> {
   const timeout = opts.timeout ?? NET_EXEC_TIMEOUT_MS;
   const retries = opts.retries ?? NET_EXEC_RETRIES;
-  const sleep = opts.sleep ?? sleepImpl;
+  const sleep = opts.sleep ?? defaultSleep;
   const backoff = opts.random ? { ...BACKOFF, random: opts.random } : BACKOFF;
 
   for (let attempt = 1; ; attempt++) {

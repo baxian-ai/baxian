@@ -1,5 +1,6 @@
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { assertInsideManagedDir } from './managed-path.js';
 import { randomUUID } from 'node:crypto';
 import { isRecord } from '../shared/index.js';
 import type { PetMeta, PetSpritesheetExt } from '../shared/index.js';
@@ -106,7 +107,7 @@ export class PetStore {
         await this.writeAssignments(map);
       }
       if (!this.dir) this.memLibrary.delete(petId);
-      else await rm(join(this.dir, petId), { recursive: true, force: true });
+      else await rm(assertInsideManagedDir(this.dir, join(this.dir, petId)), { recursive: true, force: true });
       return ids;
     });
     for (const agentId of affected) this.emit(agentId);

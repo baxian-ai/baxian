@@ -428,8 +428,8 @@ describe('saveConfig', () => {
 
     await saveConfig(path, { ...VALID_CONFIG } as BaxianConfig);
 
-    const files = await readdir(tempDir);
-    const backups = files.filter(f => /baxian\.json\.\d{8}-\d{6}$/.test(f));
+    const backups = (await readdir(join(tempDir, '.baxian', 'config-backups')))
+      .filter(f => /baxian\.json\.\d{8}-\d{6}$/.test(f));
     expect(backups).toHaveLength(1);
 
     const config = await loadConfig(path);

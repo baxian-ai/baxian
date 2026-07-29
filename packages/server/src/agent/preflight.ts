@@ -1,6 +1,5 @@
 import type { CommandRunner, RemoteShellMode } from './runner.js';
 import { LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshEnv } from './runner.js';
-import { ancestorSymlinkGuard } from './repo-store.js';
 import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork, execOutcomeUnknown } from './net-exec.js';
 import type { AgentConfig, AgentRuntime, HostConfig } from '../shared/index.js';
 import { isGitHubRepo, parseGitRemote, redactGitCredentials, repoSlug } from '../shared/index.js';
@@ -407,12 +406,12 @@ async function runAutoModePreflight(
   }
   const root = `${home}/.baxian/agents/${agentId}`;
   const absRepoPath = `${root}/repo`;
-  const mk = await runner.exec(`${ancestorSymlinkGuard(home, root)} && mkdir -p ${shellQuote(root)} && test -w ${shellQuote(root)}`);
+  const mk = await runner.exec(`mkdir -p ${shellQuote(root)} && test -w ${shellQuote(root)}`);
   if (mk.exitCode !== 0) {
     results.push({
       step: 'workdir',
       ok: false,
-      message: `Cannot create or write to ${root} (symlink-safe): ${mk.stderr || mk.stdout}`,
+      message: `Cannot create or write to ${root}: ${mk.stderr || mk.stdout}`,
     });
     return;
   }

@@ -271,40 +271,11 @@ describe('TaskStore', () => {
     expect(await store.nextId()).toBe('task-008');
   });
 
-  it('deletes task', async () => {
-    await store.set(makeTask({ id: 'task-001', status: 'pending' }));
-    await store.delete('task-001');
-    expect(await store.get('task-001')).toBeNull();
-  });
-
-  it('delete fires onChange on success and on ENOENT (idempotent), not on EPERM', async () => {
-    const fired: Array<['set' | 'delete', string]> = [];
-    store.onChange((kind, id) => fired.push([kind, id]));
-    await store.set(makeTask({ id: 'task-005', status: 'pending' }));
-    fired.length = 0;
-    await store.delete('task-005');
-    expect(fired).toEqual([['delete', 'task-005']]);
-
-    fired.length = 0;
-    await store.delete('task-missing');
-    expect(fired).toEqual([['delete', 'task-missing']]);
-
-    const { mkdir } = await import('node:fs/promises');
-    await mkdir(join(tempDir, 'state', 'tasks', 'task-stuck.json'), { recursive: true });
-    fired.length = 0;
-    await store.delete('task-stuck');
-    expect(fired).toEqual([]);
-  });
-
-  it('get/delete reject path-like ids so a store key cannot escape its dir', async () => {
+  it('get rejects path-like ids so a store key cannot escape its dir', async () => {
     await store.set(makeTask({ id: 'task-001', status: 'pending' }));
     for (const bad of ['../../../secret', '../task-001', 'a/b', '..', 'task 001', '中文']) {
       expect(await store.get(bad)).toBeNull();
     }
-    const fired: Array<['set' | 'delete', string]> = [];
-    store.onChange((kind, id) => fired.push([kind, id]));
-    await store.delete('../../../secret');
-    expect(fired).toEqual([]);
     expect(await store.get('task-001')).not.toBeNull();
   });
 });

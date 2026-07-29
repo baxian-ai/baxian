@@ -1,9 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AgentConfig, BaxianConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager } from '../../src/agent/manager.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { LocalRunner } from '../../src/agent/runner.js';
 import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from '../../src/agent/branch.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
@@ -230,7 +235,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
     function capturingRunner(): { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn>; execWithStdin: ReturnType<typeof vi.fn> } {
       return {
         exec: vi.fn(async (cmd: string): Promise<ExecResult> => ({
-          stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+          stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n'
+            : cmd.includes('BX_SKILLS_SWEPT') ? 'BX_SKILLS_SWEPT' : '',
           stderr: '',
           exitCode: 0,
         })),
@@ -252,26 +258,34 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(devStaged.every(p => /\.baxian-tmp-[0-9a-f]{12}$/.test(p))).toBe(true);
     expect(devStaged.every(p => !p.includes('/.agents/skills/'))).toBe(true);
     const devStageCmds = devRunner.execWithStdin.mock.calls.map(c => c[0] as string).filter(c => c.includes('cat > '));
-    expect(devStageCmds.every(c => c.includes(`[ "$(cd -- '/tmp/repo' 2>/dev/null && pwd -P)" = '/tmp/repo' ]`))).toBe(true);
+    expect(devStageCmds.every(c => c.includes('mkdir -p '))).toBe(true);
     const devMv = devRunner.exec.mock.calls.map(c => c[0] as string).filter(c => c.includes('mv -f'));
     expect(devMv.some(c => /\.claude\/skills\/baxian-task-check\/SKILL\.md\.baxian-tmp-[0-9a-f]{12}/.test(c))).toBe(true);
     expect(devMv.length).toBe(devStaged.length);
     const excludeCmd = devRunner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('info/exclude'));
     expect(excludeCmd).toBeDefined();
-    expect(excludeCmd).toContain('.claude/skills/baxian-*');
-    expect(excludeCmd).not.toContain("'.claude/skills/'");
+    expect(excludeCmd).toContain('cd -P .claude/skills');
+    expect(excludeCmd).toContain('rule="/${pre}baxian-*"');
     expect(excludeCmd).toContain('sh -c');
     expect(excludeCmd).toContain('show-prefix');
-    const guardCmd = devRunner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('[ -L'));
-    expect(guardCmd).toBeDefined();
-    expect(guardCmd).toContain('sh -c');
-    expect(guardCmd).toContain('find .claude/skills -maxdepth 1 -name');
-    expect(guardCmd).toContain('baxian-*');
-    expect(guardCmd).toContain('! -name');
-    expect(guardCmd).toContain('readlink');
-    expect(guardCmd).toContain('-type l -exec rm -f');
-    expect(guardCmd).toContain('-type f ! -name');
-    expect(guardCmd).toContain('SKILL.md');
+    const sweepCmd = devRunner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('maxdepth 1'));
+    expect(sweepCmd).toBeDefined();
+    expect(sweepCmd).toContain('sh -c');
+    expect(sweepCmd).toContain('find -H .claude/skills -maxdepth 1 -name');
+    expect(sweepCmd).toContain('baxian-*');
+    expect(sweepCmd).toContain('! -name');
+    expect(sweepCmd).toContain('-type l -exec sh -c');
+    expect(sweepCmd).toContain('mv -- "$f" "$t"');
+    expect(sweepCmd).toContain('{} +');
+    expect(sweepCmd).toContain('-type f ! -name');
+    expect(sweepCmd).toContain('SKILL.md');
+    expect(sweepCmd).toContain("'/tmp/repo/.claude/skills/.baxian-trash/");
+    expect(sweepCmd).toContain('BX_SKILLS_SWEPT');
+    expect(sweepCmd).toMatch(/find -H \.claude\/skills -maxdepth 1 -name \.baxian-trash -prune -o/);
+    expect(sweepCmd).toMatch(/find -H \.claude\/skills -name \.baxian-trash -prune -o -path/);
+    expect(sweepCmd).not.toContain('rm -rf');
+    expect(sweepCmd).not.toContain('rm -f');
+    expect(excludeCmd).toContain('trashrule="/${pre}.baxian-trash"');
 
     const qaAgent = agentConfig({ id: 'qa-1', runtime: 'codex', role: 'qa' });
     const qaRunner = capturingRunner();
@@ -281,6 +295,244 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(qaStaged.some(p => p.startsWith('/tmp/repo/.agents/skills/baxian-pr-review/SKILL.md.baxian-tmp-'))).toBe(true);
     expect(qaStaged.some(p => /\/baxian-(?:rules|server-feedback)\//.test(p))).toBe(false);
     expect(qaStaged.every(p => !p.includes('/.claude/skills/'))).toBe(true);
+  });
+
+  it('sweeps a symlinked skills root for real: stale entries land in a batch inside the linked tree', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'bx-sweep-'));
+    try {
+      const workdir = join(tmp, 'work');
+      const external = join(tmp, 'external-claude');
+      await mkdir(join(external, 'skills', 'baxian-old'), { recursive: true });
+      await writeFile(join(external, 'skills', 'baxian-old', 'SKILL.md'), 'stale');
+      await mkdir(workdir, { recursive: true });
+      await symlink(external, join(workdir, '.claude'));
+      const runner = {
+        exec: vi.fn(async (cmd: string): Promise<ExecResult> => ({
+          stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n'
+            : cmd.includes('BX_SKILLS_SWEPT') ? 'BX_SKILLS_SWEPT' : '',
+          stderr: '',
+          exitCode: 0,
+        })),
+        writeFile: vi.fn(async (): Promise<void> => undefined),
+        execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+      };
+      await provision(harness.manager)(runner as unknown as CommandRunner, agentConfig({ id: 'dev-1' }), workdir);
+      const sweepCmd = runner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('maxdepth 1'));
+      execFileSync('/bin/sh', ['-c', sweepCmd!]);
+
+      expect(existsSync(join(external, 'skills', 'baxian-old'))).toBe(false);
+      const batches = await readdir(join(external, 'skills', '.baxian-trash'));
+      expect(batches).toHaveLength(1);
+      expect(existsSync(join(external, 'skills', '.baxian-trash', batches[0], 'baxian-old', 'SKILL.md'))).toBe(true);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  async function realGitProvision(link: 'claude-root' | 'skills-only'): Promise<{ tmp: string; skillsReal: string }> {
+    const tmp = await mkdtemp(join(tmpdir(), 'bx-real-provision-'));
+    const workdir = join(tmp, 'work');
+    const external = join(tmp, 'external');
+    const skillsReal = link === 'claude-root' ? join(external, 'skills') : external;
+    await mkdir(join(skillsReal, 'baxian-old'), { recursive: true });
+    await writeFile(join(skillsReal, 'baxian-old', 'SKILL.md'), 'stale');
+    await mkdir(workdir, { recursive: true });
+    if (link === 'claude-root') {
+      await symlink(external, join(workdir, '.claude'));
+    } else {
+      await mkdir(join(workdir, '.claude'), { recursive: true });
+      await symlink(external, join(workdir, '.claude', 'skills'));
+    }
+    const local = new LocalRunner();
+    const git = async (cmd: string): Promise<void> => {
+      const res = await local.exec(`cd ${JSON.stringify(workdir)} && ${cmd}`);
+      expect(res.exitCode, res.stderr).toBe(0);
+    };
+    await git('git init -q');
+    await git('printf readme > README.md');
+    await git('git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
+
+    await provision(harness.manager)(local, agentConfig({ id: 'dev-1' }), workdir);
+
+    const status = await local.exec(`cd ${JSON.stringify(workdir)} && git status --porcelain`);
+    expect(status.stdout.trim()).toBe('');
+    expect(existsSync(join(skillsReal, 'baxian-old'))).toBe(false);
+    const batches = await readdir(join(skillsReal, '.baxian-trash'));
+    expect(batches).toHaveLength(1);
+    expect(existsSync(join(skillsReal, '.baxian-trash', batches[0], 'baxian-old', 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(skillsReal, 'baxian-task-check', 'SKILL.md'))).toBe(true);
+    return { tmp, skillsReal };
+  }
+
+  it('refuses to inject when a symlinked .claude points back at tracked content inside the worktree', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'bx-inrepo-'));
+    try {
+      const workdir = join(tmp, 'work');
+      await mkdir(join(workdir, 'internal-claude', 'skills', 'baxian-task-check'), { recursive: true });
+      await writeFile(join(workdir, 'internal-claude', 'skills', 'baxian-task-check', 'SKILL.md'), 'user-owned');
+      await symlink('internal-claude', join(workdir, '.claude'));
+      const local = new LocalRunner();
+      const git = async (cmd: string): Promise<void> => {
+        const res = await local.exec(`cd ${JSON.stringify(workdir)} && ${cmd}`);
+        expect(res.exitCode, res.stderr).toBe(0);
+      };
+      await git('git init -q');
+      await git('git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
+
+      await expect(provision(harness.manager)(local, agentConfig({ id: 'dev-1' }), workdir))
+        .rejects.toThrow(/project tracks/);
+
+      const skill = join(workdir, 'internal-claude', 'skills', 'baxian-task-check', 'SKILL.md');
+      expect(await local.exec(`cat ${JSON.stringify(skill)}`).then(r => r.stdout)).toBe('user-owned');
+      const status = await local.exec(`cd ${JSON.stringify(workdir)} && git status --porcelain`);
+      expect(status.stdout.trim()).toBe('');
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('provisions through a symlinked .claude/skills aimed at an untracked in-repo dir, excluded at its physical prefix', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'bx-inrepo2-'));
+    try {
+      const workdir = join(tmp, 'work');
+      await mkdir(join(workdir, '.claude'), { recursive: true });
+      await mkdir(join(workdir, 'internal-skills'), { recursive: true });
+      await writeFile(join(workdir, 'internal-skills', 'README.md'), 'mine');
+      await symlink(join('..', 'internal-skills'), join(workdir, '.claude', 'skills'));
+      const local = new LocalRunner();
+      const git = async (cmd: string): Promise<void> => {
+        const res = await local.exec(`cd ${JSON.stringify(workdir)} && ${cmd}`);
+        expect(res.exitCode, res.stderr).toBe(0);
+      };
+      await git('git init -q');
+      await git('git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
+
+      await provision(harness.manager)(local, agentConfig({ id: 'dev-1' }), workdir);
+
+      expect(existsSync(join(workdir, 'internal-skills', 'baxian-task-check', 'SKILL.md'))).toBe(true);
+      const status = await local.exec(`cd ${JSON.stringify(workdir)} && git status --porcelain`);
+      expect(status.stdout.trim()).toBe('');
+      const exclude = await local.exec(`cat ${JSON.stringify(join(workdir, '.git', 'info', 'exclude'))}`);
+      expect(exclude.stdout).toContain('/internal-skills/baxian-*');
+      expect(exclude.stdout).toContain('/internal-skills/.baxian-trash');
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('escapes gitignore metacharacters in the physical skills prefix', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'bx-meta-'));
+    try {
+      const workdir = join(tmp, 'work');
+      await mkdir(join(workdir, '.claude'), { recursive: true });
+      await mkdir(join(workdir, 'skill[dir]'), { recursive: true });
+      await writeFile(join(workdir, 'skill[dir]', 'README.md'), 'mine');
+      await symlink(join('..', 'skill[dir]'), join(workdir, '.claude', 'skills'));
+      const local = new LocalRunner();
+      const git = async (cmd: string): Promise<void> => {
+        const res = await local.exec(`cd ${JSON.stringify(workdir)} && ${cmd}`);
+        expect(res.exitCode, res.stderr).toBe(0);
+      };
+      await git('git init -q');
+      await git('git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
+
+      await provision(harness.manager)(local, agentConfig({ id: 'dev-1' }), workdir);
+
+      expect(existsSync(join(workdir, 'skill[dir]', 'baxian-task-check', 'SKILL.md'))).toBe(true);
+      const status = await local.exec(`cd ${JSON.stringify(workdir)} && git status --porcelain`);
+      expect(status.stdout.trim()).toBe('');
+      const exclude = await local.exec(`cat ${JSON.stringify(join(workdir, '.git', 'info', 'exclude'))}`);
+      expect(exclude.stdout).toContain('/skill\\[dir\\]/baxian-*');
+      expect(exclude.stdout).toContain('/skill\\[dir\\]/.baxian-trash');
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves historical trash batches out of the sweep, even unreadable ones', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'bx-trash-prune-'));
+    const locked = join(tmp, 'work', '.claude', 'skills', '.baxian-trash', 'old-batch', 'locked');
+    try {
+      const workdir = join(tmp, 'work');
+      await mkdir(join(workdir, '.claude', 'skills', '.baxian-trash', 'old-batch', 'baxian-junk'), { recursive: true });
+      await writeFile(join(workdir, '.claude', 'skills', '.baxian-trash', 'old-batch', 'baxian-junk', 'SKILL.md'), 'trashed long ago');
+      await mkdir(locked, { recursive: true });
+      await chmod(locked, 0o000);
+      const local = new LocalRunner();
+      const git = async (cmd: string): Promise<void> => {
+        const res = await local.exec(`cd ${JSON.stringify(workdir)} && ${cmd}`);
+        expect(res.exitCode, res.stderr).toBe(0);
+      };
+      await git('git init -q');
+      await git('printf readme > README.md');
+      await git('git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
+
+      await provision(harness.manager)(local, agentConfig({ id: 'dev-1' }), workdir);
+
+      expect(existsSync(join(workdir, '.claude', 'skills', '.baxian-trash', 'old-batch', 'baxian-junk', 'SKILL.md'))).toBe(true);
+      expect(existsSync(join(workdir, '.claude', 'skills', 'baxian-task-check', 'SKILL.md'))).toBe(true);
+    } finally {
+      await chmod(locked, 0o755).catch(() => {});
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('provisions end-to-end through a symlinked .claude root against a real Git repo', async () => {
+    const { tmp } = await realGitProvision('claude-root');
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  it('provisions end-to-end through a symlinked .claude/skills dir against a real Git repo', async () => {
+    const { tmp } = await realGitProvision('skills-only');
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  it('treats a transient-failure exclude probe as unknown and stops before any sweep', async () => {
+    const runner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('info/exclude')) {
+          return { stdout: '', stderr: 'ssh: connect to host box-a port 22: Connection timed out', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+    };
+    await expect(provision(harness.manager)(runner as unknown as CommandRunner, agentConfig({ id: 'dev-1' }), '/tmp/repo'))
+      .rejects.toThrow(/skill exclusion probe outcome unknown/);
+    expect(runner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('maxdepth 1'))).toBeUndefined();
+  });
+
+  it('stops provisioning when the sweep reply carries transient-failure output despite exit 0', async () => {
+    const runner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('BX_SKILLS_NON_GIT')) return { stdout: 'BX_SKILLS_OK\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('BX_SKILLS_SWEPT')) {
+          return { stdout: '', stderr: 'ssh: connect to host box-a port 22: Connection timed out', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+    };
+    await expect(provision(harness.manager)(runner as unknown as CommandRunner, agentConfig({ id: 'dev-1' }), '/tmp/repo'))
+      .rejects.toThrow(/sweep outcome unknown/);
+    expect(runner.execWithStdin).not.toHaveBeenCalled();
+  });
+
+  it('refuses to continue when the sweep exits 0 without its completion marker', async () => {
+    const runner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => ({
+        stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+        stderr: '',
+        exitCode: 0,
+      })),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+    };
+    await expect(provision(harness.manager)(runner as unknown as CommandRunner, agentConfig({ id: 'dev-1' }), '/tmp/repo'))
+      .rejects.toThrow(/no completion marker/);
+    expect(runner.execWithStdin).not.toHaveBeenCalled();
   });
 
   it('provisionRepoSkills fails when info/exclude cannot protect injected skills', async () => {
@@ -301,7 +553,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('provisionRepoSkills re-materializes on every call — no skip cache (hot-reload of workdir/runtime + tamper safe)', async () => {
     const runner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => ({
-        stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+        stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n'
+          : cmd.includes('BX_SKILLS_SWEPT') ? 'BX_SKILLS_SWEPT' : '',
         stderr: '',
         exitCode: 0,
       })),
@@ -322,14 +575,15 @@ describe('AgentManager dispatch & skill provisioning', () => {
     let maxActive = 0;
     const runner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('[ -L')) {
+        if (cmd.includes('maxdepth 1')) {
           active += 1;
           maxActive = Math.max(maxActive, active);
           await new Promise(r => setTimeout(r, 5));
           active -= 1;
         }
         return {
-          stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+          stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n'
+            : cmd.includes('BX_SKILLS_SWEPT') ? 'BX_SKILLS_SWEPT' : '',
           stderr: '',
           exitCode: 0,
         };
@@ -343,44 +597,6 @@ describe('AgentManager dispatch & skill provisioning', () => {
       provision(harness.manager)(runner as unknown as CommandRunner, agent, '/repo'),
     ]);
     expect(maxActive).toBe(1);
-  });
-
-  it('provisionRepoSkills fails fast on a symlinked parent skills dir (no silent rm of user config)', async () => {
-    const runner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> =>
-        cmd.includes('BX_SKILLS_NON_GIT')
-          ? { stdout: 'BX_SKILLS_OK\n', stderr: '', exitCode: 0 }
-          : cmd.includes('[ -L')
-          ? { stdout: '', stderr: 'baxian: .claude/skills is a symlink -> /shared/skills; replace it with a real directory', exitCode: 3 }
-          : { stdout: '', stderr: '', exitCode: 0 }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const agent = agentConfig({ id: 'dev-sym' });
-    await expect(provision(harness.manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).rejects.toThrow(/symlink-safe/);
-    expect(runner.writeFile.mock.calls.length).toBe(0);
-  });
-
-  it('skill cleanup refuses a symlinked workdir root — external skills survive (real fs)', async () => {
-    const { mkdtemp: mkTemp, rm: rmTemp, symlink: mkLink, readFile: readF } = await import('node:fs/promises');
-    const { tmpdir: osTmp } = await import('node:os');
-    const { LocalRunner } = await import('../../src/agent/runner.js');
-    const base = await mkTemp(join(osTmp(), 'bx-skillroot-'));
-    try {
-      const outside = join(base, 'outside');
-      const local = new LocalRunner();
-      await local.exec(`mkdir -p '${join(outside, '.claude/skills/baxian-old')}'`);
-      await local.exec(`printf victim > '${join(outside, '.claude/skills/baxian-old/SKILL.md')}'`);
-      const workLink = join(base, 'work');
-      await mkLink(outside, workLink);
-
-      await expect(provision(harness.manager)(local, agentConfig({ id: 'dev-rootlink' }), workLink))
-        .rejects.toThrow(/skill exclusion probe failed|cannot make injected skills invisible|symlink-safe/);
-
-      expect(await readF(join(outside, '.claude/skills/baxian-old/SKILL.md'), 'utf-8')).toBe('victim');
-    } finally {
-      await rmTemp(base, { recursive: true, force: true });
-    }
   });
 
   it('skillDirLockKey canonicalizes host + workdir so equivalent agents serialize', async () => {

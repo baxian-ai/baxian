@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseManifest, compareSemver } from '../../src/platform/manifest.js';
+import { parseManifest } from '../../src/platform/manifest.js';
 
 const VALID = JSON.stringify({
   name: 'glab', version: '1.0.0', kind: 'git-driver',
@@ -92,13 +92,5 @@ describe('parseManifest', () => {
     const r = parseManifest('[]', '/p/x');
     expect('errors' in r).toBe(true);
     expect(r.errors[0].message).toContain('must be a JSON object');
-  });
-});
-
-describe('compareSemver', () => {
-  it('orders versions', () => {
-    expect(compareSemver('1.92.0', '1.9.9')).toBe(1);
-    expect(compareSemver('1.92.0', '1.92.0')).toBe(0);
-    expect(compareSemver('1.91.9', '1.92.0')).toBe(-1);
   });
 });

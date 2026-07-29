@@ -28,7 +28,7 @@ const BAXIAN_RUNTIME_DIRS = [
   '.baxian',
 ] as const;
 
-export class BaxianRuntimeDirsError extends Error {
+class BaxianRuntimeDirsError extends Error {
   constructor(
     public readonly reason: 'unsafe-runtime-path' | 'runtime-path-probe-failed',
     message: string,
@@ -70,147 +70,110 @@ export async function ensureBaxianRuntimeDirsSafe(
 
   const dirs = BAXIAN_RUNTIME_DIRS.map(dir => `${absRepoPath}/${dir}`);
   const operands = dirs.map(shellQuote).join(' ');
-  const q = shellQuote(absRepoPath);
-  const command =
-    `[ "$(cd -- ${q} 2>/dev/null && pwd -P)" = ${q} ] || exit 9; ` +
-    `for p in ${operands}; do ` +
-      `if [ -L "$p" ] || { [ -e "$p" ] && [ ! -d "$p" ]; }; then exit 9; fi; ` +
-    `done && mkdir -p ${operands} && ` +
-    `for p in ${operands}; do [ -d "$p" ] && [ ! -L "$p" ] || exit 9; done`;
   let result: ExecResult;
   try {
-    result = await runner.exec(`sh -c ${shellQuote(command)}`);
+    result = await runner.exec(`mkdir -p ${operands}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new BaxianRuntimeDirsError(
       'runtime-path-probe-failed',
-      `Could not verify .baxian runtime paths in ${absRepoPath}: ${message}`,
+      `Could not prepare .baxian runtime paths in ${absRepoPath}: ${message}`,
     );
   }
-  const guardUnknown = execOutcomeUnknown(result);
-  if (guardUnknown || result.exitCode !== 0) {
-    if (result.exitCode === 9 && !guardUnknown) {
-      throw new BaxianRuntimeDirsError(
-        'unsafe-runtime-path',
-        `Workdir ${absRepoPath} has an unsafe .baxian runtime path; `
-        + 'baxian requires real directories contained in the Workdir.',
-      );
-    }
+  if (execOutcomeUnknown(result) || result.exitCode !== 0) {
     throw new BaxianRuntimeDirsError(
       'runtime-path-probe-failed',
-      `${guardUnknown ? 'Unknown result while verifying' : 'Failed to verify'} .baxian runtime paths in `
+      `${execOutcomeUnknown(result) ? 'Unknown result while preparing' : 'Failed to prepare'} .baxian runtime paths in `
       + `${absRepoPath}: ${result.stderr || result.stdout || `exit ${result.exitCode}`}`,
     );
   }
 }
 
-function normalizeRoot(root: string): string {
-  const cleaned = root.replace(/\/+$/, '');
-  return cleaned === '' ? '/' : cleaned;
+export function trashBatchDirUnder(trashRoot: string, reason: string): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `${trashRoot}/${stamp}-${reason}-${randomUUID().slice(0, 8)}`;
 }
 
-export function canonicalSelfGuard(path: string): string {
-  const q = shellQuote(path);
-  return `[ "$(cd -- ${q} 2>/dev/null && pwd -P)" = ${q} ]`;
+// The batch sits beside its sources inside the agent tree, so mv never crosses filesystems.
+export function trashBatchDir(home: string, agentId: string, reason: string): string {
+  return trashBatchDirUnder(`${home}/.baxian/agents/${agentId}/.baxian-trash`, reason);
 }
 
-export function isUnder(root: string, path: string): boolean {
-  const r = normalizeRoot(root);
-  return r === '/' ? path.startsWith('/') && path !== '/' : path.startsWith(`${r}/`);
+const TRASHED = 'BX_TRASHED';
+const TRASH_ABSENT = 'BX_TRASH_ABSENT';
+const MV_PRECHECK = 'BX_MV_PRECHECK';
+
+// Absent counts as success (force-remove semantics); mkdir/mv failures must surface as a non-zero exit.
+function trashMoveCommand(path: string, batchDir: string): string {
+  const p = shellQuote(path);
+  const b = shellQuote(batchDir);
+  return (
+    `if [ ! -e ${p} ] && [ ! -L ${p} ]; then printf '%s' ${TRASH_ABSENT}; ` +
+    `elif mkdir -p ${b}; then ` +
+    `base=$(basename -- ${p}); t=${b}/"$base"; n=0; ` +
+    `while [ -e "$t" ] || [ -L "$t" ]; do n=$((n+1)); t=${b}/"$base.$n"; done; ` +
+    `mv -- ${p} "$t" && printf '%s' ${TRASHED}; ` +
+    `else false; ` +
+    `fi`
+  );
 }
 
-export function ancestorSymlinkGuard(root: string, target: string): string {
-  const rootClean = normalizeRoot(root);
-  if (!isUnder(root, target)) {
-    throw new Error(`ancestorSymlinkGuard: ${target} is not under ${rootClean}`);
-  }
-  const sliceFrom = rootClean === '/' ? rootClean.length : rootClean.length + 1;
-  const parts = target.slice(sliceFrom).split('/').filter(Boolean);
-  const q = shellQuote(rootClean);
-  const checks: string[] = [`[ "$(cd -- ${q} 2>/dev/null && pwd -P)" = ${q} ]`];
-  let cur = rootClean;
-  for (const part of parts) {
-    cur = cur === '/' ? `/${part}` : `${cur}/${part}`;
-    checks.push(`[ ! -L ${shellQuote(cur)} ]`);
-  }
-  return checks.join(' && ');
-}
-
-export function guardedRemoveClause(root: string, target: string, opts: { recursive?: boolean } = {}): string {
-  const rm = opts.recursive ? 'rm -rf' : 'rm -f';
-  return `${ancestorSymlinkGuard(root, target)} && ${rm} -- ${shellQuote(target)}`;
-}
-
-const SWEEP_REMOVED = 'BX_SWEEP_REMOVED';
-const SWEEP_REFUSED = 'BX_SWEEP_REFUSED';
-
-async function sweepGuardedPath(runner: CommandRunner, path: string, guardClause?: string): Promise<void> {
-  const rm = `rm -f -- ${shellQuote(path)} && printf '%s' ${shellQuote(SWEEP_REMOVED)}`;
-  const cmd = guardClause
-    ? `if ${guardClause}; then ${rm}; else printf '%s' ${shellQuote(SWEEP_REFUSED)}; fi`
-    : rm;
+async function sweepToTrash(runner: CommandRunner, path: string, batchDir: string): Promise<void> {
   let res: ExecResult;
   try {
-    res = await runner.exec(cmd);
+    res = await runner.exec(trashMoveCommand(path, batchDir));
   } catch (err) {
-    console.warn(`[fs] sweep ${path}: outcome UNKNOWN (exec rejected) — target kept, may linger: ${err instanceof Error ? err.message : String(err)}`);
+    console.warn(`[fs] trash ${path}: outcome UNKNOWN (exec rejected) — target kept, may linger: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  if (res.exitCode !== 0 || execOutcomeUnknown(res)) {
-    console.warn(`[fs] sweep ${path}: outcome UNKNOWN (exit ${res.exitCode}: ${res.stderr.trim() || 'no stderr'}) — target kept, may linger`);
+  if (execOutcomeUnknown(res)) {
+    console.warn(`[fs] trash ${path}: outcome UNKNOWN (exit ${res.exitCode}: ${res.stderr.trim() || 'no stderr'}) — target kept, may linger`);
     return;
   }
-  if (res.stdout.includes(SWEEP_REMOVED)) return;
-  if (res.stdout.includes(SWEEP_REFUSED)) {
-    console.warn(`[fs] sweep ${path}: guard refused — target deliberately kept (rebound ancestor; not out-reaching)`);
+  if (res.exitCode !== 0) {
+    console.warn(`[fs] trash ${path}: move failed (exit ${res.exitCode}: ${res.stderr.trim() || 'no stderr'}) — target kept in place`);
     return;
   }
-  console.warn(`[fs] sweep ${path}: rm reported failure (no marker; exit ${res.exitCode})`);
+  if (res.stdout.includes(TRASH_ABSENT) || res.stdout.includes(TRASHED)) return;
+  console.warn(`[fs] trash ${path}: move reported failure (no marker; exit ${res.exitCode}) — target kept in place`);
 }
 
-export async function sweepStrayFile(runner: CommandRunner, path: string, guardClause?: string): Promise<void> {
-  await sweepGuardedPath(runner, path, guardClause);
+export async function sweepStrayFile(runner: CommandRunner, path: string, batchDir: string): Promise<void> {
+  await sweepToTrash(runner, path, batchDir);
 }
 
-function nestedSweepGuard(final: string, guardRoot?: string): string {
-  const finalIsRealDir = `[ -d ${shellQuote(final)} ] && [ ! -L ${shellQuote(final)} ]`;
-  return guardRoot ? `${ancestorSymlinkGuard(guardRoot, final)} && ${finalIsRealDir}` : finalIsRealDir;
-}
-
-export async function stageFileGuarded(
+export async function stageFile(
   runner: CommandRunner,
-  root: string,
   tmp: string,
   content: Buffer | string,
-  opts: { mode?: number } = {},
+  opts: { mode?: number; trashDir: string },
 ): Promise<void> {
   const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
-  const guard = ancestorSymlinkGuard(root, tmp);
   const dir = tmp.slice(0, tmp.lastIndexOf('/'));
   const privateCreate = opts.mode === undefined ? '' : 'umask 077 && ';
   const enforceMode = opts.mode === undefined
     ? ''
     : ` && chmod ${opts.mode.toString(8)} ${shellQuote(tmp)}`;
-  const cmd = `${guard} && mkdir -p ${shellQuote(dir)} && ${privateCreate}cat > ${shellQuote(tmp)}${enforceMode}`;
+  const cmd = `mkdir -p ${shellQuote(dir)} && ${privateCreate}cat > ${shellQuote(tmp)}${enforceMode}`;
   let res: ExecResult;
   try {
     res = await runner.execWithStdin(cmd, buf);
   } catch (err) {
-    await sweepStrayFile(runner, tmp, guard);
+    await sweepStrayFile(runner, tmp, opts.trashDir);
     throw new ExecOutcomeUnknownError(
       `staged write of ${tmp} failed (exec layer): ${err instanceof Error ? err.message : String(err)}`,
     );
   }
   if (execOutcomeUnknown(res)) {
-    await sweepStrayFile(runner, tmp, guard);
+    await sweepStrayFile(runner, tmp, opts.trashDir);
     throw new ExecOutcomeUnknownError(
       `staged write of ${tmp} outcome unknown (exit ${res.exitCode}): ${res.stderr.trim() || 'no stderr'}`,
     );
   }
   if (res.exitCode !== 0) {
-    await sweepStrayFile(runner, tmp, guard);
+    await sweepStrayFile(runner, tmp, opts.trashDir);
     throw new Error(
-      `staged write of ${tmp} failed (exit ${res.exitCode}): ${res.stderr.trim() || 'symlink-free path required'}`,
+      `staged write of ${tmp} failed (exit ${res.exitCode}): ${res.stderr.trim() || 'no stderr'}`,
     );
   }
 }
@@ -219,45 +182,45 @@ export async function moveFileIntoPlace(
   runner: CommandRunner,
   tmp: string,
   final: string,
-  opts: { guardRoot?: string } = {},
+  opts: { trashDir: string },
 ): Promise<void> {
   const tmpBase = tmp.slice(tmp.lastIndexOf('/') + 1);
+  // mv -f onto a directory target nests instead of replacing: fail closed ahead, verify a plain file landed after.
   const clauses = [
-    ...(opts.guardRoot ? [ancestorSymlinkGuard(opts.guardRoot, final)] : []),
     `[ -f ${shellQuote(tmp)} ]`,
     `[ ! -L ${shellQuote(tmp)} ]`,
     `[ ! -d ${shellQuote(final)} ]`,
+    `printf '%s' ${MV_PRECHECK}`,
     `mv -f -- ${shellQuote(tmp)} ${shellQuote(final)}`,
     `[ -f ${shellQuote(final)} ]`,
     `[ ! -L ${shellQuote(final)} ]`,
   ];
-  const guardCovers = (p: string): boolean => opts.guardRoot !== undefined && isUnder(opts.guardRoot, p);
-  const tmpGuard = guardCovers(tmp) ? ancestorSymlinkGuard(opts.guardRoot!, tmp) : undefined;
-  const nestedGuard = nestedSweepGuard(final, guardCovers(final) ? opts.guardRoot : undefined);
   const nested = `${final}/${tmpBase}`;
-  const sweepBoth = async (): Promise<void> => {
-    await sweepGuardedPath(runner, tmp, tmpGuard);
-    await sweepGuardedPath(runner, nested, nestedGuard);
+  // The nested path resolves THROUGH a symlink final; sweep it only when the precheck marker proves mv actually ran, else an unrelated same-named file behind the link would be dragged into trash.
+  const sweepFailure = async (mvMayHaveRun: boolean): Promise<void> => {
+    await sweepToTrash(runner, tmp, opts.trashDir);
+    if (mvMayHaveRun) await sweepToTrash(runner, nested, opts.trashDir);
   };
   let res: ExecResult;
   try {
     res = await runner.exec(clauses.join(' && '));
   } catch (err) {
-    await sweepBoth();
+    await sweepFailure(false);
     throw new ExecOutcomeUnknownError(
       `atomic replace of ${final} failed (exec layer): ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  const mvMayHaveRun = res.stdout.includes(MV_PRECHECK);
   if (execOutcomeUnknown(res)) {
-    await sweepBoth();
+    await sweepFailure(mvMayHaveRun);
     throw new ExecOutcomeUnknownError(
       `atomic replace of ${final} outcome unknown (exit ${res.exitCode}): ${res.stderr.trim() || 'no stderr'}`,
     );
   }
   if (res.exitCode !== 0) {
-    await sweepBoth();
+    await sweepFailure(mvMayHaveRun);
     throw new Error(
-      `atomic replace of ${final} failed (exit ${res.exitCode}): ${res.stderr.trim() || 'target must be a plain file with a symlink-free path'}`,
+      `atomic replace of ${final} failed (exit ${res.exitCode}): ${res.stderr.trim() || 'target must be a plain file'}`,
     );
   }
 }
@@ -380,15 +343,13 @@ export class RepoStore {
           `baxian never creates a user-specified Workdir implicitly.`,
         );
       }
-      const guardRoot = await this.resolveHome();
       const parent = absRepoPath.replace(/\/[^/]+$/, '');
       const staging = `${absRepoPath}.claim-${randomUUID()}`;
-      const stagingGuard = ancestorSymlinkGuard(guardRoot, staging);
-      const mk = await this.runner.exec(`${stagingGuard} && mkdir -p ${shellQuote(parent)}`);
-      if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent} (symlink-safe): ${mk.stderr}`);
+      const mk = await this.runner.exec(`mkdir -p ${shellQuote(parent)}`);
+      if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent}: ${mk.stderr}`);
       const cloneCmd = this.cloneWithGh
-        ? `${stagingGuard} && ${this.ghCloneHostEnv()}${GIT_NET_ENV} gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(staging)} --no-upstream`
-        : `${stagingGuard} && ${GIT_NET_ENV} git clone ${shellQuote(this.repo)} ${shellQuote(staging)}`;
+        ? `${this.ghCloneHostEnv()}${GIT_NET_ENV} gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(staging)} --no-upstream`
+        : `${GIT_NET_ENV} git clone ${shellQuote(this.repo)} ${shellQuote(staging)}`;
       let clone: ExecResult;
       try {
         clone = await execNetwork(this.runner, cloneCmd, {
@@ -396,15 +357,15 @@ export class RepoStore {
           retries: 0,
         });
       } catch (err) {
-        await this.discardStaging(staging, err instanceof Error ? err.message : String(err), ancestorSymlinkGuard(guardRoot, staging));
+        await this.trashStaging(staging, err instanceof Error ? err.message : String(err));
         throw err;
       }
       if (clone.exitCode !== 0) {
-        await this.discardStaging(staging, `clone exit ${clone.exitCode}`, ancestorSymlinkGuard(guardRoot, staging));
+        await this.trashStaging(staging, `clone exit ${clone.exitCode}`);
         const cmd = this.cloneWithGh ? 'gh repo clone' : 'git clone';
         throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
-      await this.promoteStaging(staging, absRepoPath, guardRoot);
+      await this.promoteStaging(staging, absRepoPath);
       if (this.isGitHub && parseGitRemote(this.repo) !== null) {
         return this.syncMatchingOriginUrl(absRepoPath);
       }
@@ -474,7 +435,13 @@ export class RepoStore {
       throw new Error(`${absRepoPath} is not a working-tree Git repository.`);
     }
     const canonicalTop = await probe(`cd ${shellQuote(top.stdout.trim())} && pwd -P`, 'canonical top');
-    if (canonicalTop.exitCode !== 0 || canonicalTop.stdout.trim() !== absRepoPath) {
+    // Physical-to-physical: the auto Workdir path may route through symlinks (e.g. a relocated ~/.baxian/agents), so the logical path itself never matches the toplevel.
+    const canonicalWorkdir = await probe(`cd ${path} && pwd -P`, 'canonical workdir');
+    if (
+      canonicalTop.exitCode !== 0 || canonicalWorkdir.exitCode !== 0
+      || canonicalTop.stdout.trim() === ''
+      || canonicalTop.stdout.trim() !== canonicalWorkdir.stdout.trim()
+    ) {
       throw new Error(
         `Workdir ${absRepoPath} must be the repository's exact top-level directory, not a subdirectory.`,
       );
@@ -523,12 +490,18 @@ export class RepoStore {
 
   private async ensureBaxianExcluded(absRepoPath: string): Promise<void> {
     const path = shellQuote(absRepoPath);
+    // Leading slash anchors to the repo root (an unanchored `.baxian` would hide sub/.baxian anywhere); no trailing slash so a user-planted symlink .baxian is still covered.
     const command =
-      `${canonicalSelfGuard(absRepoPath)} && cd ${path} && p="$(git rev-parse --git-path info/exclude)" && ` +
+      `cd ${path} && p="$(git rev-parse --git-path info/exclude)" && ` +
       `mkdir -p "$(dirname "$p")" && ` +
-      `{ grep -qxF '.baxian/' "$p" 2>/dev/null || printf '%s\\n' '.baxian/' >> "$p"; } && ` +
-      `git check-ignore -q -- .baxian/__probe__`;
+      `{ grep -qxF '/.baxian' "$p" 2>/dev/null || printf '%s\\n' '/.baxian' >> "$p"; } && ` +
+      `git check-ignore -q -- .baxian`;
     const excluded = await this.runner.exec(`sh -c ${shellQuote(command)}`);
+    if (execOutcomeUnknown(excluded)) {
+      throw new ExecOutcomeUnknownError(
+        `.baxian exclude probe in ${absRepoPath} outcome unknown (exit ${excluded.exitCode}): ${excluded.stderr.trim() || 'no stderr'}`,
+      );
+    }
     if (excluded.exitCode !== 0) {
       throw new Error(`Failed to make .baxian runtime files invisible to Git in ${absRepoPath}.`);
     }
@@ -554,9 +527,8 @@ export class RepoStore {
   private async syncOriginUrl(absRepoPath: string, originUrl: string): Promise<boolean> {
     if (parseGitRemote(this.repo) === null) return false;
     if (!accessMethodDiffers(this.repo, originUrl)) return false;
-    const guard = canonicalSelfGuard(absRepoPath);
     const unset = await this.probe(
-      `${guard} && git -C ${shellQuote(absRepoPath)} config --unset-all remote.origin.pushurl`,
+      `git -C ${shellQuote(absRepoPath)} config --unset-all remote.origin.pushurl`,
       `remote.origin.pushurl removal at ${absRepoPath}`,
     );
     if (unset.exitCode !== 0 && unset.exitCode !== 5) {
@@ -565,7 +537,7 @@ export class RepoStore {
       ));
     }
     const result = await this.runner.exec(
-      `${guard} && git -C ${shellQuote(absRepoPath)} config --replace-all remote.origin.url ${shellQuote(this.repo)}`,
+      `git -C ${shellQuote(absRepoPath)} config --replace-all remote.origin.url ${shellQuote(this.repo)}`,
     );
     if (result.exitCode !== 0) {
       throw new Error(redactGitCredentials(
@@ -593,67 +565,88 @@ export class RepoStore {
     );
   }
 
-  private async discardStaging(staging: string, reason: string, guardClause?: string): Promise<void> {
-    console.warn(`[repo-store] removing staged clone ${staging}: ${redactGitCredentials(reason)}`);
-    const rmCmd = guardClause
-      ? `if ${guardClause}; then rm -rf ${shellQuote(staging)} && echo BX_STAGING_REMOVED; else echo BX_STAGING_REFUSED; fi`
-      : `rm -rf ${shellQuote(staging)} && echo BX_STAGING_REMOVED`;
+  private async trashDir(reason: string): Promise<string> {
+    return trashBatchDir(await this.resolveHome(), this.agentId, reason);
+  }
+
+  private async trashStaging(staging: string, reason: string): Promise<void> {
+    console.warn(`[repo-store] trashing staged clone ${staging}: ${redactGitCredentials(reason)}`);
+    let batchDir: string;
     try {
-      const rm = await this.runner.exec(rmCmd);
-      if (rm.exitCode !== 0) {
-        console.warn(`[repo-store] failed to remove staged clone ${staging}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}`);
-      } else if (rm.stdout.includes('BX_STAGING_REFUSED')) {
-        console.warn(`[repo-store] staged clone ${staging} NOT removed: ancestor guard refused (rebound path); debris may remain`);
-      } else if (!rm.stdout.includes('BX_STAGING_REMOVED')) {
-        console.warn(`[repo-store] staged clone ${staging} removal outcome unknown (no marker); debris may remain`);
+      batchDir = await this.trashDir('staging');
+    } catch (err) {
+      console.warn(`[repo-store] cannot resolve trash dir for staged clone ${staging}; kept in place:`, err);
+      return;
+    }
+    try {
+      const moved = await this.runner.exec(trashMoveCommand(staging, batchDir));
+      if (execOutcomeUnknown(moved)) {
+        console.warn(`[repo-store] staged clone ${staging} trash outcome UNKNOWN (exit ${moved.exitCode}: ${moved.stderr.trim() || 'no stderr'}); debris may remain`);
+      } else if (moved.exitCode !== 0) {
+        console.warn(`[repo-store] failed to trash staged clone ${staging}: ${moved.stderr.trim() || `exit ${moved.exitCode}`}`);
+      } else if (!moved.stdout.includes(TRASHED) && !moved.stdout.includes(TRASH_ABSENT)) {
+        console.warn(`[repo-store] staged clone ${staging} trash outcome unknown (no marker); debris may remain`);
       }
     } catch (err) {
-      console.warn(`[repo-store] failed to remove staged clone ${staging}:`, err);
+      console.warn(`[repo-store] failed to trash staged clone ${staging}:`, err);
     }
   }
 
-  private async promoteStaging(staging: string, absRepoPath: string, guardRoot: string): Promise<void> {
+  private async promoteStaging(staging: string, absRepoPath: string): Promise<void> {
     const base = staging.slice(staging.lastIndexOf('/') + 1);
     const nestedPath = `${absRepoPath}/${base}`;
-    const stagingGuard = ancestorSymlinkGuard(guardRoot, staging);
-    const nestedGuard = ancestorSymlinkGuard(guardRoot, nestedPath);
-    const discardBoth = async (reason: string): Promise<void> => {
-      await this.discardStaging(staging, reason, stagingGuard);
-      await this.discardStaging(nestedPath, reason, nestedGuard);
+    const trashBoth = async (reason: string): Promise<void> => {
+      await this.trashStaging(staging, reason);
+      await this.trashStaging(nestedPath, reason);
     };
     const nonce = randomUUID();
     const claimRel = '.git/baxian-promote-claim';
     const stagingClaim = `${staging}/${claimRel}`;
     const finalClaim = `${absRepoPath}/${claimRel}`;
-    const markGuard = ancestorSymlinkGuard(guardRoot, staging);
     const mark = await this.runner.exec(
-      `${markGuard} && printf %s ${shellQuote(nonce)} > ${shellQuote(stagingClaim)}`,
+      `printf %s ${shellQuote(nonce)} > ${shellQuote(stagingClaim)}`,
     );
+    if (execOutcomeUnknown(mark)) {
+      await this.trashStaging(staging, `promote-claim write outcome unknown: ${mark.stderr.trim() || `exit ${mark.exitCode}`}`);
+      throw new ExecOutcomeUnknownError(
+        `Promote-claim write for ${staging} outcome unknown (exit ${mark.exitCode}): ${mark.stderr.trim() || 'no stderr'}`,
+      );
+    }
     if (mark.exitCode !== 0) {
-      await this.discardStaging(staging, `promote-claim write failed: ${mark.stderr.trim() || `exit ${mark.exitCode}`}`, markGuard);
+      await this.trashStaging(staging, `promote-claim write failed: ${mark.stderr.trim() || `exit ${mark.exitCode}`}`);
       throw new Error(`Cannot stamp staged clone ${staging}: ${mark.stderr.trim() || `exit ${mark.exitCode}`}`);
     }
     const promoteCmd =
-      `${ancestorSymlinkGuard(guardRoot, absRepoPath)} && ` +
       `[ ! -e ${shellQuote(absRepoPath)} ] && [ ! -L ${shellQuote(absRepoPath)} ] && ` +
-      `mv ${shellQuote(staging)} ${shellQuote(absRepoPath)}`;
+      `printf '%s' ${MV_PRECHECK} && mv ${shellQuote(staging)} ${shellQuote(absRepoPath)}`;
     let promote: ExecResult;
     try {
       promote = await this.runner.exec(promoteCmd);
     } catch (err) {
-      await this.reconcilePromote(staging, absRepoPath, nestedPath, finalClaim, nonce, guardRoot,
+      await this.reconcilePromote(staging, absRepoPath, nestedPath, finalClaim, nonce,
         `mv exec rejected: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    // Unknown outrank exit 0: a transient-tainted reply proves nothing about whether mv ran.
+    if (execOutcomeUnknown(promote)) {
+      await this.reconcilePromote(staging, absRepoPath, nestedPath, finalClaim, nonce,
+        `mv outcome unknown (exit ${promote.exitCode}): ${promote.stderr.trim()}`);
       return;
     }
     if (promote.exitCode === 0) {
       const nested = await this.runner.exec(`test -e ${shellQuote(nestedPath)}`);
-      if (execOutcomeUnknown(nested) || (nested.exitCode !== 0 && nested.exitCode !== 1)) {
+      if (execOutcomeUnknown(nested)) {
+        throw new Error(
+          `Cannot verify promoted clone at ${absRepoPath}: nested probe outcome unknown (exit ${nested.exitCode}): ${nested.stderr.trim() || 'no stderr'}; nothing moved.`,
+        );
+      }
+      if (nested.exitCode !== 0 && nested.exitCode !== 1) {
         const reason = `promote verification failed (exit ${nested.exitCode}): ${nested.stderr.trim() || 'exec layer failure'}`;
-        await discardBoth(reason);
+        await trashBoth(reason);
         throw new Error(`Cannot verify promoted clone at ${absRepoPath}; ${reason}`);
       }
       if (nested.exitCode === 1) {
-        const cleared = await this.clearPromoteClaim(finalClaim, ancestorSymlinkGuard(guardRoot, finalClaim), nonce);
+        const cleared = await this.clearPromoteClaim(finalClaim, nonce);
         if (cleared !== 'removed') {
           throw new Error(
             `Promote to ${absRepoPath} landed but its ownership marker was ${cleared} (replaced/foreign or unverifiable); refusing to adopt. Retry DELETE/clone.`,
@@ -661,15 +654,15 @@ export class RepoStore {
         }
         return;
       }
-      await this.discardStaging(nestedPath, `final path ${absRepoPath} was recreated concurrently`, nestedGuard);
+      await this.trashStaging(nestedPath, `final path ${absRepoPath} was recreated concurrently`);
       throw new Error(`Final path ${absRepoPath} was recreated while promoting; staged clone withdrawn.`);
     }
-    if (execOutcomeUnknown(promote)) {
-      await this.reconcilePromote(staging, absRepoPath, nestedPath, finalClaim, nonce, guardRoot,
-        `mv outcome unknown (exit ${promote.exitCode}): ${promote.stderr.trim()}`);
-      return;
+    // Without the precheck marker mv never started, so final/<base> cannot be ours — only the staging we provably own is withdrawn.
+    if (promote.stdout.includes(MV_PRECHECK)) {
+      await trashBoth(`promote failed: ${promote.stderr.trim() || `exit ${promote.exitCode}`}`);
+    } else {
+      await this.trashStaging(staging, `promote failed before mv: ${promote.stderr.trim() || `exit ${promote.exitCode}`}`);
     }
-    await discardBoth(`promote failed: ${promote.stderr.trim() || `exit ${promote.exitCode}`}`);
     throw new Error(
       `Cannot promote staged clone into ${absRepoPath}: ${promote.stderr.trim() || `exit ${promote.exitCode}`}`,
     );
@@ -681,18 +674,23 @@ export class RepoStore {
     nestedPath: string,
     finalClaim: string,
     nonce: string,
-    guardRoot: string,
     cause: string,
   ): Promise<void> {
+    // Reconciliation probes are remote execs too: an unknown probe must never drive a move.
     const stagingExists = await this.runner.exec(`test -e ${shellQuote(staging)}`);
+    if (execOutcomeUnknown(stagingExists)) {
+      throw new Error(
+        `Cannot reconcile promote to ${absRepoPath}: staging probe outcome unknown (exit ${stagingExists.exitCode}): ${stagingExists.stderr.trim() || 'no stderr'}; nothing moved. ${cause}`,
+      );
+    }
     if (stagingExists.exitCode === 0) {
-      await this.discardStaging(staging, `mv not executed (${cause})`, ancestorSymlinkGuard(guardRoot, staging));
+      await this.trashStaging(staging, `mv not executed (${cause})`);
       throw new Error(`Promote to ${absRepoPath} not executed; staged clone withdrawn. ${cause}`);
     }
     if (stagingExists.exitCode === 1) {
       const marker = await this.runner.exec(`cat ${shellQuote(finalClaim)} 2>/dev/null`);
       if (marker.exitCode === 0 && marker.stdout.trim() === nonce) {
-        const cleared = await this.clearPromoteClaim(finalClaim, ancestorSymlinkGuard(guardRoot, finalClaim), nonce);
+        const cleared = await this.clearPromoteClaim(finalClaim, nonce);
         if (cleared !== 'removed') {
           throw new Error(
             `Promote to ${absRepoPath} reconciliation: ownership marker was ${cleared} (final replaced after the nonce read); refusing to adopt. ${cause}`,
@@ -702,8 +700,13 @@ export class RepoStore {
         return;
       }
       const nested = await this.runner.exec(`test -e ${shellQuote(nestedPath)}`);
+      if (execOutcomeUnknown(nested)) {
+        throw new Error(
+          `Cannot reconcile promote to ${absRepoPath}: nested probe outcome unknown (exit ${nested.exitCode}): ${nested.stderr.trim() || 'no stderr'}; nothing moved. ${cause}`,
+        );
+      }
       if (nested.exitCode === 0) {
-        await this.discardStaging(nestedPath, `mv nested on target race (${cause})`, ancestorSymlinkGuard(guardRoot, nestedPath));
+        await this.trashStaging(nestedPath, `mv nested on target race (${cause})`);
         throw new Error(`Promote to ${absRepoPath} nested on a target race; staged clone withdrawn. ${cause}`);
       }
     }
@@ -711,21 +714,26 @@ export class RepoStore {
     throw new Error(`Cannot reconcile promote to ${absRepoPath}; all locations inconclusive. ${cause}`);
   }
 
-  private async clearPromoteClaim(finalClaim: string, guard: string, nonce: string): Promise<'removed' | 'refused' | 'failed'> {
+  private async clearPromoteClaim(finalClaim: string, nonce: string): Promise<'removed' | 'refused' | 'failed'> {
     try {
-      const rm = await this.runner.exec(
-        `if ${guard} && [ "$(cat ${shellQuote(finalClaim)} 2>/dev/null)" = ${shellQuote(nonce)} ]; ` +
-          `then rm -f ${shellQuote(finalClaim)} && echo BX_MARKER_REMOVED; else echo BX_MARKER_REFUSED; fi`,
+      const batchDir = await this.trashDir('claim');
+      // Nonce re-check and mv in ONE command (a separate cat→mv could displace a replaced foreign marker); the echoed marker surfaces a nonce-refused clear that the `if`'s exit 0 would otherwise mask.
+      const moved = await this.runner.exec(
+        `if [ "$(cat ${shellQuote(finalClaim)} 2>/dev/null)" = ${shellQuote(nonce)} ]; ` +
+          `then mkdir -p ${shellQuote(batchDir)} && mv -- ${shellQuote(finalClaim)} ${shellQuote(batchDir)}/ && echo BX_MARKER_TRASHED; else echo BX_MARKER_REFUSED; fi`,
       );
-      if (rm.exitCode !== 0) {
-        console.warn(`[repo-store] failed to clear promote-claim marker ${finalClaim}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}`);
+      if (moved.exitCode !== 0 || execOutcomeUnknown(moved)) {
+        console.warn(`[repo-store] failed to clear promote-claim marker ${finalClaim}: ${moved.stderr.trim() || `exit ${moved.exitCode}`}`);
         return 'failed';
       }
-      if (rm.stdout.includes('BX_MARKER_REFUSED')) {
-        console.warn(`[repo-store] promote-claim marker ${finalClaim} NOT cleared: guard/nonce mismatch (foreign or rebound); left in place`);
+      if (moved.stdout.includes('BX_MARKER_REFUSED')) {
+        console.warn(`[repo-store] promote-claim marker ${finalClaim} NOT cleared: nonce mismatch (foreign clone); left in place`);
         return 'refused';
       }
-      return 'removed';
+      // Only an explicit TRASHED marker proves the move; a bare exit 0 (empty or truncated stdout) is not a positive outcome under the three-state discipline.
+      if (moved.stdout.includes('BX_MARKER_TRASHED')) return 'removed';
+      console.warn(`[repo-store] promote-claim marker ${finalClaim} clear reported no outcome marker; treating as failed`);
+      return 'failed';
     } catch (err) {
       console.warn(`[repo-store] failed to clear promote-claim marker ${finalClaim}:`, err);
       return 'failed';
@@ -734,9 +742,8 @@ export class RepoStore {
 
   private async recoverEmptyLeftoverDir(absRepoPath: string): Promise<boolean> {
     if (this.configuredWorkdir) return false;
-    const guardRoot = await this.resolveHome();
     const undo = await this.probe(
-      `${ancestorSymlinkGuard(guardRoot, absRepoPath)} && rmdir ${shellQuote(absRepoPath)}`,
+      `rmdir ${shellQuote(absRepoPath)}`,
       `leftover dir ${absRepoPath}`,
     );
     if (undo.exitCode === 0) {
@@ -751,7 +758,7 @@ export class RepoStore {
     if (Date.now() - last < FETCH_THROTTLE_MS) return;
     const result = await execNetwork(
       this.runner,
-      `${canonicalSelfGuard(absRepoPath)} && cd ${shellQuote(absRepoPath)} && ${GIT_NET_ENV} git fetch --all --prune && git remote set-head origin --auto`,
+      `cd ${shellQuote(absRepoPath)} && ${GIT_NET_ENV} git fetch --all --prune && git remote set-head origin --auto`,
     );
     if (result.exitCode !== 0) {
       throw new Error(

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { assertInsideManagedDir } from '../state/managed-path.js';
 
 export interface RestartSentinel {
   kind: 'restart';
@@ -13,7 +14,7 @@ export interface RestartSentinel {
 const SENTINEL_FILENAME = 'restart-intent.json';
 
 function sentinelPath(stateDir: string): string {
-  return path.join(stateDir, 'state', SENTINEL_FILENAME);
+  return assertInsideManagedDir(stateDir, path.join(stateDir, 'state', SENTINEL_FILENAME));
 }
 
 export function writeRestartSentinelSync(opts: {

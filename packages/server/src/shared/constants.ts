@@ -11,9 +11,7 @@ export const DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS = 60_000;
 export const DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS = 30_000;
 export const DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS = 30 * 60_000;
 export const DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS = 3;
-export const TERMINAL_INTERVENTION_PHASES = ['attach', 'detach', 'input', 'close'] as const;
-export const TERMINAL_INTERVENTION_PHASE_SET: ReadonlySet<string> = new Set(TERMINAL_INTERVENTION_PHASES);
-export type TerminalInterventionPhase = (typeof TERMINAL_INTERVENTION_PHASES)[number];
+export type TerminalInterventionPhase = 'attach' | 'detach' | 'input' | 'close';
 
 export const DEFAULT_SERVER_CONFIG = {
   port: DEFAULT_SERVER_PORT,

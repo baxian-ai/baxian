@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
+import { readFile, writeFile, readdir, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { TaskAttentionGeneration, TaskPhase, TaskState, TaskStatus } from '../shared/index.js';
 import {
@@ -557,20 +557,6 @@ export class TaskStore {
       return match ? Math.max(max, parseInt(match[1], 10)) : max;
     }, 0);
     return `task-${String(maxNum + 1).padStart(3, '0')}`;
-  }
-
-  async delete(id: string): Promise<void> {
-    if (!SAFE_ID.test(id)) return;
-    try {
-      await unlink(this.path(id));
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException | undefined)?.code;
-      if (code !== 'ENOENT') {
-        console.error(`[TaskStore] delete ${id} failed; not broadcasting:`, err);
-        return;
-      }
-    }
-    this.fire('delete', id);
   }
 
   private fire(kind: TaskStoreChangeKind, id: string): void {

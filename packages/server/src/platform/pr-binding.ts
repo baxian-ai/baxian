@@ -1,6 +1,6 @@
 import type { NormalizedRow } from './row-schema.js';
 
-export type BindingMismatch = 'branch' | 'fork' | 'target';
+type BindingMismatch = 'branch' | 'fork' | 'target';
 export type BindingCheck = { kind: 'mismatch'; mismatch: BindingMismatch } | { kind: 'unverifiable' };
 
 export interface BindingExpectation {
