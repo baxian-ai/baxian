@@ -52,7 +52,7 @@ describe('loadPluginsOrExplainWithRoots', () => {
     expect('fatal' in r).toBe(true);
     const msg = (r as { fatal: string[] }).fatal.join('\n');
     expect(msg).toMatch(/forge/);
-    expect(msg).toMatch(/\.baxian\/plugins/);
+    expect(msg).toContain('/nonexistent-b/<name>/');
   });
 
   it('a project with a resolvable tool returns a registry', async () => {

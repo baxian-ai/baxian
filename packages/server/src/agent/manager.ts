@@ -5441,7 +5441,7 @@ export class AgentManager {
       const plugin = this.pluginRegistry.resolveTool(tool);
       if (plugin === undefined) {
         throw new Error(
-          `project '${project.id}': no git-driver plugin provides tool '${tool}' — install it under ~/.baxian/plugins/ first`,
+          `project '${project.id}': no git-driver plugin provides tool '${tool}' — install it under <home>/plugins/ first`,
         );
       }
       if (this.skillRegistry.pluginSkillNames({ pluginTools: [tool] }).length > 0) continue;

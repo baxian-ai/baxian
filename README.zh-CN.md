@@ -70,7 +70,7 @@ server 持有任务和 agent 绑定状态，通过 tmux pane 驱动 agent，并�
 > - **Node.js ≥ 22.13**
 > - 每台跑 agent 的机器（本地与远程）都装有 **tmux**
 > - **Claude Code**（`claude`）和/或 **Codex**（`codex`）CLI 已安装并登录
-> - **git**，以及仓库平台所需的 CLI —— GitHub 仓库用已认证的 **GitHub CLI**（`gh`）；其它平台需自备 CLI 并在 `~/.baxian/plugins/` 下安装对应的驱动插件
+> - **git**，以及仓库平台所需的 CLI —— GitHub 仓库用已认证的 **GitHub CLI**（`gh`）；其它平台需自备 CLI，并在实例 home 的 `plugins/` 目录下安装对应的驱动插件
 >
 > 该 CLI 需要在每台跑 agent 的机器上、以及 server 本机都完成认证：server 用它轮询评审、合并与关闭 PR，agent 用它开 PR 与发评论。
 
@@ -81,7 +81,7 @@ npm install -g baxian
 baxian
 ```
 
-打开 <http://localhost:3000>。首次运行会自动创建 `~/.baxian/config.json`。
+打开 <http://localhost:3000>。首次运行会自动创建 `~/.baxian/baxian.json`。
 
 然后在控制台里：
 
@@ -93,6 +93,7 @@ baxian
 
 ```sh
 baxian                    # 启动 server（默认命令）
+baxian --home <dir>       # 使用独立实例 home（也可设置 BAXIAN_HOME）
 baxian status             # 查看所有 agent 状态
 baxian attach <agent-id>  # 接入 agent 的 tmux 会话（本地或远程）
 baxian stop <agent-id>    # 打断一个 agent
@@ -102,7 +103,7 @@ baxian task list -p <project>
 
 ## 配置
 
-baxian 优先读取工作目录下的 `./baxian.json`，找不到时回退到 `~/.baxian/config.json`（`baxian start -c <path>` 可覆盖两者）。最小配置：
+baxian 固定读取 `<home>/baxian.json`，`<home>` 默认为 `~/.baxian`。可通过 `baxian --home <dir>` 或 `BAXIAN_HOME` 覆盖实例 home，CLI 参数优先；工作目录中的配置不会被隐式发现。最小配置：
 
 ```json
 {

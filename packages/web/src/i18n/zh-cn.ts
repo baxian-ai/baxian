@@ -476,7 +476,7 @@ export const zhCN: Messages = {
     restartNow: '现在重启',
     preRestartFetchFailed: (detail) => `获取重启前 startedAt 失败：${detail}`,
     restartTriggerFailed: (detail) => `触发重启失败：${detail}`,
-    restartTimeout: '重启超时（30s 未恢复）。请检查日志或手动 baxian start -c <path>',
+    restartTimeout: '重启超时（30s 未恢复）。请检查日志或手动执行 baxian start --home <dir>',
     githubDegraded: (repo) => `平台轮询降级（${repo}）——评审与 PR 更新可能延迟，连通恢复后自动跟上`,
     githubUnreachable: (repo) => `平台无法访问（${repo}）——任务推进暂停，连通恢复后自动继续`,
     githubRateLimited: (repo, until) => `平台轮询触发限流（${repo}），将于 ${new Date(until).toLocaleTimeString()} 后自动恢复`,

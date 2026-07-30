@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import { builtinPluginRoot, userPluginRoot } from '../../src/platform/plugin-roots.js';
-import { homedir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 
 describe('plugin roots', () => {
@@ -10,7 +9,7 @@ describe('plugin roots', () => {
     expect(root.endsWith(join('platform', 'plugins'))).toBe(true);
   });
 
-  it('userPluginRoot is ~/.baxian/plugins', () => {
-    expect(userPluginRoot()).toBe(join(homedir(), '.baxian', 'plugins'));
+  it('places user plugins under the selected instance home', () => {
+    expect(userPluginRoot('/var/lib/baxian-blue')).toBe(join('/var/lib/baxian-blue', 'plugins'));
   });
 });

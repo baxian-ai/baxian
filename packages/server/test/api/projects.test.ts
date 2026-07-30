@@ -271,8 +271,8 @@ describe('POST /api/projects', () => {
     const project = written.project.find(p => p.id === 'persisted');
     expect(project).toBeDefined();
     expect(project?.review).toBeUndefined();
-    const backups = await readdir(join(tempDir, '.baxian', 'config-backups'));
-    expect(backups.some(f => /^baxian\.json\.\d{8}-\d{6}$/.test(f))).toBe(true);
+    const backups = await readdir(tempDir);
+    expect(backups.some(f => /^baxian\.json\.\d{4}(?:-\d{2}){5}-\d{3}$/.test(f))).toBe(true);
   });
 
   it('returns 500 when no config path is configured', async () => {

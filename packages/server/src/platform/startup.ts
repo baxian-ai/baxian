@@ -39,7 +39,7 @@ export async function loadPluginsOrExplainWithRoots(
     } else if (!registry.resolveTool(tool)) {
       fatal.push(
         `project '${project.id}': no git-driver plugin provides tool '${tool}'. ` +
-        `Install one under ~/.baxian/plugins/<name>/ (searched user root: ${roots.user}; builtin root: ${roots.builtin}).`,
+        `Install one under ${roots.user}/<name>/ (builtin root: ${roots.builtin}).`,
       );
     }
   }
@@ -77,8 +77,9 @@ export async function scanPluginSkillPools(
 
 export function loadPluginsOrExplain(
   config: BaxianConfig,
+  home: string,
 ): Promise<{ registry: PluginRegistry } | { fatal: string[] }> {
-  return loadPluginsOrExplainWithRoots(config, { builtin: builtinPluginRoot(), user: userPluginRoot() });
+  return loadPluginsOrExplainWithRoots(config, { builtin: builtinPluginRoot(), user: userPluginRoot(home) });
 }
 
 export interface PlatformEntryDeps {

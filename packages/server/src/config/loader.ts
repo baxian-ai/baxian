@@ -1,10 +1,9 @@
-import { readFile, writeFile, access, mkdir, stat, open, rename, rm, realpath } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, stat, open, rename, rm, realpath } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { isRecord, type AgentConfig, type BaxianConfig, type HostConfig, type ProjectConfig, type ServerConfig } from '../shared/index.js';
 import {
-  CONFIG_FILE,
   DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
   DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS,
   DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS,
@@ -16,9 +15,6 @@ import {
   DEFAULT_TMUX_PROBE_CONCURRENCY,
   DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS,
   DEFAULT_TMUX_PROBE_TIMEOUT_MS,
-  STATE_DIR,
-  USER_CONFIG_REL,
-  USER_STATE_REL,
 } from '../shared/index.js';
 import { normalizeConfig } from './normalizer.js';
 import {
@@ -91,37 +87,13 @@ export async function loadConfig(configPath: string): Promise<BaxianConfig> {
   return result.config;
 }
 
-async function pathExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
-    throw err;
+export function resolveHome(explicit?: string): string {
+  if (explicit !== undefined) {
+    if (explicit.length === 0) throw new Error('home directory must not be empty');
+    return resolve(explicit);
   }
-}
-
-export function userConfigPath(): string {
-  return resolve(homedir(), USER_CONFIG_REL);
-}
-
-export function userStateDir(): string {
-  return resolve(homedir(), USER_STATE_REL);
-}
-
-export async function resolveConfigPath(explicit?: string): Promise<string | null> {
-  if (explicit) return resolve(explicit);
-  const cwdPath = resolve(process.cwd(), CONFIG_FILE);
-  if (await pathExists(cwdPath)) return cwdPath;
-  const userPath = userConfigPath();
-  if (await pathExists(userPath)) return userPath;
-  return null;
-}
-
-export function resolveStateDir(configPath: string): string {
-  if (resolve(dirname(configPath)) === userStateDir()) return userStateDir();
-  return resolve(dirname(configPath), STATE_DIR);
+  const envHome = process.env.BAXIAN_HOME;
+  return envHome ? resolve(envHome) : resolve(homedir(), '.baxian');
 }
 
 const DEFAULT_CONFIG_TEMPLATE = {
@@ -131,13 +103,22 @@ const DEFAULT_CONFIG_TEMPLATE = {
   project: [] as ProjectConfig[],
 };
 
-export async function createDefaultConfig(path: string): Promise<void> {
+export async function createDefaultConfig(path: string): Promise<boolean> {
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(DEFAULT_CONFIG_TEMPLATE, null, 2) + '\n');
+  try {
+    await writeFile(path, JSON.stringify(DEFAULT_CONFIG_TEMPLATE, null, 2) + '\n', {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === 'EEXIST') return false;
+    throw err;
+  }
 }
 
 export async function saveConfig(configPath: string, config: BaxianConfig): Promise<void> {
-  await backupConfig(configPath, resolveStateDir(configPath));
+  await backupConfig(configPath);
   const physical = await realpathOrSelf(configPath);
   let mode = 0o600;
   try {
@@ -147,7 +128,7 @@ export async function saveConfig(configPath: string, config: BaxianConfig): Prom
   }
   const tmp = `${physical}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   const cleanupTmp = async (): Promise<void> => {
-    // Managed-dir exemption (the only one): the tmp must sit beside the target for rename() to stay atomic, and the target is the user's config path; pid+random naming keeps the blast radius to our own tmp.
+    // A symlinked config is updated through its target, so the tmp must stay beside that target for atomic rename.
     await rm(tmp, { force: true }).catch((rmErr) => {
       console.warn(`[config] failed to remove config temp ${tmp}:`, rmErr);
     });

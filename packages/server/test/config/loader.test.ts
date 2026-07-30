@@ -7,10 +7,7 @@ import {
   saveConfig,
   prepareConfig,
   ConfigValidationError,
-  resolveConfigPath,
-  resolveStateDir,
-  userConfigPath,
-  userStateDir,
+  resolveHome,
   createDefaultConfig,
 } from '../../src/config/loader.js';
 import type { BaxianConfig } from '../../src/shared/index.js';
@@ -428,12 +425,34 @@ describe('saveConfig', () => {
 
     await saveConfig(path, { ...VALID_CONFIG } as BaxianConfig);
 
-    const backups = (await readdir(join(tempDir, '.baxian', 'config-backups')))
-      .filter(f => /baxian\.json\.\d{8}-\d{6}$/.test(f));
+    const backups = (await readdir(tempDir))
+      .filter(f => /baxian\.json\.\d{4}(?:-\d{2}){5}-\d{3}$/.test(f));
     expect(backups).toHaveLength(1);
 
     const config = await loadConfig(path);
     expect(config.server.port).toBe(8080);
+  });
+
+  it('continues writing when the same millisecond already has a backup', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-28T10:00:00'));
+    const path = join(tempDir, 'baxian.json');
+    try {
+      await writeFile(path, JSON.stringify({ old: true }));
+      await saveConfig(path, { ...VALID_CONFIG } as BaxianConfig);
+      await saveConfig(path, {
+        ...VALID_CONFIG,
+        server: { ...VALID_CONFIG.server, port: 9090 },
+      } as BaxianConfig);
+
+      const backups = (await readdir(tempDir))
+        .filter(f => /^baxian\.json\.\d{4}(?:-\d{2}){5}-\d{3}$/.test(f));
+      expect(backups).toEqual(['baxian.json.2026-04-28-10-00-00-000']);
+      expect(await readFile(join(tempDir, backups[0]), 'utf-8')).toBe('{"old":true}');
+      expect((await loadConfig(path)).server.port).toBe(9090);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('writes config even when no previous file exists', async () => {
@@ -471,7 +490,7 @@ describe('saveConfig', () => {
   });
 });
 
-describe('resolveConfigPath / resolveStateDir / userConfigPath / userStateDir', () => {
+describe('resolveHome', () => {
   let cwdReal: string;
   let homeReal: string;
   let originalCwd: string;
@@ -491,50 +510,33 @@ describe('resolveConfigPath / resolveStateDir / userConfigPath / userStateDir', 
     await rm(homeReal, { recursive: true });
   });
 
-  it('userConfigPath() points to ~/.baxian/config.json', () => {
-    expect(userConfigPath()).toBe(join(homeReal, '.baxian', 'config.json'));
+  it('defaults to ~/.baxian', () => {
+    expect(resolveHome()).toBe(join(homeReal, '.baxian'));
   });
 
-  it('userStateDir() points to ~/.baxian', () => {
-    expect(userStateDir()).toBe(join(homeReal, '.baxian'));
+  it('uses BAXIAN_HOME when no explicit home is provided', () => {
+    vi.stubEnv('BAXIAN_HOME', './env-home');
+    expect(resolveHome()).toBe(join(cwdReal, 'env-home'));
   });
 
-  it('resolveConfigPath(explicit) returns the resolved path without fs check', async () => {
-    expect(await resolveConfigPath('/some/path/baxian.json')).toBe('/some/path/baxian.json');
+  it('gives the explicit home precedence over BAXIAN_HOME', () => {
+    vi.stubEnv('BAXIAN_HOME', join(cwdReal, 'env-home'));
+    expect(resolveHome('./cli-home')).toBe(join(cwdReal, 'cli-home'));
   });
 
-  it('resolveConfigPath() returns cwd/baxian.json when it exists', async () => {
+  it('never discovers a config from cwd', async () => {
     const cwdConfig = join(cwdReal, 'baxian.json');
     await writeFile(cwdConfig, JSON.stringify({ project: [] }));
-    expect(await resolveConfigPath()).toBe(cwdConfig);
+    expect(resolveHome()).toBe(join(homeReal, '.baxian'));
   });
 
-  it('resolveConfigPath() falls back to ~/.baxian/config.json when cwd has none', async () => {
-    const user = join(homeReal, '.baxian', 'config.json');
-    await createDefaultConfig(user);
-    expect(await resolveConfigPath()).toBe(user);
+  it('treats an empty BAXIAN_HOME as unset', () => {
+    vi.stubEnv('BAXIAN_HOME', '');
+    expect(resolveHome()).toBe(join(homeReal, '.baxian'));
   });
 
-  it('resolveConfigPath() returns null when neither location has a config', async () => {
-    expect(await resolveConfigPath()).toBeNull();
-  });
-
-  it('resolveStateDir(cwd config) returns sibling .baxian/', () => {
-    expect(resolveStateDir(join(cwdReal, 'baxian.json'))).toBe(join(cwdReal, '.baxian'));
-  });
-
-  it('resolveStateDir(user config) returns ~/.baxian (config and state share the dir)', () => {
-    expect(resolveStateDir(userConfigPath())).toBe(userStateDir());
-  });
-
-  it('resolveStateDir(alias inside ~/.baxian/) still returns ~/.baxian — not nested', () => {
-    const alias = join(homeReal, '.baxian', 'cfg-alias.json');
-    expect(resolveStateDir(alias)).toBe(userStateDir());
-  });
-
-  it('resolveStateDir(deeper subdir under ~/.baxian/) falls through to sibling .baxian/', () => {
-    const deep = join(homeReal, '.baxian', 'sub', 'cfg.json');
-    expect(resolveStateDir(deep)).toBe(join(homeReal, '.baxian', 'sub', '.baxian'));
+  it('rejects an explicitly empty home', () => {
+    expect(() => resolveHome('')).toThrow('home directory must not be empty');
   });
 });
 
@@ -559,10 +561,11 @@ describe('createDefaultConfig', () => {
   });
 
   it('writes minimal config with empty project list at the given path', async () => {
-    const target = join(homeReal, '.baxian', 'config.json');
-    await createDefaultConfig(target);
+    const target = join(homeReal, '.baxian', 'baxian.json');
+    expect(await createDefaultConfig(target)).toBe(true);
     const fileStat = await stat(target);
     expect(fileStat.isFile()).toBe(true);
+    expect(fileStat.mode & 0o777).toBe(0o600);
     const parsed = JSON.parse(await readFile(target, 'utf-8'));
     expect(parsed.project).toEqual([]);
     expect(parsed.server.port).toBe(3000);
@@ -570,16 +573,25 @@ describe('createDefaultConfig', () => {
   });
 
   it('creates the parent directory chain', async () => {
-    const target = join(homeReal, '.baxian', 'config.json');
+    const target = join(homeReal, '.baxian', 'baxian.json');
     await createDefaultConfig(target);
     const dirStat = await stat(join(homeReal, '.baxian'));
     expect(dirStat.isDirectory()).toBe(true);
   });
 
   it('template content loads cleanly through loadConfig (validator + normalizer)', async () => {
-    const target = join(homeReal, '.baxian', 'config.json');
+    const target = join(homeReal, '.baxian', 'baxian.json');
     await createDefaultConfig(target);
     const cfg = await loadConfig(target);
     expect(cfg.project).toEqual([]);
+  });
+
+  it('never overwrites an existing config', async () => {
+    const target = join(homeReal, '.baxian', 'baxian.json');
+    expect(await createDefaultConfig(target)).toBe(true);
+    await writeFile(target, '{"project":[{"id":"keep"}]}');
+
+    expect(await createDefaultConfig(target)).toBe(false);
+    expect(await readFile(target, 'utf-8')).toBe('{"project":[{"id":"keep"}]}');
   });
 });

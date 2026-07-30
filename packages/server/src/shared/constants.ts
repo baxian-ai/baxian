@@ -36,7 +36,6 @@ export function isValidBranchName(name: string): boolean {
   if (name.endsWith('.')) return false;
   return name.split('/').every(p => !p.startsWith('.') && !p.endsWith('.lock'));
 }
-export const STATE_DIR = '.baxian';
 export const CONFIG_FILE = 'baxian.json';
 
 export const IMAGE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
@@ -54,9 +53,6 @@ export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;
 export const PET_UPLOAD_ROUTE_BODY_LIMIT = 12 * 1024 * 1024;
 
 export const MAX_INLINE_CONTENT_BYTES = 10 * 1024;
-
-export const USER_CONFIG_REL = '.baxian/config.json';
-export const USER_STATE_REL = '.baxian';
 
 export const TOOL_PATTERN = /^[a-z][a-z0-9-]*$/;
 export const CONTROL_CHAR_RE = /\p{Cc}/u;

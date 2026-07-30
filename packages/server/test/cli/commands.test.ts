@@ -47,6 +47,7 @@ describe('CLI command actions', () => {
     logs = [];
     warns = [];
     errors = [];
+    vi.mocked(startServer).mockClear();
     spawnSyncMock.mockReset();
     spawnSyncMock.mockReturnValue({ status: 0 });
     logSpy = vi.spyOn(console, 'log').mockImplementation((...args) => {
@@ -73,10 +74,33 @@ describe('CLI command actions', () => {
   });
 
   describe('start (default command)', () => {
-    it('runs startServer with the --config path', async () => {
+    it('runs startServer with an explicit --home', async () => {
       const cli = buildCli();
-      await cli.parseAsync(['node', 'cli', 'start', '--config', '/tmp/baxian.json']);
-      expect(vi.mocked(startServer)).toHaveBeenCalledWith('/tmp/baxian.json');
+      await cli.parseAsync(['node', 'cli', 'start', '--home', '/tmp/baxian-home']);
+      expect(vi.mocked(startServer)).toHaveBeenCalledWith('/tmp/baxian-home');
+    });
+
+    it('accepts --home when start is selected as the default command', async () => {
+      await buildCli().parseAsync(['node', 'cli', '--home', '/tmp/default-home']);
+      expect(vi.mocked(startServer)).toHaveBeenCalledWith('/tmp/default-home');
+    });
+
+    it('delegates default and BAXIAN_HOME resolution when --home is absent', async () => {
+      await buildCli().parseAsync(['node', 'cli', 'start']);
+      expect(vi.mocked(startServer)).toHaveBeenCalledWith(undefined);
+    });
+
+    it('rejects the removed --config option', async () => {
+      const cli = buildCli().exitOverride();
+      const start = cli.commands.find(command => command.name() === 'start')!;
+      let output = '';
+      const captureError = { writeErr: (message: string) => { output += message; } };
+      cli.configureOutput(captureError);
+      start.configureOutput(captureError).exitOverride();
+      await expect(cli.parseAsync(['node', 'cli', 'start', '--config', '/tmp/baxian.json']))
+        .rejects.toMatchObject({ code: 'commander.unknownOption' });
+      expect(output).toContain("unknown option '--config'");
+      expect(vi.mocked(startServer)).not.toHaveBeenCalled();
     });
   });
 

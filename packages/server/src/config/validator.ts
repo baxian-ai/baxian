@@ -261,7 +261,7 @@ function validatePlatformProjects(config: BaxianConfig, errors: ValidationError[
       if (gitCli === undefined) {
         errors.push({
           path: `${path}.gitCli`,
-          message: 'non-GitHub repos require gitCli.tool and a matching git-driver plugin under ~/.baxian/plugins/',
+          message: 'non-GitHub repos require gitCli.tool and a matching git-driver plugin under <home>/plugins/',
         });
       }
     } else if (isBareRepoSlug(project.repo) && resolveProjectTool(project) !== 'gh') {

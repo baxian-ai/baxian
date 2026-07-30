@@ -70,7 +70,7 @@ The server owns task and agent-binding state, drives agents through their tmux p
 > - **Node.js ≥ 22.13**
 > - **tmux** on every machine that runs agents (local and remote)
 > - **Claude Code** (`claude`) and/or **Codex** (`codex`) CLI installed and logged in
-> - **git**, plus the platform CLI your repo needs — **GitHub CLI** (`gh`, authenticated) for GitHub repos; another host needs its own CLI and a matching driver plugin under `~/.baxian/plugins/`
+> - **git**, plus the platform CLI your repo needs — **GitHub CLI** (`gh`, authenticated) for GitHub repos; another host needs its own CLI and a matching driver plugin under the instance home's `plugins/` directory
 >
 > The CLI must be authenticated on every machine that runs agents, and on the server itself: the server calls it to poll reviews, merge, and close PRs, while agents call it to open PRs and post comments.
 
@@ -81,7 +81,7 @@ npm install -g baxian
 baxian
 ```
 
-Open <http://localhost:3000>. The first run creates `~/.baxian/config.json` for you.
+Open <http://localhost:3000>. The first run creates `~/.baxian/baxian.json` for you.
 
 Then, in the console:
 
@@ -93,6 +93,7 @@ Then, in the console:
 
 ```sh
 baxian                    # start the server (default command)
+baxian --home <dir>       # use a separate instance home (or set BAXIAN_HOME)
 baxian status             # status of all agents
 baxian attach <agent-id>  # attach to an agent's tmux session, local or remote
 baxian stop <agent-id>    # interrupt an agent
@@ -102,7 +103,7 @@ baxian task list -p <project>
 
 ## Configuration
 
-baxian reads `./baxian.json` from the working directory first, then falls back to `~/.baxian/config.json` (`baxian start -c <path>` overrides both). A minimal configuration:
+baxian reads `<home>/baxian.json`, where `<home>` defaults to `~/.baxian`. Override the instance home with `baxian --home <dir>` or `BAXIAN_HOME`; the CLI option takes precedence. The working directory is never searched for configuration. A minimal configuration:
 
 ```json
 {

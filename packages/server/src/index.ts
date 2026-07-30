@@ -1,11 +1,9 @@
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync, existsSync } from 'node:fs';
 import {
   loadConfig,
-  resolveConfigPath,
-  resolveStateDir,
-  userConfigPath,
+  resolveHome,
   createDefaultConfig,
 } from './config/loader.js';
 import { loadPluginsOrExplain, planPlatformEntries, type PlatformEntryDeps, referencedGitTools, retainedPlatformProjectIds, scanPluginSkillPools } from './platform/startup.js';
@@ -31,7 +29,7 @@ import { platformPollerStatePath } from './platform/comment-cursor.js';
 import { buildProjectDriver, makeDriverExec } from './platform/driver-host.js';
 import { createRunner, resolveAgentHost } from './agent/runner.js';
 import type { AgentRuntimeConfig, HostConfig } from './shared/index.js';
-import { repoIdentityKey } from './shared/index.js';
+import { CONFIG_FILE, repoIdentityKey } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import { PeriodicTaskRunner } from './timing/periodic-task-runner.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
@@ -86,17 +84,15 @@ export function createPlatformPollerOptions(
   };
 }
 
-export async function startServer(configPath?: string): Promise<void> {
-  let cfgPath = await resolveConfigPath(configPath);
-  if (!cfgPath) {
-    cfgPath = userConfigPath();
-    await createDefaultConfig(cfgPath);
-    console.log(`Initialized config at ${cfgPath} (no baxian.json found in cwd, no ~/.baxian/config.json yet)`);
+export async function startServer(home?: string): Promise<void> {
+  const stateDir = resolveHome(home);
+  const cfgPath = join(stateDir, CONFIG_FILE);
+  if (await createDefaultConfig(cfgPath)) {
+    console.log(`Initialized config at ${cfgPath}`);
   }
   const config = await loadConfig(cfgPath);
 
-  const stateDir = resolveStateDir(cfgPath);
-  const [pluginsResult] = await Promise.all([loadPluginsOrExplain(config), initStateDir(stateDir)]);
+  const [pluginsResult] = await Promise.all([loadPluginsOrExplain(config, stateDir), initStateDir(stateDir)]);
   if ('fatal' in pluginsResult) {
     for (const line of pluginsResult.fatal) console.error(line);
     process.exit(1);

@@ -80,18 +80,18 @@ describe('startServer', () => {
   async function writeConfig(
     server: Record<string, unknown>,
     extra: Record<string, unknown> = {},
-  ): Promise<{ cfgPath: string; stateDir: string }> {
+  ): Promise<{ home: string; cfgPath: string; stateDir: string }> {
     const cfgPath = join(tempDir, 'baxian.json');
     await writeFile(
       cfgPath,
       JSON.stringify({ review: { rounds: 10 }, server, host: [], project: [], ...extra }),
     );
-    return { cfgPath, stateDir: join(tempDir, '.baxian') };
+    return { home: tempDir, cfgPath, stateDir: tempDir };
   }
 
   it('boots the composed server, serves /health, consumes the restart sentinel, and shuts down on SIGINT', async () => {
     const port = await getFreePort();
-    const { cfgPath, stateDir } = await writeConfig({ port, host: '127.0.0.1', ...QUIET_INTERVALS });
+    const { home, stateDir } = await writeConfig({ port, host: '127.0.0.1', ...QUIET_INTERVALS });
     await mkdir(join(stateDir, 'state'), { recursive: true });
     await writeFile(
       join(stateDir, 'state', 'restart-intent.json'),
@@ -115,7 +115,7 @@ describe('startServer', () => {
     const exitBefore = new Set(process.listeners('exit'));
 
     try {
-      await startServer(cfgPath);
+      await startServer(home);
 
       const res = await fetch(`http://127.0.0.1:${port}/health`);
       expect(res.status).toBe(200);
@@ -144,7 +144,7 @@ describe('startServer', () => {
   it('emits a platform-binding intervention when an active task binding differs from live config', async () => {
     const port = await getFreePort();
     const cfgPath = join(tempDir, 'baxian.json');
-    const stateDir = join(tempDir, '.baxian');
+    const stateDir = tempDir;
     await writeFile(cfgPath, JSON.stringify({
       review: { rounds: 3 },
       server: { port, host: '127.0.0.1', ...QUIET_INTERVALS },
@@ -170,7 +170,7 @@ describe('startServer', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
     try {
-      await startServer(cfgPath);
+      await startServer(stateDir);
 
       const events = await new EventLog(join(stateDir, 'events'))
         .readDate(new Date().toISOString().slice(0, 10));
@@ -205,12 +205,12 @@ describe('startServer', () => {
   }, 30_000);
 
   it('fails fast with ProcessLockError when another instance holds the state lock', async () => {
-    const { cfgPath, stateDir } = await writeConfig({ port: 3000, host: '127.0.0.1', ...QUIET_INTERVALS });
+    const { home, stateDir } = await writeConfig({ port: 3000, host: '127.0.0.1', ...QUIET_INTERVALS });
     await mkdir(stateDir, { recursive: true });
     const competitor = new ProcessLock(stateDir);
     await competitor.acquire();
     try {
-      await expect(startServer(cfgPath)).rejects.toBeInstanceOf(ProcessLockError);
+      await expect(startServer(home)).rejects.toBeInstanceOf(ProcessLockError);
       expect(errors.flat().join(' ')).toContain('[startup] process lock acquisition failed');
     } finally {
       await competitor.release();
@@ -218,7 +218,7 @@ describe('startServer', () => {
   });
 
   it('releases the process lock when startup fails mid-way', async () => {
-    const { cfgPath, stateDir } = await writeConfig({
+    const { home, stateDir } = await writeConfig({
       port: 3000,
       host: '127.0.0.1',
       https: { keyFile: join(tempDir, 'missing.key'), certFile: join(tempDir, 'missing.crt') },
@@ -230,7 +230,7 @@ describe('startServer', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
     try {
-      await expect(startServer(cfgPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(startServer(home)).rejects.toMatchObject({ code: 'ENOENT' });
 
       const reacquire = new ProcessLock(stateDir);
       await expect(reacquire.acquire()).resolves.not.toThrow();

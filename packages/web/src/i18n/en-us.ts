@@ -477,7 +477,7 @@ export const enUS = {
     restartNow: 'Restart now',
     preRestartFetchFailed: (detail: string) => `Failed to read startedAt before restart: ${detail}`,
     restartTriggerFailed: (detail: string) => `Failed to trigger restart: ${detail}`,
-    restartTimeout: 'Restart timed out (30s with no recovery). Check the logs, or run baxian start -c <path> manually.',
+    restartTimeout: 'Restart timed out (30s with no recovery). Check the logs, or run baxian start --home <dir> manually.',
     githubDegraded: (repo: string) => `Platform polling degraded for ${repo} — reviews and PR updates may lag until connectivity recovers`,
     githubUnreachable: (repo: string) => `Platform unreachable for ${repo} — task progress is paused and will resume automatically once connectivity recovers`,
     githubRateLimited: (repo: string, until: string) => `Platform polling rate-limited for ${repo} until ${new Date(until).toLocaleTimeString()} — updates will resume automatically`,

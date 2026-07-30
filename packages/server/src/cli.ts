@@ -219,9 +219,9 @@ export function buildCli(): Command {
   program
     .command('start', { isDefault: true })
     .description('Start the baxian server (default command)')
-    .option('-c, --config <path>', 'Path to config file')
+    .option('--home <dir>', 'Instance home directory (default ~/.baxian or BAXIAN_HOME)')
     .action(async (opts) => {
-      await startServer(opts.config);
+      await startServer(opts.home);
     });
 
   program
@@ -456,7 +456,7 @@ const isMainModule = (() => {
 if (isMainModule) {
   buildCli().parseAsync().catch((err: unknown) => {
     const e = err as { name?: string; message?: string } | null;
-    if (e && (e.name === 'ConfigValidationError' || e.name === 'ConfigNotFoundError')) {
+    if (e?.name === 'ConfigValidationError') {
       console.error(e.message);
       process.exit(1);
     }
