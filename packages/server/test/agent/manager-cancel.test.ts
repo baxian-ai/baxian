@@ -25,14 +25,6 @@ function stubClaimedPaneResolution(paneForAgent: (agentId: string) => string): v
     .mockImplementation(async (ref, claim) => ({ session: ref, paneId: paneForAgent(claim), claim }));
 }
 
-async function waitUntil(predicate: () => boolean, timeoutMs = 300): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  throw new Error('waitUntil: predicate never became true');
-}
 const harness = useManagerSuiteHarness();
 
 describe('AgentManager runtime menu marker', () => {
@@ -60,8 +52,16 @@ describe('AgentManager runtime menu marker', () => {
     });
 
     harness.manager.startRuntimeMenuWatch('dev-1');
-    await waitUntil(() => harness.events.some(e => e.type === 'human.intervention'));
-    await new Promise(resolve => setTimeout(resolve, 30));
+    try {
+      await vi.waitFor(() => {
+        expect(harness.events.some(event =>
+          event.type === 'human.intervention' &&
+          event.data.phase === 'agent_runtime_menu_resolved'
+        )).toBe(true);
+      }, { interval: 5 });
+    } finally {
+      harness.manager.stopRuntimeMenuWatch('dev-1');
+    }
 
     const interventions = harness.events.filter(e => e.type === 'human.intervention');
     expect(interventions.map(event => event.data.phase)).toEqual([
