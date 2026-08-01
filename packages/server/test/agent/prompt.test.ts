@@ -141,6 +141,16 @@ describe('buildPromptInline', () => {
     expect(() => prompt('recheck', { passToken: undefined })).toThrow(/pass\/fail token pair/);
   });
 
+  it('marks review, recheck, and fix prompts with stage: spec only while the task is in the spec phase', () => {
+    expect(prompt('review', { phase: 'spec' })).toContain('stage: spec');
+    expect(prompt('recheck', { phase: 'spec' })).toContain('stage: spec');
+    expect(prompt('fix', { phase: 'spec', prNumber: 42 })).toContain('stage: spec');
+
+    expect(prompt('review')).not.toContain('stage: spec');
+    expect(prompt('recheck')).not.toContain('stage: spec');
+    expect(prompt('fix', { phase: 'code', prNumber: 42 })).not.toContain('stage: spec');
+  });
+
   it('keeps task images in every full-context dispatch so a cleared runtime can recover', () => {
     const task = makeTask({ signalToken: SIGNAL_TOKEN });
     const develop = buildPromptInline({

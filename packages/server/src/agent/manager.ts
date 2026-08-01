@@ -7548,7 +7548,7 @@ export class AgentManager {
         acceptComposerChange: true,
       });
       await this.waitForReplPromptReady(tmux, pane, runtime, this.dispatchAckTimeoutMs, { stableIdle: true });
-      if (await this.hasRuntimeSlashCommandRejection(tmux, pane, '/clear')) {
+      if (await this.hasRuntimeSlashCommandRejection(tmux, pane, runtime, '/clear')) {
         throw new Error('Runtime rejected /clear at the dispatch boundary; refusing to reuse prior context');
       }
       await revalidate();
@@ -10848,9 +10848,9 @@ export class AgentManager {
       await this.waitForReplPromptReady(tmux, pane, runtime, this.compactIdleWaitMs);
       if (!await bindingStillOurs()) return false;
 
-      if (!await this.hasRuntimeSlashCommandRejection(tmux, pane, '/clear')) return true;
+      if (!await this.hasRuntimeSlashCommandRejection(tmux, pane, runtime, '/clear')) return true;
 
-      rejection = new Error('runtime rejected /clear because a task is still in progress');
+      rejection = new Error('runtime rejected /clear; the clear did not take effect');
       if (attempt < 2) {
         console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) /clear rejected; retrying`);
         await new Promise(r => setTimeout(r, this.compactIdlePollMs));
@@ -10862,14 +10862,28 @@ export class AgentManager {
   private async hasRuntimeSlashCommandRejection(
     tmux: TmuxManager,
     pane: PaneRef,
+    runtime: AgentRuntimeKind,
     command: '/compact' | '/clear',
   ): Promise<boolean> {
     const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
-    return this.runtimeSlashCommandRejectedPattern(command).test(cap);
+    return this.runtimeSlashCommandRejectedPatterns(runtime, command).some(re => re.test(cap));
   }
 
-  private runtimeSlashCommandRejectedPattern(command: '/compact' | '/clear'): RegExp {
-    return new RegExp(`["'“”‘’]?${command}["'“”‘’]?\\s+is disabled while a task is in progress\\.`, 'gi');
+  private runtimeSlashCommandRejectedPatterns(runtime: AgentRuntimeKind, command: '/compact' | '/clear'): RegExp[] {
+    const busyToast = new RegExp(
+      `["'“”‘’]?${command}["'“”‘’]?\\s+is disabled while a task is in progress\\.`,
+      'i',
+    );
+    switch (runtime) {
+      case 'claude-code':
+        return [busyToast];
+      case 'codex':
+        return [busyToast, new RegExp(`Unrecognized command '${command}'`, 'i')];
+      case 'opencode':
+        return [busyToast, /No matching items/i];
+      case 'qodercli':
+        return [busyToast, new RegExp(`Unknown skill: ${command.slice(1)}`, 'i')];
+    }
   }
 
   private async waitForReplPromptReady(

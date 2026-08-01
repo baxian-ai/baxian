@@ -1,9 +1,18 @@
 import { describe, it, expect, vi } from 'vitest';
+import type { AgentRuntime, BaxianConfig } from '../../src/shared/index.js';
 import { EnsureSessionError } from '../../src/agent/manager.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
 import { BranchManager } from '../../src/agent/branch.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeConfig } from '../helpers/fixtures.js';
+
+function devRuntimeConfig(runtime: AgentRuntime): BaxianConfig {
+  const config = makeConfig();
+  config.project[0]!.agent = config.project[0]!.agent.map(team =>
+    team.map(agent => (agent.id === 'dev-1' ? { ...agent, runtime } : agent)));
+  return config;
+}
 
 const NOW = '2026-05-14T05:00:00.000Z';
 
@@ -53,9 +62,10 @@ function paneRunner(
   execs: string[],
   capture: () => string | Promise<string>,
   onExec?: (cmd: string) => void | Promise<void>,
+  process?: string,
 ): CommandRunner {
   return fakeRunner({
-    agents: { 'dev-1': { paneId: '%5' } },
+    agents: { 'dev-1': { paneId: '%5', ...(process ? { process } : {}) } },
     onExec: async cmd => {
       execs.push(cmd);
       if (onExec) await onExec(cmd);
@@ -295,6 +305,46 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect(binding?.taskId).toBeUndefined();
     expect(binding?.status).not.toBe('awaiting_human');
   });
+
+  it('sends the shared /clear command for an opencode runtime', async () => {
+    const execs: string[] = [];
+    harness.manager = harness.createManager({
+      config: devRuntimeConfig('opencode'),
+      runnerFactory: () => paneRunner(execs, () => 'tab agents  ctrl+p commands', undefined, 'opencode'),
+    });
+    harness.setCompactTiming(harness.manager);
+    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
+
+    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
+    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
+
+    const joined = execs.join('\n');
+    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
+    expect(joined).not.toMatch(/send-keys -l -t %5 '\\''\/new'\\''/);
+  });
+
+  it.each([
+    ['codex', '/clear', `• Unrecognized command '/clear'. Type "/" for a list of supported commands.\n› `],
+    ['opencode', '/clear', 'No matching items\n\n/new\n\ntab agents  ctrl+p commands'],
+    ['qodercli', '/clear', 'x Unknown skill: clear\n\n> Type your message or @path/to/file'],
+  ] as const)(
+    'detects the %s unrecognized-command screen as a rejected clear instead of silent success',
+    async (runtime, clearCommand, rejectionScreen) => {
+      const execs: string[] = [];
+      harness.manager = harness.createManager({
+        config: devRuntimeConfig(runtime),
+        runnerFactory: () => paneRunner(execs, () => rejectionScreen, undefined, runtime),
+      });
+      harness.setCompactTiming(harness.manager);
+      await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
+
+      await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
+      await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
+
+      const sends = execs.filter(cmd => cmd.includes(`send-keys -l -t %5 '\\''${clearCommand}'\\''`));
+      expect(sends).toHaveLength(2);
+    },
+  );
 
   it('bails without touching the agent when its binding has moved to a different task', async () => {
     const execs: string[] = [];

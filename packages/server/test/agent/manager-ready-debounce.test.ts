@@ -13,6 +13,8 @@ import { fakeRunner } from '../helpers/fake-runner.js';
 
 const CODEX_IDLE = '› \n\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
 const CODEX_BUSY = '• Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
+const OPENCODE_IDLE = 'Ask anything...\n\ntab agents  ctrl+p commands\n';
+const OPENCODE_UNKNOWN_COMMAND = 'No matching items\n\n/new\n\ntab agents  ctrl+p commands\n';
 
 type WaitOpts = { stableIdle?: boolean };
 type WaitFn = (tmux: TmuxManager, paneId: string, runtime: string, timeoutMs: number, opts?: WaitOpts) => Promise<void>;
@@ -24,6 +26,20 @@ let tmux: TmuxManager;
 function waitReady(timeoutMs: number, opts?: WaitOpts): Promise<void> {
   const fn = (manager as unknown as { waitForReplPromptReady: WaitFn }).waitForReplPromptReady.bind(manager) as WaitFn;
   return fn(tmux, '%0', 'codex', timeoutMs, opts);
+}
+
+function dispatchBoundary(pane: ReturnType<typeof paneRefOf>, runtime: string): Promise<void> {
+  const fn = (manager as unknown as {
+    clearRuntimeForDispatchBoundary(
+      t: TmuxManager,
+      p: ReturnType<typeof paneRefOf>,
+      a: string,
+      r: string,
+      s: typeof TEST_SESSION_REF,
+      rv: () => Promise<void>,
+    ): Promise<void>;
+  }).clearRuntimeForDispatchBoundary.bind(manager);
+  return fn(tmux, pane, pane.claim, runtime, TEST_SESSION_REF, async () => undefined);
 }
 
 function mockFrames(frames: string[], opts: { cycle?: boolean } = {}): ReturnType<typeof vi.spyOn> {
@@ -171,5 +187,37 @@ describe('任务边界注入前的稳定就绪门', () => {
     )).resolves.toBeUndefined();
     expect(clearDraft).toHaveBeenCalled();
     expect(sendLiteral).toHaveBeenCalledWith(pane, '/clear');
+  });
+
+  it('opencode 边界清场与其他 runtime 一样发送 /clear', async () => {
+    mockFrames([OPENCODE_IDLE]);
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('opencode');
+    vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockResolvedValue(undefined);
+    const sendLiteral = vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'captureSettledSnapshot').mockResolvedValue(OPENCODE_IDLE);
+    vi.spyOn(TmuxManager.prototype, 'waitSubmitAck').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'setSessionOptionsIfAlive').mockResolvedValue('applied');
+    const pane = paneRefOf('%0', 'dev-1');
+
+    await expect(dispatchBoundary(pane, 'opencode')).resolves.toBeUndefined();
+    expect(sendLiteral).toHaveBeenCalledWith(pane, '/clear');
+    expect(sendLiteral).not.toHaveBeenCalledWith(pane, '/new');
+  });
+
+  it('opencode 边界清场看到 unknown-command 画面时 fail-closed，不放行 dispatch', async () => {
+    mockFrames([OPENCODE_UNKNOWN_COMMAND]);
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('opencode');
+    vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'captureSettledSnapshot').mockResolvedValue(OPENCODE_UNKNOWN_COMMAND);
+    vi.spyOn(TmuxManager.prototype, 'waitSubmitAck').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'setSessionOptionsIfAlive').mockResolvedValue('applied');
+
+    await expect(dispatchBoundary(paneRefOf('%0', 'dev-1'), 'opencode'))
+      .rejects.toThrow(/Runtime rejected \/clear at the dispatch boundary/);
   });
 });

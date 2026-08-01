@@ -163,6 +163,15 @@ describe('GitHubDriver', () => {
     expect(GITHUB_AGENT_PROMPTS.feedback).toContain('@base64');
   });
 
+  it('states the adopt-or-create publish semantics and the signal actor encoding chain', () => {
+    expect(GITHUB_AGENT_PROMPTS.publish).toContain('reuse or create one open non-draft PR');
+    expect(GITHUB_AGENT_PROMPTS.publish).toContain('exact head');
+    expect(GITHUB_AGENT_PROMPTS.publish).toContain('requested/default base');
+    expect(GITHUB_AGENT_PROMPTS.publish).toContain('stop on ambiguity');
+    expect(GITHUB_AGENT_PROMPTS.publish).toContain('numeric gh api user .id');
+    expect(GITHUB_AGENT_PROMPTS.publish).toContain('unpadded base64url');
+  });
+
   it('checks the authenticated GitHub identity and classifies rate limits', async () => {
     const good = harness([result('{"login":"alice"}')]);
     await expect(good.driver.runPreflightSteps()).resolves.toEqual([
