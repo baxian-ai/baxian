@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: [self-hosted, linux]
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 15
 
     steps:
