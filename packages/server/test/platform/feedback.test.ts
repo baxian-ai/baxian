@@ -4,7 +4,7 @@ import { buildAckMarker, buildReviewTokenLine, collectValidAcks, projectCommentR
 import { TimelineCollector } from '../../src/platform/review-timeline.js';
 import { sha256Hex } from '../../src/platform/body-digest.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
-import type { CommentSourceOp } from '../../src/platform/types.js';
+import type { CommentSource } from '../../src/platform/types.js';
 import type { FeedbackSourceScan } from '../../src/platform/feedback.js';
 
 const SHA = 'a'.repeat(40);
@@ -68,12 +68,11 @@ describe('collectPendingFeedback', () => {
     expect(result.pending.size).toBe(0);
   });
 
-  it('skips undated and system rows from the pending set', () => {
+  it('skips undated rows from the pending set', () => {
     const pendingReview: NormalizedRow = { id: 'p1', body: 'draft findings' };
     projectCommentRow(pendingReview);
     const result = collectPendingFeedback([
       scan('reviews', 'reviews', [pendingReview]),
-      scan('issue-comments', 'top-level', [row('s1', 'state changed', { system: true })]),
     ], verified);
     expect(result.pending.size).toBe(0);
   });
@@ -120,17 +119,17 @@ describe('feedbackEventTarget', () => {
 });
 
 describe('scanCommentSourcesOnce with a timeline collector', () => {
-  const sources = [
-    { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
-    { key: 'reviews', argv: ['{binary}'], map: { id: 'id', body: 'body', reviewState: { sources: ['s'], optional: true } } },
-  ] as unknown as CommentSourceOp[];
+  const sources: CommentSource[] = [
+    { key: 'issue-comments', category: 'top-level' },
+    { key: 'reviews', category: 'reviews' },
+  ];
 
   function pagedDriver(rowsByKey: Record<string, NormalizedRow[] | Error>) {
     return {
       commentSources: sources,
-      async runCommentSource(
-        source: CommentSourceOp,
-        _vars: { prNumber: number },
+      async listComments(
+        source: CommentSource,
+        _prNumber: number,
         projectPage?: (pageRows: NormalizedRow[]) => NormalizedRow[],
       ): Promise<NormalizedRow[]> {
         const rows = rowsByKey[source.key] ?? [];

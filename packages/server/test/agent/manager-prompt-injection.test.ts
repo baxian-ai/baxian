@@ -12,7 +12,6 @@ import {
 
 function makeInjectManager(runner: CommandRunner, ackMs: number, settleMs: number): AgentManager {
   const mgr = harness.createManager({
-    skillRegistry: harness.freshSkillRegistry(),
     runnerFactory: () => runner,
     dispatchAckTimeoutMs: ackMs,
     dispatchSettleTimeoutMs: settleMs,
@@ -373,7 +372,6 @@ describe('injectAndAwaitAck ack timeout', () => {
       execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const localManager = harness.createManager({
-      skillRegistry: harness.freshSkillRegistry(),
       runnerFactory: () => stuckRunner,
       dispatchAckTimeoutMs: 50,
     });

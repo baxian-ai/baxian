@@ -26,13 +26,11 @@ import {
 } from '../agent/runner.js';
 import { saveConfig, prepareConfig, ConfigValidationError } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
-import { redactProjects } from './config.js';
 import { CleanupFailedError, type DeletionClaimOutcome } from '../agent/manager.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
 import { applyConfigHotReload, prepareConfigHotReload } from '../config/hot-reload.js';
 import { gitBindingBlockerDetails, gitBindingBlockers } from './platform-guard.js';
-import { safeDriverErrorText } from '../platform/git-driver.js';
-import { projectNeedsPlatformEntry } from '../config/validator.js';
+import { safeDriverErrorText } from '../platform/types.js';
 
 interface CheckRun {
   agentId: string;
@@ -107,14 +105,14 @@ async function runServerHostChecks(
   }
   if (results.some(r => !r.ok)) return results;
   try {
-    const [row] = await driver.runOp('projectView');
+    const row = await driver.projectView();
     results.push({ step: 'platform-repo', ok: true, message: 'driver projectView OK on the server host' });
     const push = row?.pushPermitted;
     results.push(push === true
       ? { step: 'platform-push', ok: true, message: 'push permission confirmed (server merge/close channel)' }
       : push === false
         ? { step: 'platform-push', ok: false, message: 'push permission missing — server merge/close requires write access' }
-        : { step: 'platform-push', ok: true, message: 'plugin did not report pushPermitted — write access cannot be asserted statically' });
+        : { step: 'platform-push', ok: true, message: 'The platform did not report push permission — write access cannot be asserted statically' });
   } catch (err) {
     console.warn('[checks] server-host projectView failed:', safeDriverErrorText(err));
     results.push({
@@ -455,7 +453,7 @@ function switchCommittedAgentConfig(
 
 export async function projectRoutes(app: FastifyInstance): Promise<void> {
   app.get('/projects', async () => {
-    return redactProjects(app.ctx.config.project);
+    return app.ctx.config.project;
   });
 
   app.get<{ Params: { id: string } }>('/projects/:id', async (request, reply) => {
@@ -463,7 +461,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     if (!project) {
       return reply.status(404).send({ error: 'Project not found' });
     }
-    return redactProjects([project])[0];
+    return project;
   });
 
   app.post<{ Params: { id: string } }>('/projects/:id/bootstrap', async (request, reply) => {
@@ -492,14 +490,13 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
 
       const entries: CheckEntry[] = [];
       const checks: Promise<CheckRun>[] = [];
-      const gitPlatform = app.ctx.agentManager.agentGitPreflightContext(project.id);
       for (const team of project.agent) {
         for (const agent of team) {
           const host = resolveAgentHost(app.ctx.config.host, agent.host);
           const runner = createRunner(agent.mode, host);
           entries.push({ agent, hostGroup: hostGroupKey(agent.mode, host), runner });
           checks.push(
-            runPreflight(runner, agent, project.repo, host, project.id, gitPlatform, {
+            runPreflight(runner, agent, project.repo, host, project.id, {
               requireGitPush: agent.role === 'dev',
             }).then(results => ({
               agentId: agent.id,
@@ -510,15 +507,12 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         }
       }
       const agents = await Promise.all(checks);
-      let server: { results: PreflightResult[] } | undefined;
-      if (projectNeedsPlatformEntry(app.ctx.config, project)) {
-        server = { results: await runServerHostChecks(app.ctx.agentManager, project.id) };
-      }
+      const server = { results: await runServerHostChecks(app.ctx.agentManager, project.id) };
       if (request.body?.fix !== true) {
-        return reply.status(201).send({ projectId: project.id, agents, ...(server ? { server } : {}) });
+        return reply.status(201).send({ projectId: project.id, agents, server });
       }
       const fixes = await fixMissingTmux(project.id, entries, agents);
-      return reply.status(201).send({ projectId: project.id, agents, ...(server ? { server } : {}), fixes });
+      return reply.status(201).send({ projectId: project.id, agents, server, fixes });
     },
   );
 
@@ -583,7 +577,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; gitCli?: ProjectConfig['gitCli'] } }>(
+  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy } }>(
     '/projects',
     async (request, reply) => {
       if (!app.ctx.configPath) {
@@ -591,7 +585,17 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
 
       return withConfigLock(async () => {
-        const { id, repo, merge, specApproval, gitCli } = request.body ?? {};
+        const body = request.body ?? {};
+        const unknown = Object.keys(body).filter(
+          key => !['id', 'repo', 'merge', 'specApproval'].includes(key),
+        );
+        if (unknown.length > 0) {
+          return reply.status(400).send({
+            error: 'Invalid project',
+            details: unknown.map(path => ({ path, message: 'unknown project field' })),
+          });
+        }
+        const { id, repo, merge, specApproval } = body;
         if (!id || typeof id !== 'string') {
           return reply.status(400).send({ error: 'id must be a non-empty string' });
         }
@@ -607,7 +611,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           repo,
           merge: merge ?? null,
           ...(specApproval !== undefined ? { specApproval } : {}),
-          ...(gitCli !== undefined ? { gitCli } : {}),
           agent: [],
         };
 
@@ -624,14 +627,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
             return reply.status(400).send({ error: 'Invalid config', details: err.errors });
           }
           throw err;
-        }
-
-        try {
-          await app.ctx.agentManager.ensurePluginSkillPools(validated);
-        } catch (err) {
-          return reply.status(400).send({
-            error: `git-driver plugin skill pool is unusable for this config: ${err instanceof Error ? err.message : String(err)}`,
-          });
         }
 
         const guarded = await app.ctx.agentManager.guardGitConfigCommit(

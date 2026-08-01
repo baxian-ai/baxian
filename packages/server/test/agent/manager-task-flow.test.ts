@@ -1,11 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { DispatchTerminalError, EnsureSessionError } from '../../src/agent/manager.js';
-import { ApiError } from '../../src/errors.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { clearAwareRunner } from '../helpers/fake-runner.js';
 import { makeTask } from '../helpers/fixtures.js';
@@ -141,8 +137,6 @@ describe('AgentManager task binding flow', () => {
     await harness.seedAgent({ id: 'dev-1', workdir: '/repo/wt' });
     vi.spyOn(harness.manager as unknown as { ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }> }, 'ensureWorkdir')
       .mockResolvedValue({ workdir: '/repo/wt' });
-    vi.spyOn(harness.manager as unknown as { provisionRepoSkills: (...a: unknown[]) => Promise<void> }, 'provisionRepoSkills')
-      .mockResolvedValue(undefined);
     const buildSpy = vi.spyOn(
       harness.manager as unknown as { buildFreshSession: (...a: unknown[]) => Promise<unknown> }, 'buildFreshSession',
     ).mockResolvedValue({ createdSession: true, agentId: 'dev-1' });
@@ -316,8 +310,8 @@ describe('AgentManager task binding flow', () => {
       config: {
         ...harness.config,
         project: [
-          { id: 'proj-a', repo: 'user/repo-a', merge: null, agent: [] },
-          { id: 'proj-b', repo: 'user/repo-b', merge: null, agent: [] },
+          { id: 'proj-a', repo: 'https://github.com/user/repo-a.git', merge: null, agent: [] },
+          { id: 'proj-b', repo: 'https://github.com/user/repo-b.git', merge: null, agent: [] },
         ],
       },
     });
@@ -706,9 +700,7 @@ describe('AgentManager task binding flow', () => {
   it('develop dispatch holds the dev when the spec/pr-created watcher fails to arm', async () => {
     await harness.seedAgent({ id: 'dev-1' });
     const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };
-    const skillRegistry = new SkillRegistry(join(harness.tempDir, 'skills'));
-    await skillRegistry.scan();
-    const m = harness.createManager({ skillRegistry, phaseSignalWatcher: watcher as never });
+    const m = harness.createManager({ phaseSignalWatcher: watcher as never });
     vi.spyOn(m, 'startSession').mockResolvedValue(true);
     const holdSpy = vi.spyOn(m, 'markAwaitingHuman');
 
@@ -726,10 +718,7 @@ describe('AgentManager task binding flow', () => {
   it('setupPhaseSignal through the REAL watcher reports false for a config-removed agent; the hold marks it awaiting_human', async () => {
     const t = await harness.seedTask({ id: 'task-ghost', agentId: 'ghost', devAgentId: 'ghost', signalToken: 'tok-1' });
     await harness.seedAgent({ id: 'ghost', taskId: t.id });
-    const skillRegistry = new SkillRegistry(join(harness.tempDir, 'skills'));
-    await skillRegistry.scan();
     const m = harness.createManager({
-      skillRegistry,
       paneStreamerManager: {
         ensure: () => { throw new Error('unreachable: resolveAgent fails before ensure'); },
       } as never,
@@ -751,10 +740,7 @@ describe('AgentManager task binding flow', () => {
 
   it('setupPhaseSignal through the REAL watcher arms and reports true for a configured agent', async () => {
     const t = await harness.seedTask({ id: 'task-armed', signalToken: 'tok-2' });
-    const skillRegistry = new SkillRegistry(join(harness.tempDir, 'skills'));
-    await skillRegistry.scan();
     const m = harness.createManager({
-      skillRegistry,
       paneStreamerManager: {
         ensure: () => ({
           subscribeAtomic: async () => ({ unsubscribe: () => undefined, snapshot: { data: '' } }),
@@ -788,74 +774,12 @@ describe('AgentManager task binding flow', () => {
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('validateTaskDispatch raises ApiError(500) when preflight hits RequiredSkillsMissingError', async () => {
-    const unseededSkillsDir = join(harness.tempDir, 'skills-empty');
-    await mkdir(unseededSkillsDir, { recursive: true });
-    const emptyRegistry = new SkillRegistry(unseededSkillsDir);
-    await emptyRegistry.scan();
-    const badManager = harness.createManager({ skillRegistry: emptyRegistry });
-    await harness.seedAgent({ id: 'dev-1' });
-
-    let caught: unknown;
-    try {
-      await badManager.validateTaskDispatch('proj', {
-        title: 'x',
-        description: 'y',
-        preferredAgentId: 'dev-1',
-      });
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBeInstanceOf(ApiError);
-    expect((caught as ApiError).status).toBe(500);
-    expect((caught as Error).message).toMatch(/required skill/i);
-  });
-
-  it('validateTaskDispatch fails fast when baxian-signals is missing (preview carries a signal token)', async () => {
-    const partialDir = join(harness.tempDir, 'skills-no-signals');
-    await mkdir(join(partialDir, 'baxian-task-check'), { recursive: true });
-    await writeFile(
-      join(partialDir, 'baxian-task-check', 'SKILL.md'),
-      `---\nname: baxian-task-check\ndescription: stub\n---\nstub`,
-    );
-    const registry = new SkillRegistry(partialDir);
-    await registry.scan();
-    const mgr2 = harness.createManager({ skillRegistry: registry });
-    await harness.seedAgent({ id: 'dev-1' });
-
-    let caught: unknown;
-    try {
-      await mgr2.validateTaskDispatch('proj', { title: 'x', description: 'y', preferredAgentId: 'dev-1' });
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBeInstanceOf(ApiError);
-    expect((caught as ApiError).status).toBe(500);
-    expect((caught as Error).message).toMatch(/baxian-signals/);
-  });
-
-  it('failTaskForDispatchError accepts required_skills_missing reason', async () => {
-    const t = await harness.seedTask({ id: 'task-skills' });
-    await harness.seedAgent({
-      id: 'dev-1',
-      taskId: t.id,
-      paneId: '%0',
-    });
-    await harness.acquireAgentLock('dev-1');
-
-    await harness.manager.failTaskForDispatchError(
-      t.id,
-      'develop',
-      'dev-1',
-      new DispatchTerminalError('required_skills_missing', 'missing baxian-task-check'),
-    );
-
-    expect((await harness.taskStore.get(t.id))?.status).toBe('failed');
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
-  });
-
   it('startSession ack_unknown preserves binding/lock/worktree (so downstream markAwaitingHuman can take over)', async () => {
-    const t = await harness.seedTask({ id: 'task-startsession-ack-unknown', branch: 'bx/task-startsession-ack-unknown' });
+    const t = await harness.seedTask({
+      id: 'task-startsession-ack-unknown',
+      branch: 'bx/task-startsession-ack-unknown',
+      signalToken: 'dispatch12345',
+    });
     await harness.seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
@@ -886,7 +810,11 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('startSession cleanup leaves the binding when cancel took it over (cancel-clearing) during the mutex wait', async () => {
-    const t = await harness.seedTask({ id: 'task-ss-cancel-clearing', branch: 'bx/task-ss-cancel-clearing' });
+    const t = await harness.seedTask({
+      id: 'task-ss-cancel-clearing',
+      branch: 'bx/task-ss-cancel-clearing',
+      signalToken: 'dispatch12345',
+    });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.acquireAgentLock('dev-1');
 
@@ -917,7 +845,11 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('startSession set-running write preserves a cancel-clearing hold present at write time (does NOT wipe it)', async () => {
-    const t = await harness.seedTask({ id: 'task-ss-cancel-clearing-prewrite', branch: 'bx/task-ss-cancel-clearing-prewrite' });
+    const t = await harness.seedTask({
+      id: 'task-ss-cancel-clearing-prewrite',
+      branch: 'bx/task-ss-cancel-clearing-prewrite',
+      signalToken: 'dispatch12345',
+    });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
     await harness.acquireAgentLock('dev-1');
 

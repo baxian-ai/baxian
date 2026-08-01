@@ -455,7 +455,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   );
 
   function renderInfo(task: TaskState) {
-    const isLegacy = task.preferredAgentId === '';
+    const isUnassigned = task.preferredAgentId === '';
     const showApprovedAction = task.status === 'approved' && task.prNumber !== undefined;
     const showMergeReadyAction = task.status === 'merge-ready' && task.prNumber !== undefined;
     const showSpecReadyAction = task.status === 'spec-ready';
@@ -480,11 +480,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             <div className="mt-1">{task.branchCleanupSkipped.reason}</div>
           </div>
         )}
-        {isLegacy && (
+        {isUnassigned && (
           <div className="mb-4 rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
             {task.status === 'pending'
-              ? t.taskDetail.legacyPendingNotice
-              : t.taskDetail.legacyReadonlyNotice(t.status[task.status] ?? task.status)}
+              ? t.taskDetail.unassignedPendingNotice
+              : t.taskDetail.unassignedReadonlyNotice(t.status[task.status] ?? task.status)}
           </div>
         )}
 
@@ -795,7 +795,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       && task.qaAgentId !== undefined;
     const completeEnabled = isCodeMaxRounds && task.prNumber !== undefined;
     const continueEnabled = completeEnabled && !!task.agentId;
-    const isLegacy = task.preferredAgentId === '';
+    const isUnassigned = task.preferredAgentId === '';
 
     return (
       <>
@@ -816,7 +816,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             type="button"
             disabled={!retryEnabled || retrying}
             onClick={handleRetry}
-            title={isLegacy ? t.taskDetail.retryDisabledLegacyTitle : t.taskDetail.retryEnabledTitle}
+            title={isUnassigned ? t.taskDetail.retryDisabledUnassignedTitle : t.taskDetail.retryEnabledTitle}
             className="btn-secondary"
           >
             {retrying ? t.common.retrying : t.common.retry}

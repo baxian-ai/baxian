@@ -165,8 +165,5 @@ function normalizeNeedInput(raw: Record<string, unknown>): NeedInputWatermark | 
       return w;
     }
   }
-  if (typeof raw.needInputAt === 'string') {
-    return { epoch: 0, askSeq: 1, answeredSeq: 0, at: raw.needInputAt };
-  }
   return undefined;
 }

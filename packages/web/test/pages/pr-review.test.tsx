@@ -83,7 +83,7 @@ describe('PrReviewPage', () => {
     expect(screen.queryByText('Code review')).toBeNull();
   });
 
-  it('does not create a link for a non-HTTP PR URL supplied by a plugin', async () => {
+  it('does not create a link for a non-HTTP PR URL supplied by the API', async () => {
     ghMock.mockResolvedValue({
       available: true,
       prNumber: 7,

@@ -2,8 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { planPlatformEntries, retainedPlatformProjectIds } from '../../src/platform/startup.js';
-import { PlatformPoller, platformTaskView, type PlatformDriver } from '../../src/platform/platform-poller.js';
+import { auditPlatformBindings, platformEntries } from '../../src/platform/startup.js';
+import { PlatformPoller, platformTaskView } from '../../src/platform/platform-poller.js';
+import type { PlatformDriver } from '../../src/platform/types.js';
 import { computePollerHealth } from '../../src/platform/poller-health.js';
 import { applyConfigHotReload, prepareConfigHotReload } from '../../src/config/hot-reload.js';
 import { createPlatformPollerOptions } from '../../src/index.js';
@@ -14,9 +15,16 @@ import type { BaxianConfig, ProjectConfig, TaskState } from '../../src/shared/in
 const driver = (): PlatformDriver => ({
   visibilityLagMs: 0,
   commentSources: [],
-  runOp: async () => [],
-  runListPrs: async () => [],
-  runCommentSource: async () => [],
+  runPreflightSteps: async () => [],
+  projectView: async () => ({ defaultBranch: 'main', pushPermitted: true }),
+  prView: async () => ({}),
+  branchView: async () => ({}),
+  listPrs: async () => [],
+  listComments: async () => [],
+  postComment: async () => undefined,
+  mergePr: async () => undefined,
+  closePr: async () => undefined,
+  deleteBranch: async () => undefined,
 });
 
 const cfg = (projects: Array<Partial<ProjectConfig>>): BaxianConfig => ({
@@ -66,133 +74,74 @@ describe('createPlatformPollerOptions', () => {
   });
 });
 
-describe('planPlatformEntries', () => {
-  it('builds an entry for a GitHub project', () => {
-    const { entries } = planPlatformEntries(cfg([{}]), deps);
+describe('platformEntries', () => {
+  it('builds one entry per validated project through the injected driver factory', () => {
+    const entries = platformEntries(cfg([{}]), deps);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ projectId: 'p', repoUrl: 'https://github.com/a/b.git' });
-  });
-
-  it('builds an entry for a non-GitHub project with an explicit tool', () => {
-    const config = cfg([{
-      repo: 'https://gl.example.com/g/x.git',
-      gitCli: { tool: 'glab' },
-    }]);
-    expect(planPlatformEntries(config, deps).entries).toHaveLength(1);
-  });
-
-  it('skips the project with a diagnostic when no driver resolves', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const { entries } = planPlatformEntries(cfg([{}]), { ...deps, driverFor: () => undefined });
-    expect(entries).toEqual([]);
-    expect(warn.mock.calls[0]?.[0]).toMatch(/needs a platform entry/);
-    warn.mockRestore();
-  });
-
-  it('collapses projects that share one repo identity into a single entry', () => {
-    const config = cfg([
-      { id: 'first', repo: 'https://github.com/a/b.git' },
-      { id: 'second', repo: 'git@github.com:a/b.git' },
-    ]);
-    const { entries, conflicts } = planPlatformEntries(config, deps);
-    expect(entries).toHaveLength(1);
-    expect(entries[0].projectId).toBe('first');
-    expect(conflicts).toEqual([{ projectId: 'second', repoKey: 'github.com/a/b', claimedBy: 'first' }]);
-  });
-
-  it('lets a retained project claim its repo first, exposing the colliding live project as a conflict', () => {
-    const config = cfg([
-      { id: 'b-live', repo: 'https://github.com/a/b.git' },
-      { id: 'a-retained', repo: 'git@github.com:a/b.git' },
-    ]);
-    const { entries, conflicts } = planPlatformEntries(config, { ...deps, retainedProjectIds: new Set(['a-retained']) });
-    expect(entries.map(e => e.projectId)).toEqual(['a-retained']);
-    expect(conflicts).toEqual([{ projectId: 'b-live', repoKey: 'github.com/a/b', claimedBy: 'a-retained' }]);
+    expect(entries[0]?.driver).toBeDefined();
   });
 });
 
-describe('retainedPlatformProjectIds', () => {
+describe('auditPlatformBindings', () => {
   const platformCfg = cfg([{}]);
 
-  it('does not retain an active project that already has a live entry', async () => {
-    const retained = await retainedPlatformProjectIds(platformCfg, async () => [
-      task({ platformBinding: { mode: 'git', repoKey: 'github.com/a/b', tool: 'gh' } }),
-    ]);
-    expect(retained).toEqual(new Set());
-  });
-
-  it('drops the project once that task reaches a terminal status', async () => {
-    const retained = await retainedPlatformProjectIds(platformCfg, async () => [
-      task({
-        status: 'merged',
-        platformBinding: { mode: 'git', repoKey: 'github.com/a/b', tool: 'gh' },
-      }),
-    ]);
-    expect(retained.size).toBe(0);
-  });
-
-  it('scans all active platform tasks even when the configured project already qualifies', async () => {
-    const list = vi.fn(async () => []);
-    await retainedPlatformProjectIds(cfg([{}]), list);
-    expect(list).toHaveBeenCalledTimes(1);
-  });
-
-  it('reports and excludes an active task whose project was removed offline', async () => {
+  it('reports an active task whose project was removed', async () => {
     const onMismatch = vi.fn();
-    const retained = await retainedPlatformProjectIds(platformCfg, async () => [task({
+    await auditPlatformBindings(platformCfg, async () => [task({
       projectId: 'removed',
-      platformBinding: { mode: 'git', repoKey: 'github.com/removed/repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/removed/repo' },
     })], onMismatch);
-    expect(retained).toEqual(new Set());
     expect(onMismatch).toHaveBeenCalledWith(expect.objectContaining({ id: 't1' }), expect.objectContaining({
       reason: 'project-missing', differences: ['project'],
     }));
   });
 
-  it('reports and excludes an active task whose binding no longer matches the configured identity', async () => {
+  it('reports an active task whose repository binding no longer matches', async () => {
     const onMismatch = vi.fn();
-    const retained = await retainedPlatformProjectIds(platformCfg, async () => [task({
-      platformBinding: { mode: 'git', repoKey: 'github.com/other/repo', tool: 'forge' },
+    await auditPlatformBindings(platformCfg, async () => [task({
+      platformBinding: { repoKey: 'github.com/other/repo' },
     })], onMismatch);
-    expect(retained).toEqual(new Set());
     expect(onMismatch).toHaveBeenCalledWith(expect.objectContaining({ id: 't1' }), expect.objectContaining({
-      reason: 'identity-mismatch', differences: ['repoKey', 'tool'],
+      reason: 'identity-mismatch', differences: ['repoKey'],
     }));
   });
 
   it('reports an active platform task that lacks its required binding', async () => {
     const onMismatch = vi.fn();
-    const retained = await retainedPlatformProjectIds(platformCfg, async () => [task()], onMismatch);
-    expect(retained).toEqual(new Set());
+    await auditPlatformBindings(platformCfg, async () => [task()], onMismatch);
     expect(onMismatch).toHaveBeenCalledWith(expect.objectContaining({ id: 't1' }), expect.objectContaining({
-      reason: 'missing-binding-snapshot', differences: ['mode', 'repoKey', 'tool'],
+      reason: 'missing-binding-snapshot', differences: ['repoKey'],
     }));
+  });
+
+  it('ignores matching and terminal tasks', async () => {
+    const onMismatch = vi.fn();
+    await auditPlatformBindings(platformCfg, async () => [
+      task({ platformBinding: { repoKey: 'github.com/a/b' } }),
+      task({ id: 'done', status: 'merged', platformBinding: { repoKey: 'github.com/other/repo' } }),
+    ], onMismatch);
+    expect(onMismatch).not.toHaveBeenCalled();
   });
 });
 
 describe('config hot reload platform interventions', () => {
-  it('emits binding and repo-conflict interventions and retains their active fingerprints', async () => {
-    const validated = cfg([
-      { id: 'b-live', repo: 'https://github.com/a/b.git' },
-      { id: 'a-live', repo: 'git@github.com:a/b.git' },
-    ]);
+  it('reconciles entries and emits active binding interventions', async () => {
+    const validated = cfg([{ id: 'live', repo: 'https://github.com/a/b.git' }]);
     const removed = task({
       id: 'removed', projectId: 'removed-project',
-      platformBinding: { mode: 'git', repoKey: 'github.com/removed/repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/removed/repo' },
     });
     const retainKeys = vi.fn();
     const emitBinding = vi.fn(async () => undefined);
-    const emitConflict = vi.fn(async () => undefined);
     const reconcile = vi.fn();
     const reschedule = vi.fn();
     const manager = {
       listActiveGitTasks: vi.fn(async () => [removed]),
       replaceConfig: vi.fn(),
       platformBindingInterventionKey: vi.fn((t: TaskState) => `binding:${t.id}`),
-      configInterventionKey: vi.fn((projectId: string) => `config:${projectId}`),
-      retainConfigInterventionKeys: retainKeys,
+      retainPlatformBindingInterventionKeys: retainKeys,
       emitPlatformBindingIntervention: emitBinding,
-      emitConfigIntervention: emitConflict,
     };
     const ctx = {
       agentManager: manager,
@@ -207,21 +156,16 @@ describe('config hot reload platform interventions', () => {
         mismatch: expect.objectContaining({ reason: 'project-missing' }),
       }),
     ]);
-    expect(prepared.platform?.conflicts).toEqual([
-      { projectId: 'a-live', repoKey: 'github.com/a/b', claimedBy: 'b-live' },
-    ]);
+    expect(prepared.platform).toHaveLength(1);
 
     await applyConfigHotReload(ctx, validated, prepared);
 
-    expect(reconcile).toHaveBeenCalledWith(prepared.platform?.entries);
-    expect(retainKeys).toHaveBeenCalledWith(new Set(['binding:removed', 'config:a-live']));
+    expect(reconcile).toHaveBeenCalledWith(prepared.platform);
+    expect(retainKeys).toHaveBeenCalledWith(new Set(['binding:removed']));
     expect(emitBinding).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'removed' }),
       expect.objectContaining({ reason: 'project-missing' }),
     );
-    expect(emitConflict).toHaveBeenCalledWith('a-live', {
-      phase: 'repo-conflict', repoKey: 'github.com/a/b', claimedBy: 'b-live',
-    });
   });
 });
 
@@ -245,13 +189,13 @@ describe('PlatformPoller.reconcile', () => {
     expect(p.snapshots().map(s => s.projectId).sort()).toEqual(['a2', 'c']);
   });
 
-  it('resets preflight state when a surviving entry swaps its driver', () => {
+  it('keeps preflight state when hot reload reconstructs the fixed driver', () => {
     const p = poller();
     p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: driver(), statePath: '/s/a' }]);
     const entries = p['entries'] as Array<{ driver: PlatformDriver; preflightPassed?: boolean }>;
     entries[0].preflightPassed = true;
     p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: driver(), statePath: '/s/a' }]);
-    expect(entries[0].preflightPassed).toBeUndefined();
+    expect(entries[0].preflightPassed).toBe(true);
   });
 
   it('keeps preflight state when the driver instance is unchanged', () => {
@@ -262,29 +206,6 @@ describe('PlatformPoller.reconcile', () => {
     entries[0].preflightPassed = true;
     p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: d, statePath: '/s/a' }]);
     expect(entries[0].preflightPassed).toBe(true);
-  });
-
-  it('keeps preflight state across equivalent reconstructed drivers', () => {
-    const p = poller();
-    const first = { ...driver(), preflightIdentity: 'same-contract' };
-    const second = { ...driver(), preflightIdentity: 'same-contract' };
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: first, statePath: '/s/a' }]);
-    const entries = p['entries'] as Array<{ driver: PlatformDriver; preflightPassed?: boolean }>;
-    entries[0].preflightPassed = true;
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: second, statePath: '/s/a' }]);
-    expect(entries[0].driver).toBe(second);
-    expect(entries[0].preflightPassed).toBe(true);
-  });
-
-  it('resets preflight state when a reconstructed driver changes its preflight contract', () => {
-    const p = poller();
-    const first = { ...driver(), preflightIdentity: 'old-contract' };
-    const second = { ...driver(), preflightIdentity: 'new-contract' };
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: first, statePath: '/s/a' }]);
-    const entries = p['entries'] as Array<{ preflightPassed?: boolean }>;
-    entries[0].preflightPassed = true;
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: second, statePath: '/s/a' }]);
-    expect(entries[0].preflightPassed).toBeUndefined();
   });
 
   it('preserves the observation state of a surviving entry while swapping its driver', () => {
@@ -299,7 +220,7 @@ describe('PlatformPoller.reconcile', () => {
     expect(entries[0].observedPr.get('t1:7')).toEqual({ merged: true });
   });
 
-  it('applies a driver swap only after the in-flight cycle and re-runs preflight next cycle', async () => {
+  it('applies a reconstructed driver only after the in-flight cycle', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'bx-poller-swap-'));
     try {
       let releasePreflight!: () => void;
@@ -313,14 +234,14 @@ describe('PlatformPoller.reconcile', () => {
           await preflightGate;
           return [{ step: 'old', ok: true, message: 'ok' }];
         }),
-        runOp: vi.fn(async () => [{ defaultBranch: 'main', pushPermitted: true }]),
-        runListPrs: vi.fn(async () => []),
+        projectView: vi.fn(async () => ({ defaultBranch: 'main', pushPermitted: true })),
+        listPrs: vi.fn(async () => []),
       };
       const newDriver: PlatformDriver = {
         ...driver(),
         runPreflightSteps: vi.fn(async () => [{ step: 'new', ok: true, message: 'ok' }]),
-        runOp: vi.fn(async () => [{ defaultBranch: 'main', pushPermitted: true }]),
-        runListPrs: vi.fn(async () => []),
+        projectView: vi.fn(async () => ({ defaultBranch: 'main', pushPermitted: true })),
+        listPrs: vi.fn(async () => []),
       };
       const p = poller();
       const entry = { projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: oldDriver, statePath: join(dir, 'cursor.json') };
@@ -332,14 +253,14 @@ describe('PlatformPoller.reconcile', () => {
       releasePreflight();
       await inFlight;
 
-      expect(oldDriver.runListPrs).toHaveBeenCalledTimes(1);
+      expect(oldDriver.listPrs).toHaveBeenCalledTimes(1);
       expect(newDriver.runPreflightSteps).not.toHaveBeenCalled();
       const entries = p['entries'] as Array<{ projectId: string; driver: PlatformDriver; preflightPassed?: boolean }>;
-      expect(entries[0]).toMatchObject({ projectId: 'a2', driver: newDriver, preflightPassed: undefined });
+      expect(entries[0]).toMatchObject({ projectId: 'a2', driver: newDriver, preflightPassed: true });
 
       await p.poll();
-      expect(newDriver.runPreflightSteps).toHaveBeenCalledTimes(1);
-      expect(newDriver.runListPrs).toHaveBeenCalledTimes(1);
+      expect(newDriver.runPreflightSteps).not.toHaveBeenCalled();
+      expect(newDriver.listPrs).toHaveBeenCalledTimes(1);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -367,16 +288,17 @@ describe('PlatformPoller.reconcile', () => {
       const makeDriver = (name: string, fail = false): PlatformDriver => ({
         visibilityLagMs: 0,
         commentSources: [],
-        runOp: vi.fn(async () => {
+        runPreflightSteps: async () => [],
+        projectView: vi.fn(async () => {
           calls.push(`${name}:project`);
           if (fail) throw new Error(`${name} offline`);
-          return [{ defaultBranch: 'main', pushPermitted: true }];
+          return { defaultBranch: 'main', pushPermitted: true };
         }),
-        runListPrs: vi.fn(async () => {
+        listPrs: vi.fn(async () => {
           calls.push(`${name}:list`);
           return [];
         }),
-        runCommentSource: vi.fn(async () => []),
+        listComments: vi.fn(async () => []),
       });
       const p = poller();
       p.reconcile(['a', 'b', 'c'].map((name, index) => ({
@@ -406,8 +328,9 @@ describe('PlatformPoller.reconcile', () => {
       const retiringDriver: PlatformDriver = {
         visibilityLagMs: 0,
         commentSources: [],
-        runOp: vi.fn(async () => [{ defaultBranch: 'main', pushPermitted: true }]),
-        runListPrs: vi.fn(async () => {
+        runPreflightSteps: async () => [],
+        projectView: vi.fn(async () => ({ defaultBranch: 'main', pushPermitted: true })),
+        listPrs: vi.fn(async () => {
           markListStarted();
           await listGate;
           return [{
@@ -417,7 +340,7 @@ describe('PlatformPoller.reconcile', () => {
             createdAt: '2026-07-21T00:00:00Z', updatedAt: '2026-07-21T00:00:00Z',
           }];
         }),
-        runCommentSource: vi.fn(async () => []),
+        listComments: vi.fn(async () => []),
       };
       const onEvent = vi.fn();
       const p = new PlatformPoller({
@@ -461,9 +384,10 @@ describe('PlatformPoller.reconcile', () => {
       const adoptingDriver: PlatformDriver = {
         visibilityLagMs: 0,
         commentSources: [],
-        runOp: vi.fn(async () => [{ defaultBranch: 'main', pushPermitted: true }]),
-        runListPrs: vi.fn(async () => [row]),
-        runCommentSource: vi.fn(async () => []),
+        runPreflightSteps: async () => [],
+        projectView: vi.fn(async () => ({ defaultBranch: 'main', pushPermitted: true })),
+        listPrs: vi.fn(async () => [row]),
+        listComments: vi.fn(async () => []),
       };
       const taskView: PlatformTaskView = {
         taskId: 't1', terminal: false, branch: 'bx/t1', expectedBase: 'main',
@@ -510,7 +434,7 @@ describe('PlatformPoller.reconcile', () => {
       p.reconcile([{
         projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: {
           ...driver(),
-          runOp: async () => [{ defaultBranch: 'main', pushPermitted: true }],
+          projectView: async () => ({ defaultBranch: 'main', pushPermitted: true }),
         },
         statePath: join(dir, 'a.json'),
       }]);

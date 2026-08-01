@@ -17,14 +17,16 @@ import type { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
-import type { GitDriver, OpVars } from '../../src/platform/git-driver.js';
-import { DriverOpError } from '../../src/platform/git-driver.js';
+import {
+  COMMENT_BODY_MAX_BYTES,
+  DriverOpError,
+  type CommentSource,
+  type PlatformDriver,
+} from '../../src/platform/types.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
-import type { CommentSourceOp } from '../../src/platform/types.js';
 import { buildAckMarker, buildReviewTokenLine } from '../../src/platform/markers.js';
 import { PrConversationCache, prReviewCacheRevision } from '../../src/platform/pr-conversation-cache.js';
 import { sha256Hex } from '../../src/platform/body-digest.js';
-import { COMMENT_BODY_MAX_BYTES } from '../../src/platform/command-renderer.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
 import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
@@ -32,16 +34,24 @@ const SHA1 = 'a'.repeat(40);
 const TS = '2026-07-17T01:02:03Z';
 const POST_APPROVE_GENERATION = 'feedfeedfeed';
 
-const SOURCES: CommentSourceOp[] = [
-  { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
-  { key: 'inline-comments', argv: ['{binary}'], map: { id: 'id', body: 'body', discussionId: { sources: ['r'], optional: true } } },
-  { key: 'reviews', argv: ['{binary}'], map: { id: 'id', body: 'body', reviewState: { sources: ['s'], optional: true } } },
-] as unknown as CommentSourceOp[];
+const SOURCES: CommentSource[] = [
+  { key: 'issue-comments', category: 'top-level' },
+  { key: 'inline-comments', category: 'threaded' },
+  { key: 'reviews', category: 'reviews' },
+];
 
-class FakeDriver {
+type RecordedVars = {
+  prNumber?: number;
+  remoteProjectId?: string;
+  branch?: string;
+  expectedHeadSha?: string;
+  body?: string;
+};
+
+class FakeDriver implements PlatformDriver {
   visibilityLagMs = 5000;
   commentSources = SOURCES;
-  prView: NormalizedRow | Error = prRow();
+  prViewResult: NormalizedRow | Error = prRow();
   defaultBranch: string | Error = 'main';
   remoteProjectId: string | Error = 'R_repo';
   branchHead: string | undefined | Error = undefined;
@@ -51,47 +61,64 @@ class FakeDriver {
   commentLandsBeforeError = false;
   commentVisibleAfterWrite = true;
   comments: Record<string, NormalizedRow[] | Error> = { 'issue-comments': [], 'inline-comments': [], 'reviews': [] };
-  ops: Array<{ op: string; vars: OpVars }> = [];
+  ops: Array<{ op: string; vars: RecordedVars }> = [];
   mergeError: Error | undefined;
 
-  async runOp(opName: string, vars: OpVars = {}): Promise<NormalizedRow[]> {
-    this.ops.push({ op: opName, vars });
-    if (opName === 'prView') {
-      if (this.prView instanceof Error) throw this.prView;
-      return [this.prView];
-    }
-    if (opName === 'projectView') {
-      if (this.defaultBranch instanceof Error) throw this.defaultBranch;
-      if (this.remoteProjectId instanceof Error) throw this.remoteProjectId;
-      return [{ defaultBranch: this.defaultBranch, remoteProjectId: this.remoteProjectId }];
-    }
-    if (opName === 'branchView') {
-      if (this.branchHead instanceof Error) throw this.branchHead;
-      if (this.remoteProjectId instanceof Error) throw this.remoteProjectId;
-      return [{ remoteProjectId: this.remoteProjectId, headSha: this.branchHead }];
-    }
-    if (opName === 'merge') {
-      if (this.mergeError) throw this.mergeError;
-      return [];
-    }
-    if (opName === 'comment') {
-      if (typeof vars.body === 'string'
-        && (this.commentLandsBeforeError || (this.commentError === undefined && this.commentVisibleAfterWrite))) {
-        const rows = this.comments['issue-comments'];
-        if (Array.isArray(rows)) rows.push(comment(`human-spec-${rows.length + 1}`, vars.body));
-      }
-      if (this.commentError) throw this.commentError;
-      return [];
-    }
-    if (opName === 'close' && this.closeError) throw this.closeError;
-    if (opName === 'deleteBranch' && this.deleteError) throw this.deleteError;
-    if (opName === 'close' || opName === 'deleteBranch') return [];
-    throw new Error(`unexpected op ${opName}`);
+  async runPreflightSteps(): Promise<Array<{ step: string; ok: boolean; message: string }>> {
+    return [];
   }
 
-  async runCommentSource(
-    source: CommentSourceOp,
-    _vars: OpVars,
+  async prView(prNumber: number): Promise<NormalizedRow> {
+    this.ops.push({ op: 'prView', vars: { prNumber } });
+    if (this.prViewResult instanceof Error) throw this.prViewResult;
+    return this.prViewResult;
+  }
+
+  async projectView(): Promise<NormalizedRow> {
+    this.ops.push({ op: 'projectView', vars: {} });
+    if (this.defaultBranch instanceof Error) throw this.defaultBranch;
+    if (this.remoteProjectId instanceof Error) throw this.remoteProjectId;
+    return { defaultBranch: this.defaultBranch, remoteProjectId: this.remoteProjectId };
+  }
+
+  async branchView(remoteProjectId: string, branch: string): Promise<NormalizedRow> {
+    this.ops.push({ op: 'branchView', vars: { remoteProjectId, branch } });
+    if (this.branchHead instanceof Error) throw this.branchHead;
+    if (this.remoteProjectId instanceof Error) throw this.remoteProjectId;
+    return { remoteProjectId: this.remoteProjectId, headSha: this.branchHead };
+  }
+
+  async mergePr(prNumber: number, expectedHeadSha: string): Promise<void> {
+    this.ops.push({ op: 'merge', vars: { prNumber, expectedHeadSha } });
+    if (this.mergeError) throw this.mergeError;
+  }
+
+  async postComment(prNumber: number, body: string): Promise<void> {
+    this.ops.push({ op: 'comment', vars: { prNumber, body } });
+    if (this.commentLandsBeforeError || (this.commentError === undefined && this.commentVisibleAfterWrite)) {
+      const rows = this.comments['issue-comments'];
+      if (Array.isArray(rows)) rows.push(comment(`human-spec-${rows.length + 1}`, body));
+    }
+    if (this.commentError) throw this.commentError;
+  }
+
+  async closePr(prNumber: number): Promise<void> {
+    this.ops.push({ op: 'close', vars: { prNumber } });
+    if (this.closeError) throw this.closeError;
+  }
+
+  async deleteBranch(remoteProjectId: string, branch: string, expectedHeadSha: string): Promise<void> {
+    this.ops.push({ op: 'deleteBranch', vars: { remoteProjectId, branch, expectedHeadSha } });
+    if (this.deleteError) throw this.deleteError;
+  }
+
+  async listPrs(): Promise<NormalizedRow[]> {
+    throw new Error('unexpected listPrs');
+  }
+
+  async listComments(
+    source: CommentSource,
+    _prNumber: number,
     projectPage?: (rows: NormalizedRow[]) => NormalizedRow[],
   ): Promise<NormalizedRow[]> {
     const rows = this.comments[source.key];
@@ -123,7 +150,7 @@ function gitTask(over: Partial<TaskState> = {}): TaskState {
     phase: 'code',
     deliveryConfirmation: { phase: 'code', source: 'signal', at: now },
     prNumber: 42, branch: 'bx/task-1', branchCreatedByBaxian: true,
-    platformBinding: { mode: 'git', repoKey: 'github.com/owner/repo', tool: 'gh' },
+    platformBinding: { repoKey: 'github.com/owner/repo' },
     baseBranch: 'main', latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
     replyActorId: '77', replyActorStatus: 'verified',
     passToken: 'abcdef123456', failToken: '123456abcdef',
@@ -166,7 +193,7 @@ beforeEach(async () => {
   const harness = await createManagerHarness(tempDir, { config });
   ({ manager, createManager, agentStore, taskStore, lockManager } = harness);
   driver = new FakeDriver();
-  vi.spyOn(manager, 'platformDriverFor').mockReturnValue(driver as unknown as GitDriver);
+  vi.spyOn(manager, 'platformDriverFor').mockReturnValue(driver as unknown as PlatformDriver);
 });
 
 afterEach(async () => {
@@ -379,10 +406,10 @@ describe('platformVerifyPrBinding', () => {
       ['state', { state: 'closed' }],
       ['target', { targetBranch: 'develop' }],
     ] as const) {
-      driver.prView = prRow(over);
+      driver.prViewResult = prRow(over);
       await expect(manager.platformVerifyPrBinding('task-1', 42)).resolves.toEqual({ ok: false, reason });
     }
-    driver.prView = prRow({ branch: 'bx/task-9' });
+    driver.prViewResult = prRow({ branch: 'bx/task-9' });
     await expect(manager.platformVerifyPrBinding('task-1', 42)).resolves.toEqual({
       ok: false, reason: 'branch', prBranch: 'bx/task-9',
     });
@@ -456,7 +483,7 @@ describe('git spec approval gate verdicts', () => {
       passProvenance: undefined,
       reviewHeadAnchorSha: SHA1,
     });
-    driver.prView = prRow({ headSha: liveHead });
+    driver.prViewResult = prRow({ headSha: liveHead });
     const codeTask = gitTask({
       ...gate,
       status: 'in_progress',
@@ -497,7 +524,7 @@ describe('git spec approval gate verdicts', () => {
   it('rechecks a newer live head instead of approving the stale spec pass', async () => {
     await seedSpecGate();
     const changedHead = 'b'.repeat(40);
-    driver.prView = prRow({ headSha: changedHead });
+    driver.prViewResult = prRow({ headSha: changedHead });
     const transition = vi.spyOn(manager, 'transitionToCodePhase');
     const dispatch = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue(
       gitTask({ status: 'review', phase: 'spec', latestHeadSha: changedHead }),
@@ -518,7 +545,7 @@ describe('git spec approval gate verdicts', () => {
 
   it('keeps the spec gate closed when the live head probe fails', async () => {
     await seedSpecGate();
-    driver.prView = new Error('HTTP 503');
+    driver.prViewResult = new Error('HTTP 503');
     const transition = vi.spyOn(manager, 'transitionToCodePhase');
 
     await expect(manager.submitSpecVerdict('task-1', 'approve'))
@@ -783,7 +810,7 @@ describe('human code verdict delivery', () => {
 
   it('refuses to write a verdict after the live PR head has changed', async () => {
     await seedCodeReview();
-    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
 
     await expect(manager.submitCodeVerdict('task-1', 'pass'))
       .rejects.toMatchObject({ status: 409 });
@@ -794,7 +821,7 @@ describe('human code verdict delivery', () => {
 
   it('fails closed when the live PR head cannot be verified', async () => {
     await seedCodeReview();
-    driver.prView = new Error('platform offline');
+    driver.prViewResult = new Error('platform offline');
 
     await expect(manager.submitCodeVerdict('task-1', 'pass'))
       .rejects.toMatchObject({ status: 503 });
@@ -876,25 +903,6 @@ describe('human code verdict delivery', () => {
     expect(driver.ops.filter(op => op.op === 'comment')).toEqual([]);
   });
 
-  it('does not reconcile a verdict from a system-authored marker carrier', async () => {
-    await seedCodeReview();
-    const body = [
-      'Human code verdict: pass',
-      '',
-      buildReviewTokenLine({ kind: 'pass', anchorSha: SHA1, token: 'abcdef123456' }),
-    ].join('\n');
-    driver.comments['issue-comments'] = [
-      comment('system-pass', body, { system: true }),
-    ];
-    driver.commentVisibleAfterWrite = false;
-
-    await expect(manager.submitCodeVerdict('task-1', 'pass'))
-      .rejects.toMatchObject({ status: 503 });
-
-    expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
-    expect(pendingCodeVerdict((await taskStore.get('task-1'))!)).toBeDefined();
-  });
-
   it('persists an uncertain write and reconciles it without a duplicate comment', async () => {
     await seedCodeReview();
     driver.commentVisibleAfterWrite = false;
@@ -934,7 +942,7 @@ describe('human code verdict delivery', () => {
 
     await expect(manager.submitCodeVerdict('task-1', 'pass'))
       .rejects.toMatchObject({ status: 503 });
-    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
 
     await manager.flushTaskOutboxes();
 
@@ -1095,7 +1103,7 @@ describe('processGitRemoteCleanup', () => {
   it('converges a cleanup driver resolution error to manual with its diagnostic', async () => {
     await seed({ status: 'cancelled', remoteCleanup: intent() });
     vi.mocked(manager.platformDriverFor).mockImplementationOnce(() => {
-      throw new Error('plugin manifest unavailable');
+      throw new Error('platform driver unavailable');
     });
 
     await manager.processGitRemoteCleanup('task-1');
@@ -1103,12 +1111,12 @@ describe('processGitRemoteCleanup', () => {
     expect(driver.ops).toHaveLength(0);
     expect((await taskStore.get('task-1'))?.remoteCleanup).toMatchObject({
       stage: 'manual',
-      failure: { kind: 'config', message: expect.stringContaining('plugin manifest unavailable') },
+      failure: { kind: 'config', message: expect.stringContaining('platform driver unavailable') },
     });
   });
 
   it('converges a definitive PR binding mismatch to manual before close', async () => {
-    driver.prView = prRow({ targetBranch: 'release' });
+    driver.prViewResult = prRow({ targetBranch: 'release' });
     await seed({ status: 'cancelled', remoteCleanup: intent() });
 
     await manager.processGitRemoteCleanup('task-1');
@@ -1121,7 +1129,7 @@ describe('processGitRemoteCleanup', () => {
   });
 
   it('converges a permanent PR probe refusal to manual and releases the config lock', async () => {
-    driver.prView = new DriverOpError('repository not found', {
+    driver.prViewResult = new DriverOpError('repository not found', {
       opName: 'prView', errorClass: 'NOT_FOUND', exitCode: 1,
     });
     await seed({ status: 'cancelled', remoteCleanup: intent() });
@@ -1151,7 +1159,7 @@ describe('processGitRemoteCleanup', () => {
   });
 
   it('keeps a transient cleanup probe failure retryable', async () => {
-    driver.prView = new DriverOpError('temporary gateway failure', {
+    driver.prViewResult = new DriverOpError('temporary gateway failure', {
       opName: 'prView', errorClass: 'SERVER_ERROR', exitCode: 1,
     });
     await seed({ status: 'cancelled', remoteCleanup: intent() });
@@ -1181,7 +1189,7 @@ describe('processGitRemoteCleanup', () => {
   });
 
   it('keeps a user-owned branch: custom name or missing flag both skip deletion', async () => {
-    driver.prView = prRow({ branch: 'feat/custom' });
+    driver.prViewResult = prRow({ branch: 'feat/custom' });
     await seed({
       status: 'cancelled', branch: 'feat/custom', branchCreatedByBaxian: false,
       remoteCleanup: intent({ branch: 'feat/custom' }),
@@ -1199,7 +1207,7 @@ describe('processGitRemoteCleanup', () => {
   });
 
   it('persists the successful remote PR close audit before retiring a custom-branch intent', async () => {
-    driver.prView = prRow({ branch: 'feat/custom' });
+    driver.prViewResult = prRow({ branch: 'feat/custom' });
     await seed({
       status: 'cancelled', branch: 'feat/custom', branchCreatedByBaxian: false,
       prUrl: 'https://github.com/owner/repo/pull/42',
@@ -1223,7 +1231,7 @@ describe('processGitRemoteCleanup', () => {
   });
 
   it('retains the close intent when the successful-close audit cannot be persisted', async () => {
-    driver.prView = prRow({ branch: 'feat/custom' });
+    driver.prViewResult = prRow({ branch: 'feat/custom' });
     await seed({
       status: 'cancelled', branch: 'feat/custom', branchCreatedByBaxian: false,
       remoteCleanup: intent({ branch: 'feat/custom' }),
@@ -1237,7 +1245,7 @@ describe('processGitRemoteCleanup', () => {
         },
       } as unknown as EventLog),
     });
-    vi.spyOn(auditFailureManager, 'platformDriverFor').mockReturnValue(driver as unknown as GitDriver);
+    vi.spyOn(auditFailureManager, 'platformDriverFor').mockReturnValue(driver as unknown as PlatformDriver);
 
     await expect(auditFailureManager.processGitRemoteCleanup('task-1')).rejects.toThrow('audit disk full');
 
@@ -1248,7 +1256,7 @@ describe('processGitRemoteCleanup', () => {
   });
 
   it('fails closed when the branch tip changed before close', async () => {
-    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
     await seed({ status: 'cancelled', remoteCleanup: intent() });
     await manager.processGitRemoteCleanup('task-1');
     expect(driver.ops.map(o => o.op)).toEqual(['prView', 'projectView', 'close']);
@@ -1303,7 +1311,7 @@ describe('processGitRemoteCleanup', () => {
         },
       } as unknown as EventLog),
     });
-    vi.spyOn(auditFailureManager, 'platformDriverFor').mockReturnValue(driver as unknown as GitDriver);
+    vi.spyOn(auditFailureManager, 'platformDriverFor').mockReturnValue(driver as unknown as PlatformDriver);
 
     await expect(auditFailureManager.processGitRemoteCleanup('task-1')).rejects.toThrow('audit disk full');
 
@@ -1353,7 +1361,7 @@ describe('processGitRemoteCleanup', () => {
       lockManager: new LockManager(join(tempDir, 'locks')),
       eventBus: new EventBus(new EventLog(`${tempDir}/events-restarted`)),
     });
-    vi.spyOn(restarted, 'platformDriverFor').mockReturnValue(driver as unknown as GitDriver);
+    vi.spyOn(restarted, 'platformDriverFor').mockReturnValue(driver as unknown as PlatformDriver);
 
     await restarted.retryGitRemoteCleanupIntents();
 
@@ -1494,7 +1502,7 @@ describe('platformConfirmMerge', () => {
     const body = passBody();
     await seed({ passProvenance: provenanceFor(body) });
     seedAcceptedPass();
-    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
     await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
       .rejects.toThrow(/head/);
     expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
@@ -1526,7 +1534,7 @@ describe('platformConfirmMerge', () => {
     driver.mergeError = new DriverOpError('merge failed', {
       opName: 'merge', errorClass: 'MERGE_BLOCKED', exitCode: 1, stderrTail: 'Pull Request is not mergeable',
     });
-    driver.prView = prRow({ detailedMergeStatus: 'blocked' });
+    driver.prViewResult = prRow({ detailedMergeStatus: 'blocked' });
     await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
       .rejects.toThrow(/blocked/);
   });
@@ -1662,7 +1670,7 @@ describe('mergePr (git)', () => {
 describe('platform binding fingerprint', () => {
   it('refuses platform ops and raises an intervention when the snapshot no longer matches live config', async () => {
     await seed({
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/renamed', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/renamed' },
     });
     await expect(manager.platformFetchPrView('task-1')).rejects.toThrow(/binding mismatch/);
     expect(driver.ops).toHaveLength(0);
@@ -1675,9 +1683,9 @@ describe('platform binding fingerprint', () => {
     await expect(manager.platformFetchPrView('task-1')).rejects.toThrow(/binding missing/);
   });
 
-  it('platformBindingFields snapshots the identity trio only for git-mode projects', () => {
+  it('platformBindingFields snapshots the repository identity', () => {
     expect(manager.platformBindingFields('proj')).toEqual({
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/repo' },
     });
   });
 });
@@ -1702,7 +1710,7 @@ describe('git QA dispatch anchoring', () => {
       status: 'review', signalToken: 'ffff00001111', reviewRound: 1,
     });
     const acquire = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    driver.prView = new Error('HTTP 502');
+    driver.prViewResult = new Error('HTTP 502');
     const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toThrow('HTTP 502');
     expect(acquire).not.toHaveBeenCalled();
@@ -1753,7 +1761,7 @@ describe('git review lease outcomes', () => {
       deliveryConfirmation: { phase: 'spec', source: 'signal', at: TS },
       reviewDispatch: undefined,
     });
-    driver.prView = prRow({ draft: true });
+    driver.prViewResult = prRow({ draft: true });
     const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
     const emit = vi.spyOn(bus, 'emit');
     const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
@@ -1960,7 +1968,7 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
-    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
     const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
@@ -1978,13 +1986,13 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
-    driver.prView = prRow({ draft: true });
+    driver.prViewResult = prRow({ draft: true });
     const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
     const emit = vi.spyOn(bus, 'emit');
     const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
-    driver.prView = prRow({ state: 'closed' });
+    driver.prViewResult = prRow({ state: 'closed' });
     await manager.retryPendingGitReviewDispatches();
 
     const alerts = emit.mock.calls
@@ -2037,7 +2045,7 @@ describe('git review lease outcomes', () => {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
     vi.spyOn(manager, 'dispatchGitReviewLease').mockRejectedValue(
-      new DispatchTerminalError('required_skills_missing', 'QA skill missing'),
+      new DispatchTerminalError('prompt_too_large', 'QA prompt too large'),
     );
 
     await manager.retryPendingGitReviewDispatches();
@@ -2083,7 +2091,7 @@ describe('git review lease outcomes', () => {
       'emitIntervention',
     );
     start.mockResolvedValue(true);
-    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
     const manual = await manager.dispatchReviewToQa('task-1', {
       confirmUncertainNotDelivered: true,
     });
@@ -2128,7 +2136,7 @@ describe('git review lease outcomes', () => {
         },
       }],
     });
-    driver.prView = prRow({ headSha: 'b'.repeat(40) });
+    driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
     start.mockResolvedValue(true);
 
     const confirmed = await manager.dispatchReviewToQa('task-1', {
@@ -2177,7 +2185,7 @@ describe('git review lease outcomes', () => {
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
-    driver.prView = prRow({ branch: 'feature/rebound' });
+    driver.prViewResult = prRow({ branch: 'feature/rebound' });
 
     await expect(manager.dispatchReviewToQa('task-1', {
       confirmUncertainNotDelivered: true,
@@ -2749,7 +2757,7 @@ describe('manual dispatch binding recheck', () => {
       replyActorStatus: undefined,
       reviewDispatch: undefined,
     });
-    driver.prView = prRow({
+    driver.prViewResult = prRow({
       prNumber: 73,
       prUrl: 'https://github.com/owner/repo/pull/73',
       branch: 'feature/manual-review',
@@ -2792,7 +2800,7 @@ describe('manual dispatch binding recheck', () => {
       replyActorStatus: undefined,
       reviewDispatch: undefined,
     });
-    driver.prView = prRow({ prNumber: 73, branch: 'feature/unrelated' });
+    driver.prViewResult = prRow({ prNumber: 73, branch: 'feature/unrelated' });
 
     await expect(manager.dispatchReviewToQa('task-1', {
       prNumber: 73,
@@ -3014,7 +3022,7 @@ describe('manual dispatch binding recheck', () => {
   it('refuses to dispatch a git review onto a PR that fails the binding predicate', async () => {
     await seed({ status: 'review', signalToken: 'ffff00001111', reviewRound: 1 });
     const acquire = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    driver.prView = prRow({ draft: true });
+    driver.prViewResult = prRow({ draft: true });
     const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toMatchObject({
       status: 409, message: expect.stringContaining('binding draft'),
@@ -3076,18 +3084,16 @@ describe('merge gate and post-review recovery integrity', () => {
 });
 
 describe('platform dispatch descriptor context', () => {
-  it('derives the live cli descriptor for a git task', () => {
-    expect(manager.platformCliContextOf(gitTask())).toEqual({
-      tool: 'gh', host: 'github.com', repo: 'owner/repo', repoEncoded: 'owner%2Frepo',
+  it('derives the live repository descriptor for a platform task', () => {
+    expect(manager.platformPromptContextOf(gitTask())).toMatchObject({
+      repo: 'owner/repo',
+      prompts: {
+        common: expect.stringContaining('GH_HOST=github.com gh'),
+        publish: expect.any(String),
+        feedback: expect.any(String),
+        review: expect.any(String),
+      },
     });
-  });
-
-  it('carries operator notes and follows config changes live', () => {
-    manager.replaceConfig({
-      ...config,
-      project: [{ ...config.project[0], gitCli: { tool: 'gh', notes: 'runs behind :8443' } }],
-    });
-    expect(manager.platformCliContextOf(gitTask())?.notes).toBe('runs behind :8443');
   });
 
   it('fails loud when the identity drifted away', () => {
@@ -3095,11 +3101,10 @@ describe('platform dispatch descriptor context', () => {
       ...config,
       project: [{
         ...config.project[0],
-        repo: 'https://git.corp.example.com/g/p.git',
-        gitCli: { tool: 'gh' },
+        repo: 'https://github.com/g/p.git',
       }],
     });
-    expect(() => manager.platformCliContextOf(gitTask())).toThrow(/platform binding mismatch/);
+    expect(() => manager.platformPromptContextOf(gitTask())).toThrow(/platform binding mismatch/);
   });
 });
 
@@ -3144,7 +3149,7 @@ describe('ensureGitBaseSnapshot binding guard', () => {
     const task = await seed({
       baseBranch: undefined,
       status: 'in_progress',
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/other-repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/other-repo' },
     });
     await expect(m.ensureGitBaseSnapshot(task, 'develop')).rejects.toThrow(/platform binding mismatch/);
     expect((await taskStore.get('task-1'))?.baseBranch).toBeUndefined();
@@ -3155,7 +3160,7 @@ describe('ensureGitBaseSnapshot binding guard', () => {
     const task = await seed({ baseBranch: undefined, status: 'in_progress' });
     await taskStore.set({
       ...task,
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/other-repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/other-repo' },
     });
     const bus = (m as unknown as { eventBus: EventBus }).eventBus;
     vi.spyOn(bus, 'emit').mockImplementation(event => m.recordTaskAttention(event));
@@ -3280,79 +3285,17 @@ describe('noteReviewConversationRevision', () => {
   });
 });
 
-describe('agentGitPreflightContext', () => {
-  it('builds the agent-track context with the tool name as binary and live steps', () => {
-    const plugin = {
-      manifest: { tool: 'gh', minToolVersion: '2.40.0' },
-      spec: {
-        preflight: [{ argv: ['{binary}', '--version'], versionCheck: true, fixMessage: 'need {minToolVersion}' }],
-        errorClasses: [],
-      },
-    };
-    (manager as unknown as { pluginRegistry: unknown }).pluginRegistry = {
-      resolveTool: (tool: string) => (tool === 'gh' ? plugin : undefined),
-    };
-    const ctx = manager.agentGitPreflightContext('proj');
-    expect(ctx?.tool).toBe('gh');
-    expect(ctx?.minToolVersion).toBe('2.40.0');
-    expect(ctx?.renderCtx.binary).toBe('gh');
-    expect(ctx?.renderCtx.repoPath).toBe('owner/repo');
-    expect(ctx?.steps).toHaveLength(1);
-    expect(typeof ctx?.driverFor).toBe('function');
-  });
-
-  it('returns undefined without a plugin registry or a resolved plugin', () => {
-    expect(manager.agentGitPreflightContext('proj')).toBeUndefined();
-    (manager as unknown as { pluginRegistry: unknown }).pluginRegistry = { resolveTool: () => undefined };
-    expect(manager.agentGitPreflightContext('proj')).toBeUndefined();
-  });
-});
-
-describe('platformCliContextOf binding guard', () => {
+describe('platformPromptContextOf binding guard', () => {
   it('refuses to render the cli descriptor when the live identity drifted from the binding', () => {
     const drifted = gitTask({
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/other-repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/other-repo' },
     });
-    expect(() => manager.platformCliContextOf(drifted)).toThrow(/platform binding mismatch/);
+    expect(() => manager.platformPromptContextOf(drifted)).toThrow(/platform binding mismatch/);
   });
 
   it('refuses a git task without a binding snapshot', () => {
     const bare = gitTask({ platformBinding: undefined });
-    expect(() => manager.platformCliContextOf(bare)).toThrow(/binding missing/);
-  });
-});
-
-describe('config intervention fingerprints', () => {
-  it('deduplicates an active fingerprint and emits it again after the condition clears', async () => {
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    const emit = vi.spyOn(bus, 'emit').mockResolvedValue();
-    const data = { phase: 'repo-conflict', repoKey: 'github.com/owner/repo', claimedBy: 'proj-a' };
-
-    await manager.emitConfigIntervention('proj', data);
-    await manager.emitConfigIntervention('proj', data);
-    expect(emit).toHaveBeenCalledTimes(1);
-
-    manager.retainConfigInterventionKeys(new Set());
-    await manager.emitConfigIntervention('proj', data);
-    expect(emit).toHaveBeenCalledTimes(2);
-  });
-
-  it('does not latch a fingerprint when event delivery fails', async () => {
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    const emit = vi.spyOn(bus, 'emit')
-      .mockRejectedValueOnce(new Error('event log unavailable'))
-      .mockResolvedValueOnce(undefined);
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const data = { phase: 'repo-conflict', repoKey: 'github.com/owner/repo', claimedBy: 'proj-a' };
-
-    try {
-      await manager.emitConfigIntervention('proj', data);
-      await manager.emitConfigIntervention('proj', data);
-    } finally {
-      warn.mockRestore();
-    }
-
-    expect(emit).toHaveBeenCalledTimes(2);
+    expect(() => manager.platformPromptContextOf(bare)).toThrow(/binding missing/);
   });
 });
 
@@ -3378,28 +3321,13 @@ describe('listTasksForPlatformEntry', () => {
     expect(ids).toEqual(['task-bound']);
   });
 
-  it('fail-closes on a tool drift (gh→forge) even when repoKey still matches', async () => {
-    manager.replaceConfig({ ...config, project: [
-      { id: 'proj', repo: 'https://github.com/owner/repo.git', merge: null,
-        gitCli: { tool: 'forge' }, agent: [] },
-    ] });
-    await taskStore.set(gitTask({ id: 'task-gh', projectId: 'proj' }));
-    await taskStore.set({
-      ...gitTask({ id: 'task-forge', projectId: 'proj' }),
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/repo', tool: 'forge' },
-    });
-
-    const ids = (await manager.listTasksForPlatformEntry('proj')).map(t => t.id);
-    expect(ids).toEqual(['task-forge']);
-  });
-
   it('fail-closes on an offline-drifted binding that no longer matches the entry repo', async () => {
     manager.replaceConfig({ ...config, project: [
       { id: 'proj', repo: 'git@github.com:owner/repo.git', merge: null, agent: [] },
     ] });
     await taskStore.set({
       ...gitTask({ id: 'task-drift', projectId: 'proj' }),
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/OLD-repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/OLD-repo' },
     });
     await taskStore.set(gitTask({ id: 'task-current', projectId: 'proj' }));
 

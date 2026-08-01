@@ -1,17 +1,12 @@
 import { isAbsolute, normalize } from 'node:path';
-import { isBareRepoSlug,
-  CONTROL_CHAR_RE, TOOL_PATTERN,
-  hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoIdentityKey, repoSlug,
-  type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type SpecApprovalStrategy,
+import {
+  CONTROL_CHAR_RE,
+  hasEmbeddedCredentials, isGitHubRepo, isRecord, repoIdentityKey, repoSlug,
+  type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type SpecApprovalStrategy,
 } from '../shared/index.js';
 import { mayShareHostAccount, resolveAgentHost } from '../agent/runner.js';
 
 export interface ValidationError {
-  path: string;
-  message: string;
-}
-
-export interface ValidationWarning {
   path: string;
   message: string;
 }
@@ -23,49 +18,58 @@ const VALID_MERGE: MergeStrategy[] = ['auto', null];
 const VALID_SPEC_APPROVAL: Array<SpecApprovalStrategy | undefined> = ['human', null, undefined];
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 const REPO_SLUG_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
-const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const TOP_LEVEL_FIELDS = new Set(['language', 'review', 'server', 'host', 'project']);
 const REVIEW_FIELDS = new Set(['rounds']);
 const SERVER_FIELDS = new Set([
-  'port', 'host', 'token', 'https', 'allowedHosts', 'githubPollIntervalMs',
+  'port', 'host', 'token', 'https', 'allowedHosts', 'platformPollIntervalMs',
   'tmuxProbePollIntervalMs', 'tmuxProbeTimeoutMs', 'tmuxProbeConcurrency',
   'bootstrapRetryIntervalMs', 'dispatchReconcileIntervalMs', 'dispatchBusyWaitBudgetMs',
   'dispatchReconcileMaxAttempts',
 ]);
-const PROJECT_FIELDS = new Set(['id', 'repo', 'merge', 'specApproval', 'gitCli', 'agent']);
+const PROJECT_FIELDS = new Set(['id', 'repo', 'merge', 'specApproval', 'agent']);
 const AGENT_FIELDS = new Set([
   'id', 'runtime', 'mode', 'host', 'workdir', 'yolo', 'model', 'addDirs', 'role',
 ]);
+const HOST_FIELDS = new Set(['id', 'hostname', 'port', 'alias', 'user', 'password']);
+const HTTPS_FIELDS = new Set(['keyFile', 'certFile']);
 
-function unknownKeyWarnings(
+function unknownKeyErrors(
   value: unknown,
   allowed: ReadonlySet<string>,
   prefix: string,
-): ValidationWarning[] {
+): ValidationError[] {
   if (!isRecord(value)) return [];
   return Object.keys(value)
     .filter(key => !allowed.has(key))
     .map(key => ({
       path: prefix === '' ? key : `${prefix}.${key}`,
-      message: 'unknown configuration key; it will be ignored',
+      message: 'unknown configuration key',
     }));
 }
 
-export function collectUnknownConfigWarnings(config: Record<string, unknown>): ValidationWarning[] {
-  const warnings = [
-    ...unknownKeyWarnings(config, TOP_LEVEL_FIELDS, ''),
-    ...unknownKeyWarnings(config.review, REVIEW_FIELDS, 'review'),
-    ...unknownKeyWarnings(config.server, SERVER_FIELDS, 'server'),
+export function collectUnknownConfigErrors(config: Record<string, unknown>): ValidationError[] {
+  const errors = [
+    ...unknownKeyErrors(config, TOP_LEVEL_FIELDS, ''),
+    ...unknownKeyErrors(config.review, REVIEW_FIELDS, 'review'),
+    ...unknownKeyErrors(config.server, SERVER_FIELDS, 'server'),
   ];
-  if (!Array.isArray(config.project)) return warnings;
+  if (isRecord(config.server) && config.server.https !== undefined) {
+    errors.push(...unknownKeyErrors(config.server.https, HTTPS_FIELDS, 'server.https'));
+  }
+  if (Array.isArray(config.host)) {
+    config.host.forEach((host, hostIndex) => {
+      errors.push(...unknownKeyErrors(host, HOST_FIELDS, `host[${hostIndex}]`));
+    });
+  }
+  if (!Array.isArray(config.project)) return errors;
   config.project.forEach((project, projectIndex) => {
     const projectPath = `project[${projectIndex}]`;
-    warnings.push(...unknownKeyWarnings(project, PROJECT_FIELDS, projectPath));
+    errors.push(...unknownKeyErrors(project, PROJECT_FIELDS, projectPath));
     if (!isRecord(project) || !Array.isArray(project.agent)) return;
     project.agent.forEach((team, teamIndex) => {
       if (!Array.isArray(team)) return;
       team.forEach((agent, agentIndex) => {
-        warnings.push(...unknownKeyWarnings(
+        errors.push(...unknownKeyErrors(
           agent,
           AGENT_FIELDS,
           `${projectPath}.agent[${teamIndex}][${agentIndex}]`,
@@ -73,14 +77,11 @@ export function collectUnknownConfigWarnings(config: Record<string, unknown>): V
       });
     });
   });
-  return warnings;
+  return errors;
 }
 
 function isValidRepo(repo: string): boolean {
-  if (isGitHubRepo(repo)) return REPO_SLUG_PATTERN.test(repoSlug(repo));
-  const parsed = parseGitRemote(repo);
-  if (!parsed || parsed.path === '' || !isSafeGitHost(parsed.host)) return false;
-  return parsed.path.split('/').every(seg => REPO_SEGMENT_PATTERN.test(seg));
+  return isGitHubRepo(repo) && REPO_SLUG_PATTERN.test(repoSlug(repo));
 }
 
 export function validateConfig(config: BaxianConfig): ValidationError[] {
@@ -94,7 +95,6 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateGlobals(config, errors);
   validateHosts(config, errors);
   validateProjectFields(config, errors);
-  validatePlatformProjects(config, errors);
   validatePlatformRepoUniqueness(config, errors);
   validateProjectIds(config, errors);
   validateAgentFields(config, errors);
@@ -110,15 +110,6 @@ function nonEmptyString(v: unknown): boolean {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
-export function resolveProjectTool(project: ProjectConfig): string | undefined {
-  if (isRecord(project.gitCli) && typeof project.gitCli.tool === 'string') return project.gitCli.tool;
-  return nonEmptyString(project.repo) && isGitHubRepo(project.repo) ? 'gh' : undefined;
-}
-
-export function projectNeedsPlatformEntry(_config: BaxianConfig, project: ProjectConfig): boolean {
-  return resolveProjectTool(project) !== undefined;
-}
-
 function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void {
   const language = config.language as unknown;
   if (language !== undefined && language !== 'zh-CN' && language !== 'en-US') {
@@ -126,6 +117,12 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
   }
   if (!Number.isInteger(config.server.port) || config.server.port <= 0 || config.server.port > 65535) {
     errors.push({ path: 'server.port', message: 'server.port must be a positive integer ≤ 65535' });
+  }
+  if (!nonEmptyString(config.server.host)) {
+    errors.push({ path: 'server.host', message: 'server.host must be a non-empty string' });
+  }
+  if (config.server.token !== undefined && !nonEmptyString(config.server.token)) {
+    errors.push({ path: 'server.token', message: 'server.token must be a non-empty string when set' });
   }
   validateOptionalBoundedInteger(
     config.server.tmuxProbePollIntervalMs,
@@ -169,8 +166,8 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
     errors,
   );
   validateOptionalBoundedInteger(
-    config.server.githubPollIntervalMs,
-    'server.githubPollIntervalMs',
+    config.server.platformPollIntervalMs,
+    'server.platformPollIntervalMs',
     1000,
     2_147_483_647,
     errors,
@@ -223,54 +220,17 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
 function validatePlatformRepoUniqueness(config: BaxianConfig, errors: ValidationError[]): void {
   const seen = new Map<string, string>();
   config.project.forEach((project, i) => {
-    if (!nonEmptyString(project.repo) || !projectNeedsPlatformEntry(config, project)) return;
+    if (!nonEmptyString(project.repo) || !isGitHubRepo(project.repo)) return;
     const norm = repoIdentityKey(project.repo);
     const prev = seen.get(norm);
     if (prev !== undefined) {
       errors.push({
         path: `project[${i}].repo`,
-        message: `normalized repo URL must be unique across platform-polled projects (already used by project '${prev}')`,
+        message: `normalized repo URL must be unique across projects (already used by project '${prev}')`,
       });
     } else {
       seen.set(norm, project.id);
     }
-  });
-}
-
-function validatePlatformProjects(config: BaxianConfig, errors: ValidationError[]): void {
-  config.project.forEach((project, i) => {
-    const path = `project[${i}]`;
-    const gitCli = project.gitCli;
-
-    if (!nonEmptyString(project.repo)) return;
-
-    if (!isGitHubRepo(project.repo)) {
-      if (!/^https?:\/\//i.test(project.repo)) {
-        errors.push({
-          path: `${path}.repo`,
-          message: 'non-GitHub repos require an http(s):// repo URL because the platform driver derives its API endpoint from it',
-        });
-      } else {
-        try {
-          new URL(project.repo);
-        } catch {
-          errors.push({ path: `${path}.repo`, message: 'repo is not a parseable URL' });
-        }
-      }
-
-      if (gitCli === undefined) {
-        errors.push({
-          path: `${path}.gitCli`,
-          message: 'non-GitHub repos require gitCli.tool and a matching git-driver plugin under <home>/plugins/',
-        });
-      }
-    } else if (isBareRepoSlug(project.repo) && resolveProjectTool(project) !== 'gh') {
-      errors.push({
-        path: `${path}.repo`,
-        message: "a bare owner/repo slug requires the resolved tool 'gh' (plain git cannot clone a bare slug) — declare the full https:// or ssh URL, or drop gitCli.tool",
-      });
-    }
-
   });
 }
 
@@ -317,15 +277,12 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
         message:
           'project.repo must not embed credentials in the URL (e.g. "https://user:token@host/…" '
           + 'or "ssh://user:secret@host/…"). Configure auth via a git credential helper, an SSH key, '
-          + 'or GITLAB_TOKEN so the secret stays out of the config file, API responses, and logs.',
+          + 'or GITHUB_TOKEN so the secret stays out of the config file, API responses, and logs.',
       });
     } else if (!isValidRepo(project.repo)) {
       errors.push({
         path: `${path}.repo`,
-        message:
-          'project.repo must be a git URL (https / ssh / scp) or legacy "owner/repo". '
-          + 'GitHub uses the "owner/repo" single-segment form; non-GitHub hosts accept a parseable '
-          + 'host with a path whose segments match [A-Za-z0-9_-][A-Za-z0-9._-]* (no empty / "." / ".." segments).',
+        message: 'project.repo must be a full github.com HTTPS or SSH Git URL with an owner/repository path',
       });
     }
     if (!VALID_MERGE.includes(project.merge)) {
@@ -337,27 +294,6 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
     if (!Array.isArray(project.agent)) {
       errors.push({ path: `${path}.agent`, message: 'project.agent must be an array of Agent Teams' });
     }
-    validateGitCliShape(project, path, errors);
-  }
-}
-
-function validateGitCliShape(project: ProjectConfig, path: string, errors: ValidationError[]): void {
-  const gitCli = project.gitCli;
-  if (gitCli === undefined) return;
-  if (!isRecord(gitCli)) {
-    errors.push({ path: `${path}.gitCli`, message: 'gitCli must be an object' });
-    return;
-  }
-  if (typeof gitCli.tool !== 'string' || !TOOL_PATTERN.test(gitCli.tool)) {
-    errors.push({ path: `${path}.gitCli.tool`, message: `gitCli.tool must match ${TOOL_PATTERN}` });
-  }
-  if (gitCli.binary !== undefined
-    && (typeof gitCli.binary !== 'string' || !isAbsolute(gitCli.binary) || CONTROL_CHAR_RE.test(gitCli.binary))) {
-    errors.push({ path: `${path}.gitCli.binary`, message: 'gitCli.binary must be an absolute path without control characters' });
-  }
-  if (gitCli.notes !== undefined
-    && (typeof gitCli.notes !== 'string' || CONTROL_CHAR_RE.test(gitCli.notes))) {
-    errors.push({ path: `${path}.gitCli.notes`, message: 'gitCli.notes must be a string without control characters' });
   }
 }
 
@@ -588,36 +524,15 @@ function validateRemoteHosts(config: BaxianConfig, errors: ValidationError[]): v
           errors.push({ path: base, message: `Remote agent "${agent.id}" must reference a host` });
           continue;
         }
-        if (typeof agent.host === 'string') {
-          if (!hostIds.has(agent.host)) {
-            errors.push({
-              path: `${base}.host`,
-              message: `Remote agent "${agent.id}" references unknown host id "${agent.host}" — add it via Host 管理`,
-            });
-          }
-          continue;
-        }
-        if (typeof agent.host !== 'object' || Array.isArray(agent.host)) {
-          errors.push({ path: `${base}.host`, message: 'agent.host must be a host id (string) or an inline host object' });
-          continue;
-        }
-        if (!nonEmptyString(agent.host.hostname)) {
-          errors.push({ path: `${base}.host.hostname`, message: 'host.hostname must be a non-empty string' });
-        }
-        if (agent.host.port !== undefined
-          && (!Number.isInteger(agent.host.port) || agent.host.port <= 0 || agent.host.port > 65535)) {
-          errors.push({ path: `${base}.host.port`, message: 'host.port must be a positive integer ≤ 65535' });
-        }
-        if (agent.host.user !== undefined && !nonEmptyString(agent.host.user)) {
+        if (typeof agent.host !== 'string') {
           errors.push({
-            path: `${base}.host.user`,
-            message: 'host.user, if set, must be a non-empty string (omit it to let ~/.ssh/config decide)',
+            path: `${base}.host`,
+            message: 'agent.host must reference a top-level host id',
           });
-        }
-        if (agent.host.password !== undefined) {
+        } else if (!hostIds.has(agent.host)) {
           errors.push({
-            path: `${base}.host.password`,
-            message: 'inline agent.host must not carry a password; define the host in the top-level host registry and reference it by id',
+            path: `${base}.host`,
+            message: `Remote agent "${agent.id}" references unknown host id "${agent.host}" — add it via Host 管理`,
           });
         }
       }

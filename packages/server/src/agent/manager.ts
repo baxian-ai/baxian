@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { join, normalize } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createSignalToken, PASSIVE_VERDICT_WATCH } from './phase-signal.js';
-import { tmuxInstallHint, type AgentGitPreflight } from './preflight.js';
+import { tmuxInstallHint } from './preflight.js';
 import type {
   BaxianConfig,
   AgentConfig,
@@ -41,10 +41,19 @@ import {
   taskReviewRound,
   taskMatchesGeneration,
 } from '../shared/index.js';
-import { buildProjectDriver, makeDriverExec } from '../platform/driver-host.js';
-import { DriverOpError, buildDriverRunContext, GitDriver, safeDriverErrorText } from '../platform/git-driver.js';
-import type { DriverExec } from '../platform/git-driver.js';
-import type { PluginRegistry } from '../platform/plugin-registry.js';
+import {
+  buildProjectDriver,
+  buildProjectPromptContext,
+  makeDriverExec,
+} from '../platform/driver-host.js';
+import {
+  DriverOpError,
+  safeDriverErrorText,
+  validateCommentBody,
+  type DriverExec,
+  type PlatformDriver,
+  type PlatformPromptContext,
+} from '../platform/types.js';
 import { versionTimeOf, type NormalizedRow } from '../platform/row-schema.js';
 import { checkOpenPrBinding, checkPrBinding, type PrRejection } from '../platform/pr-binding.js';
 import { collectPendingFeedback, scanCommentSourcesOnce, type PendingFeedbackResult } from '../platform/feedback.js';
@@ -61,17 +70,15 @@ import type { TaskStore } from '../state/task-store.js';
 import type { LockManager } from '../state/lock.js';
 import type { EventBus } from '../event/bus.js';
 import type { ErrorRecordStore, ErrorRecordInput } from '../state/error-record-store.js';
-import { SkillRegistry, type SkillScope } from '../skill/registry.js';
 import type { CommandRunner } from './runner.js';
 import {
   createRunner,
   LocalRunner,
   shellQuote,
   resolveAgentHost,
-  hostGroupKey,
   workdirHostGroupKey,
 } from './runner.js';
-import { execOutcomeUnknown, isTransientNetworkFailure } from './net-exec.js';
+import { isTransientNetworkFailure } from './net-exec.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
 import {
   TmuxManager,
@@ -91,7 +98,7 @@ import {
   type PaneRef,
 } from './tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError, isAutoDeletableTaskBranch } from './branch.js';
-import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFile, trashBatchDirUnder, type RepoStoreCache } from './repo-store.js';
+import { RepoStore, createRepoStoreCache, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import {
   PhaseSignalWatcher,
@@ -104,17 +111,13 @@ import {
   buildPromptInline,
   buildGreetingPrompt,
   PromptSizeError,
-  RequiredSkillsMissingError,
   MAX_PROMPT_BYTES_ROUTE_LIMIT,
   type PostMergeCleanupContext,
-  type PlatformCliDescriptor,
 } from './prompt.js';
 import { ApiError } from '../errors.js';
 import { prepareConfig } from '../config/loader.js';
-import { resolveProjectTool } from '../config/validator.js';
 import { SHA_HEX_SOURCE } from '../platform/types.js';
 import { bodyDigest } from '../platform/body-digest.js';
-import { validateCommentBody } from '../platform/command-renderer.js';
 import { buildReviewTokenLine, extractReviewTokens, rowTokens } from '../platform/markers.js';
 
 const BENIGN_DISPATCH_CONFLICT_CODES = new Set(['dispatch-superseded', 'dispatch-in-flight']);
@@ -152,7 +155,6 @@ export interface EnsureSessionResult {
   ok: true;
   createdSession: boolean;
   freshRuntime: boolean;
-  skillsStale?: true;
   paneId: string;
   pane: PaneRef;
   workdir: string;
@@ -183,7 +185,6 @@ export type DispatchTerminalReason =
   | 'ack_unknown'
   | 'gate_failed'
   | 'prompt_too_large'
-  | 'required_skills_missing'
   | 'task_image_missing';
 
 export class CleanupFailedError extends Error {
@@ -280,6 +281,7 @@ const REPL_EXIT_COMMAND: Record<AgentConfig['runtime'], string> = {
 };
 
 const WORKDIR_SESSION_OPTION = '@baxian-workdir';
+const TASK_CONTEXT_SESSION_OPTION = '@baxian-context-task-id';
 
 type ReleaseRuntime =
   | { kind: 'absent' }
@@ -311,25 +313,12 @@ async function sameDirOnHost(
   return await physical(left) === await physical(right);
 }
 
-export function skillSubdirFor(runtime: AgentRuntimeConfig['runtime']): string {
-  switch (runtime) {
-    case 'codex':
-    case 'opencode':
-      return '.agents/skills';
-    case 'qodercli':
-      return '.qoder/skills';
-    default:
-      return '.claude/skills';
-  }
-}
-
 export interface AgentManagerDeps {
   config: BaxianConfig;
   agentStore: AgentStore;
   taskStore: TaskStore;
   lockManager: LockManager;
   eventBus: EventBus;
-  skillRegistry?: SkillRegistry;
   runnerFactory?: (agent: AgentConfig) => CommandRunner;
   platformRunner?: CommandRunner;
   imageStagingRoot?: string;
@@ -343,7 +332,6 @@ export interface AgentManagerDeps {
     workdir?: string,
   ) => RepoStore;
   paneStreamerManager?: PaneStreamerManager;
-  pluginRegistry?: PluginRegistry;
   platformDefaultBranchOf?: (projectId: string) => string | undefined;
   prConversationCache?: PrConversationCache;
   phaseSignalWatcher?: PhaseSignalWatcher;
@@ -431,7 +419,7 @@ export function canDispatchWithBinding(binding: AgentBindingFacts | null | undef
   return !binding?.taskId && !binding?.creationToken && binding?.status !== 'awaiting_human';
 }
 
-export const RECOVERABLE_QA_DISPATCH_HOLD_PHASES = new Set<string>([
+const RECOVERABLE_QA_DISPATCH_HOLD_PHASES = new Set<string>([
   'checkout-preparation-failed',
   'dirty-workdir',
 ]);
@@ -528,12 +516,10 @@ export class AgentManager {
   protected taskStore: TaskStore;
   protected lockManager: LockManager;
   protected eventBus: EventBus;
-  protected skillRegistry: SkillRegistry;
   protected runnerFactory?: (agent: AgentConfig) => CommandRunner;
   protected repoStoreFactory?: AgentManagerDeps['repoStoreFactory'];
   protected repoCache: RepoStoreCache;
   protected paneStreamerManager?: PaneStreamerManager;
-  protected pluginRegistry?: PluginRegistry;
   private platformDefaultBranchOf?: (projectId: string) => string | undefined;
   private readonly prConversationCache?: PrConversationCache;
   private readonly platformDriverExec: DriverExec;
@@ -573,7 +559,7 @@ export class AgentManager {
   private divergedAgents = new Set<string>();
   private deletionGeneration = new Map<string, number>();
   private compactInFlight = new Set<string>();
-  private configInterventionKeys = new Set<string>();
+  private platformBindingInterventionKeys = new Set<string>();
 
   constructor(deps: AgentManagerDeps) {
     const config = prepareConfig(deps.config);
@@ -582,11 +568,9 @@ export class AgentManager {
     this.taskStore = deps.taskStore;
     this.lockManager = deps.lockManager;
     this.eventBus = deps.eventBus;
-    this.skillRegistry = deps.skillRegistry ?? new SkillRegistry();
     this.runnerFactory = deps.runnerFactory;
     this.repoStoreFactory = deps.repoStoreFactory;
     this.paneStreamerManager = deps.paneStreamerManager;
-    this.pluginRegistry = deps.pluginRegistry;
     this.platformDefaultBranchOf = deps.platformDefaultBranchOf;
     this.prConversationCache = deps.prConversationCache;
     this.errorRecordStore = deps.errorRecordStore;
@@ -735,29 +719,14 @@ export class AgentManager {
     });
   }
 
-  async emitConfigIntervention(
-    projectId: string,
-    data: Record<string, unknown> & { phase: string },
-  ): Promise<void> {
-    const key = this.configInterventionKey(projectId, data);
-    if (this.configInterventionKeys.has(key)) return;
-    if (await this.emitIntervention(projectId, undefined, undefined, data)) {
-      this.configInterventionKeys.add(key);
-    }
-  }
-
-  configInterventionKey(projectId: string, data: Record<string, unknown> & { phase: string }): string {
-    return `config:${projectId}:${JSON.stringify(data)}`;
-  }
-
   platformBindingInterventionKey(task: TaskState, mismatch: PlatformBindingMismatch): string {
     return `binding:${task.id}:${mismatch.reason}:${mismatch.differences.join(',')}:` +
       `${JSON.stringify(mismatch.binding ?? null)}:${JSON.stringify(mismatch.live ?? null)}`;
   }
 
-  retainConfigInterventionKeys(keys: ReadonlySet<string>): void {
-    for (const key of this.configInterventionKeys) {
-      if (!keys.has(key)) this.configInterventionKeys.delete(key);
+  retainPlatformBindingInterventionKeys(keys: ReadonlySet<string>): void {
+    for (const key of this.platformBindingInterventionKeys) {
+      if (!keys.has(key)) this.platformBindingInterventionKeys.delete(key);
     }
   }
 
@@ -766,7 +735,7 @@ export class AgentManager {
     mismatch: PlatformBindingMismatch,
   ): Promise<void> {
     const key = this.platformBindingInterventionKey(task, mismatch);
-    if (this.configInterventionKeys.has(key)) return;
+    if (this.platformBindingInterventionKeys.has(key)) return;
     const emitted = await this.emitIntervention(task.projectId, task.agentId || undefined, task.id, {
       phase: 'platform-binding-mismatch',
       reason: mismatch.reason,
@@ -774,7 +743,7 @@ export class AgentManager {
       ...(mismatch.binding !== undefined ? { binding: mismatch.binding } : {}),
       ...(mismatch.live !== undefined ? { live: mismatch.live } : {}),
     });
-    if (emitted) this.configInterventionKeys.add(key);
+    if (emitted) this.platformBindingInterventionKeys.add(key);
   }
 
   private async recordError(input: ErrorRecordInput): Promise<void> {
@@ -969,15 +938,6 @@ export class AgentManager {
     });
     assertGenerationOpen();
 
-    try {
-      await this.provisionRepoSkills(runner, agent, workdir);
-    } catch (err) {
-      throw new EnsureSessionError(
-        { createdSession: false, agentId },
-        `skill provisioning failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    assertGenerationOpen();
     let snapshot: Awaited<ReturnType<TmuxManager['getSessionSnapshot']>>;
     try {
       snapshot = await tmux.getSessionSnapshot(agentId);
@@ -1013,39 +973,6 @@ export class AgentManager {
       );
     }
     return this.adoptOrRestartSessionLocked(tmux, runner, agent, agentId, workdir, workdir, snapshot);
-  }
-
-  private agentSkillScope(agentId: string): SkillScope {
-    const projectId = this.getAgentConfig(agentId)?.projectId;
-    if (projectId === undefined) return { pluginTools: [] };
-    const project = this.getProjectConfig(projectId);
-    const tool = project === undefined ? undefined : resolveProjectTool(project);
-    return { pluginTools: tool === undefined ? [] : [tool] };
-  }
-
-  private async provisionRepoSkills(
-    runner: CommandRunner,
-    agent: AgentConfig,
-    workdir: string,
-  ): Promise<void> {
-    if (this.skillRegistry.names().length === 0) return;
-    const scope = this.agentSkillScope(agent.id);
-    const subdir = skillSubdirFor(agent.runtime);
-    const destRoot = `${workdir}/${subdir}`;
-    await this.excludeInjectedSkills(runner, workdir, subdir);
-    // Batch inside the swept tree itself: a symlinked skills dir may live on another filesystem, where mv degrades to copy+unlink.
-    const trashDir = trashBatchDirUnder(`${destRoot}/.baxian-trash`, 'skills');
-    await this.runUnderSkillDirLock(this.skillDirLockKey(agent, workdir), async () => {
-      await this.ensureSkillDirSafe(runner, workdir, subdir, [
-        ...this.skillRegistry.names(),
-        ...this.skillRegistry.pluginSkillNames(scope),
-      ], trashDir);
-      await this.skillRegistry.materialize(
-        (path, content) => this.atomicWriteFile(runner, path, content, trashDir),
-        destRoot,
-        scope,
-      );
-    });
   }
 
   private sessionLifecycleChain = new Map<string, Promise<unknown>>();
@@ -1131,144 +1058,6 @@ export class AgentManager {
     await this.rollbackCreatedSession(agentId, err.partial, reason);
   }
 
-  private skillDirChain = new Map<string, Promise<unknown>>();
-  private skillDirLockKey(agent: AgentConfig, workdir: string): string {
-    const host = hostGroupKey(agent.mode, resolveAgentHost(this.config.host, agent.host));
-    const subdir = skillSubdirFor(agent.runtime);
-    const dir = workdir.replace(/\/+$/, '');
-    return `${host}:${dir}:${subdir}`;
-  }
-  private runUnderSkillDirLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const prev = this.skillDirChain.get(key) ?? Promise.resolve();
-    const run = prev.then(fn, fn);
-    const settled = run.then(() => undefined, () => undefined);
-    this.skillDirChain.set(key, settled);
-    void settled.finally(() => {
-      if (this.skillDirChain.get(key) === settled) this.skillDirChain.delete(key);
-    });
-    return run;
-  }
-
-  private async atomicWriteFile(
-    runner: CommandRunner,
-    finalPath: string,
-    content: Buffer,
-    trashDir: string,
-  ): Promise<void> {
-    const tmp = `${finalPath}.baxian-tmp-${randomBytes(6).toString('hex')}`;
-    try {
-      await stageFile(runner, tmp, content, { trashDir });
-      await moveFileIntoPlace(runner, tmp, finalPath, { trashDir });
-    } catch (err) {
-      throw new Error(`atomic skill write failed (${finalPath}): ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  private async ensureSkillDirSafe(
-    runner: CommandRunner,
-    workdir: string,
-    subdir: string,
-    keepNames: string[],
-    trashDir: string,
-  ): Promise<void> {
-    const SKILLS_SWEPT = 'BX_SKILLS_SWEPT';
-    const keep = keepNames.map((n) => `! -name ${shellQuote(n)}`).join(' ');
-    const batch = shellQuote(trashDir);
-    // Stale directories go first so the later link/file passes only see what stayed behind in kept dirs. -H follows a symlinked skills dir given as the start path; -exec … + propagates a mover failure into find's exit code (\; would swallow it); pruning .baxian-trash keeps the never-emptied trash out of the walk (it only grows, and one unreadable old batch would fail every sweep).
-    const prune = `-name .baxian-trash -prune -o`;
-    const findStaleDirs = `find -H ${subdir} -maxdepth 1 ${prune} -name 'baxian-*' ${keep}`;
-    const findStaleLinks = `find -H ${subdir} ${prune} -path '${subdir}/baxian-*' -type l`;
-    const findStaleFiles = `find -H ${subdir} ${prune} -path '${subdir}/baxian-*/*' -type f ! -name 'SKILL.md'`;
-    const mover =
-      `dest="$0"; for f in "$@"; do ` +
-      `mkdir -p "$dest" || exit 1; ` +
-      `base=$(basename -- "$f"); t="$dest/$base"; n=0; ` +
-      `while [ -e "$t" ] || [ -L "$t" ]; do n=$((n+1)); t="$dest/$base.$n"; done; ` +
-      `mv -- "$f" "$t" || exit 1; ` +
-      `done`;
-    const moveStale = (find: string): string => `${find} -exec sh -c '${mover}' ${batch} {} +`;
-    const inner =
-      `cd ${shellQuote(workdir)} && ` +
-      `mkdir -p ${subdir} && ` +
-      `${moveStale(findStaleDirs)} && ` +
-      `${moveStale(findStaleLinks)} && ` +
-      `${moveStale(findStaleFiles)} && ` +
-      `printf '%s' ${SKILLS_SWEPT}`;
-    const res = await runner.exec(`sh -c ${shellQuote(inner)}`);
-    if (execOutcomeUnknown(res)) {
-      throw new Error(
-        `skill sweep outcome unknown in ${workdir}/${subdir} (exit ${res.exitCode}): ${res.stderr.trim() || res.stdout.trim() || 'no output'}`,
-      );
-    }
-    if (res.exitCode !== 0 || !res.stdout.includes(SKILLS_SWEPT)) {
-      throw new Error(
-        `failed to prepare ${subdir} in ${workdir}: ${res.stderr.trim() || `exit ${res.exitCode}, no completion marker`}`,
-      );
-    }
-  }
-
-  private async tagSessionSkillsVersion(
-    tmux: TmuxManager,
-    agentId: string,
-    ref: TmuxSessionRef,
-  ): Promise<void> {
-    if (this.skillRegistry.names().length === 0) return;
-    await this.setSessionOptions(tmux, agentId, ref, [
-      ['@baxian-skills-version', this.skillRegistry.contentHash(this.agentSkillScope(agentId))],
-    ]);
-  }
-
-  private async replSkillsStale(tmux: TmuxManager, agentId: string, ref: TmuxSessionRef): Promise<boolean> {
-    if (this.skillRegistry.names().length === 0) return false;
-    const tagged = await tmux.getSessionOptionByRef(ref, agentId, '@baxian-skills-version');
-    return tagged !== this.skillRegistry.contentHash(this.agentSkillScope(agentId));
-  }
-
-  private async excludeInjectedSkills(
-    runner: CommandRunner,
-    workdir: string,
-    subdir: string,
-  ): Promise<void> {
-    // cd -P first: tracked/exclude/probe all run against the skills dir's PHYSICAL owning repo, so a symlink pointing back inside a worktree keeps the tracked-content protection while one pointing outside degrades to the plain non-git path.
-    const inner =
-      `cd ${shellQuote(workdir)} && ` +
-      `mkdir -p ${subdir} && cd -P ${subdir} && ` +
-      `if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo BX_SKILLS_NON_GIT; exit 0; fi; ` +
-      `tracked="$(git ls-files -- 'baxian-*' 2>/dev/null | head -5)"; ` +
-      `if [ -n "$tracked" ]; then printf 'BX_SKILLS_TRACKED %s\\n' "$tracked" | head -1; exit 0; fi; ` +
-      `p="$(git rev-parse --git-path info/exclude)" || { echo BX_SKILLS_EXCLUDE_WRITE_FAILED; exit 0; }; ` +
-      // show-prefix is a literal path but lands in a gitignore pattern: escape fnmatch metacharacters or a dir like skill[dir] never matches its own rule.
-      `pre="$(git rev-parse --show-prefix 2>/dev/null | sed 's/[][\\*?]/\\\\&/g')"; rule="/\${pre}baxian-*"; trashrule="/\${pre}.baxian-trash"; ` +
-      `{ mkdir -p "$(dirname "$p")" && { grep -qxF "$rule" "$p" 2>/dev/null || printf '%s\\n' "$rule" >> "$p"; } ` +
-      `&& { grep -qxF "$trashrule" "$p" 2>/dev/null || printf '%s\\n' "$trashrule" >> "$p"; }; } ` +
-      `|| { echo BX_SKILLS_EXCLUDE_WRITE_FAILED; exit 0; }; ` +
-      `if git check-ignore -q -- 'baxian-__probe__/SKILL.md' ` +
-      `&& git check-ignore -q -- '.baxian-trash/__probe__'; then echo BX_SKILLS_OK; ` +
-      `else echo BX_SKILLS_EXCLUDE_INEFFECTIVE; fi`;
-    const res = await runner.exec(`sh -c ${shellQuote(inner)}`);
-    if (execOutcomeUnknown(res)) {
-      throw new Error(
-        `skill exclusion probe outcome unknown in ${workdir} (exit ${res.exitCode}): ${res.stderr.trim() || res.stdout.trim() || 'no output'}`,
-      );
-    }
-    if (res.exitCode !== 0) {
-      throw new Error(
-        `skill exclusion probe failed in ${workdir}: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
-      );
-    }
-    const verdict = res.stdout.trim().split('\n').pop() ?? '';
-    if (verdict === 'BX_SKILLS_NON_GIT' || verdict === 'BX_SKILLS_OK') return;
-    if (verdict.startsWith('BX_SKILLS_TRACKED')) {
-      throw new Error(
-        `refusing to inject baxian skills into ${workdir}: project tracks ` +
-        `${verdict.replace('BX_SKILLS_TRACKED ', '')}`,
-      );
-    }
-    throw new Error(
-      `cannot make injected skills invisible to Git in ${workdir}: ${verdict || 'no probe output'}`,
-    );
-  }
-
   private runtimePinEntries(): Array<[string, string]> {
     return [
       ['prefix', 'C-b'],
@@ -1288,6 +1077,44 @@ export class AgentManager {
     if (outcome === 'gone') {
       throw new Error(
         `tmux session ${ref.sessionId} (${agentId}) vanished before its options could be applied`,
+      );
+    }
+  }
+
+  private async taskContextForSession(
+    tmux: TmuxManager,
+    agentId: string,
+    ensure: EnsureSessionResult,
+  ): Promise<string | null> {
+    if (ensure.freshRuntime) {
+      await this.setSessionOptions(
+        tmux,
+        agentId,
+        ensure.sessionRef,
+        [[TASK_CONTEXT_SESSION_OPTION, '']],
+      );
+      return null;
+    }
+    return tmux.getSessionOptionByRef(
+      ensure.sessionRef,
+      agentId,
+      TASK_CONTEXT_SESSION_OPTION,
+    );
+  }
+
+  private async rememberTaskContext(
+    tmux: TmuxManager,
+    agentId: string,
+    ref: TmuxSessionRef,
+    taskId: string,
+  ): Promise<void> {
+    try {
+      await this.setSessionOptions(tmux, agentId, ref, [[TASK_CONTEXT_SESSION_OPTION, taskId]]);
+    } catch (err) {
+      console.warn(
+        `[AgentManager] prompt for ${agentId}/${taskId} was delivered, but its context marker could not be saved; ` +
+        `the next phase will clear once and resend the full task:`,
+        err,
       );
     }
   }
@@ -1316,10 +1143,7 @@ export class AgentManager {
     workdir: string,
     sessionDir: string = workdir,
   ): Promise<EnsureSessionResult> {
-    return this.runUnderSkillDirLock(
-      this.skillDirLockKey(agent, sessionDir),
-      () => this.buildFreshSessionLocked(tmux, agent, agentId, workdir, sessionDir),
-    );
+    return this.buildFreshSessionLocked(tmux, agent, agentId, workdir, sessionDir);
   }
 
   private async buildFreshSessionLocked(
@@ -1358,7 +1182,6 @@ export class AgentManager {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
-      await this.tagSessionSkillsVersion(tmux, agentId, createdRef);
       return { ok: true, createdSession: true, freshRuntime: true, paneId: pane.paneId, pane, workdir, sessionRef: createdRef };
     } catch (err) {
       const partial: {
@@ -1479,7 +1302,7 @@ export class AgentManager {
       const token = createSignalToken();
       try {
         await this.injectAndAwaitAckSteps(
-          tmux, pane, buildGreetingPrompt(token, agent.runtime), agentId, agent.runtime,
+          tmux, pane, buildGreetingPrompt(token), agentId, agent.runtime,
         );
       } catch (err) {
         console.warn(`[bootstrap] greeting inject failed for ${agentId} (attempt ${attempt}):`, err);
@@ -1514,8 +1337,8 @@ export class AgentManager {
     const now = new Date().toISOString();
     const reason =
       'Greeting capability check failed: the agent did not echo a valid [bx:greeting] signal ' +
-      'per the baxian-signals skill within the timeout. Its runtime/model may not meet baxian ' +
-      'requirements (skill loading or pane signalling). Fix the runtime, then restart-repl or ' +
+      'from the inline startup instruction within the timeout. Its runtime/model may not meet baxian ' +
+      'pane signalling requirements. Fix the runtime, then restart-repl or ' +
       'retry the agent to re-run the check (Resume will not clear it — capability must be re-proven).';
     let wrote = false;
     await this.agentStore.update(agentId, (fresh) => {
@@ -2042,30 +1865,8 @@ export class AgentManager {
     }
     await this.setSessionOptions(tmux, agentId, sessionRef, [[WORKDIR_SESSION_OPTION, sessionDir]]);
     switch (state.kind) {
-      case 'live-runtime': {
-        let stale: boolean;
-        try {
-          stale = await this.replSkillsStale(tmux, agentId, sessionRef);
-        } catch (err) {
-          throw new EnsureSessionError(
-            { createdSession: false, agentId },
-            `skills-version probe failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        if (stale) {
-          return {
-            ok: true,
-            createdSession: false,
-            freshRuntime: false,
-            skillsStale: true,
-            paneId,
-            pane,
-            workdir,
-            sessionRef,
-          };
-        }
+      case 'live-runtime':
         return { ok: true, createdSession: false, freshRuntime: false, paneId, pane, workdir, sessionRef };
-      }
       case 'startup-dialog':
         throw new EnsureSessionError(
           {
@@ -2092,7 +1893,6 @@ export class AgentManager {
             timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
             scrollback: 0,
           });
-          await this.tagSessionSkillsVersion(tmux, agentId, sessionRef);
           return { ok: true, createdSession: false, freshRuntime: true, paneId, pane, workdir, sessionRef };
         } catch (trustErr) {
           if (trustErr instanceof ReplNotReadyError && detectStartupDialog(trustErr.lastScreen, runtime)) {
@@ -2125,7 +1925,6 @@ export class AgentManager {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
-      await this.tagSessionSkillsVersion(tmux, agentId, sessionRef);
       return { ok: true, createdSession: false, freshRuntime: true, paneId, pane, workdir, sessionRef };
     } catch (relErr) {
       if (relErr instanceof ReplNotReadyError && detectStartupDialog(relErr.lastScreen, runtime)) {
@@ -4236,7 +4035,6 @@ export class AgentManager {
     if (!this.deletionGateOpen(agentId, genAtEntry)) {
       throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
     }
-    await this.provisionRepoSkills(runner, cfg, workdir);
     await this.setSessionOptions(tmux, agentId, snapshot.ref, [[WORKDIR_SESSION_OPTION, workdir]]);
 
     const runtime = agentRuntimeKindFor(cfg);
@@ -4250,9 +4048,14 @@ export class AgentManager {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
-      await this.tagSessionSkillsVersion(tmux, agentId, snapshot.ref);
+      await this.setSessionOptions(
+        tmux,
+        agentId,
+        snapshot.ref,
+        [[TASK_CONTEXT_SESSION_OPTION, '']],
+      );
     };
-    await this.runUnderSkillDirLock(this.skillDirLockKey(cfg, workdir), relaunch);
+    await relaunch();
 
     await this.agentStore.update(agentId, (state) => {
       if (!state || !this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
@@ -4848,9 +4651,8 @@ export class AgentManager {
       phase: 'develop',
       agent: cfg,
       workdir: workdirGuess,
-      skillRegistry: this.skillRegistry,
       signalToken: 'preview-signal-token',
-      platformCli: this.platformCliContextOf(fakeTask),
+      platform: this.platformPromptContextOf(fakeTask),
     });
     return Buffer.byteLength(fullPrompt, 'utf8');
   }
@@ -4863,11 +4665,10 @@ export class AgentManager {
     return this.config.project.find(p => p.id === projectId);
   }
 
-  platformDriverFor(projectId: string): GitDriver | undefined {
-    if (!this.pluginRegistry) return undefined;
+  platformDriverFor(projectId: string): PlatformDriver | undefined {
     const project = this.getProjectConfig(projectId);
     if (!project) return undefined;
-    return buildProjectDriver(project, this.pluginRegistry, this.platformDriverExec);
+    return buildProjectDriver(project, this.platformDriverExec);
   }
 
   private findAgentTeam(anchorAgentId: string): AgentConfig[] | undefined {
@@ -5431,25 +5232,6 @@ export class AgentManager {
       token: completion.token,
       headSha: completion.approvedHeadSha,
     });
-  }
-
-  async ensurePluginSkillPools(next: BaxianConfig): Promise<void> {
-    if (!this.pluginRegistry) return;
-    for (const project of next.project) {
-      const tool = resolveProjectTool(project);
-      if (tool === undefined) continue;
-      const plugin = this.pluginRegistry.resolveTool(tool);
-      if (plugin === undefined) {
-        throw new Error(
-          `project '${project.id}': no git-driver plugin provides tool '${tool}' — install it under <home>/plugins/ first`,
-        );
-      }
-      if (this.skillRegistry.pluginSkillNames({ pluginTools: [tool] }).length > 0) continue;
-      await this.skillRegistry.scanPluginSkills(tool, join(plugin.pluginPath, 'skills'));
-      if (this.skillRegistry.pluginSkillNames({ pluginTools: [tool] }).length === 0) {
-        throw new Error(`plugin '${plugin.manifest.name}' provides no materializable skills for tool '${tool}'`);
-      }
-    }
   }
 
   async guardGitConfigCommit(
@@ -6255,47 +6037,16 @@ export class AgentManager {
   private platformBindingFor(projectId: string): NonNullable<TaskState['platformBinding']> {
     const project = this.getProjectConfig(projectId);
     if (!project) throw new Error(`project ${projectId} not found while capturing platform binding`);
-    const tool = resolveProjectTool(project);
-    if (tool === undefined) throw new Error(`project ${projectId} has no resolved platform tool`);
     return {
-      mode: 'git',
       repoKey: repoIdentityKey(project.repo),
-      tool,
     };
   }
 
-  agentGitPreflightContext(projectId: string): AgentGitPreflight | undefined {
-    const project = this.getProjectConfig(projectId);
-    if (!project || !this.pluginRegistry) return undefined;
-    const tool = resolveProjectTool(project);
-    if (tool === undefined) return undefined;
-    const plugin = this.pluginRegistry.resolveTool(tool);
-    if (plugin === undefined) return undefined;
-    const renderCtx = buildDriverRunContext(project.repo, tool);
-    return {
-      tool,
-      minToolVersion: plugin.manifest.minToolVersion,
-      steps: plugin.spec.preflight,
-      agentCommands: plugin.spec.agentCommands,
-      renderCtx,
-      driverFor: (exec) => new GitDriver(plugin, renderCtx, exec),
-    };
-  }
-
-  platformCliContextOf(task: TaskState): PlatformCliDescriptor | undefined {
+  platformPromptContextOf(task: TaskState): PlatformPromptContext | undefined {
     this.assertPlatformBinding(task);
     const project = this.getProjectConfig(task.projectId);
     if (!project) return undefined;
-    const tool = resolveProjectTool(project);
-    if (tool === undefined) return undefined;
-    const ctx = buildDriverRunContext(project.repo, tool);
-    return {
-      tool,
-      host: ctx.host,
-      repo: ctx.repoPath,
-      repoEncoded: encodeURIComponent(ctx.repoPath),
-      ...(project.gitCli?.notes !== undefined ? { notes: project.gitCli.notes } : {}),
-    };
+    return buildProjectPromptContext(project);
   }
 
   async ensureGitBaseSnapshot(task: TaskState, phase: string): Promise<TaskState> {
@@ -6356,7 +6107,7 @@ export class AgentManager {
     );
   }
 
-  private async platformTaskAndDriver(taskId: string): Promise<{ task: TaskState; driver: GitDriver }> {
+  private async platformTaskAndDriver(taskId: string): Promise<{ task: TaskState; driver: PlatformDriver }> {
     const task = await this.taskStore.get(taskId);
     if (!task) throw new Error(`task ${taskId} not found`);
     this.assertPlatformBinding(task);
@@ -6375,8 +6126,7 @@ export class AgentManager {
   async platformFetchPrView(taskId: string): Promise<NormalizedRow> {
     const { task, driver } = await this.platformTaskAndDriver(taskId);
     if (task.prNumber === undefined) throw new Error(`task ${taskId} has no bound PR`);
-    const [row] = await driver.runOp('prView', { prNumber: task.prNumber });
-    return row!;
+    return driver.prView(task.prNumber);
   }
 
   async platformFetchPrHeadSha(taskId: string): Promise<string> {
@@ -6396,25 +6146,25 @@ export class AgentManager {
     | { ok: false; reason: PrRejection; prBranch?: string }
   > {
     const { task, driver } = await this.platformTaskAndDriver(taskId);
-    const [row] = await driver.runOp('prView', { prNumber });
+    const row = await driver.prView(prNumber);
     let expectedBase = task.baseBranch;
     if (expectedBase === undefined) {
-      const [project] = await driver.runOp('projectView');
-      if (typeof project?.defaultBranch === 'string') expectedBase = project.defaultBranch;
+      const project = await driver.projectView();
+      if (typeof project.defaultBranch === 'string') expectedBase = project.defaultBranch;
     }
-    const check = checkOpenPrBinding(row!, { branch: opts.branchOverride ?? task.branch, expectedBase });
+    const check = checkOpenPrBinding(row, { branch: opts.branchOverride ?? task.branch, expectedBase });
     if (!check.ok) {
       return {
         ...check,
-        ...(check.reason === 'branch' && typeof row!.branch === 'string' ? { prBranch: row!.branch } : {}),
+        ...(check.reason === 'branch' && typeof row.branch === 'string' ? { prBranch: row.branch } : {}),
       };
     }
     return {
       ok: true,
-      prUrl: String(row!.prUrl),
-      headSha: String(row!.headSha),
-      branch: String(row!.branch),
-      targetBranch: String(row!.targetBranch),
+      prUrl: String(row.prUrl),
+      headSha: String(row.headSha),
+      branch: String(row.branch),
+      targetBranch: String(row.targetBranch),
     };
   }
 
@@ -6510,7 +6260,7 @@ export class AgentManager {
       );
       return;
     }
-    let driver: GitDriver | undefined;
+    let driver: PlatformDriver | undefined;
     try {
       driver = this.platformDriverFor(snapshot.projectId);
     } catch (err) {
@@ -6534,8 +6284,8 @@ export class AgentManager {
       let pr: NormalizedRow;
       let project: NormalizedRow;
       try {
-        [pr] = await driver.runOp('prView', { prNumber: intent.prNumber });
-        [project] = await driver.runOp('projectView');
+        pr = await driver.prView(intent.prNumber);
+        project = await driver.projectView();
       } catch (err) {
         if (err instanceof DriverOpError
           && (err.info.errorClass === 'NOT_FOUND' || err.info.errorClass === 'ACCESS_DENIED')) {
@@ -6545,12 +6295,12 @@ export class AgentManager {
         await this.recordRemoteCleanupFailure(task, generation, 'probe', safeDriverErrorText(err));
         throw err;
       }
-      const remoteProjectId = typeof project!.remoteProjectId === 'string'
-        ? project!.remoteProjectId : undefined;
-      const binding = checkPrBinding(pr!, {
+      const remoteProjectId = typeof project.remoteProjectId === 'string'
+        ? project.remoteProjectId : undefined;
+      const binding = checkPrBinding(pr, {
         branch: intent.branch,
         expectedBase: task.baseBranch,
-        defaultBranch: typeof project!.defaultBranch === 'string' ? project!.defaultBranch : undefined,
+        defaultBranch: typeof project.defaultBranch === 'string' ? project.defaultBranch : undefined,
       });
       if (!remoteProjectId || binding !== undefined) {
         let reason = 'projectView did not return remoteProjectId';
@@ -6565,8 +6315,8 @@ export class AgentManager {
         taskBranch: intent.branch,
         branchCreatedByBaxian: task.branchCreatedByBaxian,
       });
-      const liveHead = typeof pr!.headSha === 'string' && PLATFORM_HEAD_SHA_RE.test(pr!.headSha)
-        ? pr!.headSha : undefined;
+      const liveHead = typeof pr.headSha === 'string' && PLATFORM_HEAD_SHA_RE.test(pr.headSha)
+        ? pr.headSha : undefined;
       const expectedHeadSha = intent.expectedHeadSha;
       const deleteEligible = staticOwnership && expectedHeadSha !== undefined && liveHead === expectedHeadSha;
       const tipChanged = staticOwnership && !deleteEligible;
@@ -6580,7 +6330,7 @@ export class AgentManager {
       intent = credentialed.remoteCleanup;
 
       try {
-        await driver.runOp('close', { prNumber: intent.prNumber });
+        await driver.closePr(intent.prNumber);
       } catch (err) {
         if (err instanceof DriverOpError
           && (err.info.errorClass === 'NOT_FOUND' || err.info.errorClass === 'ACCESS_DENIED')) {
@@ -6641,32 +6391,25 @@ export class AgentManager {
       || intent.expectedHeadSha === undefined || intent.remoteProjectId === undefined) return;
     let mutationError: unknown;
     try {
-      await driver.runOp('deleteBranch', {
-        branch: intent.branch,
-        expectedHeadSha: intent.expectedHeadSha,
-        remoteProjectId: intent.remoteProjectId,
-      });
+      await driver.deleteBranch(intent.remoteProjectId, intent.branch, intent.expectedHeadSha);
     } catch (err) {
       mutationError = err;
     }
 
     let branch: NormalizedRow;
     try {
-      [branch] = await driver.runOp('branchView', {
-        branch: intent.branch,
-        remoteProjectId: intent.remoteProjectId,
-      });
+      branch = await driver.branchView(intent.remoteProjectId, intent.branch);
     } catch (err) {
       const mutation = mutationError === undefined ? '' : `; delete attempt: ${safeDriverErrorText(mutationError)}`;
       await this.recordRemoteCleanupFailure(task, generation, 'probe', `${safeDriverErrorText(err)}${mutation}`);
       throw err;
     }
-    if (branch!.remoteProjectId !== intent.remoteProjectId) {
-      const message = `branchView repository id changed from ${intent.remoteProjectId} to ${String(branch!.remoteProjectId)}`;
+    if (branch.remoteProjectId !== intent.remoteProjectId) {
+      const message = `branchView repository id changed from ${intent.remoteProjectId} to ${String(branch.remoteProjectId)}`;
       await this.markRemoteCleanupManual(task, generation, 'binding', message);
       return;
     }
-    if (branch!.headSha === undefined) {
+    if (branch.headSha === undefined) {
       try {
         await this.eventBus.emit({
           id: `outbox:${task.id}:${intent.prNumber}:remote-branch-deleted:${generation}`,
@@ -6692,13 +6435,13 @@ export class AgentManager {
       await this.mutateRemoteCleanup(taskId, generation, () => undefined);
       return;
     }
-    if (typeof branch!.headSha !== 'string' || !PLATFORM_HEAD_SHA_RE.test(branch!.headSha)) {
-      const message = `branchView returned an invalid head ${String(branch!.headSha)}`;
+    if (typeof branch.headSha !== 'string' || !PLATFORM_HEAD_SHA_RE.test(branch.headSha)) {
+      const message = `branchView returned an invalid head ${String(branch.headSha)}`;
       await this.recordRemoteCleanupFailure(task, generation, 'probe', message);
       throw new Error(message);
     }
-    if (branch!.headSha !== intent.expectedHeadSha) {
-      const message = `branch head changed from ${intent.expectedHeadSha} to ${branch!.headSha}`;
+    if (branch.headSha !== intent.expectedHeadSha) {
+      const message = `branch head changed from ${intent.expectedHeadSha} to ${branch.headSha}`;
       await this.markRemoteCleanupManual(task, generation, 'tip-changed', message);
       return;
     }
@@ -6709,7 +6452,7 @@ export class AgentManager {
     throw mutationError instanceof Error ? mutationError : new Error(message);
   }
 
-  private async platformScanComments(driver: GitDriver, prNumber: number): Promise<VerdictSourceScan[]> {
+  private async platformScanComments(driver: PlatformDriver, prNumber: number): Promise<VerdictSourceScan[]> {
     return scanCommentSourcesOnce(driver, prNumber, () => Date.now());
   }
 
@@ -6763,11 +6506,11 @@ export class AgentManager {
     const { task, driver } = await this.platformTaskAndDriver(taskId);
     if (task.prNumber === undefined) throw new Error(`task ${taskId} has no bound PR`);
     const prNumber = task.prNumber;
-    const [row] = await driver.runOp('prView', { prNumber });
-    const binding = checkOpenPrBinding(row!, { branch: task.branch, expectedBase: task.baseBranch });
+    const row = await driver.prView(prNumber);
+    const binding = checkOpenPrBinding(row, { branch: task.branch, expectedBase: task.baseBranch });
     if (!binding.ok) throw new Error(`merge blocked: binding ${binding.reason}`);
-    if (String(row!.headSha) !== opts.expectedHeadSha) {
-      throw new Error(`merge blocked: head moved (expected ${opts.expectedHeadSha}, saw ${String(row!.headSha)})`);
+    if (String(row.headSha) !== opts.expectedHeadSha) {
+      throw new Error(`merge blocked: head moved (expected ${opts.expectedHeadSha}, saw ${String(row.headSha)})`);
     }
     if (opts.humanOverride !== true) {
       const provenance = task.passProvenance;
@@ -6814,12 +6557,12 @@ export class AgentManager {
       throw new Error(`merge blocked: task left its merge gate (status=${fresh?.status ?? 'gone'})`);
     }
     try {
-      await driver.runOp('merge', { prNumber, expectedHeadSha: opts.expectedHeadSha });
+      await driver.mergePr(prNumber, opts.expectedHeadSha);
     } catch (err) {
       if (err instanceof DriverOpError && err.info.errorClass === 'MERGE_BLOCKED') {
         let mergeStatus: string | undefined;
         try {
-          const [fresh] = await driver.runOp('prView', { prNumber });
+          const fresh = await driver.prView(prNumber);
           if (typeof fresh?.detailedMergeStatus === 'string') mergeStatus = fresh.detailedMergeStatus;
         } catch {
         }
@@ -6843,9 +6586,7 @@ export class AgentManager {
   ): boolean {
     const binding = task.platformBinding;
     return binding !== undefined
-      && binding.mode === entryBinding.mode
-      && binding.repoKey === entryBinding.repoKey
-      && binding.tool === entryBinding.tool;
+      && binding.repoKey === entryBinding.repoKey;
   }
 
   async listTasksForPlatformEntry(projectId: string): Promise<TaskState[]> {
@@ -6853,9 +6594,7 @@ export class AgentManager {
     if (project === undefined) return [];
     const key = repoIdentityKey(project.repo);
     const entryBinding: NonNullable<TaskState['platformBinding']> = {
-      mode: 'git',
       repoKey: key,
-      tool: resolveProjectTool(project) ?? '',
     };
     const ids = new Set(this.config.project.filter(p => repoIdentityKey(p.repo) === key).map(p => p.id));
     const tasks = await this.taskStore.listStrict();
@@ -7097,9 +6836,8 @@ export class AgentManager {
         runner, project.repo, agent.mode, host, this.repoCache, agent.id, agent.workdir,
       );
     }
-    const cloneViaGh = resolveProjectTool(project) === 'gh';
     return new RepoStore(
-      runner, project.repo, agent.mode, host, this.repoCache, agent.id, agent.workdir, cloneViaGh,
+      runner, project.repo, agent.mode, host, this.repoCache, agent.id, agent.workdir,
     );
   }
 
@@ -7638,6 +7376,14 @@ export class AgentManager {
       await tmux.clearComposerDraft(pane);
       await waitReady();
       await assertSessionUnchanged();
+      if (command === '/clear') {
+        await this.setSessionOptions(
+          tmux,
+          agentId,
+          pane.session,
+          [[TASK_CONTEXT_SESSION_OPTION, '']],
+        );
+      }
       await tmux.sendKeysLiteral(pane, command);
       await tmux.sendEnter(pane);
       guardHandedOff = true;
@@ -7776,6 +7522,7 @@ export class AgentManager {
     pane: PaneRef,
     agentId: string,
     runtime: AgentConfig['runtime'],
+    sessionRef: TmuxSessionRef,
     revalidate: () => Promise<void>,
   ): Promise<void> {
     await this.acquireCompactGuard(agentId);
@@ -7787,6 +7534,12 @@ export class AgentManager {
         timeoutMs: this.dispatchSettleTimeoutMs,
       });
       const baselineTitle = await tmux.readPaneTitle(pane);
+      await this.setSessionOptions(
+        tmux,
+        agentId,
+        sessionRef,
+        [[TASK_CONTEXT_SESSION_OPTION, '']],
+      );
       await tmux.sendKeysLiteral(pane, '/clear');
       await tmux.sendEnter(pane);
       await tmux.waitSubmitAck(pane, baseline, runtime, {
@@ -8241,6 +7994,8 @@ export class AgentManager {
     const lockState = await this.agentStore.get(agentId);
     if (!lockState || lockState.taskId !== taskId || lockState.lockToken !== lockToken) return false;
     await assertOwner();
+    const reuseTaskContext =
+      (await this.taskContextForSession(tmux, agentId, ensure)) === taskId;
     try {
       await this.waitForReplPromptReady(tmux, pane, agent.runtime, this.cleanComposerWaitMs, { stableIdle: true });
     } catch (err) {
@@ -8268,9 +8023,15 @@ export class AgentManager {
         if (task.branchLocalCleaned) await this.clearBranchLocalCleaned(taskId);
       }
       await assertOwner();
-      if (!ensure.freshRuntime) {
-        await this.clearRuntimeForDispatchBoundary(tmux, pane, agentId, agent.runtime, assertOwner);
-        if (ensure.skillsStale) await this.tagSessionSkillsVersion(tmux, agentId, ensure.sessionRef);
+      if (!ensure.freshRuntime && !reuseTaskContext) {
+        await this.clearRuntimeForDispatchBoundary(
+          tmux,
+          pane,
+          agentId,
+          agent.runtime,
+          ensure.sessionRef,
+          assertOwner,
+        );
       }
     } catch (err) {
       const busyPend = await this.queueQaBusyPendingRetry(taskId, agentId, phase, ensure.createdSession, err, { passToken: opts.dispatchPassToken, pendingBudget: opts.dispatchPendingBudget });
@@ -8339,14 +8100,14 @@ export class AgentManager {
     try {
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       const taskForPrompt = await this.ensureGitBaseSnapshot(task, phase);
-      const platformCli = this.platformCliContextOf(taskForPrompt);
+      const platform = this.platformPromptContextOf(taskForPrompt);
       prompt = buildPromptInline({
         task: taskForPrompt,
         phase,
         agent,
         workdir: dispatchWorkdir,
-        skillRegistry: this.skillRegistry,
-        ...(platformCli ? { platformCli } : {}),
+        includeTaskContext: ensure.freshRuntime || !reuseTaskContext,
+        ...(platform ? { platform } : {}),
         ...(promptSignalToken ? { signalToken: promptSignalToken } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
       });
@@ -8354,9 +8115,6 @@ export class AgentManager {
       await cleanupCheckoutOrHold();
       if (err instanceof PromptSizeError) {
         throw new DispatchTerminalError('prompt_too_large', err.message);
-      }
-      if (err instanceof RequiredSkillsMissingError) {
-        throw new DispatchTerminalError('required_skills_missing', err.message);
       }
       throw err;
     }
@@ -8475,6 +8233,9 @@ export class AgentManager {
           `[AgentManager] startSession[${phase}]: injection fenced off (pass superseded) for task ${taskId}`,
         );
         return false;
+      }
+      if (!reuseTaskContext) {
+        await this.rememberTaskContext(tmux, agentId, ensure.sessionRef, taskId);
       }
       if (opts.dispatchPassToken !== undefined) {
         this.clearPendingDispatchRetryIfMatches(taskId, { agentId, signalToken: opts.dispatchPassToken });
@@ -8903,6 +8664,8 @@ export class AgentManager {
       return false;
     }
     await this.assertTaskLockOwner(agentId, taskId, lockToken);
+    const reuseTaskContext =
+      (await this.taskContextForSession(tmux, agentId, ensure)) === taskId;
     const verifiedWorkdir = stateAfterEnsure.workdir;
     if (
       !verifiedWorkdir
@@ -8963,23 +8726,20 @@ export class AgentManager {
     try {
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       const taskForPrompt = await this.ensureGitBaseSnapshot(task, phase);
-      const platformCli = this.platformCliContextOf(taskForPrompt);
+      const platform = this.platformPromptContextOf(taskForPrompt);
       prompt = buildPromptInline({
         task: taskForPrompt,
         phase,
         agent,
         workdir: verifiedWorkdir,
-        skillRegistry: this.skillRegistry,
-        ...(platformCli ? { platformCli } : {}),
+        includeTaskContext: ensure.freshRuntime || !reuseTaskContext,
+        ...(platform ? { platform } : {}),
         ...(signalToken ? { signalToken } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
       });
     } catch (err) {
       if (err instanceof PromptSizeError) {
         throw new DispatchTerminalError('prompt_too_large', err.message);
-      }
-      if (err instanceof RequiredSkillsMissingError) {
-        throw new DispatchTerminalError('required_skills_missing', err.message);
       }
       throw err;
     }
@@ -9058,8 +8818,8 @@ export class AgentManager {
     const guardBeforeInject =
       opts.guardBeforeInject ?? (phase === 'post-approve' ? postApprovePassStillLive : undefined);
 
-    if (!ensure.freshRuntime && ensure.skillsStale) {
-      const revalidateSkillRefresh = async (): Promise<void> => {
+    if (!ensure.freshRuntime && !reuseTaskContext) {
+      const revalidateContextReset = async (): Promise<void> => {
         const [currentTask, currentAgent] = await Promise.all([
           this.taskStore.get(taskId),
           this.agentStore.get(agentId),
@@ -9074,11 +8834,11 @@ export class AgentManager {
           || !bindingStillDispatchable
           || currentAgent?.lockToken !== lockToken
           || currentAgent.workdir !== verifiedWorkdir) {
-          throw new Error(`Task or agent ownership changed while refreshing skills for ${phase} dispatch`);
+          throw new Error(`Task or agent ownership changed while resetting context for ${phase} dispatch`);
         }
         await this.assertTaskLockOwner(agentId, taskId, lockToken);
         if (guardBeforeInject && !(await guardBeforeInject())) {
-          throw new Error(`Task generation changed while refreshing skills for ${phase} dispatch`);
+          throw new Error(`Task generation changed while resetting context for ${phase} dispatch`);
         }
       };
       await this.clearRuntimeForDispatchBoundary(
@@ -9086,9 +8846,9 @@ export class AgentManager {
         pane,
         agentId,
         agent.runtime,
-        revalidateSkillRefresh,
+        ensure.sessionRef,
+        revalidateContextReset,
       );
-      await this.tagSessionSkillsVersion(tmux, agentId, ensure.sessionRef);
     }
 
     if (opts.armBeforeInject && !(await opts.armBeforeInject())) {
@@ -9147,6 +8907,9 @@ export class AgentManager {
         `[AgentManager] continueSession[${phase}]: pre-paste guard rejected the inject for task ${taskId}; skipping`,
       );
       return false;
+    }
+    if (!reuseTaskContext) {
+      await this.rememberTaskContext(tmux, agentId, ensure.sessionRef, taskId);
     }
     return true;
   }
@@ -9761,16 +9524,13 @@ export class AgentManager {
     try {
       previewBytes = this.previewPromptBytesForTaskInput(projectId, input);
     } catch (err) {
-      if (err instanceof RequiredSkillsMissingError) {
-        throw new ApiError(500, err.message);
-      }
       throw new ApiError(400, err instanceof Error ? err.message : String(err));
     }
     if (previewBytes > MAX_PROMPT_BYTES_ROUTE_LIMIT) {
       throw new ApiError(
         400,
         `estimated prompt size ${previewBytes} bytes exceeds ${MAX_PROMPT_BYTES_ROUTE_LIMIT} limit; ` +
-          `reduce task description or remove some skills from AGENT_PHASES[develop]`,
+          `reduce the task description or platform workflow instructions`,
       );
     }
   }
@@ -11455,7 +11215,7 @@ export class AgentManager {
   }
 
   private async scanCodeVerdictMarker(
-    driver: GitDriver,
+    driver: PlatformDriver,
     entry: CodeVerdictOutboxEntry,
     oppositeToken: string,
   ): Promise<'present' | 'opposite' | 'dead' | 'absent' | 'unknown'> {
@@ -11467,7 +11227,7 @@ export class AgentManager {
     let opposite = false;
     for (const scan of scans) {
       for (const row of scan.rows) {
-        if (row.system === true || versionTimeOf(row) === undefined) continue;
+        if (versionTimeOf(row) === undefined) continue;
         for (const marker of rowTokens(row)) {
           if (dead.has(marker.token)) continue;
           if (marker.anchorSha.toLowerCase() !== entry.data.anchorSha.toLowerCase()) continue;
@@ -11481,7 +11241,7 @@ export class AgentManager {
   }
 
   private async reconcileCodeVerdictComment(
-    driver: GitDriver,
+    driver: PlatformDriver,
     entry: CodeVerdictOutboxEntry,
   ): Promise<'present' | 'dead' | 'absent' | 'unknown'> {
     const expectedDigest = bodyDigest(this.codeVerdictCommentBody(entry));
@@ -11489,9 +11249,7 @@ export class AgentManager {
     if (scans.some(scan => !scan.ok)) return 'unknown';
     if (deadTokens(scans).has(entry.data.token)) return 'dead';
     if (scans.some(scan => scan.rows.some(row =>
-      row.system !== true
-      && versionTimeOf(row) !== undefined
-      && row.bodyDigest === expectedDigest))) return 'present';
+      versionTimeOf(row) !== undefined && row.bodyDigest === expectedDigest))) return 'present';
     return 'absent';
   }
 
@@ -11566,10 +11324,7 @@ export class AgentManager {
     entry = claimedEntry;
     let writeFailure: { error: unknown } | undefined;
     try {
-      await driver.runOp('comment', {
-        prNumber: entry.data.prNumber,
-        body: this.codeVerdictCommentBody(entry),
-      });
+      await driver.postComment(entry.data.prNumber, this.codeVerdictCommentBody(entry));
     } catch (error) {
       writeFailure = { error };
     }
@@ -11743,7 +11498,7 @@ export class AgentManager {
   }
 
   private async reconcileSpecVerdictComment(
-    driver: GitDriver,
+    driver: PlatformDriver,
     entry: SpecVerdictOutboxEntry,
   ): Promise<'present' | 'absent' | 'unknown'> {
     const expectedDigest = bodyDigest(this.specVerdictCommentBody(entry));
@@ -11821,10 +11576,7 @@ export class AgentManager {
       entry = claimedEntry;
       let writeFailure: { error: unknown } | undefined;
       try {
-        await driver.runOp('comment', {
-          prNumber: entry.data.prNumber,
-          body: this.specVerdictCommentBody(entry),
-        });
+        await driver.postComment(entry.data.prNumber, this.specVerdictCommentBody(entry));
       } catch (error) {
         writeFailure = { error };
       }

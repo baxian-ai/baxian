@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildReviewTokenLine, extractReviewTokens, buildAckMarker, extractAckMarkers,
-  stripBaxianMarkerLines, classifyCommentSource, collectValidAcks,
+  stripBaxianMarkerLines, collectValidAcks,
   projectCommentRow, rowAcks, rowBodyDigest, rowHasBody, rowTokens,
   type AckCarrierRow, type AckActorContext,
 } from '../../src/platform/markers.js';
@@ -90,15 +90,6 @@ describe('row projection', () => {
     projectCommentRow(empty);
     expect(rowHasBody(empty)).toBe(false);
     expect(rowBodyDigest(empty)).toBe(rowBodyDigest({ id: '2', body: '' }));
-  });
-});
-
-describe('classifyCommentSource', () => {
-  it('maps declared shape to carrier class', () => {
-    expect(classifyCommentSource({ map: { id: 'id', body: 'body', reviewState: { sources: ['state'], optional: true } } })).toBe('reviews');
-    expect(classifyCommentSource({ map: { id: 'id', body: 'body', discussionId: { sources: ['in_reply_to_id'], optional: true } } })).toBe('threaded');
-    expect(classifyCommentSource({ map: { id: 'id', body: 'body' } })).toBe('top-level');
-    expect(classifyCommentSource({})).toBe('top-level');
   });
 });
 

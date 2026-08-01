@@ -36,7 +36,6 @@ it.each([
   ['github HTTPS URL', 'https://github.com/example-owner/example-repo.git'],
   ['github SSH URL', 'git@github.com:example-owner/example-repo.git'],
   ['github ssh URL', 'ssh://git@github.com/example-owner/example-repo.git'],
-  ['legacy owner/repo shorthand', 'example-owner/example-repo'],
 ])('submits a %s repo as entered', async (_label, repo) => {
   await renderAndFill(repo);
   expect(createMock).toHaveBeenCalledWith({ id: 'newproj', repo, merge: null, specApproval: 'human' });
@@ -64,13 +63,13 @@ it('defaults Spec review to Human review and submits specApproval human', async 
   expect((screen.getByLabelText('Human review (default)') as HTMLInputElement).checked).toBe(true);
   expect((screen.getByLabelText('Auto-start coding after QA approval') as HTMLInputElement).checked).toBe(false);
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'specproj' } });
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'example-owner/example-repo' } });
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/example-owner/example-repo.git' } });
   await act(async () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
   expect(createMock).toHaveBeenCalledWith({
     id: 'specproj',
-    repo: 'example-owner/example-repo',
+    repo: 'https://github.com/example-owner/example-repo.git',
     merge: null,
     specApproval: 'human',
   });
@@ -80,14 +79,14 @@ it('omits specApproval when Auto-start coding after QA approval is selected', as
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'autoproj' } });
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'example-owner/example-repo' } });
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/example-owner/example-repo.git' } });
   fireEvent.click(screen.getByLabelText('Auto-start coding after QA approval'));
   await act(async () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
   expect(createMock).toHaveBeenCalledWith({
     id: 'autoproj',
-    repo: 'example-owner/example-repo',
+    repo: 'https://github.com/example-owner/example-repo.git',
     merge: null,
   });
 });
@@ -108,10 +107,13 @@ it.each([
   ['scheme only, no path', 'https://gitlab.example.com'],
   ['non-github SSH URL', 'ssh://git@gitlab.example.com/group/proj.git'],
   ['non-github scp URL', 'git@gitlab.example.com:group/proj.git'],
+  ['multi-segment path', 'https://github.com/group/subgroup/proj.git'],
+  ['query suffix', 'https://github.com/group/proj.git?token=x'],
+  ['fragment suffix', 'https://github.com/group/proj.git#readme'],
 ])('rejects %s with the URL-format field error', async (_label, repo) => {
   await renderAndFill(repo);
   expect(createMock).not.toHaveBeenCalled();
-  expect(screen.getByText(/other platforms require an HTTP\(S\) URL/)).toBeTruthy();
+  expect(screen.getByText(/full github\.com HTTPS or SSH Git URL/)).toBeTruthy();
 });
 
 it('surfaces a config load failure instead of silently rendering the github default', async () => {
@@ -122,7 +124,7 @@ it('surfaces a config load failure instead of silently rendering the github defa
 
 it('preserves line breaks in a multiline create failure', async () => {
   createMock.mockRejectedValue(new Error('project invalid\nrepo: unreachable'));
-  await renderAndFill('example-owner/example-repo');
+  await renderAndFill('https://github.com/example-owner/example-repo.git');
   const banner = await screen.findByText(/project invalid/);
   expect(banner.textContent).toBe('project invalid\nrepo: unreachable');
   expect(banner.classList.contains('whitespace-pre-line')).toBe(true);
@@ -132,76 +134,15 @@ it('does not render or submit a review mode', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'gitproj' } });
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'example-owner/example-repo' } });
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/example-owner/example-repo.git' } });
   expect(screen.queryByText('Review mode')).toBeNull();
   await act(async () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
   expect(createMock).toHaveBeenCalledWith({
     id: 'gitproj',
-    repo: 'example-owner/example-repo',
+    repo: 'https://github.com/example-owner/example-repo.git',
     merge: null,
     specApproval: 'human',
-  });
-});
-
-it('offers a tool override for an explicit GitHub URL', async () => {
-  configGetMock.mockResolvedValue({
-    review: { rounds: 2 },
-    server: { port: 7080 },
-    host: [],
-    project: [],
-  });
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
-  await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/o/r.git' } });
-  expect(await screen.findByLabelText('Git CLI tool')).toBeTruthy();
-
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'owner/repo' } });
-  expect(screen.queryByLabelText('Git CLI tool')).toBeNull();
-});
-
-it('surfaces the git CLI inputs for a non-GitHub repo', async () => {
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
-  await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://gitlab.example.com/group/proj.git' } });
-  expect(await screen.findByLabelText('Git CLI tool')).toBeTruthy();
-});
-
-it('requires a git CLI tool for a non-GitHub HTTP(S) repo', async () => {
-  await renderAndFill('https://gitlab.example.com/group/proj.git');
-
-  expect(createMock).not.toHaveBeenCalled();
-  expect(screen.getByText('Required for non-GitHub repositories')).toBeTruthy();
-});
-
-it('preserves a non-GitHub CLI override while switching repository shapes', async () => {
-  configGetMock.mockResolvedValue({
-    review: { rounds: 2 },
-    server: { port: 7080 },
-    host: [],
-    project: [],
-  });
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
-  await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'forgeproj' } });
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://git.corp.example.com/g/p.git' } });
-  const toolInput = await screen.findByLabelText('Git CLI tool');
-  fireEvent.change(toolInput, { target: { value: 'forge' } });
-  fireEvent.change(screen.getByLabelText('CLI instance notes (optional)'), { target: { value: 'runs behind :8443' } });
-
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'owner/repo' } });
-  expect(screen.queryByLabelText('Git CLI tool')).toBeNull();
-  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://git.corp.example.com/g/p.git' } });
-
-  await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
-  });
-  expect(createMock).toHaveBeenCalledWith({
-    id: 'forgeproj',
-    repo: 'https://git.corp.example.com/g/p.git',
-    merge: null,
-    specApproval: 'human',
-    gitCli: { tool: 'forge', notes: 'runs behind :8443' },
   });
 });

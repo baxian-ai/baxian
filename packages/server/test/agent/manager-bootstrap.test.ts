@@ -42,7 +42,7 @@ beforeEach(async () => {
   const config = makeConfig({
     project: [{
       id: 'proj',
-      repo: 'owner/repo',
+      repo: 'https://github.com/owner/repo.git',
       merge: null,
       agent: [[
         makeAgent({ yolo: true }),
@@ -339,7 +339,7 @@ describe('AgentManager greeting capability gate', () => {
     expect(localEvents.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
     expect(injectSpy).toHaveBeenCalledTimes(1);
     expect(awaitOnce).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'dev-1', kind: 'greeting' }));
-    expect(String(injectSpy.mock.calls[0][2])).toContain('baxian-greeting');
+    expect(String(injectSpy.mock.calls[0][2])).toContain('[bx:greeting:');
   });
 
   it('holds the agent as awaiting_human (greeting_failed) when greeting never verifies', async () => {

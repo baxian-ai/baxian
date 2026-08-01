@@ -19,7 +19,7 @@ export interface AgentConfig {
   runtime: AgentRuntime;
   role: AgentRole;
   mode: AgentMode;
-  host?: string | HostConfig;
+  host?: string;
   workdir?: string;
   yolo?: boolean;
   model?: string;
@@ -31,14 +31,7 @@ export interface ProjectConfig {
   repo: string;
   merge: MergeStrategy;
   specApproval?: SpecApprovalStrategy;
-  gitCli?: GitCliConfig;
   agent: AgentConfig[][];
-}
-
-export interface GitCliConfig {
-  tool: string;
-  binary?: string;
-  notes?: string;
 }
 
 interface ReviewConfig {
@@ -56,7 +49,7 @@ interface ServerConfig {
   host?: string;
   https?: HttpsConfig;
   allowedHosts?: string[];
-  githubPollIntervalMs?: number;
+  platformPollIntervalMs?: number;
   tmuxProbePollIntervalMs?: number;
   tmuxProbeTimeoutMs?: number;
   tmuxProbeConcurrency?: number;

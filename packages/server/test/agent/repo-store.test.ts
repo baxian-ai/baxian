@@ -16,7 +16,7 @@ import {
 import { ExecOutcomeUnknownError } from '../../src/agent/net-exec.js';
 import { LocalRunner, shellQuote, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
 
-const PROJECT_REPO = 'https://git.example.com/group/project.git';
+const PROJECT_REPO = 'https://github.com/group/project.git';
 const local = new LocalRunner();
 const testTrash = (home: string): string => trashBatchDir(home, 'test-agent', 'test');
 let tempDir: string;
@@ -56,7 +56,7 @@ class TestRunner implements CommandRunner {
     if (this.emptyRemoteRefs && command.includes('for-each-ref') && command.includes('refs/remotes/')) {
       return { stdout: '', stderr: '', exitCode: 0 };
     }
-    const cloneTarget = command.match(/(?:git clone|gh repo clone) (?:'[^']+'|\S+) '([^']+)'/)?.[1];
+    const cloneTarget = command.match(/git clone (?:'[^']+'|\S+) '([^']+)'/)?.[1];
     if (cloneTarget) {
       const cloned = await local.exec(
         `git clone -q ${shellQuote(this.cloneSource)} ${shellQuote(cloneTarget)} && ` +
@@ -271,7 +271,7 @@ describe('RepoStore per-agent Workdir', () => {
 
   it('rejects an origin that does not match the project repository', async () => {
     const path = join(tempDir, 'wrong-origin');
-    await cloneAt(path, 'https://git.example.com/other/project.git');
+    await cloneAt(path, 'https://github.com/other/project.git');
     const store = new RepoStore(
       new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
       createRepoStoreCache(), 'dev-1', path,
@@ -282,7 +282,7 @@ describe('RepoStore per-agent Workdir', () => {
 
   it('validates but does not rewrite the origin access method in a user-specified Workdir', async () => {
     const path = join(tempDir, 'custom-ssh-origin');
-    const sshOrigin = 'git@git.example.com:group/project.git';
+    const sshOrigin = 'git@github.com:group/project.git';
     await cloneAt(path, sshOrigin);
     const store = new RepoStore(
       new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
@@ -392,64 +392,27 @@ describe('RepoStore per-agent Workdir', () => {
     await expect(store.ensure()).rejects.toThrow(/no readable remote-tracking refs/i);
   });
 
-  it('GitHub auto clone command never requests a bare repository', async () => {
-    const home = join(tempDir, 'home');
-    await run(`mkdir -p ${shellQuote(home)}`);
-    const runner = new TestRunner(home, origin, 'https://github.com/owner/repo.git');
-    const store = new RepoStore(
-      runner, 'owner/repo', 'remote', { hostname: 'box-a' },
-      createRepoStoreCache(), 'dev-1',
-    );
-
-    await store.ensure();
-
-    const clone = runner.commands.find(command => command.includes('gh repo clone'));
-    expect(clone).toContain("GH_HOST='github.com' ");
-    expect(clone).toContain("gh repo clone 'owner/repo'");
-    expect(clone).not.toContain('--bare');
-  });
-
-  it('pins gh auto clone of a self-hosted forge URL to the URL host', async () => {
-    const home = join(tempDir, 'home');
-    await run(`mkdir -p ${shellQuote(home)}`);
-    const ghesRepo = 'https://ghe.example/owner/repo.git';
-    const runner = new TestRunner(home, origin, ghesRepo);
-    const store = new RepoStore(
-      runner, ghesRepo, 'remote', { hostname: 'box-a' },
-      createRepoStoreCache(), 'dev-1', undefined, true,
-    );
-
-    await store.ensure();
-
-    const clone = runner.commands.find(command => command.includes('gh repo clone'));
-    expect(clone).toContain("GH_HOST='ghe.example' ");
-    expect(clone).toContain(`gh repo clone ${shellQuote(ghesRepo)}`);
-  });
-
-  it('clones a github repo with plain git when the resolved tool is not gh', async () => {
-    const origin = join(tempDir, 'origin.git');
-    await run(`git init --bare ${shellQuote(origin)}`);
+  it('auto clone uses the configured URL with ordinary git', async () => {
     const home = join(tempDir, 'home');
     await run(`mkdir -p ${shellQuote(home)}`);
     const runner = new TestRunner(home, origin, 'https://github.com/owner/repo.git');
     const store = new RepoStore(
       runner, 'https://github.com/owner/repo.git', 'remote', { hostname: 'box-a' },
-      createRepoStoreCache(), 'dev-1', undefined, false,
+      createRepoStoreCache(), 'dev-1',
     );
 
     await store.ensure();
 
-    expect(runner.commands.some(command => command.includes('gh repo clone'))).toBe(false);
-    expect(runner.commands.some(command => command.includes('GH_HOST='))).toBe(false);
     const clone = runner.commands.find(command => command.includes('git clone'));
     expect(clone).toContain("git clone 'https://github.com/owner/repo.git'");
+    expect(clone).not.toContain('--bare');
   });
 });
 
 describe('accessMethodDiffers', () => {
   it('distinguishes HTTPS and SSH while treating equivalent SSH forms alike', () => {
-    expect(accessMethodDiffers('https://git.example.com/g/p.git', 'git@git.example.com:g/p.git')).toBe(true);
-    expect(accessMethodDiffers('ssh://git@git.example.com/g/p.git', 'git@git.example.com:g/p.git')).toBe(false);
+    expect(accessMethodDiffers('https://github.com/g/p.git', 'git@github.com:g/p.git')).toBe(true);
+    expect(accessMethodDiffers('ssh://git@github.com/g/p.git', 'git@github.com:g/p.git')).toBe(false);
   });
 });
 
@@ -959,7 +922,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, ok],
       [/rev-parse --resolve-git-dir /, ok],
-      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/remote get-url origin/, { stdout: 'git@github.com:group/project.git\n', stderr: '', exitCode: 0 }],
       [/--unset-all remote\.origin\.pushurl/, { stdout: '', stderr: '', exitCode: 5 }],
     ]);
 
@@ -973,7 +936,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     const rules: Array<[RegExp, ExecResult | ExecResult[]]> = [
       [/^test -d /, ok],
       [/rev-parse --resolve-git-dir /, ok],
-      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/remote get-url origin/, { stdout: 'git@github.com:group/project.git\n', stderr: '', exitCode: 0 }],
       [/--unset-all remote\.origin\.pushurl/, [
         { stdout: '', stderr: 'error: could not lock config file', exitCode: 4 },
         { stdout: '', stderr: '', exitCode: 5 },
@@ -997,7 +960,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, ok],
       [/rev-parse --resolve-git-dir /, ok],
-      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/remote get-url origin/, { stdout: 'git@github.com:group/project.git\n', stderr: '', exitCode: 0 }],
       [/--unset-all remote\.origin\.pushurl/, { stdout: '', stderr: 'error: could not lock config file', exitCode: 4 }],
     ]);
 
@@ -1008,7 +971,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, ok],
       [/rev-parse --resolve-git-dir /, ok],
-      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/remote get-url origin/, { stdout: 'git@github.com:group/project.git\n', stderr: '', exitCode: 0 }],
       [/--unset-all remote\.origin\.pushurl/, { stdout: '', stderr: 'ssh: connect to host box-a: Connection timed out', exitCode: 255 }],
     ]);
 
@@ -1019,7 +982,7 @@ describe('RepoStore destructive-cleanup guards', () => {
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, ok],
       [/rev-parse --resolve-git-dir '[^']*\.git'/, ok],
-      [/remote get-url origin/, { stdout: 'https://git.example.com/group/project.git\n', stderr: '', exitCode: 0 }],
+      [/remote get-url origin/, { stdout: 'https://github.com/group/project.git\n', stderr: '', exitCode: 0 }],
       [/rev-parse --show-toplevel/, { stdout: '', stderr: 'ssh: connect to host box-a: Connection timed out', exitCode: 255 }],
     ]);
 
@@ -1284,10 +1247,10 @@ describe('stageFile (real filesystem)', () => {
     expect(await run(`cat ${shellQuote(`${dir}/sub/.tmp-abc`)}`)).toBe('payload');
   });
 
-  it('creates missing parent directories inside the staged command (fresh skill dirs)', async () => {
-    const tmp = `${dir}/.claude/skills/baxian-new/SKILL.md.baxian-tmp-abc123`;
-    await stageFile(local, tmp, 'skill-body', { trashDir: testTrash(dir) });
-    expect(await run(`cat ${shellQuote(tmp)}`)).toBe('skill-body');
+  it('creates missing parent directories inside the staged command', async () => {
+    const tmp = `${dir}/.baxian/artifacts/task/put-spec.baxian-tmp-abc123`;
+    await stageFile(local, tmp, 'helper-body', { trashDir: testTrash(dir) });
+    expect(await run(`cat ${shellQuote(tmp)}`)).toBe('helper-body');
   });
 });
 

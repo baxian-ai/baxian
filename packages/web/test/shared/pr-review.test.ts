@@ -76,7 +76,7 @@ describe('prReviewRevision', () => {
     reviewConversationUpdatedAt: undefined,
   };
 
-  it('changes when the conversation display revision moves and stays stable for legacy tasks', () => {
+  it('changes when the conversation display revision moves and stays stable without an update', () => {
     const before = prReviewRevision(base);
     expect(prReviewRevision({ ...base })).toBe(before);
     const after = prReviewRevision({ ...base, reviewConversationUpdatedAt: '2026-07-19T02:00:00Z' });

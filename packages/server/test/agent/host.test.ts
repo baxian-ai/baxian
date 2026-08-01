@@ -28,18 +28,11 @@ describe('resolveAgentHost', () => {
     expect(resolveAgentHost([KEY_HOST], 'missing')).toBeUndefined();
   });
 
-  it('passes a legacy inline host object through unchanged', () => {
-    const inline = { hostname: 'legacy', user: 'old' };
-    expect(resolveAgentHost([KEY_HOST], inline)).toBe(inline);
-  });
-
   it('returns undefined for an undefined ref (local agent)', () => {
     expect(resolveAgentHost([KEY_HOST], undefined)).toBeUndefined();
   });
 
-  it('fails closed for malformed inline and registered hosts', () => {
-    expect(resolveAgentHost([], { hostname: '', port: 22 })).toBeUndefined();
-    expect(resolveAgentHost([], { hostname: 'box', port: 70_000 })).toBeUndefined();
+  it('fails closed for a malformed registered host', () => {
     expect(resolveAgentHost([
       { id: 'broken', hostname: 'box', port: Number.NaN },
     ], 'broken')).toBeUndefined();

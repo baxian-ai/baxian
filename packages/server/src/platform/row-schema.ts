@@ -1,5 +1,4 @@
-import type { MappedRow } from './field-mapper.js';
-import { MAP_FIELD_KINDS, SHA_HEX_SOURCE } from './types.js';
+import { SHA_HEX_SOURCE } from './types.js';
 
 export type NormalizedRow = Record<string, unknown>;
 
@@ -14,6 +13,20 @@ export const LINE_SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
 
 const SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
 const TIMESTAMP_SHAPE_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
+
+type MapFieldKind = 'id' | 'prNumber' | 'sha' | 'timestamp' | 'state' | 'boolean' | 'integer' | 'string';
+const MAP_FIELD_KINDS: Readonly<Record<string, MapFieldKind>> = {
+  prNumber: 'prNumber',
+  prUrl: 'string', branch: 'string', targetBranch: 'string', title: 'string', body: 'string',
+  author: 'string', prAuthor: 'string', reviewState: 'string', detailedMergeStatus: 'string',
+  defaultBranch: 'string', path: 'string', state: 'state',
+  headSha: 'sha', commitSha: 'sha',
+  mergedAt: 'timestamp', updatedAt: 'timestamp', createdAt: 'timestamp',
+  sourceProjectId: 'id', targetProjectId: 'id', remoteProjectId: 'id', id: 'id', discussionId: 'id', parentId: 'id',
+  authorId: 'id', prAuthorId: 'id',
+  draft: 'boolean', pushPermitted: 'boolean',
+  line: 'integer', originalLine: 'integer',
+};
 
 const daysInMonth = (year: number, month: number): number =>
   [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] ?? 0;
@@ -71,7 +84,7 @@ function normalizeField(field: string, value: unknown): { ok: true; value: unkno
 
 export function validateRows(
   opName: string,
-  rows: MappedRow[],
+  rows: Record<string, unknown>[],
   opts?: { sourceKey?: string },
 ): NormalizedRow[] {
   const label = opts?.sourceKey === undefined ? opName : `${opName}[${opts.sourceKey}]`;

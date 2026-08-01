@@ -16,7 +16,7 @@ const baseConfig: BaxianConfig = {
   review: { rounds: 10 },
   server: DEFAULT_SERVER_CONFIG,
   project: [{
-    id: 'p1', repo: 'u/r1', merge: null,
+    id: 'p1', repo: 'https://github.com/u/r1.git', merge: null,
     agent: [
       [
         { id: 'dev-a', runtime: 'claude-code', role: 'dev', mode: 'local' },
@@ -81,26 +81,6 @@ describe('bootstrapAutoRepos', () => {
     expect(ensure).toHaveBeenCalledTimes(2);
   });
 
-  it.each<{ tool: string; cloneViaGh: boolean }>([
-    { tool: 'forge', cloneViaGh: false },
-    { tool: 'gh', cloneViaGh: true },
-  ])('passes cloneViaGh=$cloneViaGh for tool $tool', async ({ tool, cloneViaGh }) => {
-    const repoStoreFactory = vi.fn(() => repoStore(async () => '/r'));
-    const config: BaxianConfig = {
-      ...baseConfig,
-      project: [{
-        ...baseConfig.project[0],
-        repo: 'https://github.com/u/r1.git',
-        gitCli: { tool },
-      }],
-    };
-
-    await bootstrapAutoRepos(autoBootstrapDeps(repoStoreFactory, config));
-
-    expect(repoStoreFactory).toHaveBeenCalledTimes(2);
-    expect(repoStoreFactory.mock.calls.every(call => call[7] === cloneViaGh)).toBe(true);
-  });
-
   it('on success: emits agent.bootstrap_succeeded but does NOT create state files for never-dispatched agents', async () => {
     await bootstrapAutoRepos(autoBootstrapDeps(() => repoStore(async () => '/r')));
     expect(hasEvent('agent.bootstrap_succeeded')).toBe(true);
@@ -131,7 +111,7 @@ describe('bootstrapAutoRepos', () => {
       ...baseConfig,
       project: [
         ...baseConfig.project,
-        { id: 'p2', repo: 'u/r2', merge: null, agent: [[
+        { id: 'p2', repo: 'https://github.com/u/r2.git', merge: null, agent: [[
           { id: 'dev-c', runtime: 'claude-code', role: 'dev', mode: 'local' },
         ]] },
       ],
@@ -322,25 +302,26 @@ describe('runSingleTarget — new behaviors', () => {
 });
 
 describe('classifyBootstrapError', () => {
-  const repo = 'owner/missing';
+  const repo = 'https://github.com/owner/missing.git';
   const ACCESS = 'BOOTSTRAP_REPO_ACCESS_DENIED';
   const ENSURE = 'BOOTSTRAP_REPO_ENSURE_FAILED';
   type Out = ReturnType<typeof classifyBootstrapError>;
 
   it.each<{ name: string; input: string; reason: string; extra?: (out: Out) => void }>([
     {
-      name: 'maps gh GraphQL "Could not resolve to a Repository" to ACCESS_DENIED',
-      input: `gh repo clone ${repo} failed: GraphQL: Could not resolve to a Repository with the name 'owner/missing'. (repository)`,
+      name: 'maps a git clone repository-not-found failure to ACCESS_DENIED',
+      input: `git clone ${repo} failed: remote: Repository not found.`,
       reason: ACCESS,
       extra: out => {
-        expect(out.message).toContain('"owner/missing"');
-        expect(out.message).toContain('Could not resolve to a Repository');
-        expect(out.recommendation).toContain('collaborator');
+        expect(out.message).toContain(`"${repo}"`);
+        expect(out.message).toContain('Repository not found');
+        expect(out.recommendation).toContain('credential helper');
       },
     },
-    { name: 'maps "Repository not found" (gh CLI) to ACCESS_DENIED', input: 'fatal: Repository not found', reason: ACCESS },
-    { name: 'maps bare "404" (gh poller failure) to ACCESS_DENIED', input: 'gh: Not Found (HTTP 404)', reason: ACCESS },
-    { name: 'maps "Permission denied (publickey)" (ssh git clone) to ACCESS_DENIED', input: 'Permission denied (publickey).', reason: ACCESS },
+    { name: 'maps HTTPS authentication failure to ACCESS_DENIED', input: `git clone ${repo} failed: Authentication failed`, reason: ACCESS },
+    { name: 'maps an HTTP 404 in clone context to ACCESS_DENIED', input: `git clone ${repo} failed: HTTP 404`, reason: ACCESS },
+    { name: 'maps SSH public-key denial to ACCESS_DENIED', input: 'git@github.com: Permission denied (publickey).', reason: ACCESS },
+    { name: 'maps a credential-helper failure to ACCESS_DENIED', input: `git clone ${repo} failed: could not read Username`, reason: ACCESS },
     {
       name: 'falls through to ENSURE_FAILED for network / unknown failures',
       input: 'connect ETIMEDOUT 140.82.121.4:443',
@@ -349,69 +330,38 @@ describe('classifyBootstrapError', () => {
     },
     { name: 'does NOT match "404" embedded in longer numbers (word-boundary guard)', input: 'exit code 4040', reason: ENSURE },
     {
-      name: 'does NOT classify local mkdir EACCES as ACCESS_DENIED — would mislead UI to "grant gh collaborator"',
+      name: 'does NOT classify local mkdir EACCES as repository access denial',
       input: `EACCES: permission denied, mkdir '/var/baxian/repos/${repo}'`,
       reason: ENSURE,
-      extra: out => { expect(out.recommendation).not.toContain('collaborator'); },
+      extra: out => { expect(out.recommendation).not.toContain('credential helper'); },
     },
-    { name: 'does NOT classify standalone "access denied" without GitHub context as ACCESS_DENIED', input: 'access denied: filesystem readonly', reason: ENSURE },
-    { name: 'treats bare "Permission denied" PAIRED with github.com mention as ACCESS_DENIED', input: 'Permission denied while talking to https://github.com/...', reason: ACCESS },
-    { name: 'does NOT classify "sh: gh: command not found" as ACCESS_DENIED', input: 'sh: gh: command not found', reason: ENSURE },
-    { name: 'does NOT classify "gh: API rate limit exceeded" as ACCESS_DENIED (no auth keyword)', input: 'gh: API rate limit exceeded', reason: ENSURE },
-    { name: 'DOES classify line-start "gh: Not Found (HTTP 404)" as ACCESS_DENIED', input: 'gh: Not Found (HTTP 404)', reason: ACCESS },
+    { name: 'does NOT classify standalone access denied without Git context', input: 'access denied: filesystem readonly', reason: ENSURE },
+    { name: 'does NOT classify an unrelated platform rate limit as access denial', input: 'API rate limit exceeded', reason: ENSURE },
   ])('$name', ({ input, reason, extra }) => {
     const out = classifyBootstrapError(input, repo);
     expect(out.reason).toBe(reason);
     extra?.(out);
   });
-});
 
-describe('classifyBootstrapError — non-GitHub (generic git) repos', () => {
-  const repo = 'https://gitlab.example.com/group/proj.git';
-  const ACCESS = 'BOOTSTRAP_REPO_ACCESS_DENIED';
-  const ENSURE = 'BOOTSTRAP_REPO_ENSURE_FAILED';
-  const credRepo = 'https://oauth2:SECRETTOKEN@gitlab.example.com/group/proj.git';
-  type Out = ReturnType<typeof classifyBootstrapError>;
+  it('redacts credentials from every classified bootstrap error', () => {
+    const secret = 'top-secret-token';
+    const out = classifyBootstrapError(
+      `fatal: unable to access 'https://alice:${secret}@github.com/owner/missing.git': Repository not found`,
+      repo,
+    );
 
-  it.each<{ name: string; input: string; repo?: string; reason: string; extra?: (out: Out) => void }>([
-    {
-      name: 'maps https auth failure (URL-scheme context) to ACCESS_DENIED with a neutral, host-scoped hint',
-      input: `git clone ${repo} failed: fatal: Authentication failed for 'https://gitlab.example.com/group/proj.git/'`,
-      reason: ACCESS,
-      extra: out => {
-        expect(out.recommendation).toContain('gitlab.example.com');
-        expect(out.recommendation).not.toContain('collaborator');
-      },
-    },
-    { name: 'maps ssh "Permission denied (publickey)" to ACCESS_DENIED', input: 'git@gitlab.example.com: Permission denied (publickey).', reason: ACCESS },
-    { name: 'maps repository-not-found (with scheme) to ACCESS_DENIED', input: `fatal: repository 'https://gitlab.example.com/group/proj.git/' not found`, reason: ACCESS },
-    { name: 'host-unreachable (no scheme / auth keyword) stays ENSURE_FAILED', input: 'fatal: unable to access: Could not resolve host: gitlab.example.com', reason: ENSURE },
-    { name: 'does NOT match a local mkdir error that merely embeds the repos-ext host path', input: "EACCES: permission denied, mkdir '/home/u/.baxian/repos-ext/gitlab.example.com/group/proj'", reason: ENSURE },
-    { name: 'does NOT classify "git: command not found" (with URL context) as ACCESS_DENIED', input: `git clone ${repo} failed: /bin/sh: git: command not found`, reason: ENSURE },
-    { name: 'does NOT classify dash\'s "git: not found" (missing binary) as ACCESS_DENIED', input: `git clone ${repo} failed: /bin/sh: 1: git: not found`, reason: ENSURE },
-    {
-      name: 'redacts an embedded token from the access-denied classification message',
-      input: `git clone ${credRepo} failed: fatal: Authentication failed for '${credRepo}/'`,
-      repo: credRepo,
-      reason: ACCESS,
-      extra: out => {
-        expect(out.message).not.toContain('SECRETTOKEN');
-        expect(out.message).toContain('gitlab.example.com');
-      },
-    },
-  ])('$name', ({ input, repo: rowRepo, reason, extra }) => {
-    const out = classifyBootstrapError(input, rowRepo ?? repo);
-    expect(out.reason).toBe(reason);
-    extra?.(out);
+    expect(out.message).not.toContain(secret);
+    expect(out.message).not.toContain('alice');
+    expect(out.message).toContain('https://github.com/owner/missing.git');
   });
 });
 
 describe('autoBootstrapAgentIds', () => {
   it('includes auto-mode agents (no workdir) and excludes explicit-workdir agents', () => {
     const config: BaxianConfig = {
-      github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
+      review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
       project: [{
-        id: 'p', repo: 'u/r', merge: null,
+        id: 'p', repo: 'https://github.com/u/r.git', merge: null,
         agent: [
           [
             { id: 'auto-dev', runtime: 'claude-code', role: 'dev', mode: 'local' },
@@ -434,7 +384,7 @@ describe('collectTargets host resolution (string id refs)', () => {
       server: DEFAULT_SERVER_CONFIG,
       host: [{ id: 'box', hostname: 'box.example.com', port: 2222, user: 'agent' }],
       project: [{
-        id: 'p1', repo: 'u/r', merge: null,
+        id: 'p1', repo: 'https://github.com/u/r.git', merge: null,
         agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box' }]],
       }],
     };
@@ -452,7 +402,7 @@ describe('collectTargets host resolution (string id refs)', () => {
         { id: 'box2', hostname: 'h', port: 22, user: 'u' },
       ],
       project: [{
-        id: 'p1', repo: 'u/r', merge: null,
+        id: 'p1', repo: 'https://github.com/u/r.git', merge: null,
         agent: [
           [{ id: 'da', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box' }],
           [{ id: 'db', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box2' }],

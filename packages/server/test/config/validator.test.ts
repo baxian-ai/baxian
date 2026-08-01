@@ -34,7 +34,7 @@ function makeConfig(overrides: Partial<BaxianConfig> = {}): BaxianConfig {
     project: [
       {
         id: 'proj',
-        repo: 'user/repo',
+        repo: 'https://github.com/user/repo.git',
         merge: null,
         agent: [
           [
@@ -54,7 +54,7 @@ function withProject(project: ProjectConfig, rest: Partial<BaxianConfig> = {}): 
 
 function devProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
   return {
-    id: 'pp', repo: 'u/r', merge: null,
+    id: 'pp', repo: 'https://github.com/u/r.git', merge: null,
     agent: [makeAgentTeam()],
     ...overrides,
   };
@@ -74,12 +74,7 @@ function hasPathEndingWith(config: BaxianConfig, suffix: string): boolean {
 
 function repoErrors(repo: string) {
   return validateConfig(withProject(
-    devProject({
-      repo,
-      ...(repo.includes('github.com') || /^[^/:]+\/[^/]+$/.test(repo)
-        ? {}
-        : { gitCli: { tool: 'glab' } }),
-    }),
+    devProject({ repo }),
   )).filter(e => e.path.endsWith('.repo'));
 }
 
@@ -99,8 +94,8 @@ describe('validateConfig', () => {
   it('detects duplicate agent ids across projects', () => {
     const config = makeConfig({
       project: [
-        { id: 'p1', repo: 'u/r1', merge: null, agent: [makeAgentTeam({ id: 'dup' }, { id: 'q1' })] },
-        { id: 'p2', repo: 'u/r2', merge: null, agent: [makeAgentTeam({ id: 'dup' }, { id: 'q2' })] },
+        { id: 'p1', repo: 'https://github.com/u/r1.git', merge: null, agent: [makeAgentTeam({ id: 'dup' }, { id: 'q1' })] },
+        { id: 'p2', repo: 'https://github.com/u/r2.git', merge: null, agent: [makeAgentTeam({ id: 'dup' }, { id: 'q2' })] },
       ],
     });
     const errors = validateConfig(config);
@@ -166,21 +161,18 @@ describe('validateConfig', () => {
   });
 
   it('accepts remote agent with host config', () => {
-    const config = withProject(devProject({
-      agent: [makeAgentTeam({
-        id: 'd1',
-        mode: 'remote',
-        host: { hostname: 'server', user: 'rock' },
-      })],
-    }));
+    const config = withProject(
+      devProject({ agent: [makeAgentTeam({ id: 'd1', mode: 'remote', host: 'server' })] }),
+      { host: [{ id: 'server', hostname: 'server', user: 'rock' }] },
+    );
     expect(validateConfig(config)).toEqual([]);
   });
 
   it('detects duplicate project ids', () => {
     const config = makeConfig({
       project: [
-        { id: 'same', repo: 'u/r1', merge: null, agent: [makeAgentTeam({ id: 'd1' }, { id: 'q1' })] },
-        { id: 'same', repo: 'u/r2', merge: null, agent: [makeAgentTeam({ id: 'd2' }, { id: 'q2' })] },
+        { id: 'same', repo: 'https://github.com/u/r1.git', merge: null, agent: [makeAgentTeam({ id: 'd1' }, { id: 'q1' })] },
+        { id: 'same', repo: 'https://github.com/u/r2.git', merge: null, agent: [makeAgentTeam({ id: 'd2' }, { id: 'q2' })] },
       ],
     });
     expect(validateConfig(config).some(e => e.message.includes('Duplicate project id'))).toBe(true);
@@ -203,27 +195,17 @@ describe('validateConfig', () => {
     }
   });
 
-  it('accepts non-github http(s) git URLs, including multi-segment subgroup paths', () => {
-    const ok = [
+  it('rejects shorthand, non-GitHub, insecure, port-qualified, and multi-segment repository forms', () => {
+    const unsupported = [
+      'owner/repo',
       'https://gitlab.example.com/group/proj.git',
       'https://gitlab.example.com/group/sub/deep/proj',
       'https://gitea.internal/team/repo.git',
-    ];
-    for (const repo of ok) {
-      expect.soft(repoErrors(repo), repo).toEqual([]);
-    }
-  });
-
-  it('rejects github multi-segment paths and non-github paths with unsafe segments', () => {
-    const bad = [
+      'http://github.com/owner/repo.git',
       'https://github.com/group/sub/proj.git',
       'https://github.com:443/org/repo.git',
-      'https://gitlab.example.com/group/../proj.git',
-      'https://gitlab.example.com/group//proj.git',
-      'https://gitlab.example.com/.hidden/proj',
-      'https://gitlab.example.com/',
     ];
-    for (const repo of bad) {
+    for (const repo of unsupported) {
       expect.soft(repoErrors(repo).length, repo).toBeGreaterThan(0);
     }
   });
@@ -243,43 +225,13 @@ describe('validateConfig', () => {
 
   it('rejects project.repo with embedded credentials (http(s) userinfo OR ssh secret — must not be stored)', () => {
     for (const repo of [
-      'https://oauth2:TOKEN@gitlab.example.com/group/proj.git',
-      'https://TOKEN@gitlab.example.com/group/proj.git',
-      'ssh://git:TOKEN@gitlab.example.com/group/proj.git',
+      'https://oauth2:TOKEN@github.com/group/proj.git',
+      'https://TOKEN@github.com/group/proj.git',
+      'ssh://git:TOKEN@github.com/group/proj.git',
     ]) {
       const errs = repoErrors(repo);
       expect.soft(errs.some(error => /must not embed credentials/.test(error.message)), repo).toBe(true);
     }
-  });
-
-  it('rejects non-github SSH and scp URLs because the platform driver needs an HTTP API endpoint', () => {
-    for (const repo of ['ssh://git@gitlab.example.com/group/proj.git', 'git@gitlab.example.com:group/proj.git']) {
-      expect.soft(
-        repoErrors(repo).some(error => /require an http\(s\):\/\//.test(error.message)),
-        repo,
-      ).toBe(true);
-    }
-  });
-
-  it('accepts a non-github project with a complete Agent Team', () => {
-    const cfg = withProject(devProject({
-      id: 'gl', repo: 'https://gitlab.example.com/group/proj.git',
-      gitCli: { tool: 'glab' },
-      agent: [makeAgentTeam({ id: 'gldev' }, { id: 'glqa' })],
-    }));
-    expect(validateConfig(cfg)).toEqual([]);
-  });
-
-  it('requires an explicit gitCli driver for a non-github project', () => {
-    const errors = validateConfig(withProject(devProject({
-      id: 'gl',
-      repo: 'https://gitlab.example.com/group/proj.git',
-      agent: [makeAgentTeam({ id: 'gldev' }, { id: 'glqa' })],
-    })));
-    expect(errors).toContainEqual(expect.objectContaining({
-      path: 'project[0].gitCli',
-      message: expect.stringContaining('require gitCli.tool'),
-    }));
   });
 
   it('rejects unknown agent.runtime / role / mode', () => {
@@ -382,12 +334,12 @@ describe('validateConfig', () => {
   });
 
   it.each<[string, number[], boolean]>([
-    ['accepts server.githubPollIntervalMs within [1000, 2^31-1]', [1000, 60000, 2147483647], false],
-    ['rejects server.githubPollIntervalMs out of [1000, 2^31-1] or non-integer', [500, 0, -1000, 1500.5, 2147483648], true],
+    ['accepts server.platformPollIntervalMs within [1000, 2^31-1]', [1000, 60000, 2147483647], false],
+    ['rejects server.platformPollIntervalMs out of [1000, 2^31-1] or non-integer', [500, 0, -1000, 1500.5, 2147483648], true],
   ])('%s', (_label, samples, rejected) => {
     for (const ms of samples) {
-      const cfg = withServer({ githubPollIntervalMs: ms });
-      expect(validateConfig(cfg).some(e => e.path === 'server.githubPollIntervalMs')).toBe(rejected);
+      const cfg = withServer({ platformPollIntervalMs: ms });
+      expect(validateConfig(cfg).some(e => e.path === 'server.platformPollIntervalMs')).toBe(rejected);
     }
   });
 
@@ -408,21 +360,6 @@ describe('validateConfig', () => {
   ])('accepts project.specApproval = %s', (_label, specApproval) => {
     const cfg = withProject(devProject(specApproval === undefined ? {} : { specApproval }));
     expect(hasPathEndingWith(cfg, '.specApproval')).toBe(false);
-  });
-
-  it.each<[string, AgentConfig['host'], string | null]>([
-    ['rejects remote agent host with empty hostname', { hostname: '' }, 'host.hostname'],
-    ['accepts remote agent with hostname only (user omitted)', { hostname: 'box' }, null],
-    ['rejects host.user when set to an empty string', { hostname: 'box', user: '   ' }, 'host.user'],
-  ])('%s', (_label, host, suffix) => {
-    const cfg = withProject(devProject({
-      agent: [makeAgentTeam({ id: 'dd', mode: 'remote', host })],
-    }));
-    if (suffix === null) {
-      expect(validateConfig(cfg)).toEqual([]);
-    } else {
-      expect(hasPathEndingWith(cfg, suffix)).toBe(true);
-    }
   });
 
   it('accepts agent without workdir (auto mode)', () => {
@@ -450,53 +387,47 @@ describe('validateConfig', () => {
   });
 
   it('allows equal Workdir paths on different remote hosts', () => {
-    const config = withProject(devProject({
-      agent: [[
-        makeAgent({
-          id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent',
-          host: { hostname: 'dev.example.com', user: 'git' },
-        }),
-        makeAgent({
-          id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent',
-          host: { hostname: 'qa.example.com', user: 'git' },
-        }),
-      ]],
-    }));
+    const config = withProject(
+      devProject({ agent: [[
+        makeAgent({ id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent', host: 'dev-box' }),
+        makeAgent({ id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent', host: 'qa-box' }),
+      ]] }),
+      { host: [
+        { id: 'dev-box', hostname: 'dev.example.com', user: 'git' },
+        { id: 'qa-box', hostname: 'qa.example.com', user: 'git' },
+      ] },
+    );
 
     expect(validateConfig(config)).toEqual([]);
   });
 
   it('treats an omitted SSH port and explicit port 22 as the same Workdir host', () => {
-    const config = withProject(devProject({
-      agent: [[
-        makeAgent({
-          id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent',
-          host: { hostname: 'box.example.com', user: 'git' },
-        }),
-        makeAgent({
-          id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent',
-          host: { hostname: 'box.example.com', user: 'git', port: 22 },
-        }),
-      ]],
-    }));
+    const config = withProject(
+      devProject({ agent: [[
+        makeAgent({ id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent', host: 'box-default' }),
+        makeAgent({ id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent', host: 'box-22' }),
+      ]] }),
+      { host: [
+        { id: 'box-default', hostname: 'box.example.com', user: 'git' },
+        { id: 'box-22', hostname: 'box.example.com', user: 'git', port: 22 },
+      ] },
+    );
 
     const error = validateConfig(config).find(item => item.path.endsWith('[1].workdir'));
     expect(error?.message).toContain('must not share a directory');
   });
 
   it('rejects equal Workdir paths on the same host and account despite distinct SSH ports', () => {
-    const config = withProject(devProject({
-      agent: [[
-        makeAgent({
-          id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent',
-          host: { hostname: 'box.example.com', user: 'git', port: 22 },
-        }),
-        makeAgent({
-          id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent',
-          host: { hostname: 'box.example.com', user: 'git', port: 2222 },
-        }),
-      ]],
-    }));
+    const config = withProject(
+      devProject({ agent: [[
+        makeAgent({ id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent', host: 'box-22' }),
+        makeAgent({ id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent', host: 'box-2222' }),
+      ]] }),
+      { host: [
+        { id: 'box-22', hostname: 'box.example.com', user: 'git', port: 22 },
+        { id: 'box-2222', hostname: 'box.example.com', user: 'git', port: 2222 },
+      ] },
+    );
 
     const error = validateConfig(config).find(item => item.path.endsWith('[1].workdir'));
     expect(error?.message).toContain('must not share a directory');
@@ -519,10 +450,10 @@ describe('validateConfig', () => {
 
   it('accepts valid GitHub-style repo names', () => {
     const cases = [
-      'owner/repo',
-      'owner-1/repo_2',
-      'a.b/c.d',
-      'A_B/C-D',
+      'https://github.com/owner/repo.git',
+      'git@github.com:owner-1/repo_2.git',
+      'ssh://git@github.com/a.b/c.d',
+      'https://github.com/A_B/C-D',
     ];
     for (const repo of cases) {
       expect(repoErrors(repo)).toEqual([]);
@@ -634,7 +565,7 @@ describe('id format validation', () => {
     ['rejects project.id with leading dash', '-leading', false],
     ['accepts well-formed ids', 'kk-cc', true],
   ] as const)('%s', (_label, id, valid) => {
-    const config = withProject({ id, repo: 'a/b', merge: null, agent: [] });
+    const config = withProject({ id, repo: 'https://github.com/a/b.git', merge: null, agent: [] });
     if (valid) {
       expect(validateConfig(config)).toEqual([]);
     } else {
@@ -644,7 +575,7 @@ describe('id format validation', () => {
 
   it('rejects agent.id with bad format', () => {
     const config = withProject({
-      id: 'p1', repo: 'a/b', merge: null,
+      id: 'p1', repo: 'https://github.com/a/b.git', merge: null,
       agent: [[makeAgent({ id: 'BAD', role: 'dev' })]],
     });
     expect(validateConfig(config).some(e => e.path.includes('agent') && e.path.includes('id'))).toBe(true);
@@ -705,7 +636,7 @@ describe('remote agent host references', () => {
     return withProject(
       {
         id: 'proj',
-        repo: 'u/r',
+        repo: 'https://github.com/u/r.git',
         merge: null,
         agent: [makeAgentTeam({ id: 'rdev', mode: 'remote', host, workdir: undefined })],
       },
@@ -716,11 +647,9 @@ describe('remote agent host references', () => {
   it.each<[string, AgentConfig['host'], Partial<BaxianConfig>, HostCheck]>([
     ['accepts a remote agent referencing an existing host id', 'box', { host: [{ id: 'box', hostname: 'h', user: 'u' }] }, accepts],
     ['rejects a remote agent referencing an unknown host id', 'ghost', { host: [] }, message(/unknown host id/)],
-    ['still accepts a legacy inline host object', { hostname: 'legacy', user: 'old' }, {}, accepts],
-    ['rejects an inline host carrying a password (secrets belong in the registry)', { hostname: 'legacy', password: 'x' } as never, {}, message(/must not carry a password/)],
-    ['rejects a legacy inline host with an out-of-range port (interpolated into ssh)', { hostname: 'legacy', port: 70000 } as never, {}, path('project.proj.agent.rdev.host.port')],
+    ['rejects an inline host object', { hostname: 'inline', user: 'old' } as never, {}, path('project.proj.agent.rdev.host')],
     ['treats a null agent.host as missing (clean error, not a TypeError/500)', null as never, {}, noThrowMessage(/must reference a host/)],
-    ['rejects a non-string, non-object agent.host (e.g. number) cleanly', 42 as never, {}, noThrowPath('project.proj.agent.rdev.host')],
+    ['rejects a non-string agent.host cleanly', 42 as never, {}, noThrowPath('project.proj.agent.rdev.host')],
   ])('%s', (_label, host, rest, check) => {
     check(remoteHostConfig(host, rest));
   });

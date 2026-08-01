@@ -104,7 +104,7 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
 
 const PROJECT: ProjectConfig = {
   id: 'baxian',
-  repo: 'baxian-ai/baxian',
+  repo: 'https://github.com/baxian-ai/baxian.git',
   merge: null,
   agent: [[
     { id: 'bx-dev', runtime: 'claude-code', role: 'dev', mode: 'local' },
@@ -948,25 +948,25 @@ describe('TaskDetail page — human attention and code verdict', () => {
   });
 });
 
-describe('TaskDetail page — legacy tasks', () => {
-  it('pending legacy task explains how to assign a dev', () => {
+describe('TaskDetail page — unassigned tasks', () => {
+  it('pending unassigned task explains how to assign a dev', () => {
     setTask(makeTask({ status: 'pending', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
     expect(screen.getByText(/This task has no Dev agent assigned/)).toBeTruthy();
   });
 
-  it('terminal legacy task disables Retry with the legacy tooltip', () => {
+  it('terminal unassigned task disables Retry with the unassigned tooltip', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
     const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
     expect(retry.disabled).toBe(true);
-    expect(retry.title).toBe('Legacy task has no Dev agent assigned; cannot retry');
+    expect(retry.title).toBe('Task has no Dev agent assigned; cannot retry');
   });
 
-  it('terminal legacy task explains the current status is read-only', () => {
+  it('terminal unassigned task explains the current status is read-only', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText('Legacy task with no Dev agent assigned. Current status: "Cancelled". Read-only.')).toBeTruthy();
+    expect(screen.getByText('Task has no Dev agent assigned. Current status: "Cancelled". Read-only.')).toBeTruthy();
   });
 });
 

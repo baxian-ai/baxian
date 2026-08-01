@@ -25,8 +25,6 @@ function managerWithBound(tasks: Array<{
   id: string;
   projectId: string;
   repoKey: string;
-  mode?: string;
-  tool?: string;
 }>): AgentManager {
   return {
     listActiveGitTasks: async (projectId?: string) =>
@@ -35,7 +33,7 @@ function managerWithBound(tasks: Array<{
         .map(t => ({
           id: t.id,
           projectId: t.projectId,
-          platformBinding: { mode: t.mode ?? 'git', repoKey: t.repoKey, tool: t.tool ?? 'gh' },
+          platformBinding: { repoKey: t.repoKey },
         } as TaskState)),
   } as unknown as AgentManager;
 }
@@ -46,17 +44,13 @@ const twoProjectCfg = (projects: Array<{ id: string; repo: string }>): BaxianCon
 } as BaxianConfig);
 
 describe('gitBindingBlockers', () => {
-  it('blocks repo and tool changes while platform tasks are active', async () => {
+  it('blocks repository changes while platform tasks are active', async () => {
     const manager = managerWith(['task-1']);
     const current = config();
-    for (const next of [
-      config({ repo: 'git@github.com:owner/other.git' }),
-      config({ gitCli: { tool: 'forge' } }),
-    ]) {
-      expect(await gitBindingBlockers(manager, current, next)).toEqual([
-        { projectId: 'proj', taskIds: ['task-1'] },
-      ]);
-    }
+    const next = config({ repo: 'git@github.com:owner/other.git' });
+    expect(await gitBindingBlockers(manager, current, next)).toEqual([
+      { projectId: 'proj', taskIds: ['task-1'] },
+    ]);
   });
 
   it('blocks removing a project that still has active git tasks', async () => {
@@ -87,21 +81,18 @@ describe('gitBindingBlockers', () => {
     const manager = managerWithBound([{
       id: 'task-restore', projectId: 'proj', repoKey: 'github.com/owner/repo',
     }]);
-    const current = config({
-      repo: 'git@github.com:owner/drifted.git',
-      gitCli: { tool: 'forge' },
-    });
+    const current = config({ repo: 'git@github.com:owner/drifted.git' });
 
     expect(await gitBindingBlockers(manager, current, config())).toEqual([]);
   });
 
   it.each([
-    ['project task first', ['project-task', 'legacy-task']],
-    ['legacy task first', ['legacy-task', 'project-task']],
+    ['project task first', ['project-task', 'removed-task']],
+    ['removed task first', ['removed-task', 'project-task']],
   ])('allows a project to restore its own bound repo regardless of task scan order (%s)', async (_label, order) => {
     const tasks = {
       'project-task': { id: 'project-task', projectId: 'proj', repoKey: 'github.com/owner/repo' },
-      'legacy-task': { id: 'legacy-task', projectId: 'legacy', repoKey: 'github.com/owner/repo' },
+      'removed-task': { id: 'removed-task', projectId: 'removed', repoKey: 'github.com/owner/repo' },
     } as const;
     const manager = managerWithBound(order.map(id => tasks[id as keyof typeof tasks]));
     const current = config({ repo: 'git@github.com:owner/drifted.git' });
@@ -148,26 +139,6 @@ describe('gitBindingBlockers', () => {
     });
   });
 
-  it('attributes every owner when a new project targets a repo with legacy multi-owner bindings', async () => {
-    const manager = managerWithBound([
-      { id: 'task-b', projectId: 'b', repoKey: 'github.com/owner/repo' },
-      { id: 'task-a', projectId: 'a', repoKey: 'github.com/owner/repo' },
-    ]);
-    const current = twoProjectCfg([
-      { id: 'a', repo: 'git@github.com:owner/repo.git' },
-      { id: 'b', repo: 'https://github.com/owner/repo.git' },
-    ]);
-    const next = twoProjectCfg([
-      ...current.project.map(project => ({ id: project.id, repo: project.repo })),
-      { id: 'c', repo: 'https://github.com/owner/repo.git' },
-    ]);
-
-    expect(await gitBindingBlockers(manager, current, next)).toEqual([
-      { projectId: 'c', taskIds: ['task-a'], lockedByProjectId: 'a' },
-      { projectId: 'c', taskIds: ['task-b'], lockedByProjectId: 'b' },
-    ]);
-  });
-
   it('attributes cross-project repo-lock diagnostics to the changed project and names the lock owner', () => {
     expect(gitBindingBlockerDetails([{
       projectId: 'b', taskIds: ['task-a'], lockedByProjectId: 'a',
@@ -177,14 +148,6 @@ describe('gitBindingBlockers', () => {
     }]);
   });
 
-  it('does not block a project that already shared the locked repo', async () => {
-    const manager = managerWithBound([{ id: 'task-a', projectId: 'a', repoKey: 'github.com/owner/repo' }]);
-    const cfg = twoProjectCfg([
-      { id: 'a', repo: 'git@github.com:owner/repo.git' },
-      { id: 'b', repo: 'https://github.com/owner/repo.git' },
-    ]);
-    expect(await gitBindingBlockers(manager, cfg, cfg)).toEqual([]);
-  });
 });
 
 describe('activeParticipantBlockers', () => {

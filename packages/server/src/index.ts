@@ -6,7 +6,7 @@ import {
   resolveHome,
   createDefaultConfig,
 } from './config/loader.js';
-import { loadPluginsOrExplain, planPlatformEntries, type PlatformEntryDeps, referencedGitTools, retainedPlatformProjectIds, scanPluginSkillPools } from './platform/startup.js';
+import { auditPlatformBindings, platformEntries, type PlatformEntryDeps } from './platform/startup.js';
 import { initStateDir } from './state/init.js';
 import { AgentStore } from './state/agent-store.js';
 import { TaskStore } from './state/task-store.js';
@@ -16,7 +16,6 @@ import { LockManager } from './state/lock.js';
 import { ProcessLock, ProcessLockError } from './state/process-lock.js';
 import { EventBus } from './event/bus.js';
 import { EventLog } from './event/log.js';
-import { SkillRegistry, assertCoreSkillsPresent } from './skill/registry.js';
 import { AgentManager } from './agent/manager.js';
 import { PaneStreamerManager } from './agent/pane-streamer-manager.js';
 import { EventBroker } from './event/broker.js';
@@ -92,12 +91,7 @@ export async function startServer(home?: string): Promise<void> {
   }
   const config = await loadConfig(cfgPath);
 
-  const [pluginsResult] = await Promise.all([loadPluginsOrExplain(config, stateDir), initStateDir(stateDir)]);
-  if ('fatal' in pluginsResult) {
-    for (const line of pluginsResult.fatal) console.error(line);
-    process.exit(1);
-  }
-  const pluginRegistry = pluginsResult.registry;
+  await initStateDir(stateDir);
 
   const processLock = new ProcessLock(stateDir);
   try {
@@ -152,8 +146,6 @@ export async function startServer(home?: string): Promise<void> {
     }
 
     const serverDistDir = dirname(fileURLToPath(import.meta.url));
-    const skillsDir = pickExistingPath(serverDistDir, ['./skills', '../../../skills']);
-
     const agentStore = new AgentStore(`${stateDir}/state/agents`);
     const taskStore = new TaskStore(`${stateDir}/state/tasks`);
     const errorRecordStore = new ErrorRecordStore(`${stateDir}/state/errors`);
@@ -164,13 +156,7 @@ export async function startServer(home?: string): Promise<void> {
     const eventBroker = new EventBroker();
     const tmuxSessionStatusStore = new TmuxSessionStatusStore();
 
-    const registry = new SkillRegistry(skillsDir);
-    await registry.scan();
-    assertCoreSkillsPresent(registry, skillsDir);
-    await scanPluginSkillPools(registry, pluginRegistry.all(), referencedGitTools(config));
-
-    let resolveHostRef: (agent: AgentRuntimeConfig) => HostConfig | undefined = (agent) =>
-      (typeof agent.host === 'object' ? agent.host : undefined);
+    let resolveHostRef: (agent: AgentRuntimeConfig) => HostConfig | undefined = () => undefined;
     const paneStreamerManager = new PaneStreamerManager({
       runnerFactory: (agent) => createRunner(agent.mode, resolveHostRef(agent)),
       hostResolver: (agent) => resolveHostRef(agent),
@@ -178,7 +164,7 @@ export async function startServer(home?: string): Promise<void> {
 
     const driverExec = makeDriverExec(createRunner('local'));
     const platformEntryDeps: PlatformEntryDeps = {
-      driverFor: (project) => buildProjectDriver(project, pluginRegistry, driverExec),
+      driverFor: (project) => buildProjectDriver(project, driverExec),
       statePathFor: (repoUrl) => platformPollerStatePath(stateDir, repoUrl),
     };
     let defaultBranchOf: (projectId: string) => string | undefined = () => undefined;
@@ -189,9 +175,7 @@ export async function startServer(home?: string): Promise<void> {
       taskStore,
       lockManager,
       eventBus,
-      skillRegistry: registry,
       paneStreamerManager,
-      pluginRegistry,
       errorRecordStore,
       imageStagingRoot: `${stateDir}/state/task-images`,
       platformDefaultBranchOf: (projectId) => defaultBranchOf(projectId),
@@ -286,21 +270,13 @@ export async function startServer(home?: string): Promise<void> {
     poller.setLifecycleHook(() => {
       eventPublisher.publishPollersChange(() => poller.snapshots());
     });
-    const entryPlan = planPlatformEntries(config, {
-      ...platformEntryDeps,
-      retainedProjectIds: await retainedPlatformProjectIds(
-        config,
-        () => agentManager.listActiveGitTasks(),
-        (task, mismatch) => agentManager.emitPlatformBindingIntervention(task, mismatch),
-      ),
-    });
-    poller.reconcile(entryPlan.entries);
-    for (const conflict of entryPlan.conflicts) {
-      await agentManager.emitConfigIntervention(conflict.projectId, {
-        phase: 'repo-conflict', repoKey: conflict.repoKey, claimedBy: conflict.claimedBy,
-      }).catch(err => console.warn('[startup] repo-conflict intervention emit failed:', err));
-    }
-    poller.start(config.server.githubPollIntervalMs);
+    await auditPlatformBindings(
+      config,
+      () => agentManager.listActiveGitTasks(),
+      (task, mismatch) => agentManager.emitPlatformBindingIntervention(task, mismatch),
+    );
+    poller.reconcile(platformEntries(config, platformEntryDeps));
+    poller.start(config.server.platformPollIntervalMs);
 
     const httpsOpts = config.server.https
       ? {

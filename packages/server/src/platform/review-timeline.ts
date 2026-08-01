@@ -1,15 +1,15 @@
-import type { CommentSourceOp } from './types.js';
-import { DriverOpError, safeDriverErrorText } from './git-driver.js';
+import type { CommentSource, CommentSourceClass } from './types.js';
+import { DriverOpError, safeDriverErrorText } from './types.js';
 import { versionTimeOf, type NormalizedRow } from './row-schema.js';
-import { classifyCommentSource, rowBodyDigest, rowTokens, stripBaxianMarkerLines, type CommentSourceClass } from './markers.js';
+import { rowBodyDigest, rowTokens, stripBaxianMarkerLines } from './markers.js';
 import { MAX_INLINE_CONTENT_BYTES } from '../shared/index.js';
 import type { PrReviewItem, PrReviewItemKind } from '../shared/index.js';
 
 export interface TimelineSourceReader {
-  readonly commentSources: CommentSourceOp[];
-  runCommentSource(
-    source: CommentSourceOp,
-    vars: { prNumber: number },
+  readonly commentSources: readonly CommentSource[];
+  listComments(
+    source: CommentSource,
+    prNumber: number,
     projectPage?: (pageRows: NormalizedRow[]) => NormalizedRow[],
     shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean,
   ): Promise<NormalizedRow[]>;
@@ -53,16 +53,15 @@ export class TimelineCollector {
   private readonly errors: string[] = [];
   private rateLimitedFlag = false;
 
-  constructor(sources: readonly CommentSourceOp[]) {
+  constructor(sources: readonly CommentSource[]) {
     const sourceCount = Math.max(sources.length, 1);
     this.itemQuota = Math.max(1, Math.floor(TIMELINE_MAX_ITEMS / sourceCount));
     this.byteQuota = Math.max(1, Math.floor(TIMELINE_MAX_BYTES / sourceCount));
   }
 
-  admitPage(source: CommentSourceOp, pageRows: readonly NormalizedRow[]): void {
+  admitPage(source: CommentSource, pageRows: readonly NormalizedRow[]): void {
     const bucket = this.bucket(source);
     for (const row of pageRows) {
-      if (row.system === true) continue;
       const id = String(row.id);
       const digest = rowBodyDigest(row);
       if (bucket.seenRows.get(id) === digest) continue;
@@ -78,7 +77,7 @@ export class TimelineCollector {
     }
   }
 
-  overQuota(source: CommentSourceOp): boolean {
+  overQuota(source: CommentSource): boolean {
     const bucket = this.bucket(source);
     if (bucket.truncated) return true;
     if (bucket.collected.length >= this.itemQuota || bucket.bytes >= this.byteQuota) {
@@ -116,11 +115,11 @@ export class TimelineCollector {
     };
   }
 
-  private bucket(source: CommentSourceOp): SourceBucket {
+  private bucket(source: CommentSource): SourceBucket {
     let bucket = this.buckets.get(source.key);
     if (!bucket) {
       bucket = {
-        kind: KIND_BY_CLASS[classifyCommentSource(source)],
+        kind: KIND_BY_CLASS[source.category],
         collected: [],
         bytes: 0,
         truncated: false,
@@ -140,9 +139,9 @@ export async function buildDriverReviewTimeline(
   for (const source of driver.commentSources) {
     let pagedInline = false;
     try {
-      const rows = await driver.runCommentSource(
+      const rows = await driver.listComments(
         source,
-        { prNumber },
+        prNumber,
         pageRows => {
           pagedInline = true;
           collector.admitPage(source, pageRows);

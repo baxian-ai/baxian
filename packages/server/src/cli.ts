@@ -250,10 +250,10 @@ export function buildCli(): Command {
     .description('Attach to agent tmux session (local or remote)')
     .action(async (agentId, opts) => {
       const ctx = ctxOf(opts);
-      let agent: { mode: 'local' | 'remote'; host?: string | HostConfig } | undefined;
+      let agent: { mode: 'local' | 'remote'; host?: string } | undefined;
       let resolvedHost: HostConfig | undefined;
       try {
-        type CfgAgent = { id: string; mode: 'local' | 'remote'; host?: string | HostConfig };
+        type CfgAgent = { id: string; mode: 'local' | 'remote'; host?: string };
         type CfgRes = {
           host?: HostConfig[];
           project?: Array<{ agent?: CfgAgent[][] }>;

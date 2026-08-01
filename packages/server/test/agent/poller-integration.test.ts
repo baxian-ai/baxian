@@ -32,7 +32,7 @@ beforeEach(async () => {
   const pollerConfig = makeConfig({
     project: [{
       id: 'proj',
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       merge: null,
       agent: [[
         makeAgent({ workdir: undefined }),

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile, readdir, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentManager } from '../../src/agent/manager.js';
@@ -9,7 +9,6 @@ import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
 import type { BaxianConfig, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
@@ -23,7 +22,7 @@ const CONFIG: BaxianConfig = {
   server: DEFAULT_SERVER_CONFIG,
   project: [{
     id: 'proj',
-    repo: 'user/repo',
+    repo: 'https://github.com/user/repo.git',
     merge: null,
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '' },
@@ -44,14 +43,6 @@ beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-img-test-'));
   await initStateDir(tempDir);
   stagingRoot = join(tempDir, 'state', 'task-images');
-
-  const skillsDir = join(tempDir, 'skills');
-  for (const s of ['baxian-greeting', 'baxian-task-check', 'baxian-signals']) {
-    await mkdir(join(skillsDir, s), { recursive: true });
-    await writeFile(join(skillsDir, s, 'SKILL.md'), `# ${s}`);
-  }
-  const skillRegistry = new SkillRegistry(skillsDir);
-  await skillRegistry.scan();
 
   agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
   taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
@@ -78,7 +69,6 @@ beforeEach(async () => {
     taskStore,
     lockManager,
     eventBus,
-    skillRegistry,
     runnerFactory: () => mockRunner,
     imageStagingRoot: stagingRoot,
   });
@@ -237,7 +227,7 @@ describe('retryTask image preservation', () => {
       preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1',
       phase: 'code', reviewRound: 0,
       status: 'failed', branch: `bx/${id}`, createdAt: now, updatedAt: now,
-      platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/user/repo' },
       images: [filename],
     });
     if (writeStaged) {

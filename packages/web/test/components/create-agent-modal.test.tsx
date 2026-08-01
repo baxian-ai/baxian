@@ -22,7 +22,7 @@ function cfg(hosts: BaxianConfig['host']): BaxianConfig {
     review: { rounds: 10 },
     server: { port: 3000 },
     host: hosts,
-    project: [{ id: 'baxian', repo: 'o/r', merge: null, agent: [] }],
+    project: [{ id: 'baxian', repo: 'https://github.com/o/r.git', merge: null, agent: [] }],
   };
 }
 
@@ -56,7 +56,7 @@ function cfgWithAgents(agent: ProjectConfig['agent']): BaxianConfig {
     review: { rounds: 10 },
     server: { port: 3000 },
     host: [],
-    project: [{ id: 'baxian', repo: 'o/r', merge: null, agent }],
+    project: [{ id: 'baxian', repo: 'https://github.com/o/r.git', merge: null, agent }],
   };
 }
 

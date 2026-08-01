@@ -28,7 +28,7 @@ baxian 是 **tmux 原生**的。一个 agent 就是 tmux session 里的一个交
 
 - **终端墙** —— 控制台内嵌每个 agent 的实时终端（WebSocket 推流、xterm.js 渲染）。点击任意窗格即可向真实会话输入，无需切换窗口就能看清每个 agent 在做什么。
 - **自动评审循环** —— QA 在 pull request 上发布评审意见，Dev 逐条修复并给出提交，或说明拒绝理由，再由 QA 复审，循环直到结论为 `approve`。
-- **评审发生在真实的 PR 上** —— 每任务一个分支、自动建 PR、通过平台自己的 CLI（GitHub 用 `gh`，需另行安装并认证）轮询评审动态；项目设置 `merge: "auto"` 时，任务通过并经你确认后由 baxian 代为合并 PR。
+- **评审发生在真实的 PR 上** —— 每任务一个分支、自动创建 GitHub PR，并通过 `gh`（需另行安装并认证）轮询评审动态；项目设置 `merge: "auto"` 时，任务通过并经你确认后由 baxian 代为合并 PR。
 - **Spec 人审门禁（可选）** —— 项目配置 `specApproval: "human"` 后，走规格稿路线的任务在 QA 通过规格稿时停驻在 `spec-ready`，等你签字确认才开始编码。
 - **本地与远程 agent** —— agent 可以跑在任何 SSH 可达的机器上，远端 tmux 会话由 baxian 代管。
 - **不需要 API key** —— agent 运行的是交互式 Claude Code / Codex CLI，凭证只有你已有的订阅账号。
@@ -70,7 +70,7 @@ server 持有任务和 agent 绑定状态，通过 tmux pane 驱动 agent，并�
 > - **Node.js ≥ 22.13**
 > - 每台跑 agent 的机器（本地与远程）都装有 **tmux**
 > - **Claude Code**（`claude`）和/或 **Codex**（`codex`）CLI 已安装并登录
-> - **git**，以及仓库平台所需的 CLI —— GitHub 仓库用已认证的 **GitHub CLI**（`gh`）；其它平台需自备 CLI，并在实例 home 的 `plugins/` 目录下安装对应的驱动插件
+> - 已配置仓库读写凭据的 **git**，以及已认证的 **GitHub CLI**（`gh`）。私有 HTTPS 仓库需在每台 agent 主机上执行 `gh auth setup-git`。
 >
 > 该 CLI 需要在每台跑 agent 的机器上、以及 server 本机都完成认证：server 用它轮询评审、合并与关闭 PR，agent 用它开 PR 与发评论。
 
@@ -139,7 +139,6 @@ baxian 固定读取 `<home>/baxian.json`，`<home>` 默认为 `~/.baxian`。可�
 | `server.token` | 保护 API 与 Web 控制台的 Bearer token |
 | `project[].merge` | `"auto"`：任务通过并经你确认后，由 baxian 代为合并 PR；`null`：手动合并 |
 | `project[].specApproval` | `"human"`：QA 通过规格稿后停驻 `spec-ready` 等你确认；`null`（默认）：QA 通过即进入编码 |
-| `project[].gitCli.tool` | 由哪个平台 CLI 驱动 PR 评审。GitHub 仓库自动解析为 `gh`；其它平台必须声明，并安装对应的驱动插件 |
 | `project[].agent[][].mode` + `host` | `local` 本地运行，或 `remote` 配主机 id 走 SSH 代管 |
 
 ## 许可证

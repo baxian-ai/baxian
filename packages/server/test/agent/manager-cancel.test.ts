@@ -50,7 +50,7 @@ describe('AgentManager runtime menu marker', () => {
         },
       }],
     });
-    harness.manager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => runner });
+    harness.manager = harness.createManager({ runnerFactory: () => runner });
     harness.manager['runtimeMenuPollIntervalMs'] = 5;
     await harness.seedTask();
     await harness.seedAgent({
@@ -77,7 +77,6 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('sends ESC to both dev and qa, never /clear, then clears both bindings', async () => {
     const sentKeys: string[] = [];
     const localManager = harness.createManager({
-      skillRegistry: harness.freshSkillRegistry(),
       runnerFactory: () => clearAwareRunner(sentKeys, pane => (pane === '%1' ? CODEX_PANE : CLAUDE_PANE)),
     });
     harness.setCompactTiming(localManager);
@@ -128,7 +127,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
       writeFile: vi.fn(async (): Promise<void> => undefined),
       execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => runner });
+    const localManager = harness.createManager({ runnerFactory: () => runner });
 
     const oldTask = makeTask({ id: 'task-old' });
     const newTask = makeTask({ id: 'task-new' });
@@ -180,7 +179,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
       writeFile: vi.fn(async (): Promise<void> => undefined),
       execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => runner });
+    const localManager = harness.createManager({ runnerFactory: () => runner });
 
     harness.mockInterruptPane(localManager, false);
 
@@ -214,7 +213,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('keeps the mutex-busy hold reason and emits a single intervention when the pane mutex stays busy', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
     Object.assign(localManager, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
     stubClaimedPaneResolution(() => '%0');
     (localManager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('dev-1');
@@ -238,7 +237,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('releases neither agent until both panes are interrupted, so a slow qa interrupt cannot expose a freed dev', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
 
     const t = await harness.seedTask({ qaAgentId: 'qa-1' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -266,7 +265,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('refuses Resume while cancel cleanup is in flight, and the worker still completes both releases', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
 
     const t = await harness.seedTask({ qaAgentId: 'qa-1' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -294,7 +293,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('a duplicate cancel of an already-cancelling task does not clear the in-flight guard early', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
 
     const t = await harness.seedTask({ qaAgentId: 'qa-1' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -323,7 +322,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('a dev whose interrupt fails does not strand qa — qa is still interrupted and released', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
 
     const t = await harness.seedTask({ qaAgentId: 'qa-1' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -346,7 +345,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('does not stale-mark a rebound agent when it is reassigned mid-cleanup (release+reassign race)', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
 
     const t = await harness.seedTask();
     await harness.taskStore.set(makeTask({ id: 'task-new' }));
@@ -382,7 +381,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('blocks a concurrent terminal-task escape release while cancel is mid-cleanup', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
     const t = await harness.seedTask({ qaAgentId: 'qa-1' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
@@ -407,7 +406,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('cancel of one task does not block a rebound agent release by its new task', async () => {
-    const localManager = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), runnerFactory: () => createManagerSuiteRunner() });
+    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
     await harness.taskStore.set(makeTask({ id: 'task-old', agentId: 'dev-1', qaAgentId: 'qa-1' }));
     await harness.taskStore.set(makeTask({ id: 'task-new', agentId: 'dev-1' }));
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-new', paneId: '%0' });
@@ -960,7 +959,6 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-img-toctou', paneId: '%0' });
     const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
     const localManager = harness.createManager({
-      skillRegistry: harness.freshSkillRegistry(),
       runnerFactory: () => ({
         exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
         writeFile: vi.fn(async () => {
@@ -985,7 +983,6 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
       return realGet(id);
     });
     const localManager = harness.createManager({
-      skillRegistry: harness.freshSkillRegistry(),
       runnerFactory: () => ({
         exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
         writeFile: vi.fn(async () => undefined),
@@ -999,7 +996,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
   });
 
   it('cancel-interrupt guard wait is derived from the configured dispatch ack timeout (not the default)', () => {
-    const m = harness.createManager({ skillRegistry: harness.freshSkillRegistry(), dispatchAckTimeoutMs: 60_000 }) as unknown as {
+    const m = harness.createManager({ dispatchAckTimeoutMs: 60_000 }) as unknown as {
       cancelInterruptGuardWaitMs: number; dispatchAckTimeoutMs: number;
     };
     expect(m.dispatchAckTimeoutMs).toBe(60_000);

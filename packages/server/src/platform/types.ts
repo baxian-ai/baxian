@@ -1,88 +1,106 @@
 import type { EventType } from '../shared/types.js';
+import type { NormalizedRow } from './row-schema.js';
 
-export interface MappedEvent {
+const SAFE_ERROR_SUMMARY_CHARS = 200;
+export const COMMENT_BODY_MAX_BYTES = 64 * 1024;
+
+export interface PlatformEvent {
   type: EventType;
   repo: string;
   data: Record<string, unknown>;
   taskId?: string;
 }
 
-export interface PluginManifest {
-  name: string;
-  version: string;
-  kind: 'git-driver';
-  tool: string;
-  minToolVersion: string;
-  driverSchema: 1;
+export type CommentSourceClass = 'reviews' | 'threaded' | 'top-level';
+
+export interface CommentSource {
+  key: string;
+  category: CommentSourceClass;
 }
 
-export interface PluginValidationError {
-  pluginPath: string;
-  message: string;
+export interface PlatformAgentPrompts {
+  common: string;
+  publish: string;
+  feedback: string;
+  review: string;
 }
 
-export const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export interface PlatformPromptContext {
+  repo: string;
+  prompts: PlatformAgentPrompts;
+}
 
-export type MapValueSpec = string | { sources: string[]; optional?: boolean; values?: Record<string, string> };
+export interface DriverExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
 
-export interface DriverOp {
-  argv: string[];
-  env?: Record<string, string>;
-  stdin?: string;
-  parse?: 'json' | 'json-paged';
-  responseEnvelope?: 'graphql';
-  flatten?: string;
-  map?: Record<string, MapValueSpec>;
-  optional?: boolean;
-  treatAsSuccess?: string[];
+export type DriverExec = (
+  command: string,
+  opts: { timeout: number; maxBuffer: number; stdin?: Buffer },
+) => Promise<DriverExecResult>;
+
+export interface PlatformDriver {
+  readonly visibilityLagMs: number;
+  readonly commentSources: readonly CommentSource[];
+  runPreflightSteps(): Promise<Array<{ step: string; ok: boolean; message: string }>>;
+  projectView(): Promise<NormalizedRow>;
+  prView(prNumber: number): Promise<NormalizedRow>;
+  branchView(remoteProjectId: string, branch: string): Promise<NormalizedRow>;
+  listPrs(
+    shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean,
+  ): Promise<NormalizedRow[]>;
+  listComments(
+    source: CommentSource,
+    prNumber: number,
+    projectPage?: (pageRows: NormalizedRow[]) => NormalizedRow[],
+    shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean,
+  ): Promise<NormalizedRow[]>;
+  postComment(prNumber: number, body: string): Promise<void>;
+  mergePr(prNumber: number, expectedHeadSha: string): Promise<void>;
+  closePr(prNumber: number): Promise<void>;
+  deleteBranch(remoteProjectId: string, branch: string, expectedHeadSha: string): Promise<void>;
+}
+
+export class DriverOpError extends Error {
+  constructor(
+    message: string,
+    readonly info: { opName: string; errorClass?: string; exitCode?: number; stderrTail?: string },
+  ) {
+    super(message);
+    this.name = 'DriverOpError';
+  }
+}
+
+export class DriverInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DriverInputError';
+  }
+}
+
+export function safeDriverErrorText(err: unknown): string {
+  if (err instanceof DriverOpError) {
+    const cls = err.info.errorClass ? `, class ${err.info.errorClass}` : '';
+    return `op ${err.info.opName} failed (exit ${err.info.exitCode ?? 'n/a'}${cls})`;
+  }
+  if (err instanceof Error) {
+    const head = err.message.slice(0, SAFE_ERROR_SUMMARY_CHARS);
+    const clipped = err.message.length > SAFE_ERROR_SUMMARY_CHARS ? '…' : '';
+    return `${err.name}: ${head}${clipped}`;
+  }
+  return String(err).slice(0, SAFE_ERROR_SUMMARY_CHARS);
+}
+
+export function validateCommentBody(body: string): void {
+  if (body.trim() === '') throw new DriverInputError('comment body must be non-empty');
+  if (body.includes('\0')) throw new DriverInputError('comment body must not contain NUL');
+  const bytes = Buffer.byteLength(body, 'utf8');
+  if (bytes > COMMENT_BODY_MAX_BYTES) {
+    throw new DriverInputError(`comment body exceeds ${COMMENT_BODY_MAX_BYTES} bytes`);
+  }
 }
 
 export const SOURCE_KEY_PATTERN = /^[a-z][a-z0-9-]*$/;
-
-export interface CommentSourceOp extends DriverOp {
-  key: string;
-}
-
-export interface DriverSpec {
-  ops: Record<string, DriverOp>;
-  commentSources: CommentSourceOp[];
-  visibilityLagSeconds: number;
-  preflight: Array<{ argv: string[]; env?: Record<string, string>; fixMessage: string; versionCheck?: boolean }>;
-  agentCommands: string[][];
-  errorClasses: Array<{ class: string; regex: string[] }>;
-}
-
-export const PLACEHOLDERS: ReadonlySet<string> = new Set([
-  'scheme', 'hostname', 'host', 'hostUrl', 'repoPath', 'repoPathEncoded',
-  'prNumber', 'expectedHeadSha', 'remoteProjectId', 'branch', 'branchEncoded', 'body', 'binary',
-]);
-
-const TASK_CONTEXT_PLACEHOLDERS: ReadonlySet<string> = new Set([
-  'prNumber', 'expectedHeadSha', 'remoteProjectId', 'branch', 'branchEncoded', 'body',
-]);
-export const PREFLIGHT_PLACEHOLDERS: ReadonlySet<string> = new Set(
-  [...PLACEHOLDERS].filter(p => !TASK_CONTEXT_PLACEHOLDERS.has(p)),
-);
-
-export const PLACEHOLDERS_WITH_PAGE: ReadonlySet<string> = new Set([...PLACEHOLDERS, 'page']);
-export const PREFLIGHT_FIXMESSAGE_PLACEHOLDERS: ReadonlySet<string> = new Set([...PREFLIGHT_PLACEHOLDERS, 'minToolVersion']);
-
-export type MapFieldKind = 'id' | 'prNumber' | 'sha' | 'timestamp' | 'state' | 'boolean' | 'integer' | 'string';
-export const MAP_FIELD_KINDS: Readonly<Record<string, MapFieldKind>> = {
-  prNumber: 'prNumber',
-  prUrl: 'string', branch: 'string', targetBranch: 'string', title: 'string', body: 'string',
-  author: 'string', prAuthor: 'string', reviewState: 'string', detailedMergeStatus: 'string',
-  defaultBranch: 'string', username: 'string', path: 'string', state: 'state',
-  headSha: 'sha', commitSha: 'sha',
-  mergedAt: 'timestamp', updatedAt: 'timestamp', createdAt: 'timestamp', approvedAt: 'timestamp',
-  sourceProjectId: 'id', targetProjectId: 'id', remoteProjectId: 'id', id: 'id', discussionId: 'id', parentId: 'id',
-  authorId: 'id', prAuthorId: 'id',
-  draft: 'boolean', system: 'boolean', resolvable: 'boolean', resolved: 'boolean', pushPermitted: 'boolean',
-  line: 'integer', originalLine: 'integer',
-};
-export const MAP_TARGET_FIELDS: ReadonlySet<string> = new Set(Object.keys(MAP_FIELD_KINDS));
-
-export const SINGLE_RESOURCE_OPS: ReadonlySet<string> = new Set(['prView', 'projectView', 'branchView']);
-export const WRITE_OPS: ReadonlySet<string> = new Set(['comment', 'merge', 'close', 'deleteBranch']);
-
 export const SHA_HEX_SOURCE = '[0-9a-fA-F]{7,64}';

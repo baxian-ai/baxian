@@ -1,5 +1,5 @@
 import { BODY_DIGEST_SOURCE, bodyDigest } from './body-digest.js';
-import { SHA_HEX_SOURCE, SOURCE_KEY_PATTERN } from './types.js';
+import { SHA_HEX_SOURCE, SOURCE_KEY_PATTERN, type CommentSourceClass } from './types.js';
 import { LINE_SAFE_ID_RE, versionTimeOf, type NormalizedRow } from './row-schema.js';
 
 export interface ReviewTokenMarker {
@@ -83,15 +83,6 @@ export function rowAcks(row: NormalizedRow): AckMarker[] {
 
 export function rowHasBody(row: NormalizedRow): boolean {
   return isProjected(row) ? row.hasBody === true : rawBody(row) !== '';
-}
-
-export type CommentSourceClass = 'reviews' | 'threaded' | 'top-level';
-
-export function classifyCommentSource(source: { map?: Record<string, unknown> }): CommentSourceClass {
-  const map = source.map ?? {};
-  if ('reviewState' in map) return 'reviews';
-  if ('discussionId' in map) return 'threaded';
-  return 'top-level';
 }
 
 export interface AckActorContext {

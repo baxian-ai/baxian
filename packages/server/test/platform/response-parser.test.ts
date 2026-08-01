@@ -16,12 +16,9 @@ describe('parseJsonPagedPage', () => {
     expect(parseJsonPagedPage('[{"iid":1},{"iid":2}]')).toEqual([{ iid: 1 }, { iid: 2 }]);
   });
 
-  it('accepts concatenated-arrays framing with newline', () => {
-    expect(parseJsonPagedPage('[{"iid":1}]\n[{"iid":2}]')).toEqual([{ iid: 1 }, { iid: 2 }]);
-  });
-
-  it('accepts concatenated-arrays framing without separator', () => {
-    expect(parseJsonPagedPage('[{"iid":1}][{"iid":2}]')).toEqual([{ iid: 1 }, { iid: 2 }]);
+  it('rejects concatenated arrays because one gh page has one JSON array', () => {
+    expect(() => parseJsonPagedPage('[{"id":1}]\n[{"id":2}]')).toThrow(ResponseParseError);
+    expect(() => parseJsonPagedPage('[{"id":1}][{"id":2}]')).toThrow(ResponseParseError);
   });
 
   it('empty page yields empty array', () => {
@@ -38,19 +35,8 @@ describe('parseJsonPagedPage', () => {
     expect(() => parseJsonPagedPage('{"a":1}')).toThrow(ResponseParseError);
   });
 
-  it('splits on array boundary even when a string body contains literal "]["', () => {
-    expect(parseJsonPagedPage('[{"id":1,"body":"a][b"}][{"id":2}]')).toEqual([
-      { id: 1, body: 'a][b' },
-      { id: 2 },
-    ]);
-  });
-
   it('keeps a single segment whose only element is a string containing "]["', () => {
     expect(parseJsonPagedPage('["a][b"]')).toEqual(['a][b']);
-  });
-
-  it('splits correctly when a string contains an escaped quote before a new segment', () => {
-    expect(parseJsonPagedPage('["a\\"b"][1]')).toEqual(['a"b', 1]);
   });
 
   it('rejects an unterminated string with a ResponseParseError, not a raw SyntaxError', () => {

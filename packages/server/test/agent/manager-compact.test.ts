@@ -165,7 +165,7 @@ beforeEach(async () => {
   const config = makeConfig({
     project: [{
       id: 'proj',
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       merge: null,
       agent: [[
         makeAgent({ workdir: join(tempDir, 'dev-1') }),

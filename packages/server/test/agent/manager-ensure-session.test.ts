@@ -23,7 +23,6 @@ describe('AgentManager.ensureSession', () => {
 
   let tmuxSessions: Map<string, { claim: string; readyOnce: boolean; sessionId: string }>;
   let nextSessionId: number;
-  let currentSkillsVersion = '';
 
   function execCmds(): string[] {
     return runner.exec.mock.calls.map(c => c[0] as string);
@@ -148,11 +147,6 @@ describe('AgentManager.ensureSession', () => {
           match: cmd => cmd.includes('pane_current_command') && cmd.includes('capture-pane'),
           reply: { stdout: 'BX_PANE_OKclaude\n⏵⏵ bypass permissions on\n' },
         },
-        {
-          match: 'BX_PANE_OK#{@baxian-skills-version}',
-          reply: () => ({ stdout: `BX_PANE_OK${currentSkillsVersion}\n` }),
-        },
-        { match: 'BX_SKILLS_NON_GIT', reply: { stdout: 'BX_SKILLS_OK\n' } },
       ],
     });
     return async (cmd: string): Promise<ExecResult> => {
@@ -220,9 +214,6 @@ describe('AgentManager.ensureSession', () => {
         if (cmd.includes('@baxian-agent-id')) {
           return { stdout: `${sess.claim}\n`, stderr: '', exitCode: 0 };
         }
-        if (cmd.includes('@baxian-skills-version')) {
-          return { stdout: `${currentSkillsVersion}\n`, stderr: '', exitCode: 0 };
-        }
         return { stdout: '', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('list-panes')) {
@@ -246,7 +237,7 @@ describe('AgentManager.ensureSession', () => {
     config = makeConfig({
       project: [{
         id: 'proj',
-        repo: 'owner/repo',
+        repo: 'https://github.com/owner/repo.git',
         merge: null,
         agent: [[
           makeAgent({ yolo: true }),
@@ -268,7 +259,6 @@ describe('AgentManager.ensureSession', () => {
       },
     });
     ({ manager, createManager } = harness);
-    currentSkillsVersion = harness.skillRegistry.contentHash();
   });
 
   afterEach(async () => {
@@ -415,41 +405,6 @@ describe('AgentManager.ensureSession', () => {
     const result = await manager.ensureSession('dev-1', 'runtime');
     expect(result.createdSession).toBe(false);
     expect(result.paneId).toBe('%0');
-  });
-
-  it('runtime mode, shell relaunch path tags the session with the skills version (so the next adopt is not seen stale)', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
-    overrideExec(
-      c => c.includes('pane_current_command') && c.includes('capture-pane'),
-      { stdout: 'BX_PANE_OKzsh\n' },
-    );
-    await manager.ensureSession('dev-1', 'runtime');
-    expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
-  });
-
-  it('runtime mode, live REPL with stale skills defers retagging until task-boundary /clear succeeds', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
-    overrideExec(
-      c => c.includes('BX_PANE_OK#{@baxian-skills-version}'),
-      { stdout: 'BX_PANE_OKstale-version\n' },
-    );
-    const result = await manager.ensureSession('dev-1', 'runtime');
-    expect(result.createdSession).toBe(false);
-    expect(result.skillsStale).toBe(true);
-    const calls = execCmds();
-    expect(calls.some(c => c.includes('kill-session'))).toBe(false);
-    expect(calls.some(c => c.includes('new-session'))).toBe(false);
-    expect(setOptionCalls('@baxian-skills-version')).toHaveLength(0);
-  });
-
-  it('runtime mode, a tmux probe failure during the skills-version check surfaces as EnsureSessionError (does NOT kill the live REPL)', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
-    overrideExec(
-      c => c.includes('BX_PANE_OK#{@baxian-skills-version}'),
-      { stderr: 'tmux probe boom', exitCode: 2 },
-    );
-    await expect(manager.ensureSession('dev-1', 'runtime')).rejects.toThrow(/skills-version probe failed/);
-    expect(execCmds().some(c => c.includes('kill-session'))).toBe(false);
   });
 
   it('create path pins window-size=latest so plain tmux attach follows the current terminal size', async () => {
@@ -701,16 +656,18 @@ describe('AgentManager.ensureSession', () => {
     expect(bytes).toBeGreaterThan(0);
   });
 
-  it('previewPromptBytesForTaskInput includes the live platform CLI descriptor', () => {
+  it('previewPromptBytesForTaskInput includes the live repository descriptor', () => {
     const baseline = manager.previewPromptBytesForTaskInput('proj', {
       title: 'hi',
       description: 'do work',
       preferredAgentId: 'dev-1',
     });
-    const notes = '汉'.repeat(170);
     manager.replaceConfig({
       ...config,
-      project: [{ ...config.project[0], gitCli: { tool: 'gh', notes } }],
+      project: [{
+        ...config.project[0],
+        repo: 'https://github.com/example-owner/a-much-longer-repository-name.git',
+      }],
     });
 
     const withNotes = manager.previewPromptBytesForTaskInput('proj', {
@@ -719,7 +676,7 @@ describe('AgentManager.ensureSession', () => {
       preferredAgentId: 'dev-1',
     });
 
-    expect(withNotes - baseline).toBeGreaterThanOrEqual(Buffer.byteLength(notes, 'utf8'));
+    expect(withNotes).toBeGreaterThan(baseline);
   });
 
   it('replaceConfig: rebuilds agentIndex so newly added agents are visible', async () => {
@@ -778,8 +735,6 @@ describe('AgentManager.ensureSession', () => {
   type RestartReplPrivates = {
     pollPaneCommandStable: (...a: unknown[]) => Promise<string>;
     ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }>;
-    provisionRepoSkills: (...a: unknown[]) => Promise<void>;
-    tagSessionSkillsVersion: (...a: unknown[]) => Promise<void>;
   };
   function stubRestartRepl(): RestartReplPrivates {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
@@ -789,32 +744,16 @@ describe('AgentManager.ensureSession', () => {
     return m;
   }
 
-  it('restartReplOnly tags @baxian-skills-version after a successful re-provision', async () => {
-    const m = stubRestartRepl();
-    vi.spyOn(m, 'provisionRepoSkills').mockResolvedValue(undefined);
-    const tagSpy = vi.spyOn(m, 'tagSessionSkillsVersion');
+  it('restartReplOnly clears the remembered task context after a successful relaunch', async () => {
+    stubRestartRepl();
 
     await manager.restartReplOnly('dev-1');
 
-    expect(tagSpy).toHaveBeenCalledTimes(1);
-    expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
-  });
-
-  it('restartReplOnly fails closed and does not relaunch when skill re-provision fails', async () => {
-    const m = stubRestartRepl();
-    vi.spyOn(m, 'provisionRepoSkills').mockRejectedValue(new Error('ssh write failed'));
-    const tagSpy = vi.spyOn(m, 'tagSessionSkillsVersion');
-
-    await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/ssh write failed/);
-
-    expect(tagSpy).not.toHaveBeenCalled();
-    expect(setOptionCalls('@baxian-skills-version')).toEqual([]);
-    expect(execCmds().some(c => c.includes('permission-mode'))).toBe(false);
+    expect(setOptionCalls('@baxian-context-task-id')).toHaveLength(1);
   });
 
   it('restartReplOnly refuses to relaunch when the pane has moved outside the fixed Workdir', async () => {
-    const m = stubRestartRepl();
-    vi.spyOn(m, 'provisionRepoSkills').mockResolvedValue(undefined);
+    stubRestartRepl();
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
         return { stdout: 'BX_PANE_OK/tmp/wrong-directory\n', stderr: '', exitCode: 0 };
@@ -941,7 +880,6 @@ describe('AgentManager.ensureSession', () => {
 
       expect(result.createdSession).toBe(false);
       expect(result.freshRuntime).toBe(true);
-      expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
     });
 
     it('reports dialogPending when a startup dialog appears after the trust auto-answer', async () => {
@@ -1054,13 +992,6 @@ describe('AgentManager.ensureSession', () => {
       expect((await manager['agentStore'].get('dev-1'))?.workdir).toBe('/tmp/auto-repo');
     });
 
-    it('wraps a skill provisioning failure', async () => {
-      vi.spyOn(console, 'warn').mockImplementation(() => {});
-      runner.execWithStdin.mockRejectedValue(new Error('remote write refused'));
-      await expect(manager.ensureSession('dev-1', 'runtime'))
-        .rejects.toThrow(/skill provisioning failed/);
-    });
-
     it('wraps a tmux session-probe failure', async () => {
       overrideExec(
         c => c.includes('list-sessions'),
@@ -1128,7 +1059,6 @@ describe('AgentManager.ensureSession', () => {
       await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/repo store down/);
 
       expect(execCmds().some(c => c.includes('permission-mode'))).toBe(false);
-      expect(setOptionCalls('@baxian-skills-version')).toEqual([]);
     });
   });
 

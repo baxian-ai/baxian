@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildLaunchCommand, launchCommandIn, skillSubdirFor } from '../../src/agent/manager.js';
+import { buildLaunchCommand, launchCommandIn } from '../../src/agent/manager.js';
 import type { AgentRuntime } from '../../src/shared/index.js';
 import { makeAgent } from '../helpers/fixtures.js';
 
@@ -139,17 +139,6 @@ describe('buildLaunchCommand', () => {
         "env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --model 'opus' --add-dir '/x'",
       );
     });
-  });
-});
-
-describe('skillSubdirFor', () => {
-  it.each<[AgentRuntime, string]>([
-    ['claude-code', '.claude/skills'],
-    ['codex', '.agents/skills'],
-    ['opencode', '.agents/skills'],
-    ['qodercli', '.qoder/skills'],
-  ])('%s materializes skills under %s', (runtime, dir) => {
-    expect(skillSubdirFor(runtime)).toBe(dir);
   });
 });
 

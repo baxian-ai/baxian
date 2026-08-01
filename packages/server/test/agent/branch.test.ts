@@ -616,7 +616,7 @@ describe('BranchManager', () => {
     const stateRoot = join(tempDir, 'manager-state');
     const config = makeConfig({
       project: [{
-        id: 'proj', repo: 'owner/repo', merge: null,
+        id: 'proj', repo: 'https://github.com/owner/repo.git', merge: null,
         agent: [[
           makeAgent({ runtime: 'codex', workdir }),
           makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
@@ -676,7 +676,7 @@ describe('BranchManager', () => {
     const stateRoot = join(tempDir, 'busy-manager-state');
     const config = makeConfig({
       project: [{
-        id: 'proj', repo: 'owner/repo', merge: null,
+        id: 'proj', repo: 'https://github.com/owner/repo.git', merge: null,
         agent: [[
           makeAgent({ runtime: 'codex', workdir }),
           makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
@@ -733,7 +733,7 @@ describe('BranchManager', () => {
     const stateRoot = join(tempDir, 'skipped-manager-state');
     const config = makeConfig({
       project: [{
-        id: 'proj', repo: 'owner/repo', merge: null,
+        id: 'proj', repo: 'https://github.com/owner/repo.git', merge: null,
         agent: [[
           makeAgent({ runtime: 'codex', workdir }),
           makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),

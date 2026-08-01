@@ -8,11 +8,11 @@ vi.mock('../../src/hooks/use-pollers.ts', () => ({
   usePollers: () => ({ data: pollersState.data, loaded: pollersState.data !== null, error: null }),
 }));
 
-import { GithubConnectivityBanner } from '../../src/components/github-connectivity-banner.tsx';
+import { PlatformConnectivityBanner } from '../../src/components/platform-connectivity-banner.tsx';
 
 function snapshot(overrides: Partial<PollerSnapshot> = {}): PollerSnapshot {
   return {
-    repo: 'user/repo',
+    repo: 'https://github.com/user/repo.git',
     projectId: 'proj',
     intervalMs: 15000,
     isPolling: false,
@@ -22,55 +22,55 @@ function snapshot(overrides: Partial<PollerSnapshot> = {}): PollerSnapshot {
   };
 }
 
-describe('GithubConnectivityBanner', () => {
+describe('PlatformConnectivityBanner', () => {
   beforeEach(() => {
     pollersState.data = null;
   });
 
   it('renders nothing before poller data arrives', () => {
-    const { container } = render(<GithubConnectivityBanner />);
+    const { container } = render(<PlatformConnectivityBanner />);
     expect(container.innerHTML).toBe('');
   });
 
   it('renders nothing when every poller is healthy', () => {
-    pollersState.data = [snapshot(), snapshot({ repo: 'user/other' })];
-    const { container } = render(<GithubConnectivityBanner />);
+    pollersState.data = [snapshot(), snapshot({ repo: 'https://github.com/user/other.git' })];
+    const { container } = render(<PlatformConnectivityBanner />);
     expect(container.innerHTML).toBe('');
   });
 
   it('renders nothing for unknown health (poller has not run yet)', () => {
     pollersState.data = [snapshot({ health: 'unknown' })];
-    const { container } = render(<GithubConnectivityBanner />);
+    const { container } = render(<PlatformConnectivityBanner />);
     expect(container.innerHTML).toBe('');
   });
 
   it('shows a degraded notice naming the repo', () => {
     pollersState.data = [
       snapshot(),
-      snapshot({ repo: 'user/flaky', health: 'degraded', consecutiveFailures: 1 }),
+      snapshot({ repo: 'https://github.com/user/flaky.git', health: 'degraded', consecutiveFailures: 1 }),
     ];
-    render(<GithubConnectivityBanner />);
+    render(<PlatformConnectivityBanner />);
     expect(screen.getByText(/Platform polling degraded/)).not.toBeNull();
     expect(screen.getByText(/user\/flaky/)).not.toBeNull();
   });
 
   it('reports unreachable when any poller is failed, even if another is merely degraded', () => {
     pollersState.data = [
-      snapshot({ repo: 'user/flaky', health: 'degraded' }),
-      snapshot({ repo: 'user/down', health: 'failed', consecutiveFailures: 4 }),
+      snapshot({ repo: 'https://github.com/user/flaky.git', health: 'degraded' }),
+      snapshot({ repo: 'https://github.com/user/down.git', health: 'failed', consecutiveFailures: 4 }),
     ];
-    render(<GithubConnectivityBanner />);
+    render(<PlatformConnectivityBanner />);
     expect(screen.getByText(/Platform unreachable/)).not.toBeNull();
     expect(screen.getByText(/user\/down/)).not.toBeNull();
   });
 
   it('shows an active rate limit even while poller health remains healthy', () => {
     pollersState.data = [snapshot({
-      repo: 'user/throttled',
+      repo: 'https://github.com/user/throttled.git',
       lastErrorClass: 'RATE_LIMIT',
       rateLimitedUntil: '2099-01-01T00:00:00.000Z',
     })];
-    render(<GithubConnectivityBanner />);
+    render(<PlatformConnectivityBanner />);
     expect(screen.getByText(/Platform polling rate-limited/)).not.toBeNull();
     expect(screen.getByText(/user\/throttled/)).not.toBeNull();
   });
@@ -80,20 +80,20 @@ describe('GithubConnectivityBanner', () => {
       lastErrorClass: 'RATE_LIMIT',
       rateLimitedUntil: '2000-01-01T00:00:00.000Z',
     })];
-    const { container } = render(<GithubConnectivityBanner />);
+    const { container } = render(<PlatformConnectivityBanner />);
     expect(container.innerHTML).toBe('');
   });
 
   it('reports a failed poller ahead of a concurrently rate-limited one', () => {
     pollersState.data = [
       snapshot({
-        repo: 'user/throttled',
+        repo: 'https://github.com/user/throttled.git',
         lastErrorClass: 'RATE_LIMIT',
         rateLimitedUntil: '2099-01-01T00:00:00.000Z',
       }),
-      snapshot({ repo: 'user/down', health: 'failed', consecutiveFailures: 3 }),
+      snapshot({ repo: 'https://github.com/user/down.git', health: 'failed', consecutiveFailures: 3 }),
     ];
-    render(<GithubConnectivityBanner />);
+    render(<PlatformConnectivityBanner />);
     expect(screen.getByText(/Platform unreachable/)).not.toBeNull();
     expect(screen.getByText(/user\/down/)).not.toBeNull();
   });
@@ -101,12 +101,12 @@ describe('GithubConnectivityBanner', () => {
   it('surfaces the last poll error as a tooltip for diagnosis', () => {
     pollersState.data = [
       snapshot({
-        repo: 'user/down',
+        repo: 'https://github.com/user/down.git',
         health: 'failed',
         lastErrorMessage: 'pollPullRequests failed (exit=1): dial tcp: i/o timeout',
       }),
     ];
-    render(<GithubConnectivityBanner />);
+    render(<PlatformConnectivityBanner />);
     const banner = screen.getByText(/Platform unreachable/).closest('div');
     expect(banner?.getAttribute('title')).toContain('i/o timeout');
   });

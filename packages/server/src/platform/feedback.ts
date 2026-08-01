@@ -1,11 +1,10 @@
 import {
-  ackCarrierKey, ackRevisionKey, classifyCommentSource, collectValidAcks, projectCommentRow,
+  ackCarrierKey, ackRevisionKey, collectValidAcks, projectCommentRow,
   rowAcks, rowBodyDigest, rowHasBody, rowTokens,
-  type AckActorContext, type AckCarrierRow, type AckCollection, type CommentSourceClass,
+  type AckActorContext, type AckCarrierRow, type AckCollection,
 } from './markers.js';
 import { versionTimeOf, type NormalizedRow } from './row-schema.js';
-import type { CommentSourceOp } from './types.js';
-import type { OpVars } from './git-driver.js';
+import type { CommentSource, CommentSourceClass } from './types.js';
 import { deadTokens, type VerdictSourceScan } from './verdict-engine.js';
 
 export interface FeedbackSourceScan {
@@ -21,16 +20,16 @@ export interface PendingFeedbackResult {
 }
 
 export interface CommentSourceReader {
-  commentSources: CommentSourceOp[];
-  runCommentSource(
-    source: CommentSourceOp,
-    vars: OpVars,
+  readonly commentSources: readonly CommentSource[];
+  listComments(
+    source: CommentSource,
+    prNumber: number,
     projectPage?: (pageRows: NormalizedRow[]) => NormalizedRow[],
   ): Promise<NormalizedRow[]>;
 }
 
 export interface ScanRowCollector {
-  admitPage(source: CommentSourceOp, pageRows: readonly NormalizedRow[]): void;
+  admitPage(source: CommentSource, pageRows: readonly NormalizedRow[]): void;
   noteFailure(sourceKey: string, error: unknown): void;
 }
 
@@ -43,20 +42,19 @@ export async function scanCommentSourcesOnce(
 ): Promise<VerdictSourceScan[]> {
   const scans: VerdictSourceScan[] = [];
   for (const source of driver.commentSources) {
-    const sourceClass = classifyCommentSource(source);
     const scanStartedAt = now();
     try {
       let pagedInline = false;
-      const rows = await driver.runCommentSource(source, { prNumber }, pageRows => {
+      const rows = await driver.listComments(source, prNumber, pageRows => {
         pagedInline = true;
         collector?.admitPage(source, pageRows);
         for (const row of pageRows) projectCommentRow(row);
         return pageRows;
       });
       if (!pagedInline && collector !== undefined) collector.admitPage(source, rows);
-      scans.push({ key: source.key, sourceClass, ok: true, scanStartedAt, rows: rows.filter(r => r.system !== true) });
+      scans.push({ key: source.key, sourceClass: source.category, ok: true, scanStartedAt, rows });
     } catch (error) {
-      scans.push({ key: source.key, sourceClass, ok: false, scanStartedAt, rows: [] });
+      scans.push({ key: source.key, sourceClass: source.category, ok: false, scanStartedAt, rows: [] });
       collector?.noteFailure(source.key, error);
       onFailure?.(source.key, error);
     }
@@ -81,7 +79,6 @@ function unackedRevision(
   sourceKey: string,
   acks: AckCollection,
 ): { id: string; digest: string } | undefined {
-  if (row.system === true) return undefined;
   if (versionTimeOf(row) === undefined) return undefined;
   if (!rowHasBody(row)) return undefined;
   const id = String(row.id);

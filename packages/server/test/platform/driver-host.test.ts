@@ -1,153 +1,78 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { PluginRegistry } from '../../src/platform/plugin-registry.js';
-import { GitDriver, type DriverExecResult } from '../../src/platform/git-driver.js';
+import { describe, expect, it } from 'vitest';
+import { GitHubDriver } from '../../src/platform/github-driver.js';
 import { buildProjectDriver, makeDriverExec } from '../../src/platform/driver-host.js';
+import type { DriverExecResult } from '../../src/platform/types.js';
 import type { CommandRunner, ExecOptions, ExecResult } from '../../src/agent/runner.js';
 import type { ProjectConfig } from '../../src/shared/index.js';
-import { MANIFEST, DRIVER } from './plugin-fixtures.js';
 
-let base = '';
-let registry: PluginRegistry;
-
-async function writePlugin(root: string, tool: string): Promise<void> {
-  const p = join(root, tool);
-  await mkdir(p, { recursive: true });
-  await writeFile(join(p, 'baxian-plugin.json'), MANIFEST(tool));
-  await writeFile(join(p, 'driver.json'), DRIVER);
-  const skillDir = join(p, 'skills', `baxian-cli-${tool}`);
-  await mkdir(skillDir, { recursive: true });
-  await writeFile(join(skillDir, 'SKILL.md'), `---\nname: baxian-cli-${tool}\ndescription: ops manual\n---\nbody`);
-}
-
-function project(over: Partial<ProjectConfig> = {}): ProjectConfig {
-  return { id: 'p1', repo: 'git@github.com:owner/repo.git', agent: [], ...over } as ProjectConfig;
-}
-
-beforeEach(async () => {
-  base = await mkdtemp(join(tmpdir(), 'bx-driver-host-'));
-  const builtin = join(base, 'builtin');
-  const user = join(base, 'user');
-  await mkdir(builtin, { recursive: true });
-  await mkdir(user, { recursive: true });
-  await writePlugin(builtin, 'gh');
-  await writePlugin(user, 'forge');
-  registry = (await PluginRegistry.load({ builtin, user })).registry;
-});
-
-afterEach(async () => {
-  await rm(base, { recursive: true, force: true });
-});
-
-const NO_EXEC = () => Promise.reject(new Error('exec must not run in construction'));
+const project: ProjectConfig = {
+  id: 'p1',
+  repo: 'git@github.com:owner/repo.git',
+  merge: null,
+  agent: [],
+};
+const NO_EXEC = () => Promise.reject(new Error('exec must not run during construction'));
 
 describe('buildProjectDriver', () => {
-  it('resolves the github zero-config path to the gh plugin', () => {
-    const driver = buildProjectDriver(project(), registry, NO_EXEC);
-    expect(driver).toBeInstanceOf(GitDriver);
+  it('builds the currently supported GitHub driver', () => {
+    const first = buildProjectDriver(project, NO_EXEC);
+    const second = buildProjectDriver(project, NO_EXEC);
+    expect(first).toBeInstanceOf(GitHubDriver);
+    expect(second).toBeInstanceOf(GitHubDriver);
+    expect(second).not.toBe(first);
   });
 
-  it('uses the declared gitCli tool for non-github repos', () => {
-    const driver = buildProjectDriver(
-      project({ repo: 'https://git.corp.example.com/group/proj.git', gitCli: { tool: 'forge', binary: '/opt/bin/forge' } }),
-      registry,
-      NO_EXEC,
-    );
-    expect(driver).toBeInstanceOf(GitDriver);
-  });
-
-  it('gives equivalent reconstructed drivers a stable preflight identity', () => {
-    const first = buildProjectDriver(project(), registry, NO_EXEC)!;
-    const second = buildProjectDriver(project(), registry, NO_EXEC)!;
-    const differentBinary = buildProjectDriver(
-      project({ gitCli: { tool: 'gh', binary: '/opt/bin/gh' } }),
-      registry,
-      NO_EXEC,
-    )!;
-    expect(second.preflightIdentity).toBe(first.preflightIdentity);
-    expect(differentBinary.preflightIdentity).not.toBe(first.preflightIdentity);
-  });
-
-  it('returns undefined when the tool is unresolvable or the plugin is absent', () => {
-    expect(buildProjectDriver(project({ repo: 'https://git.corp.example.com/g/p.git' }), registry, NO_EXEC))
-      .toBeUndefined();
-    expect(buildProjectDriver(project({ gitCli: { tool: 'unknown-tool' } }), registry, NO_EXEC))
-      .toBeUndefined();
+  it('rejects repositories that the current platform resolver does not support', () => {
+    expect(() => buildProjectDriver({ ...project, repo: 'https://gitlab.com/o/r.git' }, NO_EXEC))
+      .toThrow(/GitHub driver requires/);
   });
 });
 
 describe('makeDriverExec', () => {
-  function runnerWith(result: ExecResult): CommandRunner {
+  function runnerWith(value: ExecResult): CommandRunner {
     return {
-      exec: async (_command: string, _options?: ExecOptions) => result,
+      exec: async () => value,
       writeFile: async () => undefined,
-      execWithStdin: async () => result,
+      execWithStdin: async () => value,
     };
   }
 
-  it('passes the command through and resolves non-zero exit codes', async () => {
-    const exec = makeDriverExec(runnerWith({ stdout: 'out', stderr: 'HTTP 404', exitCode: 1 }));
-    const result: DriverExecResult = await exec('gh api x', { timeout: 1000, maxBuffer: 1024 });
-    expect(result).toEqual({ stdout: 'out', stderr: 'HTTP 404', exitCode: 1 });
-  });
-
-  it('forwards timeout and maxBuffer to the runner', async () => {
+  it('passes through non-zero results and execution limits', async () => {
     let seen: ExecOptions | undefined;
     const runner: CommandRunner = {
-      exec: async (_command: string, options?: ExecOptions) => {
+      ...runnerWith({ stdout: 'out', stderr: 'HTTP 404', exitCode: 1 }),
+      exec: async (_command, options) => {
         seen = options;
-        return { stdout: '', stderr: '', exitCode: 0 };
+        return { stdout: 'out', stderr: 'HTTP 404', exitCode: 1 };
       },
-      writeFile: async () => undefined,
-      execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
-    await makeDriverExec(runner)('gh api y', { timeout: 1234, maxBuffer: 4096 });
+    const value: DriverExecResult = await makeDriverExec(runner)('gh api x', {
+      timeout: 1234,
+      maxBuffer: 4096,
+    });
+    expect(value).toEqual({ stdout: 'out', stderr: 'HTTP 404', exitCode: 1 });
     expect(seen).toEqual({ timeout: 1234, maxBuffer: 4096 });
   });
 
   it('uses execWithStdin whenever stdin is present, including an empty buffer', async () => {
     let seen: { command: string; stdin: Buffer; options?: ExecOptions } | undefined;
     const runner: CommandRunner = {
-      exec: async () => {
-        throw new Error('plain exec must not receive stdin-backed driver operations');
-      },
+      exec: async () => { throw new Error('plain exec must not receive stdin-backed operations'); },
       writeFile: async () => undefined,
       execWithStdin: async (command, stdin, options) => {
         seen = { command, stdin, options };
         return { stdout: '', stderr: '', exitCode: 0 };
       },
     };
-
     await makeDriverExec(runner)('gh api comment', {
       timeout: 1234,
       maxBuffer: 4096,
       stdin: Buffer.alloc(0),
     });
-
     expect(seen).toEqual({
       command: 'gh api comment',
       stdin: Buffer.alloc(0),
       options: { timeout: 1234, maxBuffer: 4096 },
     });
-  });
-});
-
-describe('GitDriver.runPreflightSteps', () => {
-  function driverWith(result: ExecResult) {
-    return buildProjectDriver(project(), registry, async () => result)!;
-  }
-
-  it('classifies a rate-limited step from raw output and never returns it', async () => {
-    const driver = driverWith({ stdout: 'secret-diagnostic', stderr: 'HTTP 429 rate limit exceeded', exitCode: 1 });
-    await expect(driver.runPreflightSteps()).rejects.toMatchObject({ info: { errorClass: 'RATE_LIMIT' } });
-  });
-
-  it('returns plain results for a non-rate-limit failure', async () => {
-    const driver = driverWith({ stdout: 'secret-diagnostic', stderr: 'command not found', exitCode: 127 });
-    const results = await driver.runPreflightSteps();
-    expect(results.some(r => !r.ok)).toBe(true);
-    expect(JSON.stringify(results)).not.toContain('secret-diagnostic');
   });
 });

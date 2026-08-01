@@ -3,7 +3,7 @@ import type { AgentRole, TaskPhase, TaskStatus } from './types.js';
 export const DEFAULT_REVIEW_ROUNDS = 10;
 export const DEFAULT_SERVER_PORT = 3000;
 export const DEFAULT_SERVER_HOST = '127.0.0.1';
-export const DEFAULT_GITHUB_POLL_INTERVAL_MS = 30_000;
+export const DEFAULT_PLATFORM_POLL_INTERVAL_MS = 30_000;
 export const DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS = 10_000;
 export const DEFAULT_TMUX_PROBE_TIMEOUT_MS = 3_000;
 export const DEFAULT_TMUX_PROBE_CONCURRENCY = 4;
@@ -16,7 +16,7 @@ export type TerminalInterventionPhase = 'attach' | 'detach' | 'input' | 'close';
 export const DEFAULT_SERVER_CONFIG = {
   port: DEFAULT_SERVER_PORT,
   host: DEFAULT_SERVER_HOST,
-  githubPollIntervalMs: DEFAULT_GITHUB_POLL_INTERVAL_MS,
+  platformPollIntervalMs: DEFAULT_PLATFORM_POLL_INTERVAL_MS,
   tmuxProbePollIntervalMs: DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS,
   tmuxProbeTimeoutMs: DEFAULT_TMUX_PROBE_TIMEOUT_MS,
   tmuxProbeConcurrency: DEFAULT_TMUX_PROBE_CONCURRENCY,
@@ -54,7 +54,6 @@ export const PET_UPLOAD_ROUTE_BODY_LIMIT = 12 * 1024 * 1024;
 
 export const MAX_INLINE_CONTENT_BYTES = 10 * 1024;
 
-export const TOOL_PATTERN = /^[a-z][a-z0-9-]*$/;
 export const CONTROL_CHAR_RE = /\p{Cc}/u;
 
 export type DispatchPhase =
@@ -65,21 +64,6 @@ export type DispatchPhase =
   | 'merge'
   | 'review'
   | 'recheck';
-
-export const AGENT_PHASES: Record<AgentRole, Record<string, { skills: string[] }>> = {
-  dev: {
-    develop: { skills: ['baxian-task-check'] },
-    fix: { skills: ['baxian-pr-feedback'] },
-    'post-approve': { skills: ['baxian-pr-feedback'] },
-    merge: { skills: [] },
-    code: { skills: ['baxian-task-check'] },
-  },
-  qa: {
-    review: { skills: ['baxian-pr-review'] },
-    recheck: { skills: ['baxian-pr-recheck'] },
-    merge: { skills: [] },
-  },
-};
 
 export const PHASE_EXPECTED_STATUS: Record<string, TaskStatus[]> = {
   develop: ['in_progress'],

@@ -10,7 +10,7 @@ import {
   execOutcomeUnknown,
 } from './net-exec.js';
 import type { AgentMode, HostConfig } from '../shared/index.js';
-import { isGitHubRepo, normalizeRepoUrl, parseGitRemote, parseRepoUrlParts, redactGitCredentials, repoSlug } from '../shared/index.js';
+import { normalizeRepoUrl, redactGitCredentials } from '../shared/index.js';
 
 export interface RepoStoreCache {
   homes: Map<string, string>;
@@ -89,7 +89,7 @@ export async function ensureBaxianRuntimeDirsSafe(
   }
 }
 
-export function trashBatchDirUnder(trashRoot: string, reason: string): string {
+function trashBatchDirUnder(trashRoot: string, reason: string): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   return `${trashRoot}/${stamp}-${reason}-${randomUUID().slice(0, 8)}`;
 }
@@ -226,8 +226,6 @@ export async function moveFileIntoPlace(
 }
 
 export class RepoStore {
-  private readonly isGitHub: boolean;
-  private readonly cloneWithGh: boolean;
   private readonly repo: string;
 
   constructor(
@@ -238,11 +236,8 @@ export class RepoStore {
     private cache: RepoStoreCache,
     private agentId: string,
     private configuredWorkdir?: string,
-    cloneViaGh?: boolean,
   ) {
     this.repo = repo.trim();
-    this.isGitHub = isGitHubRepo(this.repo);
-    this.cloneWithGh = cloneViaGh ?? this.isGitHub;
   }
 
   async ensure(): Promise<string> {
@@ -347,9 +342,7 @@ export class RepoStore {
       const staging = `${absRepoPath}.claim-${randomUUID()}`;
       const mk = await this.runner.exec(`mkdir -p ${shellQuote(parent)}`);
       if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent}: ${mk.stderr}`);
-      const cloneCmd = this.cloneWithGh
-        ? `${this.ghCloneHostEnv()}${GIT_NET_ENV} gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(staging)} --no-upstream`
-        : `${GIT_NET_ENV} git clone ${shellQuote(this.repo)} ${shellQuote(staging)}`;
+      const cloneCmd = `${GIT_NET_ENV} git clone ${shellQuote(this.repo)} ${shellQuote(staging)}`;
       let clone: ExecResult;
       try {
         clone = await execNetwork(this.runner, cloneCmd, {
@@ -362,13 +355,9 @@ export class RepoStore {
       }
       if (clone.exitCode !== 0) {
         await this.trashStaging(staging, `clone exit ${clone.exitCode}`);
-        const cmd = this.cloneWithGh ? 'gh repo clone' : 'git clone';
-        throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
+        throw new Error(redactGitCredentials(`git clone ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
       await this.promoteStaging(staging, absRepoPath);
-      if (this.isGitHub && parseGitRemote(this.repo) !== null) {
-        return this.syncMatchingOriginUrl(absRepoPath);
-      }
       return false;
     }
 
@@ -403,17 +392,6 @@ export class RepoStore {
     }
 
     return this.syncMatchingOriginUrl(absRepoPath);
-  }
-
-  private ghCloneHostEnv(): string {
-    let host: string | undefined = 'github.com';
-    if (!this.isGitHub) {
-      const parts = parseRepoUrlParts(this.repo);
-      host = parts === null
-        ? undefined
-        : parts.port === '' ? parts.hostname : `${parts.hostname}:${parts.port}`;
-    }
-    return host === undefined ? '' : `GH_HOST=${shellQuote(host)} `;
   }
 
   private async probe(cmd: string, what: string): Promise<ExecResult> {
@@ -525,7 +503,6 @@ export class RepoStore {
   }
 
   private async syncOriginUrl(absRepoPath: string, originUrl: string): Promise<boolean> {
-    if (parseGitRemote(this.repo) === null) return false;
     if (!accessMethodDiffers(this.repo, originUrl)) return false;
     const unset = await this.probe(
       `git -C ${shellQuote(absRepoPath)} config --unset-all remote.origin.pushurl`,
@@ -548,12 +525,9 @@ export class RepoStore {
   }
 
   private originMatches(originUrl: string): boolean {
-    if (this.isGitHub) {
-      return normalizeRepoUrl(originUrl)?.toLowerCase() === repoSlug(this.repo).toLowerCase();
-    }
-    const want = parseGitRemote(this.repo);
-    const got = parseGitRemote(originUrl);
-    return want !== null && got !== null && want.host === got.host && want.path === got.path;
+    const expected = normalizeRepoUrl(this.repo);
+    const actual = normalizeRepoUrl(originUrl);
+    return expected !== null && actual !== null && expected.toLowerCase() === actual.toLowerCase();
   }
 
   private async probeDirExists(absRepoPath: string): Promise<boolean> {

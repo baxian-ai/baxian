@@ -1,5 +1,5 @@
 import type { BaxianConfig, AgentConfig, ProjectConfig, BaxianEvent, HostConfig } from '../shared/index.js';
-import { isGitHubRepo, parseGitRemote, redactGitCredentials } from '../shared/index.js';
+import { redactGitCredentials } from '../shared/index.js';
 import type { AgentStore } from '../state/agent-store.js';
 import type { ErrorRecordStore } from '../state/error-record-store.js';
 import type { EventBus } from '../event/bus.js';
@@ -7,7 +7,6 @@ import type { CommandRunner } from './runner.js';
 import { createRunner, resolveAgentHost } from './runner.js';
 import { RepoStore, type RepoStoreCache } from './repo-store.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
-import { resolveProjectTool } from '../config/validator.js';
 
 export interface BootstrapDeps {
   config: BaxianConfig;
@@ -24,7 +23,6 @@ export interface BootstrapDeps {
     cache: RepoStoreCache,
     agentId: string,
     workdir?: string,
-    cloneViaGh?: boolean,
   ) => RepoStore;
   onAgentAffected?: (agentIds: string[]) => void;
 }
@@ -92,15 +90,12 @@ export async function runSingleTarget(
     const runner = deps.runnerFactory
       ? deps.runnerFactory(rep)
       : createRunner(rep.mode, target.resolvedHost);
-    const cloneViaGh = resolveProjectTool(target.project) === 'gh';
     const repoStore = deps.repoStoreFactory
       ? deps.repoStoreFactory(
           runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache, rep.id, rep.workdir,
-          cloneViaGh,
         )
       : new RepoStore(
           runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache, rep.id, rep.workdir,
-          cloneViaGh,
         );
     workdir = await repoStore.ensure();
   } catch (err) {
@@ -167,25 +162,24 @@ export async function runSingleTarget(
   return { ok: false, failureMessage: message };
 }
 
-const STRONG_ACCESS_PATTERNS = [
-  /could not resolve to a repository/i,
-  /repository not found/i,
-  /\bGraphQL:/,
-];
-
-const GENERIC_AUTH_PATTERNS = [
-  /permission denied/i,
+const REPOSITORY_ACCESS_PATTERNS = [
+  /repository(?:[^\n]*?)not found/i,
+  /could not read (?:Username|Password)/i,
   /authentication failed/i,
-  /access denied/i,
-  /\b(HTTP\s+)?404\b/,
+  /permission denied \(publickey\)/i,
 ];
 
-const GITHUB_CONTEXT_PATTERNS = [
-  /github\.com/i,
-  /\bgit@/,
+const AMBIGUOUS_ACCESS_PATTERNS = [
+  /permission denied/i,
+  /access denied/i,
+  /\b(?:HTTP\s+)?(?:401|403|404)\b/i,
+];
+
+const GIT_ACCESS_CONTEXT_PATTERNS = [
+  /\bgit (?:clone|fetch|ls-remote)\b/i,
+  /(?:https?|ssh):\/\//i,
+  /\bgit@/i,
   /\(publickey\)/i,
-  /gh repo/i,
-  /^gh:\s/m,
 ];
 
 export function classifyBootstrapError(message: string, repo: string): {
@@ -193,51 +187,23 @@ export function classifyBootstrapError(message: string, repo: string): {
   message: string;
   recommendation: string;
 } {
-  if (!isGitHubRepo(repo)) return classifyGenericGitError(message, repo);
-  const accessDenied = STRONG_ACCESS_PATTERNS.some(re => re.test(message))
-    || (GENERIC_AUTH_PATTERNS.some(re => re.test(message))
-        && GITHUB_CONTEXT_PATTERNS.some(re => re.test(message)));
+  const safeMessage = redactGitCredentials(message);
+  const localFilesystemFailure = /\b(?:EACCES|EPERM)\b/i.test(message)
+    || /permission denied[\s\S]*?\b(?:mkdir|open|write|unlink|rename)\b/i.test(message);
+  const accessDenied = !localFilesystemFailure
+    && (REPOSITORY_ACCESS_PATTERNS.some(re => re.test(message))
+      || (AMBIGUOUS_ACCESS_PATTERNS.some(re => re.test(message))
+        && GIT_ACCESS_CONTEXT_PATTERNS.some(re => re.test(message))));
   if (accessDenied) {
     return {
       reason: 'BOOTSTRAP_REPO_ACCESS_DENIED',
-      message: `GitHub repo "${repo}" not found or access denied (underlying error: ${message}).`,
-      recommendation: `Verify the repo URL and grant the host's gh account collaborator access to "${repo}", then retry.`,
+      message: `Repository "${redactGitCredentials(repo)}" not found or access denied (underlying error: ${safeMessage}).`,
+      recommendation: 'Verify the repo URL and this host\'s HTTPS credential helper or SSH key, then retry.',
     };
   }
   return {
     reason: 'BOOTSTRAP_REPO_ENSURE_FAILED',
-    message,
-    recommendation: 'Check repository access and retry bootstrap.',
-  };
-}
-
-function classifyGenericGitError(message: string, repo: string): {
-  reason: string;
-  message: string;
-  recommendation: string;
-} {
-  const host = parseGitRemote(repo)?.host;
-  const gitContext = /(?:https?|ssh):\/\//i.test(message)
-    || /\bgit@/.test(message)
-    || /\(publickey\)/i.test(message);
-  const accessDenied = gitContext && (
-    GENERIC_AUTH_PATTERNS.some(re => re.test(message))
-    || /could not read (?:Username|Password)/i.test(message)
-    || /\brepository\b[\s\S]*?\bnot found\b/i.test(message)
-    || /could not be found/i.test(message)
-  );
-  if (accessDenied) {
-    return {
-      reason: 'BOOTSTRAP_REPO_ACCESS_DENIED',
-      message: redactGitCredentials(`Repo "${repo}" not found or access denied (underlying error: ${message}).`),
-      recommendation:
-        `Verify the repo URL and the git credentials (HTTPS credential helper or SSH key) for ` +
-        `${host ?? 'this host'}, then retry.`,
-    };
-  }
-  return {
-    reason: 'BOOTSTRAP_REPO_ENSURE_FAILED',
-    message,
+    message: safeMessage,
     recommendation: 'Check repository access and retry bootstrap.',
   };
 }

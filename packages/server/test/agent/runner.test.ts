@@ -410,12 +410,12 @@ describe('SshRunner.writeFile (stdin streaming, no ARG_MAX ceiling)', () => {
   it('sends mkdir -p + cat > against shell-quoted paths as the remote command', async () => {
     const { runner: local, calls } = captureLocal();
     const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.writeFile('/srv/baxian/skills/foo/SKILL.md', 'x');
+    await ssh.writeFile('/srv/baxian/artifacts/task/put-spec', 'x');
     const cmd = calls[0].cmd;
     expect(cmd).toContain('mkdir -p');
-    expect(cmd).toContain('/srv/baxian/skills/foo');
+    expect(cmd).toContain('/srv/baxian/artifacts/task');
     expect(cmd).toContain('cat >');
-    expect(cmd).toContain('/srv/baxian/skills/foo/SKILL.md');
+    expect(cmd).toContain('/srv/baxian/artifacts/task/put-spec');
     expect(calls[0].stdin!.equals(Buffer.from('x', 'utf8'))).toBe(true);
   });
 

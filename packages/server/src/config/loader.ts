@@ -8,7 +8,7 @@ import {
   DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS,
   DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS,
   DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS,
-  DEFAULT_GITHUB_POLL_INTERVAL_MS,
+  DEFAULT_PLATFORM_POLL_INTERVAL_MS,
   DEFAULT_REVIEW_ROUNDS,
   DEFAULT_SERVER_HOST,
   DEFAULT_SERVER_PORT,
@@ -16,12 +16,10 @@ import {
   DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS,
   DEFAULT_TMUX_PROBE_TIMEOUT_MS,
 } from '../shared/index.js';
-import { normalizeConfig } from './normalizer.js';
 import {
-  collectUnknownConfigWarnings,
+  collectUnknownConfigErrors,
   validateConfig,
   type ValidationError,
-  type ValidationWarning,
 } from './validator.js';
 import { backupConfig } from './backup.js';
 
@@ -33,17 +31,24 @@ export class ConfigValidationError extends Error {
   }
 }
 
-export function prepareConfigWithWarnings(
-  raw: unknown,
-): { config: BaxianConfig; warnings: ValidationWarning[] } {
+export function prepareConfig(raw: unknown): BaxianConfig {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     const got = Array.isArray(raw) ? 'array' : raw === null ? 'null' : typeof raw;
     throw new ConfigValidationError([
       { path: '', message: `config must be a JSON object (got ${got})` },
     ]);
   }
-  const normalized = normalizeConfig(raw);
-  const warnings = collectUnknownConfigWarnings(normalized);
+  const normalized = raw as Record<string, unknown>;
+  const unknownErrors = collectUnknownConfigErrors(normalized);
+  if (unknownErrors.length > 0) throw new ConfigValidationError(unknownErrors);
+  for (const section of ['review', 'server'] as const) {
+    const value = normalized[section];
+    if (value !== undefined && !isRecord(value)) {
+      throw new ConfigValidationError([
+        { path: section, message: `${section} must be an object` },
+      ]);
+    }
+  }
   if ('project' in normalized && normalized.project !== undefined && !Array.isArray(normalized.project)) {
     throw new ConfigValidationError([
       { path: 'project', message: 'project must be an array' },
@@ -71,20 +76,12 @@ export function prepareConfigWithWarnings(
   if (errors.length > 0) {
     throw new ConfigValidationError(errors);
   }
-  return { config, warnings };
-}
-
-export function prepareConfig(raw: unknown): BaxianConfig {
-  return prepareConfigWithWarnings(raw).config;
+  return config;
 }
 
 export async function loadConfig(configPath: string): Promise<BaxianConfig> {
   const raw = await readFile(configPath, 'utf-8');
-  const result = prepareConfigWithWarnings(JSON.parse(raw));
-  for (const warning of result.warnings) {
-    console.warn(`[config] ${warning.path}: ${warning.message}`);
-  }
-  return result.config;
+  return prepareConfig(JSON.parse(raw));
 }
 
 export function resolveHome(explicit?: string): string {
@@ -184,10 +181,6 @@ function validateProjectShapes(project: unknown): ValidationError[] {
   });
   return errors;
 }
-function isFiniteNumber(v: unknown): v is number {
-  return typeof v === 'number' && Number.isFinite(v);
-}
-
 function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
   const rv = isRecord(normalized.review) ? normalized.review : {};
   const sv = isRecord(normalized.server) ? normalized.server : {};
@@ -206,22 +199,24 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
       ? { language: normalized.language as BaxianConfig['language'] }
       : {}),
     review: {
-      rounds: isFiniteNumber(rv.rounds) ? rv.rounds : DEFAULT_REVIEW_ROUNDS,
+      rounds: (rv.rounds === undefined ? DEFAULT_REVIEW_ROUNDS : rv.rounds) as number,
     },
     server: {
-      port: isFiniteNumber(sv.port) ? sv.port : DEFAULT_SERVER_PORT,
-      host: typeof sv.host === 'string' ? sv.host : DEFAULT_SERVER_HOST,
-      ...(typeof sv.token === 'string' && sv.token.trim().length > 0 ? { token: sv.token } : {}),
+      port: (sv.port === undefined ? DEFAULT_SERVER_PORT : sv.port) as number,
+      host: (sv.host === undefined ? DEFAULT_SERVER_HOST : sv.host) as string,
+      ...(sv.token === undefined ? {} : { token: sv.token as string }),
       ...(hasHttps ? { https: sv.https as unknown as ServerConfig['https'] } : {}),
       ...(hasAllowedHosts ? { allowedHosts: sv.allowedHosts as unknown as string[] } : {}),
-      githubPollIntervalMs: isFiniteNumber(sv.githubPollIntervalMs) ? sv.githubPollIntervalMs : DEFAULT_GITHUB_POLL_INTERVAL_MS,
-      tmuxProbePollIntervalMs: isFiniteNumber(sv.tmuxProbePollIntervalMs) ? sv.tmuxProbePollIntervalMs : DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS,
-      tmuxProbeTimeoutMs: isFiniteNumber(sv.tmuxProbeTimeoutMs) ? sv.tmuxProbeTimeoutMs : DEFAULT_TMUX_PROBE_TIMEOUT_MS,
-      tmuxProbeConcurrency: isFiniteNumber(sv.tmuxProbeConcurrency) ? sv.tmuxProbeConcurrency : DEFAULT_TMUX_PROBE_CONCURRENCY,
-      bootstrapRetryIntervalMs: isFiniteNumber(sv.bootstrapRetryIntervalMs) ? sv.bootstrapRetryIntervalMs : DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
-      dispatchReconcileIntervalMs: isFiniteNumber(sv.dispatchReconcileIntervalMs) ? sv.dispatchReconcileIntervalMs : DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS,
-      dispatchBusyWaitBudgetMs: isFiniteNumber(sv.dispatchBusyWaitBudgetMs) ? sv.dispatchBusyWaitBudgetMs : DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS,
-      dispatchReconcileMaxAttempts: isFiniteNumber(sv.dispatchReconcileMaxAttempts) ? sv.dispatchReconcileMaxAttempts : DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS,
+      platformPollIntervalMs: (sv.platformPollIntervalMs === undefined
+        ? DEFAULT_PLATFORM_POLL_INTERVAL_MS
+        : sv.platformPollIntervalMs) as number,
+      tmuxProbePollIntervalMs: (sv.tmuxProbePollIntervalMs === undefined ? DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS : sv.tmuxProbePollIntervalMs) as number,
+      tmuxProbeTimeoutMs: (sv.tmuxProbeTimeoutMs === undefined ? DEFAULT_TMUX_PROBE_TIMEOUT_MS : sv.tmuxProbeTimeoutMs) as number,
+      tmuxProbeConcurrency: (sv.tmuxProbeConcurrency === undefined ? DEFAULT_TMUX_PROBE_CONCURRENCY : sv.tmuxProbeConcurrency) as number,
+      bootstrapRetryIntervalMs: (sv.bootstrapRetryIntervalMs === undefined ? DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS : sv.bootstrapRetryIntervalMs) as number,
+      dispatchReconcileIntervalMs: (sv.dispatchReconcileIntervalMs === undefined ? DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS : sv.dispatchReconcileIntervalMs) as number,
+      dispatchBusyWaitBudgetMs: (sv.dispatchBusyWaitBudgetMs === undefined ? DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS : sv.dispatchBusyWaitBudgetMs) as number,
+      dispatchReconcileMaxAttempts: (sv.dispatchReconcileMaxAttempts === undefined ? DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS : sv.dispatchReconcileMaxAttempts) as number,
     },
     host: hosts,
     project: projects.map(applyProjectDefaults),
@@ -236,7 +231,6 @@ function applyProjectDefaults(p: Record<string, unknown>): ProjectConfig {
     ...(p.specApproval !== undefined
       ? { specApproval: p.specApproval as ProjectConfig['specApproval'] }
       : {}),
-    ...(p.gitCli !== undefined ? { gitCli: p.gitCli as ProjectConfig['gitCli'] } : {}),
     agent: Array.isArray(p.agent)
       ? (p.agent as Record<string, unknown>[][]).map(team => team.map(applyAgentDefaults))
       : [],

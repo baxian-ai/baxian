@@ -29,7 +29,7 @@ const DRAFT_KEY_BAXIAN = 'baxian.draft.createTask:baxian';
 function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
   return makeProjectFixture({
     id: 'baxian',
-    repo: 'baxian-ai/baxian',
+    repo: 'https://github.com/baxian-ai/baxian.git',
     merge: 'auto',
     agent: [[
       { id: 'bx-dev', runtime: 'claude-code', role: 'dev', mode: 'local' },

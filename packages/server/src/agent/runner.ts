@@ -207,12 +207,10 @@ function ensureAskpassHelper(): Promise<string> {
 
 export function resolveAgentHost(
   hosts: HostConfig[] | undefined,
-  ref: string | HostConfig | undefined,
+  ref: string | undefined,
 ): HostConfig | undefined {
   if (ref === undefined) return undefined;
-  const host: unknown = typeof ref === 'string'
-    ? (hosts ?? []).find(h => h.id === ref)
-    : ref;
+  const host: unknown = (hosts ?? []).find(h => h.id === ref);
   return isUsableHostConfig(host) ? host : undefined;
 }
 

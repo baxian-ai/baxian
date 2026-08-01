@@ -48,13 +48,6 @@ describe('row-schema: listPrs/prView', () => {
     expect(validateRows('listPrs', [{ ...PR_ROW, updatedAt: '2026-07-17T12:00:00+23:59' }])).toHaveLength(1);
   });
 
-  it('validates system as a strict boolean', () => {
-    const ts = '2026-07-17T01:02:03Z';
-    expect(validateRows('listComments', [{ id: 1, body: 'x', createdAt: ts, system: true }])[0]!.system).toBe(true);
-    expect(() => validateRows('listComments', [{ id: 1, body: 'x', createdAt: ts, system: 'false' }]))
-      .toThrow(RowSchemaError);
-  });
-
   it('rejects out-of-domain state even after translation', () => {
     expect(() => validateRows('listPrs', [{ ...PR_ROW, state: 'opened' }])).toThrow(RowSchemaError);
   });

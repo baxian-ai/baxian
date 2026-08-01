@@ -29,7 +29,7 @@ function makeConfig(agents: AgentConfig[]): BaxianConfig {
     server: DEFAULT_SERVER_CONFIG,
     project: [{
       id: 'proj',
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       merge: null,
       agent: agents.map(agent => [agent]),
     }],
@@ -930,7 +930,7 @@ describe('TmuxProbePoller', () => {
     const baseConfig: BaxianConfig = {
       review: { rounds: 10 },
       server: { ...DEFAULT_SERVER_CONFIG, tmuxProbePollIntervalMs: 2000 },
-      project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[ag1]] }],
+      project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[ag1]] }],
     };
     const exec = vi.fn(async () => present);
     const poller = makePoller({
@@ -966,7 +966,7 @@ describe('TmuxProbePoller', () => {
     const baseConfig: BaxianConfig = {
       review: { rounds: 10 },
       server: { ...DEFAULT_SERVER_CONFIG, tmuxProbeConcurrency: 2, tmuxProbeTimeoutMs: 1500 },
-      project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[makeAgent('dev-1')]] }],
+      project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[makeAgent('dev-1')]] }],
     };
     const poller = makePoller({
       config: baseConfig,
@@ -995,7 +995,7 @@ describe('TmuxProbePoller', () => {
         tmuxProbeTimeoutMs: 4000,
         tmuxProbeConcurrency: 8,
       },
-      project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[makeAgent('dev-1')]] }],
+      project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[makeAgent('dev-1')]] }],
     };
     const poller = makePoller({
       config: customConfig,

@@ -6,8 +6,7 @@ import { BRANCH_PREFIX } from '../shared/constants.js';
 import { repoIdentityKey } from '../shared/git-url.js';
 import { TASK_TERMINAL_STATUS_SET } from '../shared/constants.js';
 import type { TaskState } from '../shared/types.js';
-import type { CommentSourceOp, MappedEvent } from './types.js';
-import { DriverOpError, type OpVars } from './git-driver.js';
+import { DriverOpError, type PlatformDriver, type PlatformEvent } from './types.js';
 import type { NormalizedRow } from './row-schema.js';
 import { versionTimeOf } from './row-schema.js';
 import { CommentCursorStore } from './comment-cursor.js';
@@ -61,20 +60,6 @@ export function platformTaskView(task: TaskState): PlatformTaskView {
   };
 }
 
-export interface PlatformDriver {
-  readonly visibilityLagMs: number;
-  readonly commentSources: CommentSourceOp[];
-  readonly preflightIdentity?: string;
-  runPreflightSteps?(): Promise<Array<{ step: string; ok: boolean; message: string }>>;
-  runOp(opName: string, vars?: OpVars): Promise<NormalizedRow[]>;
-  runListPrs(vars: OpVars, shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean): Promise<NormalizedRow[]>;
-  runCommentSource(
-    source: CommentSourceOp,
-    vars: OpVars,
-    projectPage?: (pageRows: NormalizedRow[]) => NormalizedRow[],
-  ): Promise<NormalizedRow[]>;
-}
-
 export interface PlatformPollerEntryInit {
   projectId: string;
   repoUrl: string;
@@ -83,7 +68,7 @@ export interface PlatformPollerEntryInit {
 }
 
 export interface PlatformPollerOptions {
-  onEvent: (projectId: string, event: MappedEvent) => void | Promise<void>;
+  onEvent: (projectId: string, event: PlatformEvent) => void | Promise<void>;
   tasks: PlatformTasksProvider;
   task: (taskId: string) => Promise<PlatformTaskView | null>;
   now?: () => number;
@@ -247,11 +232,6 @@ export class PlatformPoller {
   ): void {
     if (entry.retired) return;
     entry.projectId = init.projectId;
-    const samePreflight = entry.driver.preflightIdentity !== undefined
-      && init.driver.preflightIdentity !== undefined
-      ? entry.driver.preflightIdentity === init.driver.preflightIdentity
-      : entry.driver === init.driver;
-    if (!samePreflight) entry.preflightPassed = undefined;
     entry.driver = init.driver;
   }
 
@@ -483,7 +463,7 @@ export class PlatformPoller {
       if (!activePrs.has(Number(key.split(':')[0]))) entry.loggedUndated.delete(key);
     }
 
-    if (entry.preflightPassed !== true && entry.driver.runPreflightSteps !== undefined) {
+    if (entry.preflightPassed !== true) {
       let steps: Array<{ step: string; ok: boolean; message: string }>;
       try {
         steps = await entry.driver.runPreflightSteps();
@@ -503,14 +483,14 @@ export class PlatformPoller {
 
     let defaultBranch: string | undefined;
     try {
-      const [row] = await entry.driver.runOp('projectView');
+      const row = await entry.driver.projectView();
       this.assertEntryActive(entry);
       if (row !== undefined && typeof row.defaultBranch === 'string') {
         entry.defaultBranch = row.defaultBranch;
         entry.defaultBranchStale = 0;
         defaultBranch = row.defaultBranch;
       }
-      if (row !== undefined && entry.preflightPassed !== true && entry.driver.runPreflightSteps !== undefined) {
+      if (row !== undefined && entry.preflightPassed !== true) {
         if (row.pushPermitted === false) {
           fail('preflight-push', new Error(
             `push permission missing for ${entry.repoUrl} — server merge/close requires write access`,
@@ -518,7 +498,7 @@ export class PlatformPoller {
           return failures;
         } else {
           if (row.pushPermitted === undefined) {
-            console.warn(`[PlatformPoller] ${entry.repoKey}: plugin did not report pushPermitted — write access cannot be asserted`);
+            console.warn(`[PlatformPoller] ${entry.repoKey}: platform did not report push permission — write access cannot be asserted`);
           }
           entry.preflightPassed = true;
         }
@@ -568,7 +548,7 @@ export class PlatformPoller {
     const scanStartedAt = this.now();
     let prRows: NormalizedRow[];
     try {
-      prRows = await entry.driver.runListPrs({}, pageRows => {
+      prRows = await entry.driver.listPrs(pageRows => {
         if (prsCursor.watermarkTime === null) return false;
         return pageRows.some(r => {
           const vt = versionTimeOf(r);
@@ -600,7 +580,7 @@ export class PlatformPoller {
         byId.set(task.taskId, task);
         pendingByPr.set(pending.prNumber, pending.taskId);
         if (prRows.some(row => row.prNumber === pending.prNumber)) continue;
-        const [row] = await entry.driver.runOp('prView', { prNumber: pending.prNumber });
+        const row = await entry.driver.prView(pending.prNumber);
         this.assertEntryActive(entry);
         if (row !== undefined) prRows.push({ ...row, prNumber: pending.prNumber });
       } catch (e) {
@@ -770,7 +750,7 @@ export class PlatformPoller {
     const obsKey = `${task.taskId}:${prNumber}`;
     let prRow: NormalizedRow | undefined;
     try {
-      [prRow] = await entry.driver.runOp('prView', { prNumber });
+      prRow = await entry.driver.prView(prNumber);
       this.assertEntryActive(entry);
     } catch (e) {
       fail(`prView pr#${prNumber}`, e);
@@ -862,7 +842,7 @@ export class PlatformPoller {
     const fp = [task.passToken, task.failToken, decision.kind, decision.carrier.sourceKey, decision.carrier.id, decision.carrier.bodyDigest].join(':');
     if (entry.deliveredVerdicts.get(obsKey) === fp) return;
     try {
-      const [freshRow] = await entry.driver.runOp('prView', { prNumber });
+      const freshRow = await entry.driver.prView(prNumber);
       this.assertEntryActive(entry);
       const freshEligible = freshRow !== undefined
         && this.bindingCheck(task, freshRow, defaultBranch) === undefined
@@ -997,7 +977,7 @@ export class PlatformPoller {
   }
 
   private async emit(
-    entry: InternalEntry, type: MappedEvent['type'], data: Record<string, unknown>, taskId: string,
+    entry: InternalEntry, type: PlatformEvent['type'], data: Record<string, unknown>, taskId: string,
   ): Promise<void> {
     this.assertEntryActive(entry);
     await this.opts.onEvent(entry.projectId, { type, repo: entry.repoKey, data, taskId });

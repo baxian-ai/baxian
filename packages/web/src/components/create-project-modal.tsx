@@ -14,26 +14,12 @@ interface Props {
 }
 
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
-const HTTP_REPO_URL_PATTERN = /^https?:\/\/[^/\s]+\/[^\s]+$/;
-const BARE_REPO_SLUG_PATTERN = /^[^/\s:@]+\/[^/\s]+$/;
+const REPO_SEGMENT = '[A-Za-z0-9_-][A-Za-z0-9._-]*';
 const REPO_URL_PATTERNS = [
-  HTTP_REPO_URL_PATTERN,
-  /^ssh:\/\/git@github\.com\/[^\s]+$/,
-  /^git@github\.com:[^\s]+$/,
-  BARE_REPO_SLUG_PATTERN,
+  new RegExp(`^https://github\\.com/${REPO_SEGMENT}/${REPO_SEGMENT}(?:\\.git)?/?$`),
+  new RegExp(`^ssh://git@github\\.com/${REPO_SEGMENT}/${REPO_SEGMENT}(?:\\.git)?/?$`),
+  new RegExp(`^git@github\\.com:${REPO_SEGMENT}/${REPO_SEGMENT}(?:\\.git)?/?$`),
 ];
-
-function isBareSlug(repo: string): boolean {
-  return BARE_REPO_SLUG_PATTERN.test(repo.trim());
-}
-
-function isGitHubRepo(repo: string): boolean {
-  const value = repo.trim();
-  return isBareSlug(value)
-    || /^https?:\/\/github\.com\//.test(value)
-    || /^ssh:\/\/git@github\.com\//.test(value)
-    || /^git@github\.com:/.test(value);
-}
 
 export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const t = useT();
@@ -41,11 +27,9 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [repo, setRepo] = useState('');
   const [merge, setMerge] = useState<MergeStrategy>(null);
   const [specApproval, setSpecApproval] = useState<SpecApprovalStrategy>('human');
-  const [gitCliTool, setGitCliTool] = useState('');
-  const [gitCliNotes, setGitCliNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [fieldErrors, setFieldErrors] = useState<{ id?: string; repo?: string; gitCliTool?: string }>({});
+  const [fieldErrors, setFieldErrors] = useState<{ id?: string; repo?: string }>({});
   const [existingIds, setExistingIds] = useState<Set<string>>(new Set());
   const sessionRef = useRef(0);
   const { show } = useToast();
@@ -59,8 +43,6 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     setRepo('');
     setMerge(null);
     setSpecApproval('human');
-    setGitCliTool('');
-    setGitCliNotes('');
     setError(null);
     setFieldErrors({});
     setExistingIds(new Set());
@@ -81,10 +63,8 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     onClose();
   };
 
-  const showGitCli = repo.trim() !== '' && !isBareSlug(repo);
-
   const validate = (): boolean => {
-    const errs: { id?: string; repo?: string; gitCliTool?: string } = {};
+    const errs: { id?: string; repo?: string } = {};
     const normalizedRepo = repo.trim();
     if (!id) errs.id = t.createProject.required;
     else if (!ID_PATTERN.test(id)) errs.id = t.common.idFormatError;
@@ -95,10 +75,6 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     else if (!repoValid) {
       errs.repo = t.createProject.repoFormatError;
     }
-    if (repoValid && !isGitHubRepo(normalizedRepo) && gitCliTool.trim() === '') {
-      errs.gitCliTool = t.createProject.gitCliToolRequired;
-    }
-
     setFieldErrors(errs);
     return Object.keys(errs).length === 0;
   };
@@ -115,9 +91,6 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
         repo: repo.trim(),
         merge,
         ...(specApproval ? { specApproval } : {}),
-        ...(showGitCli && gitCliTool.trim()
-          ? { gitCli: { tool: gitCliTool.trim(), ...(gitCliNotes.trim() ? { notes: gitCliNotes.trim() } : {}) } }
-          : {}),
       });
       if (result.restartRequired) flagDirty();
       show({
@@ -236,30 +209,6 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
           </label>
         </div>
 
-        {showGitCli && (
-          <div>
-            <label className="mb-1 block">
-              <span className={labelCls}>{t.createProject.gitCliToolLabel}</span>
-              <input
-                value={gitCliTool}
-                onChange={e => setGitCliTool(e.target.value)}
-                placeholder={t.createProject.gitCliToolPlaceholder}
-                disabled={submitting}
-                className={inputCls}
-              />
-              {fieldErrors.gitCliTool && <div className={fieldErrCls}>{fieldErrors.gitCliTool}</div>}
-            </label>
-            <label className="block">
-              <span className={labelCls}>{t.createProject.gitCliNotesLabel}</span>
-              <input
-                value={gitCliNotes}
-                onChange={e => setGitCliNotes(e.target.value)}
-                disabled={submitting}
-                className={inputCls}
-              />
-            </label>
-          </div>
-        )}
       </form>
     </Modal>
   );

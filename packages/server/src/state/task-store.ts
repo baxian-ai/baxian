@@ -355,9 +355,9 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
   }
   if (raw.platformBinding !== undefined) {
     const binding = raw.platformBinding;
-    const keys = ['mode', 'repoKey', 'tool'];
+    const keys = ['repoKey'];
     if (!isRecord(binding) || keys.some(key => typeof binding[key] !== 'string' || (binding[key] as string).trim() === '')) {
-      throw taskSchemaError('platformBinding', 'a { mode, repoKey, tool } identity record when present');
+      throw taskSchemaError('platformBinding', 'a { repoKey } identity record when present');
     }
   }
   optionalString(raw, 'baseBranch');

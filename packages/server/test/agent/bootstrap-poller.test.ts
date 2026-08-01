@@ -18,7 +18,7 @@ const devAgent: AgentConfig = {
 };
 const config: BaxianConfig = {
   github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
-  project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[devAgent]] }],
+  project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[devAgent]] }],
 };
 const noopRunner = {
   exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
@@ -104,8 +104,8 @@ describe('BootstrapPoller', () => {
     const cfg2: BaxianConfig = {
       ...config,
       project: [
-        { id: 'p1', repo: 'user/r1', merge: null, agent: [[{ ...devAgent, id: 'dev-1' }]] },
-        { id: 'p2', repo: 'user/r2', merge: null, agent: [[{ ...devAgent, id: 'dev-2' }]] },
+        { id: 'p1', repo: 'https://github.com/user/r1.git', merge: null, agent: [[{ ...devAgent, id: 'dev-1' }]] },
+        { id: 'p2', repo: 'https://github.com/user/r2.git', merge: null, agent: [[{ ...devAgent, id: 'dev-2' }]] },
       ],
     };
     let ensureCalls = 0;
@@ -119,24 +119,6 @@ describe('BootstrapPoller', () => {
     });
     await poller.pollOnce();
     expect(ensureCalls).toBe(2);
-  });
-
-  it('passes the plain-git clone decision through BootstrapPoller', async () => {
-    const repoStoreFactory = vi.fn(() => ({ ensure: async () => '/p' }));
-    const customToolConfig: BaxianConfig = {
-      ...config,
-      project: [{
-        ...config.project[0],
-        repo: 'https://github.com/user/repo.git',
-        gitCli: { tool: 'forge' },
-      }],
-    };
-    const poller = makePoller({ config: customToolConfig, repoStoreFactory });
-
-    await poller.pollOnce();
-
-    expect(repoStoreFactory).toHaveBeenCalledTimes(1);
-    expect(repoStoreFactory.mock.calls[0]?.[7]).toBe(false);
   });
 
   it('runs branch reconciliation after a completed poll', async () => {
@@ -189,8 +171,8 @@ describe('BootstrapPoller', () => {
     const cfgTwoProjects: BaxianConfig = {
       github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
       project: [
-        { id: 'p-yes', repo: 'u/r1', merge: null, agent: [[{ ...devAgent, id: 'dev-yes' }]] },
-        { id: 'p-no', repo: 'u/r2', merge: null, agent: [[{ ...devAgent, id: 'dev-no' }]] },
+        { id: 'p-yes', repo: 'https://github.com/u/r1.git', merge: null, agent: [[{ ...devAgent, id: 'dev-yes' }]] },
+        { id: 'p-no', repo: 'https://github.com/u/r2.git', merge: null, agent: [[{ ...devAgent, id: 'dev-no' }]] },
       ],
     };
 
@@ -212,7 +194,7 @@ describe('BootstrapPoller', () => {
       const cfgOnlyManual: BaxianConfig = {
         ...cfgTwoProjects,
         project: [{
-          id: 'manual-only', repo: 'u/r3', merge: null,
+          id: 'manual-only', repo: 'https://github.com/u/r3.git', merge: null,
           agent: [[{ ...devAgent, id: 'dev-m', workdir: '/manual' }]],
         }],
       };

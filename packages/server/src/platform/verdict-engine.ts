@@ -1,6 +1,6 @@
 import { rowBodyDigest, rowTokens } from './markers.js';
 import { versionTimeOf, versionTimestampOf, type NormalizedRow } from './row-schema.js';
-import type { CommentSourceClass } from './markers.js';
+import type { CommentSourceClass } from './types.js';
 
 export interface VerdictSourceScan {
   key: string;
@@ -57,7 +57,7 @@ interface TokenMatch {
 }
 
 function isProtocolCarrier(row: NormalizedRow): boolean {
-  return row.system !== true && versionTimeOf(row) !== undefined;
+  return versionTimeOf(row) !== undefined;
 }
 
 export function deadTokens(sources: VerdictSourceScan[]): Set<string> {

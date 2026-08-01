@@ -504,7 +504,7 @@ describe('EventPublisher — deletes, failures and auxiliary channels', () => {
     const publisher = new EventPublisher(broker, ctx, taskStore, { pollersDebounceMs: 10 });
 
     const snapshots: PollerSnapshot[] = [{
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       projectId: 'proj',
       intervalMs: 1000,
       isPolling: false,

@@ -550,7 +550,7 @@ describe('TaskStore git review fields', () => {
     const task = makeTask({
       id: 'task-platform-bound',
       status: 'pending',
-      platformBinding: { mode: 'git', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/repo' },
     });
     await store.set(task);
     expect(await store.get(task.id)).toEqual(task);

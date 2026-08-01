@@ -1,4 +1,4 @@
-import type { BaxianConfig, AgentConfig } from '../shared/index.js';
+import type { BaxianConfig, AgentConfig, HostConfig } from '../shared/index.js';
 import type { AgentStore } from '../state/agent-store.js';
 import type { EventBus } from '../event/bus.js';
 import type { ErrorRecordStore } from '../state/error-record-store.js';
@@ -19,11 +19,10 @@ export interface BootstrapPollerOptions {
     runner: CommandRunner,
     repoSlug: string,
     mode: AgentConfig['mode'],
-    host: AgentConfig['host'],
+    host: HostConfig | undefined,
     cache: RepoStoreCache,
     agentId: string,
     workdir?: string,
-    cloneViaGh?: boolean,
   ) => RepoStore;
   onAgentAffected?: (agentIds: string[]) => void;
   onPollComplete?: () => Promise<void>;

@@ -3189,7 +3189,7 @@ describe('generation-fenced review dispatch', () => {
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
       signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
     }));
-    const error = new DispatchTerminalError('required_skills_missing', 'QA skill missing');
+    const error = new DispatchTerminalError('prompt_too_large', 'QA prompt too large');
     vi.spyOn(manager, 'dispatchGitReviewLease').mockRejectedValue(error);
     const fail = vi.spyOn(manager, 'failTaskForDispatchError').mockResolvedValue(undefined);
 

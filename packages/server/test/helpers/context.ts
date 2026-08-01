@@ -3,6 +3,7 @@ import { PetStore } from '../../src/state/pet-store.js';
 import { TmuxSessionStatusStore } from '../../src/agent/tmux-probe-poller.js';
 import type { AppContext } from '../../src/app.js';
 import { createManagerHarness } from './manager-harness.js';
+import { fakeRunner } from './fake-runner.js';
 import { makeConfig } from './fixtures.js';
 
 export async function createTestContext(tempDir: string): Promise<AppContext> {
@@ -10,7 +11,7 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
     review: { rounds: 10 },
     project: [{
       id: 'proj',
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       merge: null,
       agent: [[
         { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: join(tempDir, 'dev-1') },
@@ -18,7 +19,22 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
       ]],
     }],
   });
-  const harness = await createManagerHarness(tempDir, { config });
+  const platformRunner = fakeRunner({
+    rules: [{
+      match: "'repos/user/repo'",
+      reply: {
+        stdout: JSON.stringify({
+          default_branch: 'main',
+          node_id: 'R_repo',
+          permissions: { push: true },
+        }),
+      },
+    }],
+  });
+  const harness = await createManagerHarness(tempDir, {
+    config,
+    deps: { platformRunner },
+  });
   const tmuxSessionStatusStore = new TmuxSessionStatusStore();
   const petStore = new PetStore(join(tempDir, 'state', 'pets'));
 

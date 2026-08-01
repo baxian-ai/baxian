@@ -1,23 +1,23 @@
 import { describe, it, expect } from 'vitest';
 import { buildDriverReviewTimeline } from '../../src/platform/review-timeline.js';
 import { buildReviewTokenLine } from '../../src/platform/markers.js';
-import { DriverOpError } from '../../src/platform/git-driver.js';
+import { DriverOpError } from '../../src/platform/types.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
-import type { CommentSourceOp } from '../../src/platform/types.js';
+import type { CommentSource } from '../../src/platform/types.js';
 
 const SHA = 'a'.repeat(40);
-const SOURCES: CommentSourceOp[] = [
-  { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
-  { key: 'inline-comments', argv: ['{binary}'], map: { id: 'id', body: 'body', discussionId: { sources: ['r'], optional: true }, parentId: { sources: ['p'], optional: true } } },
-  { key: 'reviews', argv: ['{binary}'], map: { id: 'id', body: 'body', reviewState: { sources: ['s'], optional: true } } },
-] as unknown as CommentSourceOp[];
+const SOURCES: CommentSource[] = [
+  { key: 'issue-comments', category: 'top-level' },
+  { key: 'inline-comments', category: 'threaded' },
+  { key: 'reviews', category: 'reviews' },
+];
 
 function driverWith(comments: Record<string, NormalizedRow[] | Error>) {
   return {
     commentSources: SOURCES,
-    runCommentSource: async (
-      source: CommentSourceOp,
-      _vars: { prNumber: number },
+    listComments: async (
+      source: CommentSource,
+      _prNumber: number,
       projectPage?: (rows: NormalizedRow[]) => NormalizedRow[],
     ) => {
       const rows = comments[source.key] ?? [];
@@ -32,6 +32,15 @@ const row = (id: string, body: string, extra: Record<string, unknown> = {}): Nor
   ({ id, body, createdAt: '2026-07-19T01:00:00Z', ...extra });
 
 describe('buildDriverReviewTimeline', () => {
+  it('uses the adapter-provided category instead of interpreting the source key', async () => {
+    const source: CommentSource = { key: 'gitlab-discussions', category: 'threaded' };
+    const { items } = await buildDriverReviewTimeline({
+      commentSources: [source],
+      listComments: async () => [row('7', 'discussion', { path: 'a.ts', line: 3 })],
+    }, 42);
+    expect(items[0]).toMatchObject({ kind: 'review-comment', sourceKey: 'gitlab-discussions' });
+  });
+
   it('keeps same-id rows from different sources as distinct threads', async () => {
     const { items } = await buildDriverReviewTimeline(driverWith({
       'issue-comments': [row('7', 'top-level')],
@@ -98,12 +107,12 @@ describe('buildDriverReviewTimeline', () => {
     const pageRows: NormalizedRow[][] = [];
     const spyingDriver = {
       commentSources: driver.commentSources,
-      runCommentSource: async (
-        source: CommentSourceOp,
-        vars: { prNumber: number },
+      listComments: async (
+        source: CommentSource,
+        prNumber: number,
         projectPage?: (rows: NormalizedRow[]) => NormalizedRow[],
       ) => {
-        const rows = await driver.runCommentSource(source, vars, projectPage);
+        const rows = await driver.listComments(source, prNumber, projectPage);
         pageRows.push(rows);
         return rows;
       },
@@ -123,7 +132,7 @@ describe('buildDriverReviewTimeline', () => {
     const touched: string[] = [];
     const driver = {
       commentSources: SOURCES,
-      runCommentSource: async (source: CommentSourceOp) => {
+      listComments: async (source: CommentSource) => {
         touched.push(source.key);
         if (source.key === 'issue-comments') {
           throw new DriverOpError('op listComments failed (exit 1, class RATE_LIMIT): HTTP 429', {
@@ -156,7 +165,7 @@ describe('buildDriverReviewTimeline', () => {
     const huge = 'S'.repeat(3 * 1024 * 1024);
     const { error } = await buildDriverReviewTimeline({
       commentSources: SOURCES,
-      runCommentSource: async () => {
+      listComments: async () => {
         throw new Error(`row schema violation: ${JSON.stringify({ author: huge, sentinel: 'SECRET123' })}`);
       },
     }, 42);
@@ -171,9 +180,9 @@ describe('buildDriverReviewTimeline', () => {
     let requested = 0;
     const driver = {
       commentSources: [SOURCES[0]],
-      runCommentSource: async (
-        _source: CommentSourceOp,
-        _vars: { prNumber: number },
+      listComments: async (
+        _source: CommentSource,
+        _prNumber: number,
         projectPage?: (rows: NormalizedRow[]) => NormalizedRow[],
         shouldStop?: (rows: NormalizedRow[], page: number) => boolean,
       ) => {
@@ -196,9 +205,9 @@ describe('buildDriverReviewTimeline', () => {
     const seenPages: NormalizedRow[][] = [];
     const driver = {
       commentSources: [SOURCES[0]],
-      runCommentSource: async (
-        _source: CommentSourceOp,
-        _vars: { prNumber: number },
+      listComments: async (
+        _source: CommentSource,
+        _prNumber: number,
         projectPage?: (rows: NormalizedRow[]) => NormalizedRow[],
       ) => {
         const slim = projectPage?.([row('c1', 'first version')]) ?? [];
@@ -214,7 +223,7 @@ describe('buildDriverReviewTimeline', () => {
   it('never leaks driver stderr tails into the response error', async () => {
     const { error } = await buildDriverReviewTimeline({
       commentSources: SOURCES,
-      runCommentSource: async () => {
+      listComments: async () => {
         throw new DriverOpError(
           'op listComments failed (exit 1, class ACCESS_DENIED): token-like-diagnostic=SECRET123',
           { opName: 'listComments', errorClass: 'ACCESS_DENIED', exitCode: 1 },
@@ -256,9 +265,9 @@ describe('buildDriverReviewTimeline', () => {
     };
     const driver = {
       commentSources: SOURCES,
-      runCommentSource: async (
-        source: CommentSourceOp,
-        _vars: { prNumber: number },
+      listComments: async (
+        source: CommentSource,
+        _prNumber: number,
         projectPage?: (rows: NormalizedRow[]) => NormalizedRow[],
         shouldStop?: (rows: NormalizedRow[], page: number) => boolean,
       ) => {
@@ -278,9 +287,9 @@ describe('buildDriverReviewTimeline', () => {
     const dup = row('c1', 'same row twice');
     const driver = {
       commentSources: SOURCES,
-      runCommentSource: async (
-        source: CommentSourceOp,
-        _vars: { prNumber: number },
+      listComments: async (
+        source: CommentSource,
+        _prNumber: number,
         projectPage?: (rows: NormalizedRow[]) => NormalizedRow[],
       ) => {
         if (source.key === 'issue-comments') {

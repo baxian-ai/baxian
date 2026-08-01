@@ -62,7 +62,7 @@ describe('formatServerRunningMessage', () => {
 
 describe('startServer', () => {
   const QUIET_INTERVALS = {
-    githubPollIntervalMs: 3_600_000,
+    platformPollIntervalMs: 3_600_000,
     tmuxProbePollIntervalMs: 3_600_000,
     bootstrapRetryIntervalMs: 3_600_000,
   };
@@ -160,7 +160,7 @@ describe('startServer', () => {
       preferredAgentId: 'dev-retained', agentId: 'dev-retained', devAgentId: 'dev-retained',
       qaAgentId: 'qa-retained',
       reviewRound: 0, status: 'pending',
-      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      platformBinding: { repoKey: 'github.com/owner/other' },
       createdAt: now, updatedAt: now,
     });
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
@@ -181,7 +181,7 @@ describe('startServer', () => {
         data: expect.objectContaining({
           phase: 'platform-binding-mismatch',
           reason: 'identity-mismatch',
-          differences: ['mode'],
+          differences: ['repoKey'],
         }),
       }));
 

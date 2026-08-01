@@ -2,23 +2,20 @@ import { describe, it, expect, beforeAll, afterAll, onTestFinished, vi } from 'v
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { PlatformPoller, platformTaskView, type PlatformTaskView } from '../../src/platform/platform-poller.js';
 import { platformPollerStatePath } from '../../src/platform/comment-cursor.js';
-import { GitDriver, buildDriverRunContext, type DriverExec } from '../../src/platform/git-driver.js';
-import { parseDriverSpec } from '../../src/platform/driver-spec.js';
+import { GitHubDriver, buildGitHubRunContext } from '../../src/platform/github-driver.js';
+import type { DriverExec } from '../../src/platform/types.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
-import type { MappedEvent } from '../../src/platform/types.js';
+import type { PlatformEvent } from '../../src/platform/types.js';
 import { registerEventHandlers } from '../../src/event/handlers.js';
 import type { BaxianEvent } from '../../src/shared/index.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
 import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
-const DRIVER_JSON = join(dirname(fileURLToPath(import.meta.url)), '../../src/platform/plugins/github/driver.json');
-const GH_SKILL = join(dirname(fileURLToPath(import.meta.url)), '../../src/platform/plugins/github/skills/baxian-cli-gh/SKILL.md');
 const execFileAsync = promisify(execFile);
 const SHA = 'd'.repeat(40);
 const ANCHOR = SHA;
@@ -41,9 +38,9 @@ const ghReview = (id: number, body: string, state: string) => ({
   id, body, user: { login: 'qa', id: 88 }, submitted_at: OLD_TS, state, commit_id: SHA,
 });
 
-describe('PlatformPoller over the real github driver.json (fake gh)', () => {
+describe('PlatformPoller over the GitHub driver (fake gh)', () => {
   let dir = '';
-  const events: MappedEvent[] = [];
+  const events: PlatformEvent[] = [];
   const world = {
     pulls: [ghPull] as unknown[],
     prView: ghPull as unknown,
@@ -59,8 +56,6 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
 
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), 'bx-gh-poller-'));
-    const parsed = parseDriverSpec(await readFile(DRIVER_JSON, 'utf8'), DRIVER_JSON);
-    if ('errors' in parsed) throw new Error(parsed.errors.map(e => e.message).join('\n'));
     const exec: DriverExec = async (cmd) => {
       const page = Number(/[?&]page=(\d+)/.exec(cmd)?.[1] ?? '1');
       const body = (rows: unknown[]) => ({ stdout: JSON.stringify(page === 1 ? rows : []), stderr: '', exitCode: 0 });
@@ -77,7 +72,7 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
       };
       throw new Error(`no gh fixture for: ${cmd}`);
     };
-    const driver = new GitDriver({ spec: parsed.spec }, buildDriverRunContext('git@github.com:owner/repo.git', 'gh'), exec);
+    const driver = new GitHubDriver(buildGitHubRunContext('git@github.com:owner/repo.git'), exec);
     poller = new PlatformPoller({
       onEvent: (_p, event) => { events.push(event); },
       tasks: async () => tasks,
@@ -159,61 +154,7 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
   });
 });
 
-type LifecycleKind = 'github' | 'forge';
-
-const FORGE_FIELD_PATHS = new Map<string, string>([
-  ['number', 'iid'],
-  ['html_url', 'web_url'],
-  ['state', 'status'],
-  ['draft', 'is_draft'],
-  ['merged_at', 'merged_on'],
-  ['updated_at', 'updated_on'],
-  ['title', 'summary'],
-  ['head.ref', 'source.branch'],
-  ['head.sha', 'source.oid'],
-  ['head.repo.id', 'source.project.uid'],
-  ['base.ref', 'target.branch'],
-  ['base.repo.id', 'target.project.uid'],
-  ['user.login', 'author.handle'],
-  ['user.id', 'author.uid'],
-  ['mergeable_state', 'merge_state'],
-  ['default_branch', 'primary_branch'],
-  ['node_id', 'project_uid'],
-  ['permissions.push', 'capabilities.push'],
-  ['id', 'uid'],
-  ['body', 'text'],
-  ['created_at', 'created_on'],
-  ['submitted_at', 'submitted_on'],
-  ['commit_id', 'commit_oid'],
-  ['in_reply_to_id', 'parent_uid'],
-  ['path', 'file_path'],
-  ['line', 'line_number'],
-  ['original_line', 'original_line_number'],
-  ['api', 'rest'],
-]);
-
-function forgeDriverValue(value: unknown): unknown {
-  if (typeof value === 'string') {
-    const mapped = FORGE_FIELD_PATHS.get(value) ?? value;
-    return mapped
-      .replaceAll('repos/{repoPath}/issues/{prNumber}/comments', 'projects/{repoPath}/tickets/{prNumber}/notes')
-      .replaceAll('repos/{repoPath}/pulls/{prNumber}/comments', 'projects/{repoPath}/changes/{prNumber}/inline-notes')
-      .replaceAll('repos/{repoPath}/pulls', 'projects/{repoPath}/changes')
-      .replaceAll('repos/{repoPath}/git/refs/heads', 'projects/{repoPath}/refs/heads')
-      .replaceAll('repos/{repoPath}', 'projects/{repoPath}');
-  }
-  if (Array.isArray(value)) return value.map(forgeDriverValue);
-  if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => [
-      key === 'GH_HOST' ? 'FORGE_HOST' : key,
-      forgeDriverValue(child),
-    ]));
-  }
-  return value;
-}
-
 function lifecyclePr(
-  kind: LifecycleKind,
   branch: string,
   headSha: string,
   updatedAt: string,
@@ -221,38 +162,25 @@ function lifecyclePr(
   mergedAt: string | null = null,
   mergeState = 'clean',
 ): unknown {
-  if (kind === 'github') {
-    return {
-      number: 42, html_url: 'https://github.com/owner/repo/pull/42', state, draft: false,
-      merged_at: mergedAt, updated_at: updatedAt, title: 'feat: lifecycle',
-      head: { ref: branch, sha: headSha, repo: { id: 1001 } },
-      base: { ref: 'main', repo: { id: 1001 } },
-      user: { login: 'devbot', id: 77 }, mergeable_state: mergeState,
-    };
-  }
   return {
-    iid: 42, web_url: 'https://forge.example.com/owner/repo/changes/42', status: state,
-    is_draft: false, merged_on: mergedAt, updated_on: updatedAt, summary: 'feat: lifecycle',
-    source: { branch, oid: headSha, project: { uid: 1001 } },
-    target: { branch: 'main', project: { uid: 1001 } },
-    author: { handle: 'devbot', uid: 77 }, merge_state: mergeState,
+    number: 42, html_url: 'https://github.com/owner/repo/pull/42', state, draft: false,
+    merged_at: mergedAt, updated_at: updatedAt, title: 'feat: lifecycle',
+    head: { ref: branch, sha: headSha, repo: { id: 1001 } },
+    base: { ref: 'main', repo: { id: 1001 } },
+    user: { login: 'devbot', id: 77 }, mergeable_state: mergeState,
   };
 }
 
 function lifecycleComment(
-  kind: LifecycleKind,
   id: number,
   body: string,
   at: string,
   authorId: number,
 ): unknown {
-  return kind === 'github'
-    ? { id, body, user: { login: `user-${authorId}`, id: authorId }, created_at: at, updated_at: at }
-    : { uid: id, text: body, author: { handle: `user-${authorId}`, uid: authorId }, created_on: at, updated_on: at };
+  return { id, body, user: { login: `user-${authorId}`, id: authorId }, created_at: at, updated_at: at };
 }
 
 function lifecycleReview(
-  kind: LifecycleKind,
   id: number,
   body: string,
   at: string,
@@ -260,30 +188,18 @@ function lifecycleReview(
   commitSha: string,
   authorId: number,
 ): unknown {
-  return kind === 'github'
-    ? {
-        id, body, user: { login: `user-${authorId}`, id: authorId },
-        submitted_at: at, state, commit_id: commitSha,
-      }
-    : {
-        uid: id, text: body, author: { handle: `user-${authorId}`, uid: authorId },
-        submitted_on: at, status: state, commit_oid: commitSha,
-      };
+  return {
+    id, body, user: { login: `user-${authorId}`, id: authorId },
+    submitted_at: at, state, commit_id: commitSha,
+  };
 }
 
-async function lifecycleHarness(kind: LifecycleKind) {
-  const dir = await mkdtemp(join(tmpdir(), `bx-${kind}-lifecycle-`));
+async function lifecycleHarness() {
+  const dir = await mkdtemp(join(tmpdir(), 'bx-github-lifecycle-'));
   onTestFinished(async () => {
     vi.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
   });
-  const githubDriverJson = await readFile(DRIVER_JSON, 'utf8');
-  const driverJson = kind === 'github'
-    ? githubDriverJson
-    : JSON.stringify(forgeDriverValue(JSON.parse(githubDriverJson)));
-  const parsed = parseDriverSpec(driverJson, `${kind}-driver.json`);
-  if ('errors' in parsed) throw new Error(parsed.errors.map(e => e.message).join('\n'));
-
   let now = Date.now();
   const commands: string[] = [];
   const world = {
@@ -301,7 +217,7 @@ async function lifecycleHarness(kind: LifecycleKind) {
     mergeState: 'clean',
   };
   const currentPr = () => lifecyclePr(
-    kind, world.branch, world.headSha, world.updatedAt, world.state, world.mergedAt, world.mergeState,
+    world.branch, world.headSha, world.updatedAt, world.state, world.mergedAt, world.mergeState,
   );
   const exec: DriverExec = async (command) => {
     commands.push(command);
@@ -310,9 +226,9 @@ async function lifecycleHarness(kind: LifecycleKind) {
       stdout: JSON.stringify(page === 1 ? rows : []), stderr: '', exitCode: 0,
     });
     if (command.includes("'--version'")) {
-      return { stdout: `${kind === 'github' ? 'gh' : 'forge'} version 2.40.0`, stderr: '', exitCode: 0 };
+      return { stdout: 'gh version 2.40.0', stderr: '', exitCode: 0 };
     }
-    if (command.endsWith("'api' 'user'") || command.endsWith("'rest' 'user'")) {
+    if (command.endsWith("'api' 'user'")) {
       return { stdout: JSON.stringify({ id: 77, login: 'devbot' }), stderr: '', exitCode: 0 };
     }
     if (command.includes("'PUT'") && command.includes("/merge'")) {
@@ -340,38 +256,29 @@ async function lifecycleHarness(kind: LifecycleKind) {
       };
     }
     if (command.includes('?state=all')) return pageBody([currentPr()]);
-    if (command.includes('/issues/42/comments?') || command.includes('/tickets/42/notes?')) {
+    if (command.includes('/issues/42/comments?')) {
       return pageBody(world.issueComments);
     }
-    if (command.includes('/pulls/42/comments?') || command.includes('/changes/42/inline-notes?')) {
+    if (command.includes('/pulls/42/comments?')) {
       return pageBody(world.inlineComments);
     }
     if (command.includes('/reviews?')) return pageBody(world.reviews);
-    if (/(?:pulls|changes)\/42'$/.test(command)) {
+    if (/pulls\/42'$/.test(command)) {
       return { stdout: JSON.stringify(currentPr()), stderr: '', exitCode: 0 };
     }
-    if (command.endsWith("'repos/owner/repo'") || command.endsWith("'projects/owner/repo'")) {
-      const project = kind === 'github'
-        ? { node_id: 'R_repo', default_branch: 'main', permissions: { push: true } }
-        : { project_uid: 'R_repo', primary_branch: 'main', capabilities: { push: true } };
+    if (command.endsWith("'repos/owner/repo'")) {
+      const project = { node_id: 'R_repo', default_branch: 'main', permissions: { push: true } };
       return { stdout: JSON.stringify(project), stderr: '', exitCode: 0 };
     }
-    throw new Error(`no ${kind} lifecycle fixture for: ${command}`);
+    throw new Error(`no GitHub lifecycle fixture for: ${command}`);
   };
 
-  const repo = kind === 'github'
-    ? 'git@github.com:owner/repo.git'
-    : 'https://forge.example.com/owner/repo.git';
-  const driver = new GitDriver(
-    { spec: parsed.spec },
-    buildDriverRunContext(repo, kind === 'github' ? 'gh' : 'forge'),
-    exec,
-  );
+  const repo = 'git@github.com:owner/repo.git';
+  const driver = new GitHubDriver(buildGitHubRunContext(repo), exec);
   const config = makeConfig({
-    review: { rounds: 3, mode: 'git' },
+    review: { rounds: 3 },
     project: [{
       id: 'proj', repo, merge: 'auto',
-      ...(kind === 'forge' ? { gitCli: { tool: 'forge' } } : {}),
       agent: [[
         makeAgent({ workdir: '/tmp/lifecycle-dev' }),
         makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/lifecycle-qa' }),
@@ -397,8 +304,7 @@ async function lifecycleHarness(kind: LifecycleKind) {
 
   const verdictLog = join(dir, 'fake-gh-verdict.log');
   const fakeGh = join(dir, 'gh');
-  if (kind === 'github') {
-    await writeFile(fakeGh, `#!/bin/sh
+  await writeFile(fakeGh, `#!/bin/sh
 printf '%s\\t%s\\n' "$GH_HOST" "$*" >> "$FAKE_GH_LOG"
 case " $* " in
   *" --approve "*)
@@ -414,7 +320,6 @@ esac
 echo "unexpected fake gh invocation: $*" >&2
 exit 2
 `, { mode: 0o755 });
-  }
 
   const sameAccountReview = async (
     id: number,
@@ -422,7 +327,6 @@ exit 2
     commitSha: string,
     at: string,
   ): Promise<unknown> => {
-    if (kind !== 'github') throw new Error('same-account gh fallback is github-only');
     const bodyFile = join(dir, `verdict-${id}.txt`);
     await writeFile(bodyFile, body);
     const action = body.includes('baxian:review:pass') ? '--approve' : '--request-changes';
@@ -442,10 +346,10 @@ exit 2
     await execFileAsync('gh', [
       'pr', 'review', '42', '-R', 'owner/repo', '--comment', '--body-file', bodyFile,
     ], { env });
-    return lifecycleReview(kind, id, body, at, 'COMMENTED', commitSha, 77);
+    return lifecycleReview(id, body, at, 'COMMENTED', commitSha, 77);
   };
 
-  const mappedEvents: MappedEvent[] = [];
+  const mappedEvents: PlatformEvent[] = [];
   const poller = new PlatformPoller({
     now: () => now,
     tasks: async () => (await taskStore.list()).map(platformTaskView),
@@ -488,28 +392,21 @@ exit 2
       world.updatedAt = new Date(now - 10_000).toISOString();
     },
     comment(id: number, body: string, authorId: number, at: string) {
-      return lifecycleComment(kind, id, body, at, authorId);
+      return lifecycleComment(id, body, at, authorId);
     },
     review(id: number, body: string, state: string, commitSha: string, authorId: number, at: string) {
-      return lifecycleReview(kind, id, body, at, state, commitSha, authorId);
+      return lifecycleReview(id, body, at, state, commitSha, authorId);
     },
     sameAccountReview,
     async verdictCommands() {
-      if (kind !== 'github') return [];
       return (await readFile(verdictLog, 'utf8')).trim().split('\n');
     },
   };
 }
 
-describe.each(['github', 'forge'] as const)('%s driver lifecycle integration', (kind) => {
+describe('GitHub driver lifecycle integration', () => {
   it('runs task creation, adoption, same-account fallback, fix, recheck, and merge end to end', async () => {
-    const h = await lifecycleHarness(kind);
-    if (kind === 'github') {
-      const skill = await readFile(GH_SKILL, 'utf8');
-      expect(skill).toContain('gh pr review <pr> -R <cli-repo> --approve --body-file <verdict-file>');
-      expect(skill).toContain('Can not approve your own pull request');
-      expect(skill).toContain('gh pr review <pr> -R <cli-repo> --comment --body-file <verdict-file>');
-    }
+    const h = await lifecycleHarness();
     const created = await h.manager.createTask('proj', {
       title: 'Lifecycle', description: 'exercise the complete platform path', preferredAgentId: 'dev-1',
     });
@@ -548,9 +445,7 @@ describe.each(['github', 'forge'] as const)('%s driver lifecycle integration', (
     })}`;
     const failAt = h.advance();
     const humanComment = h.comment(300, humanBody, 55, failAt);
-    const failReview = kind === 'github'
-      ? await h.sameAccountReview(900, failBody, SHA, failAt)
-      : h.review(900, failBody, 'COMMENTED', SHA, 77, failAt);
+    const failReview = await h.sameAccountReview(900, failBody, SHA, failAt);
     h.world.issueComments = [humanComment];
     h.world.reviews = [failReview];
 
@@ -586,9 +481,7 @@ describe.each(['github', 'forge'] as const)('%s driver lifecycle integration', (
       kind: 'pass', anchorSha: SHA, token: task.passToken!,
     })}`;
     const passAt = h.advance();
-    const passReview = kind === 'github'
-      ? await h.sameAccountReview(901, passBody, SHA, passAt)
-      : h.review(901, passBody, 'COMMENTED', SHA, 77, passAt);
+    const passReview = await h.sameAccountReview(901, passBody, SHA, passAt);
     h.world.reviews = [failReview, passReview];
     await h.poller.poll();
     expect((await h.taskStore.get(created.id))?.status).toBe('review');
@@ -667,24 +560,18 @@ describe.each(['github', 'forge'] as const)('%s driver lifecycle integration', (
     const mergeCommands = h.commands.filter(command => command.includes("'PUT'") && command.includes("/merge'"));
     expect(mergeCommands).toHaveLength(2);
     expect(mergeCommands.every(command => command.includes(`'sha=${SHA}'`))).toBe(true);
-    if (kind === 'github') {
-      const verdictCommands = await h.verdictCommands();
-      expect(verdictCommands).toHaveLength(4);
-      expect(verdictCommands.filter(command => command.includes('--request-changes'))).toHaveLength(1);
-      expect(verdictCommands.filter(command => command.includes('--approve'))).toHaveLength(1);
-      expect(verdictCommands.filter(command => command.includes('--comment'))).toHaveLength(2);
-      expect(verdictCommands.every(command => command.startsWith('github.com\tpr review 42 -R owner/repo'))).toBe(true);
-      expect(h.emittedEvents.some(event => event.type === 'review.submitted'
-        && event.data.source === 'pane-signal')).toBe(false);
-    }
-    if (kind === 'forge') {
-      expect(h.commands.some(command => command.includes("FORGE_HOST='forge.example.com'"))).toBe(true);
-      expect(h.commands.every(command => !command.includes('github.com'))).toBe(true);
-    }
+    const verdictCommands = await h.verdictCommands();
+    expect(verdictCommands).toHaveLength(4);
+    expect(verdictCommands.filter(command => command.includes('--request-changes'))).toHaveLength(1);
+    expect(verdictCommands.filter(command => command.includes('--approve'))).toHaveLength(1);
+    expect(verdictCommands.filter(command => command.includes('--comment'))).toHaveLength(2);
+    expect(verdictCommands.every(command => command.startsWith('github.com\tpr review 42 -R owner/repo'))).toBe(true);
+    expect(h.emittedEvents.some(event => event.type === 'review.submitted'
+      && event.data.source === 'pane-signal')).toBe(false);
   });
 
   it('routes cancellation cleanup through the declared close and deleteBranch operations', async () => {
-    const h = await lifecycleHarness(kind);
+    const h = await lifecycleHarness();
     const task = await h.manager.createTask('proj', {
       title: 'Cancel lifecycle', description: 'close and delete', preferredAgentId: 'dev-1',
     });
@@ -716,7 +603,7 @@ describe.each(['github', 'forge'] as const)('%s driver lifecycle integration', (
   });
 
   it('anchors a closed-unmerged PR once and clears the durable gate when it reopens', async () => {
-    const h = await lifecycleHarness(kind);
+    const h = await lifecycleHarness();
     const created = await h.manager.createTask('proj', {
       title: 'Close lifecycle', description: 'close without merge', preferredAgentId: 'dev-1',
     });

@@ -7,7 +7,6 @@ import type {
   BaxianConfig,
   AgentMode,
   HostConfig,
-  GitCliConfig,
   MergeStrategy,
   SpecApprovalStrategy,
   PrReviewConversation,
@@ -312,7 +311,7 @@ export const api = {
   projects: {
     list: () => get<ProjectConfig[]>('/projects'),
     get: (id: string) => get<ProjectConfig>(`/projects/${enc(id)}`),
-    create: (body: { id: string; repo: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; gitCli?: GitCliConfig }) =>
+    create: (body: { id: string; repo: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy }) =>
       post<{ project: ProjectConfig; restartRequired: boolean }>('/projects', body),
     delete: (id: string) =>
       del<{ removed: string; restartRequired: boolean }>(`/projects/${enc(id)}`),

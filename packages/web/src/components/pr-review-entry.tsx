@@ -167,15 +167,15 @@ function RoundBlock({
       <div className="mb-1 text-xs text-og-400">{label}</div>
       <div className="space-y-1.5">
         {round.items.map((item, itemIndex) => (
-          <GithubTurnRow key={prReviewItemKey(item, `${index}-${itemIndex}`)} item={item} onOpen={onOpen} />
+          <PlatformTurnRow key={prReviewItemKey(item, `${index}-${itemIndex}`)} item={item} onOpen={onOpen} />
         ))}
-        {round.review && <GithubTurnRow item={round.review} onOpen={onOpen} />}
+        {round.review && <PlatformTurnRow item={round.review} onOpen={onOpen} />}
       </div>
     </div>
   );
 }
 
-function GithubTurnRow({ item, onOpen }: { item: PrReviewItem; onOpen: (anchor?: string) => void }) {
+function PlatformTurnRow({ item, onOpen }: { item: PrReviewItem; onOpen: (anchor?: string) => void }) {
   const t = useT();
   const verdict = item.verdict;
   const badge = verdict

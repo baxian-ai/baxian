@@ -43,7 +43,7 @@ beforeEach(async () => {
   const config = makeConfig({
     project: [{
       id: 'proj',
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       merge: null,
       agent: [[
         makeAgent({ workdir: join(tempDir, 'dev-1') }),
@@ -203,7 +203,7 @@ describe('dispatchPendingTask', () => {
       project: [
         ...manager.getConfig().project,
         {
-          id: 'proj2', repo: 'user/other', merge: null,
+          id: 'proj2', repo: 'https://github.com/user/other.git', merge: null,
           agent: [[
             { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: tempDir },
             { id: 'qa-2', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: join(tempDir, 'qa-2') },

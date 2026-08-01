@@ -1,8 +1,11 @@
 import type { CommandRunner } from '../agent/runner.js';
 import type { ProjectConfig } from '../shared/types.js';
-import { resolveProjectTool } from '../config/validator.js';
-import { buildDriverRunContext, GitDriver, type DriverExec } from './git-driver.js';
-import type { PluginRegistry } from './plugin-registry.js';
+import {
+  GITHUB_AGENT_PROMPTS,
+  buildGitHubRunContext,
+  GitHubDriver,
+} from './github-driver.js';
+import type { DriverExec, PlatformDriver, PlatformPromptContext } from './types.js';
 
 export function makeDriverExec(runner: CommandRunner): DriverExec {
   return (command, opts) => opts.stdin === undefined
@@ -16,13 +19,18 @@ export function makeDriverExec(runner: CommandRunner): DriverExec {
 
 export function buildProjectDriver(
   project: ProjectConfig,
-  registry: PluginRegistry,
   exec: DriverExec,
-): GitDriver | undefined {
-  const tool = resolveProjectTool(project);
-  if (tool === undefined) return undefined;
-  const plugin = registry.resolveTool(tool);
-  if (plugin === undefined) return undefined;
-  const binary = project.gitCli?.binary ?? tool;
-  return new GitDriver(plugin, buildDriverRunContext(project.repo, binary), exec);
+): PlatformDriver {
+  return buildRepoDriver(project.repo, exec);
+}
+
+export function buildRepoDriver(repo: string, exec: DriverExec): PlatformDriver {
+  return new GitHubDriver(buildGitHubRunContext(repo), exec);
+}
+
+export function buildProjectPromptContext(project: ProjectConfig): PlatformPromptContext {
+  return {
+    repo: buildGitHubRunContext(project.repo).repoPath,
+    prompts: GITHUB_AGENT_PROMPTS,
+  };
 }

@@ -207,19 +207,13 @@ describe('VerdictEngine: at-least-once pass delivery', () => {
   });
 });
 
-describe('VerdictEngine: unpublished and system rows are not protocol carriers', () => {
+describe('VerdictEngine: unpublished rows are not protocol carriers', () => {
   it('ignores undated rows for both directions until they gain a timestamp', () => {
     const engine = new VerdictEngine();
     const pending: NormalizedRow = { id: '1', body: `draft findings\n${failLine}`, reviewState: 'PENDING' };
     expect(engine.evaluate(input([scan('reviews', 'reviews', [pending])]))).toBe(undefined);
     const submitted = engine.evaluate(input([scan('reviews', 'reviews', [row('1', `draft findings\n${failLine}`, OLD)])]));
     expect(submitted).toMatchObject({ kind: 'fail' });
-  });
-
-  it('ignores system rows even when they carry the current fail token', () => {
-    const engine = new VerdictEngine();
-    const sys = row('1', `pipeline note\n${failLine}`, OLD, { system: true });
-    expect(engine.evaluate(input([scan('src', 'threaded', [sys])]))).toBe(undefined);
   });
 
   it('rejects undated rows as provenance carriers', () => {

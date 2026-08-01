@@ -1,27 +1,15 @@
 import type { CommandRunner, RemoteShellMode } from './runner.js';
 import { LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshEnv } from './runner.js';
-import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork, execOutcomeUnknown } from './net-exec.js';
+import { GIT_NET_ENV, execNetwork, execOutcomeUnknown } from './net-exec.js';
 import type { AgentConfig, AgentRuntime, HostConfig } from '../shared/index.js';
-import { isGitHubRepo, parseGitRemote, redactGitCredentials, repoSlug } from '../shared/index.js';
-import { runDriverPreflightSteps, type DriverPreflightStep } from '../platform/preflight-exec.js';
-import type { RenderContext } from '../platform/command-renderer.js';
-import { safeDriverErrorText } from '../platform/git-driver.js';
+import { redactGitCredentials } from '../shared/index.js';
+import { buildRepoDriver } from '../platform/driver-host.js';
+import { safeDriverErrorText } from '../platform/types.js';
 
 export interface PreflightResult {
   step: string;
   ok: boolean;
   message: string;
-}
-
-export interface AgentGitPreflight {
-  tool: string;
-  minToolVersion: string;
-  steps: readonly DriverPreflightStep[];
-  agentCommands: readonly string[][];
-  renderCtx: RenderContext;
-  driverFor: (
-    exec: (cmd: string, opts: { timeout: number; maxBuffer: number }) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
-  ) => { runOp(opName: string): Promise<Array<Record<string, unknown>>> };
 }
 
 const CLI_BINARY: Record<AgentRuntime, string> = {
@@ -32,8 +20,7 @@ const CLI_BINARY: Record<AgentRuntime, string> = {
 };
 
 const PREFLIGHT_PROBE_TIMEOUT_MS = 5000;
-
-const PREFLIGHT_NET = { timeout: GH_EXEC_TIMEOUT_MS, retries: 0 } as const;
+const PREFLIGHT_NET = { timeout: 30_000, retries: 0 } as const;
 
 async function probeNetwork(
   runner: CommandRunner,
@@ -105,7 +92,6 @@ export async function runPreflight(
   repo: string,
   host?: HostConfig,
   projectId?: string,
-  gitPlatform?: AgentGitPreflight,
   options: { requireGitPush?: boolean } = {},
 ): Promise<PreflightResult[]> {
   repo = repo.trim();
@@ -147,7 +133,7 @@ export async function runPreflight(
 
   const isAuto = !agent.workdir;
   let lsRemote: LsRemoteTarget = { skip: true };
-  const probe = await gitLsRemoteProbeUrl(runner, repo, agent, gitPlatform, {
+  const probe = await gitLsRemoteProbeUrls(runner, repo, agent, {
     requirePush: options.requireGitPush === true,
   });
   if ('error' in probe) {
@@ -165,40 +151,15 @@ export async function runPreflight(
     await runManualModePreflight(runner, agent.workdir!, repo, results, lsRemote);
   }
 
-  if (gitPlatform !== undefined) {
-    await runGitPlatformChecks(runner, agent, gitPlatform, results);
-  } else if (isGitHubRepo(repo) && isAuto) {
-    const slug = repoSlug(repo);
-    const ghCheck = await probeNetwork(runner, 'gh auth status');
-    const ghOutcomeUnknown = ghCheck.exitCode === 124 || execOutcomeUnknown(ghCheck);
-    results.push({
-      step: 'gh',
-      ok: ghCheck.exitCode === 0 && !ghOutcomeUnknown,
-      message: ghCheck.exitCode === 0 && !ghOutcomeUnknown
-        ? 'GitHub CLI authenticated'
-        : ghOutcomeUnknown
-          ? 'Could not verify GitHub CLI authentication because the probe outcome is unknown — check network connectivity and retry'
-          : 'Run "gh auth login" or set GITHUB_TOKEN',
-    });
-
-    const ghRepoCheck = await probeNetwork(runner, `gh api repos/${slug}`);
-    results.push({
-      step: 'gh-repo',
-      ok: ghRepoCheck.exitCode === 0,
-      message: ghRepoCheck.exitCode === 0
-        ? `gh api access to ${slug} OK`
-        : `gh api repos/${slug} failed — check token scopes`,
-    });
-  }
+  await runPlatformChecks(runner, agent, repo, results);
 
   return results;
 }
 
-async function gitLsRemoteProbeUrl(
+async function gitLsRemoteProbeUrls(
   runner: CommandRunner,
   repo: string,
   agent: AgentConfig,
-  git?: AgentGitPreflight,
   options: { requirePush: boolean } = { requirePush: false },
 ): Promise<{ urls: string[] } | { error: string }> {
   const read = async (cmd: string): Promise<{ value: string; lines: string[] } | { error: string }> => {
@@ -234,92 +195,49 @@ async function gitLsRemoteProbeUrl(
     }
     return { urls: [...new Set(urls)] };
   }
-  if ((git !== undefined && git.tool !== 'gh') || !isGitHubRepo(repo)) return { urls: [repo] };
-  const slug = repoSlug(repo);
-  const hostname = git?.renderCtx.hostname ?? parseGitRemote(repo)?.host ?? 'github.com';
-  const hostScoped = await read(`gh config get -h ${shellQuote(hostname)} git_protocol`);
-  if ('error' in hostScoped) return hostScoped;
-  let protocol = hostScoped.value;
-  if (protocol === '') {
-    const globalCfg = await read('gh config get git_protocol');
-    if ('error' in globalCfg) return globalCfg;
-    protocol = globalCfg.value;
-  }
-  if (protocol === '') protocol = 'https';
-  return {
-    urls: [protocol === 'ssh' ? `git@${hostname}:${slug}.git` : `https://${hostname}/${slug}.git`],
-  };
+  return { urls: [repo] };
 }
 
-async function runGitPlatformChecks(
+async function runPlatformChecks(
   runner: CommandRunner,
   agent: AgentConfig,
-  git: AgentGitPreflight,
+  repo: string,
   results: PreflightResult[],
 ): Promise<void> {
-  const ctx = { ...git.renderCtx, binary: git.tool, minToolVersion: git.minToolVersion };
-  const stepResults = await runDriverPreflightSteps((cmd) => probeNetwork(runner, cmd), git.steps, ctx);
-  results.push(...stepResults);
-  if (stepResults.some((s) => !s.ok)) return;
-
-  const runsPlatformWrites = agent.role === 'dev';
-  if (runsPlatformWrites && git.agentCommands.length > 0) {
-    const missing: string[] = [];
-    const probeErrors: string[] = [];
-    for (const group of git.agentCommands) {
-      let satisfied = false;
-      const groupErrors: string[] = [];
-      for (const cmd of group) {
-        try {
-          const probe = await runner.exec(`command -v ${cmd}`, { timeout: PREFLIGHT_PROBE_TIMEOUT_MS });
-          if (probe.exitCode === 0 && lastNonEmptyLine(probe.stdout) !== '') {
-            satisfied = true;
-            break;
-          }
-        } catch (err) {
-          groupErrors.push(`${cmd}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-      if (!satisfied) {
-        missing.push(group.join(' or '));
-        probeErrors.push(...groupErrors);
-      }
-    }
-    const detail = probeErrors.length > 0 ? ` (probe failures: ${probeErrors.join('; ')})` : '';
-    results.push(missing.length === 0 && probeErrors.length === 0
-      ? { step: 'platform-skill-deps', ok: true, message: 'all commands declared by the platform skill are available' }
-      : {
-        step: 'platform-skill-deps',
-        ok: false,
-        message: missing.length === 0
-          ? `could not verify the commands required by the platform skill${detail}`
-          : `missing command(s) required by the platform skill: ${missing.join(', ')} — install them on this host${detail}`,
-      });
-  }
-
-  const driver = git.driverFor(async (cmd, opts) => {
+  const driver = buildRepoDriver(repo, async (cmd, opts) => {
     try {
       return await execNetwork(runner, cmd, { timeout: opts.timeout, retries: 0 });
     } catch (err) {
       return { stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: 124 };
     }
   });
+  let stepResults: PreflightResult[];
+  try {
+    stepResults = await driver.runPreflightSteps();
+  } catch (err) {
+    const message = safeDriverErrorText(err);
+    console.warn('[preflight] driver preflight failed:', message);
+    results.push({ step: 'driver-preflight', ok: false, message });
+    return;
+  }
+  results.push(...stepResults);
+  if (stepResults.some((s) => !s.ok)) return;
   let row: Record<string, unknown> | undefined;
   try {
-    [row] = await driver.runOp('projectView');
+    row = await driver.projectView();
   } catch (err) {
     console.warn('[preflight] projectView failed:', safeDriverErrorText(err));
     results.push({
       step: 'platform-repo',
       ok: false,
-      message: `driver projectView on ${git.renderCtx.repoPath} failed — check the ${git.tool} credentials and repo authorization on this host (${safeDriverErrorText(err)})`,
+      message: `Platform access to ${repo} failed — check the platform CLI credentials and repository authorization on this host (${safeDriverErrorText(err)})`,
     });
     return;
   }
   results.push({
     step: 'platform-repo',
     ok: true,
-    message: `driver projectView on ${git.renderCtx.repoPath} OK`,
+    message: `Platform access to ${repo} OK`,
   });
 
   const push = row?.pushPermitted;
@@ -341,7 +259,7 @@ async function runGitPlatformChecks(
     results.push({
       step: 'platform-push',
       ok: true,
-      message: 'plugin did not report pushPermitted — write access cannot be asserted statically',
+      message: 'The platform did not report push permission — write access cannot be asserted statically',
     });
   }
 }
@@ -393,7 +311,6 @@ async function runAutoModePreflight(
   results: PreflightResult[],
   lsRemote: LsRemoteTarget,
 ): Promise<void> {
-  const gh = isGitHubRepo(repo);
   const homeProbe = await runner.exec('cd ~ && pwd -P');
   const home = homeProbe.stdout.trim();
   if (homeProbe.exitCode !== 0 || home === '') {
@@ -442,36 +359,23 @@ async function runAutoModePreflight(
     results.push({
       step: 'workdir',
       ok: true,
-      message: `${absRepoPath} does not yet exist; will be created by ${gh ? 'gh repo clone' : 'git clone'}`,
+      message: `${absRepoPath} does not yet exist; will be created by git clone`,
     });
   }
 
   if ('skip' in lsRemote) return;
-  const lsRemoteOverride = lsRemote.urls?.[0];
-  if (!gh) {
-    const url = lsRemoteOverride ?? repo;
-    const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(url)} HEAD`);
-    results.push({
-      step: 'git',
-      ok: ls.exitCode === 0,
-      message: ls.exitCode === 0
-        ? 'git ls-remote OK'
-        : `git ls-remote ${redactGitCredentials(url)} failed — check the git credentials (HTTPS credential helper or SSH key) for this host`,
-    });
-    return;
-  }
-
-  if (lsRemoteOverride === undefined) return;
-  const lsRemoteUrl = lsRemoteOverride;
-  const protocol = lsRemoteUrl.startsWith('git@') || lsRemoteUrl.startsWith('ssh://') ? 'ssh' : 'https';
-  const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
+  const url = lsRemote.urls[0] ?? repo;
+  const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(url)} HEAD`);
+  const credentialHint = /^https:\/\/github\.com\//i.test(url)
+    ? 'run "gh auth setup-git" on this host or configure another Git HTTPS credential helper'
+    : /^https:\/\//i.test(url)
+      ? 'configure a Git HTTPS credential helper on this host'
+      : 'check the SSH key and host configuration on this host';
   results.push({
     step: 'git',
     ok: ls.exitCode === 0,
     message: ls.exitCode === 0
-      ? `git ls-remote (${protocol}) OK`
-      : protocol === 'https'
-        ? `git ls-remote ${lsRemoteUrl} failed — run "gh auth setup-git" to register the credential helper`
-        : `git ls-remote ${lsRemoteUrl} failed — check ~/.ssh config; try "ssh -T git@github.com"`,
+      ? 'git ls-remote OK'
+      : `git ls-remote ${redactGitCredentials(url)} failed — ${credentialHint}`,
   });
 }

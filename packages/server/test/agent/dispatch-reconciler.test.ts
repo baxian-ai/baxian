@@ -13,7 +13,6 @@ import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
 import { ApiError } from '../../src/errors.js';
 
@@ -25,7 +24,7 @@ const CONFIG: BaxianConfig = {
   server: DEFAULT_SERVER_CONFIG,
   project: [{
     id: 'proj',
-    repo: 'user/repo',
+    repo: 'https://github.com/user/repo.git',
     merge: null,
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
@@ -63,7 +62,6 @@ beforeEach(async () => {
     taskStore,
     lockManager,
     eventBus,
-    skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
     runnerFactory: () => noopRunner,
   });
 });

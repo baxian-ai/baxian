@@ -117,9 +117,7 @@ export class PaneStreamerManager {
     const existing = this.streamers.get(agent.id);
     if (existing && !existing.isDestroyed()) return existing;
     const runner = this.runnerFactory(agent);
-    const resolveHost = () => (this.hostResolver
-      ? this.hostResolver(agent)
-      : (typeof agent.host === 'object' ? agent.host : undefined));
+    const resolveHost = () => this.hostResolver?.(agent);
     const tmux = new TmuxManager(runner);
     const owner = this.ownerOf(agent);
     const streamer = new PaneStreamer(agent, tmux, resolveHost, {

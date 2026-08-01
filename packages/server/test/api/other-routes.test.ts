@@ -88,24 +88,6 @@ describe('GET /api/config', () => {
     expect(body.host[0].password).toBe('***');
   });
 
-  it('redacts a legacy inline agent.host password on GET /config and GET /projects', async () => {
-    app.ctx.config = {
-      ...app.ctx.config,
-      project: [{
-        id: 'proj', repo: 'user/repo', merge: null,
-        agent: [[
-          { id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: { hostname: 'legacy', password: 'inline-secret' } },
-          { id: 'rqa', runtime: 'codex', role: 'qa', mode: 'remote', host: { hostname: 'legacy', password: 'inline-secret' } },
-        ]],
-      }],
-    };
-    const cfg = JSON.parse((await get('/api/config')).body) as BaxianConfig;
-    expect((cfg.project[0].agent[0][0].host as { password?: string }).password).toBe('***');
-
-    const projects = JSON.parse((await get('/api/projects')).body) as ProjectConfig[];
-    expect((projects[0].agent[0][0].host as { password?: string }).password).toBe('***');
-  });
-
 });
 
 describe('PATCH /api/config', () => {
@@ -166,25 +148,24 @@ describe('PATCH /api/config', () => {
     expect(app.ctx.config.server.token).toBeUndefined();
   });
 
-  it('returns unknown-key warnings while stripping the keys from memory and disk', async () => {
+  it('rejects unknown keys and leaves memory and disk unchanged', async () => {
     const configPath = await seedConfigPath(app, tempDir);
+    const memoryBefore = app.ctx.config;
+    const diskBefore = await readFile(configPath, 'utf8');
 
     const response = await patch('/api/config', {
       obsolete: true,
       review: { rounds: 3, mode: 'server', afterDone: 'pr' },
     }, { headers: JSON_HEADERS });
 
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).warnings).toEqual(expect.arrayContaining([
-      { path: 'obsolete', message: 'unknown configuration key; it will be ignored' },
-      { path: 'review.mode', message: 'unknown configuration key; it will be ignored' },
-      { path: 'review.afterDone', message: 'unknown configuration key; it will be ignored' },
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).details).toEqual(expect.arrayContaining([
+      { path: 'obsolete', message: 'unknown configuration key' },
+      { path: 'review.mode', message: 'unknown configuration key' },
+      { path: 'review.afterDone', message: 'unknown configuration key' },
     ]));
-    expect(app.ctx.config.review).toEqual({ rounds: 3 });
-    expect(app.ctx.config).not.toHaveProperty('obsolete');
-    const saved = JSON.parse(await readFile(configPath, 'utf8'));
-    expect(saved.review).toEqual({ rounds: 3 });
-    expect(saved).not.toHaveProperty('obsolete');
+    expect(app.ctx.config).toBe(memoryBefore);
+    expect(await readFile(configPath, 'utf8')).toBe(diskBefore);
   });
 
   it('rejects host edits via PATCH /config (registry is managed via /hosts) and preserves current.host', async () => {
@@ -210,7 +191,7 @@ describe('PATCH /api/config', () => {
     for (const bad of [
       { id: 'bad' },
       'oops',
-      [{ id: 'pp', repo: 'u/r', merge: null, agent: { not: 'array' } }],
+      [{ id: 'pp', repo: 'https://github.com/u/r.git', merge: null, agent: { not: 'array' } }],
     ]) {
       const response = await patch('/api/config', { project: bad }, { headers: JSON_HEADERS });
       expect(response.statusCode, JSON.stringify(bad)).toBe(400);
@@ -223,7 +204,7 @@ describe('PATCH /api/config', () => {
       ...app.ctx.config,
       host: [{ id: 'box', hostname: 'h', port: 22 }, { id: 'box2', hostname: 'h2', port: 22 }],
       project: [{
-        id: 'proj', repo: 'user/repo', merge: null,
+        id: 'proj', repo: 'https://github.com/user/repo.git', merge: null,
         agent: [[
           { id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box' },
           { id: 'rqa', runtime: 'codex', role: 'qa', mode: 'remote', host: 'box' },
@@ -234,7 +215,7 @@ describe('PATCH /api/config', () => {
 
     const response = await patch('/api/config', {
       project: [{
-        id: 'proj', repo: 'user/repo', merge: null,
+        id: 'proj', repo: 'https://github.com/user/repo.git', merge: null,
         agent: [[
           { id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box2' },
           { id: 'rqa', runtime: 'codex', role: 'qa', mode: 'remote', host: 'box' },
@@ -305,7 +286,7 @@ describe('PATCH /api/config', () => {
       host: [{ id: 'box', hostname: 'remote.example', user: 'runner' }],
       project: [{
         id: 'proj',
-        repo: 'user/repo',
+        repo: 'https://github.com/user/repo.git',
         merge: null,
         agent: [[{
           id: 'rdev',
@@ -500,26 +481,26 @@ describe('PATCH /api/config', () => {
     expect(JSON.parse(await readFile(configPath, 'utf8')).project[0].agent[0][0].workdir).toBe(nextWorkdir);
   });
 
-  it('rejects PATCH with out-of-range server.githubPollIntervalMs and preserves existing valid value', async () => {
+  it('rejects PATCH with out-of-range server.platformPollIntervalMs and preserves existing valid value', async () => {
     await seedConfigPath(app, tempDir);
     app.ctx.config = {
       ...app.ctx.config,
-      server: { ...app.ctx.config.server, githubPollIntervalMs: 45000 },
+      server: { ...app.ctx.config.server, platformPollIntervalMs: 45000 },
     };
 
     for (const bad of [500, 1500.5, 2147483648]) {
-      const response = await patch('/api/config', { server: { port: 3000, githubPollIntervalMs: bad } }, { headers: JSON_HEADERS });
+      const response = await patch('/api/config', { server: { port: 3000, platformPollIntervalMs: bad } }, { headers: JSON_HEADERS });
       expect(response.statusCode).toBe(400);
-      expect(app.ctx.config.server.githubPollIntervalMs).toBe(45000);
+      expect(app.ctx.config.server.platformPollIntervalMs).toBe(45000);
     }
   });
 
-  it('accepts PATCH with valid server.githubPollIntervalMs and persists it', async () => {
+  it('accepts PATCH with valid server.platformPollIntervalMs and persists it', async () => {
     await seedConfigPath(app, tempDir);
 
-    const response = await patch('/api/config', { server: { port: 3000, githubPollIntervalMs: 60000 } }, { headers: JSON_HEADERS });
+    const response = await patch('/api/config', { server: { port: 3000, platformPollIntervalMs: 60000 } }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(200);
-    expect(app.ctx.config.server.githubPollIntervalMs).toBe(60000);
+    expect(app.ctx.config.server.platformPollIntervalMs).toBe(60000);
   });
 
   it('rejects non-object JSON bodies (primitive / array) with 400, not 500', async () => {
@@ -538,7 +519,7 @@ describe('PATCH /api/config', () => {
     app.ctx.config = {
       ...app.ctx.config,
       project: [{
-        id: 'p1', repo: 'a/b', merge: null,
+        id: 'p1', repo: 'https://github.com/a/b.git', merge: null,
         agent: [[
           { id: 'going-away', runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true },
           { id: 'going-away-qa', runtime: 'codex', role: 'qa', mode: 'local', yolo: true },
@@ -559,7 +540,7 @@ describe('PATCH /api/config', () => {
     app.ctx.config = {
       ...app.ctx.config,
       project: [{
-        id: 'p1', repo: 'a/b', merge: null,
+        id: 'p1', repo: 'https://github.com/a/b.git', merge: null,
         agent: [[
           { id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true },
           { id: 'becoming-manual-qa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/manual-qa', yolo: true },
@@ -570,7 +551,7 @@ describe('PATCH /api/config', () => {
     app.ctx.errorRecordStore = { sweepStaleBootstrapErrors } as never;
 
     const response = await patch('/api/config', { project: [{
-      id: 'p1', repo: 'a/b', merge: null,
+      id: 'p1', repo: 'https://github.com/a/b.git', merge: null,
       agent: [[
         { id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/manual', yolo: true },
         { id: 'becoming-manual-qa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/manual-qa', yolo: true },
@@ -655,7 +636,7 @@ describe('PATCH /api/config', () => {
 
       const { statusCode, body } = await patchAndRead({
         review: { rounds: 5 },
-        server: { port: 3000, githubPollIntervalMs: 60000 },
+        server: { port: 3000, platformPollIntervalMs: 60000 },
       });
       expect(statusCode).toBe(200);
       expect(body.restartRequired).toBe(false);
@@ -678,7 +659,7 @@ describe('PATCH /api/config', () => {
 
       const { statusCode, body } = await patchAndRead({
         review: { rounds: 7 },
-        server: { port: 4444, githubPollIntervalMs: 45_000 },
+        server: { port: 4444, platformPollIntervalMs: 45_000 },
       });
       expect(statusCode).toBe(200);
       expect(body.restartRequired).toBe(true);
@@ -756,7 +737,7 @@ describe('GET /api/projects', () => {
     const body = JSON.parse(response.body) as ProjectConfig[];
     expect(body).toHaveLength(1);
     expect(body[0].id).toBe('proj');
-    expect(body[0].repo).toBe('user/repo');
+    expect(body[0].repo).toBe('https://github.com/user/repo.git');
   });
 });
 
@@ -766,7 +747,7 @@ describe('GET /api/projects/:id', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as ProjectConfig;
     expect(body.id).toBe('proj');
-    expect(body.repo).toBe('user/repo');
+    expect(body.repo).toBe('https://github.com/user/repo.git');
   });
 
   it('returns 404 for unknown project', async () => {

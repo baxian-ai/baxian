@@ -30,7 +30,7 @@ describe('GET /api/pollers', () => {
     const ctx = await createTestContext(tempDir);
     const sample: PollerSnapshot[] = [
       {
-        repo: 'user/repo',
+        repo: 'https://github.com/user/repo.git',
         projectId: 'proj',
         intervalMs: 30_000,
         isPolling: false,

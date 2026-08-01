@@ -11,7 +11,6 @@ export class ExecOutcomeUnknownError extends Error {
 export const GIT_NET_ENV = 'GIT_HTTP_LOW_SPEED_LIMIT=1024 GIT_HTTP_LOW_SPEED_TIME=30';
 
 export const NET_EXEC_TIMEOUT_MS = 60_000;
-export const GH_EXEC_TIMEOUT_MS = 30_000;
 export const CLONE_EXEC_TIMEOUT_MS = 600_000;
 const NET_EXEC_RETRIES = 2;
 

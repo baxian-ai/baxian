@@ -17,7 +17,7 @@ function worst(pollers: PollerSnapshot[]): { poller: PollerSnapshot; kind: 'fail
   return degraded ? { poller: degraded, kind: 'degraded' } : null;
 }
 
-export function GithubConnectivityBanner() {
+export function PlatformConnectivityBanner() {
   const t = useT();
   const { data } = usePollers();
   if (!data) return null;
@@ -26,10 +26,10 @@ export function GithubConnectivityBanner() {
   const { poller, kind } = affected;
 
   const text = kind === 'failed'
-    ? t.banner.githubUnreachable(poller.repo)
+    ? t.banner.platformUnreachable(poller.repo)
     : kind === 'rate-limited'
-      ? t.banner.githubRateLimited(poller.repo, poller.rateLimitedUntil!)
-      : t.banner.githubDegraded(poller.repo);
+      ? t.banner.platformRateLimited(poller.repo, poller.rateLimitedUntil!)
+      : t.banner.platformDegraded(poller.repo);
 
   return (
     <div

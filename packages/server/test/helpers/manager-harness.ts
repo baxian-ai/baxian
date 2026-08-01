@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, vi } from 'vitest';
@@ -10,25 +10,15 @@ import type {
 } from '../../src/shared/index.js';
 import { AgentManager, type AgentManagerDeps } from '../../src/agent/manager.js';
 import { BranchManager } from '../../src/agent/branch.js';
-import type { PaneRef, TmuxManager, TmuxSessionRef } from '../../src/agent/tmux.js';
+import { TmuxManager, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
 import { fakeRunner } from './fake-runner.js';
 import { makeConfig, makeTask } from './fixtures.js';
-
-const SKILL_NAMES = [
-  'baxian-greeting',
-  'baxian-task-check',
-  'baxian-pr-review',
-  'baxian-pr-feedback',
-  'baxian-pr-recheck',
-  'baxian-signals',
-];
 
 export const TEST_SESSION_REF: TmuxSessionRef = {
   sessionId: '$1',
@@ -83,13 +73,6 @@ export async function createManagerHarness(
 ) {
   await initStateDir(tempDir);
 
-  const skillsDir = join(tempDir, 'skills');
-  for (const skillName of SKILL_NAMES) {
-    const skillDir = join(skillsDir, skillName);
-    await mkdir(skillDir, { recursive: true });
-    await writeFile(join(skillDir, 'SKILL.md'), `# ${skillName}\nMock skill for testing.`);
-  }
-
   const deps = overrides.deps ?? {};
   const defaultConfig = makeConfig();
   defaultConfig.project[0]!.agent = defaultConfig.project[0]!.agent.map(team => (
@@ -101,8 +84,6 @@ export async function createManagerHarness(
   const lockManager = deps.lockManager ?? new LockManager(join(tempDir, 'locks'));
   const eventLog = new EventLog(join(tempDir, 'events'));
   const eventBus = deps.eventBus ?? new EventBus(eventLog);
-  const skillRegistry = deps.skillRegistry ?? new SkillRegistry(skillsDir);
-  if (!deps.skillRegistry) await skillRegistry.scan();
   const runner = fakeRunner();
   const events: BaxianEvent[] = [];
   eventBus.on('*', event => { events.push(event); });
@@ -114,7 +95,6 @@ export async function createManagerHarness(
     taskStore,
     lockManager,
     eventBus,
-    skillRegistry,
     runnerFactory: deps.runnerFactory ?? (() => runner),
     ...(overrides.useDefaultPlatformRunner === false
       ? {}
@@ -164,8 +144,6 @@ export async function createManagerHarness(
     lockManager,
     eventBus,
     eventLog,
-    skillRegistry,
-    freshSkillRegistry: () => new SkillRegistry(skillsDir),
     runner,
     events,
     seedAgent,
@@ -183,7 +161,7 @@ export function createManagerSuiteRunner() {
   });
 }
 
-export async function createManagerSuiteHarness(tempDir: string) {
+async function createManagerSuiteHarness(tempDir: string) {
   const runner = createManagerSuiteRunner();
   const harness = await createManagerHarness(tempDir, {
     config: makeConfig({ review: { rounds: 2 } }),
@@ -219,10 +197,12 @@ export async function createManagerSuiteHarness(tempDir: string) {
       ok: true,
       createdSession: false,
       freshRuntime: false,
+      sessionRef: TEST_SESSION_REF,
       paneId: '%0',
       workdir: (await harness.agentStore.get(agentId))?.workdir ?? '/tmp/repo',
       ...resultOverrides,
     }));
+    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(null);
     vi.spyOn(
       target as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
       'waitForReplPromptReady',

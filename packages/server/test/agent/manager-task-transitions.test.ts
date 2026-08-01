@@ -153,7 +153,6 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
   function specManager(): AgentManager {
     return harness.createManager({
       config: harness.config,
-      skillRegistry: harness.freshSkillRegistry(),
       phaseSignalWatcher: watcherStub() as never,
     });
   }
@@ -835,8 +834,7 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
 
   it('holds the dev when the pr-created watcher prevents code-phase delivery', async () => {
     const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };
-    const m2 = harness.createManager({
-      skillRegistry: harness.freshSkillRegistry(), phaseSignalWatcher: watcher as never,
+    const m2 = harness.createManager({ phaseSignalWatcher: watcher as never,
     });
     await seedSpecApproved();
     vi.spyOn(m2, 'releaseAgentForTask').mockResolvedValue(true);

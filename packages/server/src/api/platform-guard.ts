@@ -1,5 +1,4 @@
 import type { BaxianConfig } from '../shared/types.js';
-import { projectNeedsPlatformEntry, resolveProjectTool } from '../config/validator.js';
 import { repoIdentityKey } from '../shared/git-url.js';
 import type { AgentManager } from '../agent/manager.js';
 
@@ -85,38 +84,32 @@ export async function activeParticipantBlockers(
   }));
 }
 
-function identityTrio(
+function platformIdentity(
   config: BaxianConfig,
   projectId: string,
-): { mode: string; repoKey: string; tool: string } | undefined {
+): { repoKey: string } | undefined {
   const project = config.project.find(p => p.id === projectId);
   if (!project) return undefined;
   return {
-    mode: 'git',
     repoKey: repoIdentityKey(project.repo),
-    tool: resolveProjectTool(project) ?? '',
   };
 }
 
 function sameIdentity(
-  left: ReturnType<typeof identityTrio>,
-  right: ReturnType<typeof identityTrio>,
+  left: ReturnType<typeof platformIdentity>,
+  right: ReturnType<typeof platformIdentity>,
 ): boolean {
   return left !== undefined && right !== undefined
-    && left.mode === right.mode
-    && left.repoKey === right.repoKey
-    && left.tool === right.tool;
+    && left.repoKey === right.repoKey;
 }
 
 function restoresEveryBinding(
-  identity: ReturnType<typeof identityTrio>,
+  identity: ReturnType<typeof platformIdentity>,
   tasks: Awaited<ReturnType<AgentManager['listActiveGitTasks']>>,
 ): boolean {
   return identity !== undefined && tasks.every(task =>
     task.platformBinding !== undefined
-    && task.platformBinding.mode === identity.mode
-    && task.platformBinding.repoKey === identity.repoKey
-    && task.platformBinding.tool === identity.tool);
+    && task.platformBinding.repoKey === identity.repoKey);
 }
 
 function startsOccupyingRepo(
@@ -125,10 +118,8 @@ function startsOccupyingRepo(
   project: BaxianConfig['project'][number],
   repoKey: string,
 ): boolean {
-  if (!projectNeedsPlatformEntry(next, project)) return false;
   const previous = current.project.find(candidate => candidate.id === project.id);
   return previous === undefined
-    || !projectNeedsPlatformEntry(current, previous)
     || repoIdentityKey(previous.repo) !== repoKey;
 }
 
@@ -143,8 +134,8 @@ export async function gitBindingBlockers(
   };
 
   for (const project of current.project) {
-    const before = identityTrio(current, project.id);
-    const after = identityTrio(next, project.id);
+    const before = platformIdentity(current, project.id);
+    const after = platformIdentity(next, project.id);
     if (sameIdentity(before, after)) continue;
     const tasks = await manager.listActiveGitTasks(project.id);
     if (tasks.length === 0) continue;

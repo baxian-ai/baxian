@@ -29,7 +29,7 @@ const VALID_CONFIG = {
   project: [
     {
       id: 'myproj',
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       merge: null,
       agent: [
         [
@@ -42,7 +42,7 @@ const VALID_CONFIG = {
 };
 
 const PROJECT = {
-  id: 'pp', repo: 'u/r',
+  id: 'pp', repo: 'https://github.com/u/r.git',
   agent: [[
     { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
     { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
@@ -68,7 +68,7 @@ describe('loadConfig', () => {
       project: [
         {
           id: 'pp',
-          repo: 'u/r',
+          repo: 'https://github.com/u/r.git',
           agent: [[
             { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
             { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
@@ -86,12 +86,12 @@ describe('loadConfig', () => {
     expect(config.review).toEqual({ rounds: 10 });
   });
 
-  it('normalizes plural keys', async () => {
+  it('rejects plural aliases instead of maintaining a second config dialect', async () => {
     const withPlurals = {
       projects: [
         {
           id: 'pp',
-          repo: 'u/r',
+          repo: 'https://github.com/u/r.git',
           agents: [[
             { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
             { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
@@ -102,9 +102,7 @@ describe('loadConfig', () => {
     const path = join(tempDir, 'baxian.json');
     await writeFile(path, JSON.stringify(withPlurals));
 
-    const config = await loadConfig(path);
-    expect(config.project).toHaveLength(1);
-    expect(config.project[0].agent).toHaveLength(1);
+    await expect(loadConfig(path)).rejects.toThrow(/projects: unknown configuration key/);
   });
 
   it('throws ConfigValidationError for invalid config', async () => {
@@ -112,7 +110,7 @@ describe('loadConfig', () => {
       project: [
         {
           id: 'pp',
-          repo: 'u/r',
+          repo: 'https://github.com/u/r.git',
           agent: [[{ id: 'q1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' }]],
         },
       ],
@@ -144,13 +142,13 @@ describe('prepareConfig type guards', () => {
   it('rejects malformed project/agent element shapes instead of dropping them or throwing raw TypeError', () => {
     expect(() => prepareConfig({ project: [null] })).toThrow(/project\[0\] must be an object/);
     expect(() => prepareConfig({ project: ['oops'] })).toThrow(/project\[0\] must be an object/);
-    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: 42 }] }))
+    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'https://github.com/u/r.git', agent: 42 }] }))
       .toThrow(/project\[0\]\.agent must be an array of Agent Teams/);
-    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: [{}] }] }))
+    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'https://github.com/u/r.git', agent: [{}] }] }))
       .toThrow(/project\[0\]\.agent\[0\] must be an array of agents/);
-    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: [[null]] }] }))
+    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'https://github.com/u/r.git', agent: [[null]] }] }))
       .toThrow(/project\[0\]\.agent\[0\]\[0\] must be an object/);
-    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: [{}] }] }))
+    expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'https://github.com/u/r.git', agent: [{}] }] }))
       .toThrow(ConfigValidationError);
   });
 
@@ -196,40 +194,38 @@ describe('prepareConfig type guards', () => {
     expect(cfg.project).toEqual([]);
   });
 
-  it('silently drops legacy github field from on-disk config (webhook ingestion was removed)', () => {
-    const cfg = prepareConfig({
+  it('rejects retired config fields instead of silently discarding them', () => {
+    expect(() => prepareConfig({
       github: { secret: 'webhook-secret-from-old-config' },
       project: [PROJECT],
-    });
-    expect((cfg as unknown as { github?: unknown }).github).toBeUndefined();
+    })).toThrow(/github: unknown configuration key/);
   });
 
-  it('falls back to default port when server.port is non-finite', () => {
-    const cfg = withServer({ port: 'eight thousand' });
-    expect(cfg.server.port).toBe(3000);
+  it('rejects an explicitly invalid server.port', () => {
+    expect(() => withServer({ port: 'eight thousand' })).toThrow(/server\.port/);
   });
 
-  it('drops server.token when not string, falls back host to default when not string', () => {
-    const cfg = withServer({ token: { x: 1 }, host: 7 });
-    expect(cfg.server.token).toBeUndefined();
-    expect(cfg.server.host).toBe('127.0.0.1');
+  it('rejects invalid server.token and server.host values', () => {
+    expect(() => withServer({ token: { x: 1 } })).toThrow(/server\.token/);
+    expect(() => withServer({ host: 7 })).toThrow(/server\.host/);
   });
 
-  it('keeps a valid positive integer server.githubPollIntervalMs within [1000ms, 2^31-1]', () => {
+  it('keeps a valid positive integer server.platformPollIntervalMs within [1000ms, 2^31-1]', () => {
     for (const value of [1000, 60000, 2147483647]) {
-      expect(withServer({ githubPollIntervalMs: value }).server.githubPollIntervalMs).toBe(value);
+      expect(withServer({ platformPollIntervalMs: value }).server.platformPollIntervalMs).toBe(value);
     }
   });
 
-  it('falls back non-number / non-finite server.githubPollIntervalMs to default (out-of-range finite numbers go to the validator pass)', () => {
-    for (const value of [undefined, '30000', NaN]) {
-      expect(withServer({ githubPollIntervalMs: value }).server.githubPollIntervalMs).toBe(30_000);
+  it('defaults an omitted platform poll interval and rejects explicitly invalid values', () => {
+    expect(withServer({}).server.platformPollIntervalMs).toBe(30_000);
+    for (const value of ['30000', NaN]) {
+      expect(() => withServer({ platformPollIntervalMs: value })).toThrow(ConfigValidationError);
     }
   });
 
-  it('rejects out-of-range / non-integer server.githubPollIntervalMs via ConfigValidationError (so PATCH returns 400 instead of silently falling back)', () => {
+  it('rejects out-of-range / non-integer server.platformPollIntervalMs via ConfigValidationError (so PATCH returns 400 instead of silently falling back)', () => {
     for (const value of [500, 1500.5, 0, -1000, 2147483648]) {
-      expect(() => withServer({ githubPollIntervalMs: value })).toThrow(ConfigValidationError);
+      expect(() => withServer({ platformPollIntervalMs: value })).toThrow(ConfigValidationError);
     }
   });
 
@@ -244,15 +240,12 @@ describe('prepareConfig type guards', () => {
     expect(cfg.server.tmuxProbeConcurrency).toBe(4);
   });
 
-  it('falls back non-number server tmux probe settings to defaults', () => {
-    const cfg = withServer({
-      tmuxProbePollIntervalMs: '10000',
-      tmuxProbeTimeoutMs: null,
-      tmuxProbeConcurrency: Number.POSITIVE_INFINITY,
-    });
-    expect(cfg.server.tmuxProbePollIntervalMs).toBe(10_000);
-    expect(cfg.server.tmuxProbeTimeoutMs).toBe(3_000);
-    expect(cfg.server.tmuxProbeConcurrency).toBe(4);
+  it('rejects explicitly invalid tmux probe settings', () => {
+    for (const server of [
+      { tmuxProbePollIntervalMs: '10000' },
+      { tmuxProbeTimeoutMs: null },
+      { tmuxProbeConcurrency: Number.POSITIVE_INFINITY },
+    ]) expect(() => withServer(server)).toThrow(ConfigValidationError);
   });
 
   it('passes through server.bootstrapRetryIntervalMs', () => {
@@ -260,9 +253,9 @@ describe('prepareConfig type guards', () => {
     expect(config.server.bootstrapRetryIntervalMs).toBe(30_000);
   });
 
-  it('falls back non-finite server.bootstrapRetryIntervalMs to default', () => {
-    const config = withServer({ port: 3000, bootstrapRetryIntervalMs: 'oops' as unknown as number });
-    expect(config.server.bootstrapRetryIntervalMs).toBe(60_000);
+  it('rejects an explicitly invalid server.bootstrapRetryIntervalMs', () => {
+    expect(() => withServer({ port: 3000, bootstrapRetryIntervalMs: 'oops' }))
+      .toThrow(ConfigValidationError);
   });
 
   it('passes through dispatch reconcile knobs', () => {
@@ -284,12 +277,11 @@ describe('prepareConfig type guards', () => {
     expect(config.server.dispatchReconcileMaxAttempts).toBe(3);
   });
 
-  it('falls back to default rounds when review.rounds is non-finite', () => {
-    const cfg = prepareConfig({
+  it('rejects explicitly invalid review.rounds', () => {
+    expect(() => prepareConfig({
       review: { rounds: NaN },
       project: [PROJECT],
-    });
-    expect(cfg.review.rounds).toBe(10);
+    })).toThrow(/review\.rounds/);
   });
 
   it('keeps review config limited to rounds', () => {
@@ -300,7 +292,7 @@ describe('prepareConfig type guards', () => {
     expect(cfg.review).toEqual({ rounds: 10 });
   });
 
-  it('warns for unknown keys at every supported scope and ignores them', async () => {
+  it('rejects unknown keys at every supported scope', async () => {
     const path = join(tempDir, 'baxian.json');
     await writeFile(path, JSON.stringify({
       legacyTop: true,
@@ -315,23 +307,16 @@ describe('prepareConfig type guards', () => {
         }))),
       }],
     }));
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    const cfg = await loadConfig(path);
-
-    expect(warn.mock.calls.map(call => String(call[0]))).toEqual(expect.arrayContaining([
-      expect.stringContaining('legacytop'),
-      expect.stringContaining('review.mode'),
-      expect.stringContaining('review.afterDone'),
-      expect.stringContaining('server.reviewBaseDir'),
-      expect.stringContaining('project[0].review'),
-      expect.stringContaining('project[0].agent[0][0].serverReview'),
-      expect.stringContaining('project[0].agent[0][1].serverReview'),
-    ]));
-    expect(cfg.review).toEqual({ rounds: 10 });
-    expect((cfg.server as unknown as Record<string, unknown>).reviewBaseDir).toBeUndefined();
-    expect((cfg.project[0] as unknown as Record<string, unknown>).review).toBeUndefined();
-    expect((cfg.project[0].agent[0][0] as unknown as Record<string, unknown>).serverReview).toBeUndefined();
+    await expect(loadConfig(path)).rejects.toMatchObject({
+      errors: expect.arrayContaining([
+        { path: 'legacyTop', message: 'unknown configuration key' },
+        { path: 'review.mode', message: 'unknown configuration key' },
+        { path: 'review.afterDone', message: 'unknown configuration key' },
+        { path: 'server.reviewBaseDir', message: 'unknown configuration key' },
+        { path: 'project[0].review', message: 'unknown configuration key' },
+        { path: 'project[0].agent[0][0].serverReview', message: 'unknown configuration key' },
+      ]),
+    });
   });
 
   it('rejects an incomplete Agent Team', () => {
@@ -339,7 +324,7 @@ describe('prepareConfig type guards', () => {
       review: { rounds: 10 },
       project: [{
         id: 'pp',
-        repo: 'u/r',
+        repo: 'https://github.com/u/r.git',
         agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
       }],
     })).toThrow(/exactly one qa agent/);
@@ -579,7 +564,7 @@ describe('createDefaultConfig', () => {
     expect(dirStat.isDirectory()).toBe(true);
   });
 
-  it('template content loads cleanly through loadConfig (validator + normalizer)', async () => {
+  it('template content loads cleanly through loadConfig', async () => {
     const target = join(homeReal, '.baxian', 'baxian.json');
     await createDefaultConfig(target);
     const cfg = await loadConfig(target);

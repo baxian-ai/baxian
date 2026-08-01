@@ -24,7 +24,7 @@ export function makeConfig(overrides: ConfigOverrides = {}): BaxianConfig {
     host: [],
     project: [{
       id: 'proj',
-      repo: 'user/repo',
+      repo: 'https://github.com/user/repo.git',
       merge: null,
       agent: [[
         makeAgent(),
@@ -64,7 +64,7 @@ export function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     branch,
     branchCreatedByBaxian: cloned.branchCreatedByBaxian ?? branch === `bx/${id}`,
     reviewRound: 0,
-    platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
+    platformBinding: { repoKey: 'github.com/user/repo' },
     status: 'in_progress',
     createdAt: '2026-05-14T05:00:00.000Z',
     updatedAt: '2026-05-14T05:00:00.000Z',

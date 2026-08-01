@@ -4,7 +4,7 @@ import type { BaxianConfig, HttpsConfig, HostConfig, ProjectConfig } from '../sh
 import { autoBootstrapAgentIds } from '../agent/bootstrap.js';
 import {
   saveConfig,
-  prepareConfigWithWarnings,
+  prepareConfig,
   ConfigValidationError,
 } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
@@ -73,6 +73,7 @@ function sameHttps(a: HttpsConfig | undefined, b: HttpsConfig | undefined): bool
 function resolveSensitive(incoming: string | undefined, current: string | undefined): string | undefined {
   if (incoming === REDACTED) return current;
   if (incoming === undefined) return current;
+  if (incoming.trim() === '') return undefined;
   return incoming;
 }
 
@@ -80,19 +81,8 @@ function redactHostSecret(host: HostConfig): HostConfig {
   return host.password !== undefined ? { ...host, password: REDACTED } : host;
 }
 
-function redactAgentHostRef(host: string | HostConfig | undefined): string | HostConfig | undefined {
-  return host && typeof host === 'object' ? redactHostSecret(host) : host;
-}
-
 export function redactHosts(hosts: HostConfig[]): HostConfig[] {
   return hosts.map(redactHostSecret);
-}
-
-export function redactProjects(projects: ProjectConfig[]): ProjectConfig[] {
-  return projects.map(p => ({
-    ...p,
-    agent: p.agent.map(team => team.map(a => ({ ...a, host: redactAgentHostRef(a.host) }))),
-  }));
 }
 
 export function redactConfig(config: BaxianConfig): BaxianConfig {
@@ -103,7 +93,7 @@ export function redactConfig(config: BaxianConfig): BaxianConfig {
       ...(config.server.token !== undefined ? { token: REDACTED } : {}),
     },
     host: redactHosts(config.host ?? []),
-    project: redactProjects(config.project ?? []),
+    project: config.project,
   };
 }
 
@@ -165,9 +155,8 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       };
 
       let validated: BaxianConfig;
-      let warnings: Array<{ path: string; message: string }>;
       try {
-        ({ config: validated, warnings } = prepareConfigWithWarnings(merged));
+        validated = prepareConfig(merged);
       } catch (err) {
         if (err instanceof ConfigValidationError) {
           return reply.status(400).send({
@@ -230,14 +219,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      try {
-        await app.ctx.agentManager.ensurePluginSkillPools(validated);
-      } catch (err) {
-        return reply.status(400).send({
-          error: `git-driver plugin skill pool is unusable for this config: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      }
-
       const mustRestart = requiresRestart(current, validated);
       const committed = await app.ctx.agentManager.guardGitConfigCommit(
         current,
@@ -273,7 +254,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       return reply.send({
         config: redactConfig(validated),
         restartRequired: mustRestart,
-        ...(warnings.length > 0 ? { warnings } : {}),
         note: mustRestart
           ? 'Saved and hot-reloadable fields applied. server.host/port/https changes require a restart to take effect.'
           : 'Saved and applied immediately (no restart required).',

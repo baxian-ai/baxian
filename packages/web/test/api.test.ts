@@ -333,17 +333,17 @@ describe('response handling helpers', () => {
     fetchSpy.mockImplementationOnce(async () => jsonResponse({
       error: 'Invalid config',
       details: [
-        { path: 'project[0].gitCli.tool', message: 'required for non-GitHub repositories' },
+        { path: 'project[0].repo', message: 'must be a full github.com repository URL' },
         { path: 7, message: 'invalid path' },
         null,
       ],
     }, 400));
     const err = await api.projects.list().catch((e: unknown) => e) as ApiError;
     expect(err.message).toBe(
-      'Invalid config\nproject[0].gitCli.tool: required for non-GitHub repositories',
+      'Invalid config\nproject[0].repo: must be a full github.com repository URL',
     );
     expect(err.details).toEqual([
-      { path: 'project[0].gitCli.tool', message: 'required for non-GitHub repositories' },
+      { path: 'project[0].repo', message: 'must be a full github.com repository URL' },
     ]);
   });
 

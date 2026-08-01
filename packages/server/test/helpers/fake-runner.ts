@@ -111,9 +111,6 @@ function protocolReply(
     const marker = command.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
     return complete({ stdout: `${marker}\n${pane.screen}` });
   }
-  if (command.includes('BX_SKILLS_SWEPT')) {
-    return complete({ stdout: 'BX_SKILLS_SWEPT' });
-  }
   return SUCCESS;
 }
 

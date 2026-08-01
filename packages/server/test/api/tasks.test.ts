@@ -787,7 +787,7 @@ describe('POST /api/tasks - op-aware gates', () => {
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body);
     expect(body.error).toMatch(/exceeds.*limit/);
-    expect(body.error).toMatch(/AGENT_PHASES/);
+    expect(body.error).toMatch(/task description or platform workflow instructions/);
   });
 
   it('previewPromptBytesForTaskInput throws (unknown agent) → 400', async () => {
@@ -825,7 +825,7 @@ describe('GET /api/tasks/:id/pr-review', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  const GIT_BINDING = { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' };
+  const GIT_BINDING = { repoKey: 'github.com/user/repo' };
 
   function spyLiveBinding(binding = GIT_BINDING) {
     return vi.spyOn(app.ctx.agentManager, 'platformBindingFields')
@@ -836,9 +836,9 @@ describe('GET /api/tasks/:id/pr-review', () => {
     await seedTask(app.ctx.taskStore, { id: 'git-ok', prNumber: 7, platformBinding: GIT_BINDING });
     const fakeDriver = {
       commentSources: [
-        { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
+        { key: 'issue-comments', category: 'top-level' },
       ],
-      runCommentSource: async () => [{ id: 'c1', body: 'from driver', createdAt: '2026-07-19T01:00:00Z' }],
+      listComments: async () => [{ id: 'c1', body: 'from driver', createdAt: '2026-07-19T01:00:00Z' }],
     };
     const bindingSpy = spyLiveBinding();
     const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor')
@@ -864,7 +864,7 @@ describe('GET /api/tasks/:id/pr-review', () => {
 
   it('a drifted platform binding never queries the live repo for a historical task', async () => {
     await seedTask(app.ctx.taskStore, { id: 'git-drift', prNumber: 7, status: 'merged', platformBinding: GIT_BINDING });
-    const bindingSpy = spyLiveBinding({ mode: 'git', repoKey: 'github.com/user/other-repo', tool: 'gh' });
+    const bindingSpy = spyLiveBinding({ repoKey: 'github.com/user/other-repo' });
     const driverSpy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor');
     const res = await get('/api/tasks/git-drift/pr-review');
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'driver-unavailable' });
@@ -876,9 +876,9 @@ describe('GET /api/tasks/:id/pr-review', () => {
   function countingDriver(): { driver: unknown; calls: number[] } {
     const calls: number[] = [];
     const driver = {
-      commentSources: [{ key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } }],
-      runCommentSource: async (_src: unknown, vars: { prNumber: number }) => {
-        calls.push(vars.prNumber);
+      commentSources: [{ key: 'issue-comments', category: 'top-level' }],
+      listComments: async (_src: unknown, prNumber: number) => {
+        calls.push(prNumber);
         return [{ id: 'c1', body: 'hi', createdAt: '2026-07-19T01:00:00Z' }];
       },
     };
@@ -936,7 +936,7 @@ describe('GET /api/tasks/:id/pr-review', () => {
     const body = JSON.parse((await get('/api/tasks/git-fresh/pr-review')).body);
     expect(body.fetchedAt).toMatch(/^\d{4}-/);
     expect(body.autoRefresh).toBe(true);
-    expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.githubPollIntervalMs);
+    expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.platformPollIntervalMs);
     spy.mockRestore();
     bindingSpy.mockRestore();
   });
@@ -978,14 +978,14 @@ describe('GET /api/tasks/:id/pr-review', () => {
     });
     const body = JSON.parse((await get('/api/tasks/git-reopened/pr-review')).body);
     expect(body.autoRefresh).toBe(true);
-    expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.githubPollIntervalMs);
+    expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.platformPollIntervalMs);
     spy.mockRestore();
     bindingSpy.mockRestore();
   });
 });
 
 describe('POST /api/tasks/:id/pr-review/refresh', () => {
-  const GIT_BINDING = { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' };
+  const GIT_BINDING = { repoKey: 'github.com/user/repo' };
 
   function spyLiveBinding() {
     return vi.spyOn(app.ctx.agentManager, 'platformBindingFields')
@@ -995,9 +995,9 @@ describe('POST /api/tasks/:id/pr-review/refresh', () => {
   function countingDriver(): { driver: unknown; calls: number[] } {
     const calls: number[] = [];
     const driver = {
-      commentSources: [{ key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } }],
-      runCommentSource: async (_src: unknown, vars: { prNumber: number }) => {
-        calls.push(vars.prNumber);
+      commentSources: [{ key: 'issue-comments', category: 'top-level' }],
+      listComments: async (_src: unknown, prNumber: number) => {
+        calls.push(prNumber);
         return [{ id: 'c1', body: 'hi', createdAt: '2026-07-19T01:00:00Z' }];
       },
     };
@@ -1029,9 +1029,9 @@ describe('POST /api/tasks/:id/pr-review/refresh', () => {
     const calls: number[] = [];
     let label = 'before';
     const driver = {
-      commentSources: [{ key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } }],
-      runCommentSource: async (_src: unknown, vars: { prNumber: number }) => {
-        calls.push(vars.prNumber);
+      commentSources: [{ key: 'issue-comments', category: 'top-level' }],
+      listComments: async (_src: unknown, prNumber: number) => {
+        calls.push(prNumber);
         return [{ id: 'c1', body: label, createdAt: '2026-07-19T01:00:00Z' }];
       },
     };

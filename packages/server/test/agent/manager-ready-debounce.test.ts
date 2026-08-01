@@ -4,7 +4,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentManager } from '../../src/agent/manager.js';
 import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
-import { createManagerHarness } from '../helpers/manager-harness.js';
+import {
+  createManagerHarness,
+  paneRefOf,
+  TEST_SESSION_REF,
+} from '../helpers/manager-harness.js';
 import { fakeRunner } from '../helpers/fake-runner.js';
 
 const CODEX_IDLE = '› \n\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
@@ -111,10 +115,24 @@ describe('任务边界注入前的稳定就绪门', () => {
     vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
 
     const boundary = (manager as unknown as {
-      clearRuntimeForDispatchBoundary(t: TmuxManager, p: string, a: string, r: string, rv: () => Promise<void>): Promise<void>;
+      clearRuntimeForDispatchBoundary(
+        t: TmuxManager,
+        p: ReturnType<typeof paneRefOf>,
+        a: string,
+        r: 'codex',
+        s: typeof TEST_SESSION_REF,
+        rv: () => Promise<void>,
+      ): Promise<void>;
     }).clearRuntimeForDispatchBoundary.bind(manager);
 
-    await expect(boundary(tmux, '%0', 'qa-1', 'codex', async () => undefined))
+    await expect(boundary(
+      tmux,
+      paneRefOf('%0', 'qa-1'),
+      'qa-1',
+      'codex',
+      TEST_SESSION_REF,
+      async () => undefined,
+    ))
       .rejects.toBeInstanceOf(ReplNotReadyError);
     expect(clearDraft).not.toHaveBeenCalled();
     expect(sendLiteral).not.toHaveBeenCalled();
@@ -129,13 +147,29 @@ describe('任务边界注入前的稳定就绪门', () => {
     vi.spyOn(TmuxManager.prototype, 'captureSettledSnapshot').mockResolvedValue(CODEX_IDLE);
     vi.spyOn(TmuxManager.prototype, 'waitSubmitAck').mockResolvedValue(undefined);
     vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
+    vi.spyOn(TmuxManager.prototype, 'setSessionOptionsIfAlive').mockResolvedValue('applied');
 
     const boundary = (manager as unknown as {
-      clearRuntimeForDispatchBoundary(t: TmuxManager, p: string, a: string, r: string, rv: () => Promise<void>): Promise<void>;
+      clearRuntimeForDispatchBoundary(
+        t: TmuxManager,
+        p: ReturnType<typeof paneRefOf>,
+        a: string,
+        r: 'codex',
+        s: typeof TEST_SESSION_REF,
+        rv: () => Promise<void>,
+      ): Promise<void>;
     }).clearRuntimeForDispatchBoundary.bind(manager);
+    const pane = paneRefOf('%0', 'qa-1');
 
-    await expect(boundary(tmux, '%0', 'qa-1', 'codex', async () => undefined)).resolves.toBeUndefined();
+    await expect(boundary(
+      tmux,
+      pane,
+      'qa-1',
+      'codex',
+      TEST_SESSION_REF,
+      async () => undefined,
+    )).resolves.toBeUndefined();
     expect(clearDraft).toHaveBeenCalled();
-    expect(sendLiteral).toHaveBeenCalledWith('%0', '/clear');
+    expect(sendLiteral).toHaveBeenCalledWith(pane, '/clear');
   });
 });

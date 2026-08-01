@@ -19,7 +19,7 @@ interface Captured { cmd: string; env?: Record<string, string> }
 
 function remoteAgentProject(): ProjectConfig {
   return {
-    id: 'proj', repo: 'user/repo', merge: null,
+    id: 'proj', repo: 'https://github.com/user/repo.git', merge: null,
     agent: [[
       { id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box' },
       { id: 'rqa', runtime: 'codex', role: 'qa', mode: 'remote', host: 'box' },

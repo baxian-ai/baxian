@@ -74,13 +74,6 @@ describe('AgentStore', () => {
     expect(await readFile(path, 'utf-8')).not.toContain('cutoverToken');
   });
 
-  it('migrates legacy flat needInputAt into an epoch-0 lit watermark', async () => {
-    const state = makeState('dev-1', { taskId: 'task-001' });
-    await store.set({ ...state, needInputAt: NOW } as never);
-    const loaded = await store.get('dev-1');
-    expect(loaded?.needInput).toEqual({ epoch: 0, askSeq: 1, answeredSeq: 0, at: NOW });
-  });
-
   it('overwrites existing binding facts', async () => {
     await store.set(makeState('dev-1', { taskId: 'task-a' }));
     await store.set(makeState('dev-1', { taskId: 'task-b' }));

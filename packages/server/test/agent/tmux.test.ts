@@ -528,28 +528,28 @@ describe('TmuxManager', () => {
 
     it('reads the option through a claim-checked marker-first command', async () => {
       primeExec(okHeader('1.2.3'));
-      expect(await tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).toBe('1.2.3');
+      expect(await tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-context-task-id')).toBe('1.2.3');
       const cmd = lastCmd(runner);
       expect(cmd).toContain("tmux if-shell -t '$7'");
       expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
-      expect(cmd).toContain('#{@baxian-skills-version}');
+      expect(cmd).toContain('#{@baxian-context-task-id}');
       expect(cmd).toContain('BX_PANE_OK');
       expect(cmd).toContain('BX_TARGET_GONE');
     });
 
     it('maps an unset/empty option to null', async () => {
       primeExec(okHeader(''));
-      expect(await tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).toBeNull();
+      expect(await tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-context-task-id')).toBeNull();
     });
 
     it('throws PaneGoneError when the identity condition fails', async () => {
       primeExec('BX_TARGET_GONE\n');
-      await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).rejects.toThrow(PaneGoneError);
+      await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-context-task-id')).rejects.toThrow(PaneGoneError);
     });
 
     it('throws PaneGoneError when the server is gone', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
-      await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).rejects.toThrow(PaneGoneError);
+      await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-context-task-id')).rejects.toThrow(PaneGoneError);
     });
   });
 
@@ -1045,9 +1045,9 @@ describe('TmuxManager', () => {
     });
 
     it('does NOT re-send Enter while a Codex completion popup is open (Enter would insert, not submit)', async () => {
-      const baseline = buildBaseline('› $baxian-pr-review\n  phase: review\n', 0);
+      const baseline = buildBaseline('› Review the PR\n  phase: review\n', 0);
       runner.exec.mockResolvedValue({
-        stdout: composeSnapStdout('› $baxian-pr-review\n  phase: review\n\n  Press enter to insert or esc to close\n', 0),
+        stdout: composeSnapStdout('› Review the PR\n  phase: review\n\n  Press enter to insert or esc to close\n', 0),
         stderr: '',
         exitCode: 0,
       });
@@ -1059,7 +1059,7 @@ describe('TmuxManager', () => {
     });
 
     it('re-sends Enter when the prompt body quotes the popup footer but the status line is still below it', async () => {
-      const held = '› $baxian-pr-review\n  note: Press enter to insert or esc to close\n\n  gpt-5.5 xhigh · ~/repo\n';
+      const held = '› Review the PR\n  note: Press enter to insert or esc to close\n\n  gpt-5.5 xhigh · ~/repo\n';
       const baseline = buildBaseline(held, 0);
       let submitted = false;
       runner.exec.mockImplementation(async () => ({
@@ -1149,9 +1149,9 @@ describe('TmuxManager', () => {
     });
 
     it('detects a Codex completion popup whose footer a narrow pane wrapped across two rows', async () => {
-      const baseline = buildBaseline('› $baxian-pr-review\n  phase: review\n', 0);
+      const baseline = buildBaseline('› Review the PR\n  phase: review\n', 0);
       runner.exec.mockResolvedValue({
-        stdout: composeSnapStdout('› $baxian-pr-review\n  Build Web Apps [Plugin]\n\n  Press enter to insert or esc\n  to close\n', 0),
+        stdout: composeSnapStdout('› Review the PR\n  Build Web Apps [Plugin]\n\n  Press enter to insert or esc\n  to close\n', 0),
         stderr: '',
         exitCode: 0,
       });

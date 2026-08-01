@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   CLONE_EXEC_TIMEOUT_MS,
-  GH_EXEC_TIMEOUT_MS,
   GIT_NET_ENV,
   NET_EXEC_TIMEOUT_MS,
   execNetwork,
@@ -222,9 +221,5 @@ describe('execNetwork', () => {
 describe('constants', () => {
   it('exposes the git low-speed guard as a shell env prefix', () => {
     expect(GIT_NET_ENV).toBe('GIT_HTTP_LOW_SPEED_LIMIT=1024 GIT_HTTP_LOW_SPEED_TIME=30');
-  });
-
-  it('keeps gh timeout tighter than the git default', () => {
-    expect(GH_EXEC_TIMEOUT_MS).toBeLessThan(NET_EXEC_TIMEOUT_MS);
   });
 });

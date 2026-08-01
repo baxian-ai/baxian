@@ -47,18 +47,6 @@ describe('AgentManager need-input watermark persistence', () => {
     expect((await harness.agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 3, askSeq: 1, answeredSeq: 1 });
   });
 
-  it('treats legacy flat needInputAt as an epoch-0 lit watermark via parse migration', async () => {
-    await harness.seedAgent({ id: 'dev-1', taskId: 't-wm' });
-    const raw = { id: 'dev-1', projectId: 'proj', taskId: 't-wm', updatedAt: NOW, needInputAt: '2026-07-06T10:00:00.000Z' };
-    await harness.agentStore.update('dev-1', () => raw as never);
-    const migrated = await harness.agentStore.get('dev-1');
-    expect(migrated?.needInput).toEqual({
-      epoch: 0, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00.000Z',
-    });
-    expect(await commit({ epoch: 0, askSeq: 1, answeredSeq: 1 })).toBe('ok');
-    expect((await harness.agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 0, askSeq: 1, answeredSeq: 1 });
-  });
-
   it('bump(fresh) strips seqs, bump(restore) carries them; both advance the epoch', async () => {
     await seedWatermarkAgent({ epoch: 4, askSeq: 2, answeredSeq: 1, at: NOW });
     const restored = await harness.manager['bumpNeedInputEpochForArm']('dev-1', 't-wm', 'restore');

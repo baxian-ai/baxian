@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { AgentConfig, TaskState } from '../../src/shared/index.js';
 import { AgentManager, EnsureSessionError } from '../../src/agent/manager.js';
-import { PromptSizeError, RequiredSkillsMissingError } from '../../src/agent/prompt.js';
+import { PromptSizeError } from '../../src/agent/prompt.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from '../../src/agent/branch.js';
-import { DriverOpError } from '../../src/platform/git-driver.js';
+import { DriverOpError } from '../../src/platform/types.js';
 import {
   createManagerSuiteRunner,
   paneRefOf,
@@ -14,7 +14,7 @@ import {
 
 const NOW = '2026-05-14T05:00:00.000Z';
 
-const GIT_BINDING = { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' };
+const GIT_BINDING = { repoKey: 'github.com/user/repo' };
 
 function stubImagePathsThrow(mgr: AgentManager, err: Error): void {
   vi.spyOn(
@@ -134,25 +134,12 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     expect(parkSpy).toHaveBeenCalledWith('/tmp/repo');
   });
 
-  it('maps RequiredSkillsMissingError to DispatchTerminalError(required_skills_missing)', async () => {
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    harness.stubEnsureSession(harness.manager);
-    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
-    stubImagePathsThrow(harness.manager, new RequiredSkillsMissingError(['baxian-task-check']));
-
-    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
-      reason: 'required_skills_missing',
-    });
-    expect(parkSpy).toHaveBeenCalledWith('/tmp/repo');
-  });
-
   it.each([
     { name: 'task disappears mid-dispatch', fresh: null },
     { name: 'task turns terminal mid-dispatch', fresh: { status: 'cancelled' as const } },
     { name: 'task status leaves the phase expectation mid-dispatch', fresh: { status: 'review' as const } },
   ])('parks the fixed Workdir and aborts when the $name', async ({ fresh }) => {
-    const t = await harness.seedTask();
+    const t = await harness.seedTask({ signalToken: 'dispatch12345' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     harness.stubEnsureSession(harness.manager);
     const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
@@ -170,7 +157,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
   });
 
   it('aborts without cleanup when the bound agent loses ownership mid-dispatch', async () => {
-    const t = await harness.seedTask();
+    const t = await harness.seedTask({ signalToken: 'dispatch12345' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     harness.stubEnsureSession(harness.manager);
     const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
@@ -195,7 +182,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
   it('aborts without cleanup when an unbound-phase agent gets reassigned mid-dispatch', async () => {
     const t = await harness.seedTask({
       status: 'review', signalToken: 'tok123456789', latestHeadSha: 'a'.repeat(40),
-      passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
+      reviewHeadAnchorSha: 'a'.repeat(40), passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
     });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id });
     harness.stubEnsureSession(harness.manager);
@@ -222,7 +209,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     const latestHeadSha = 'a'.repeat(40);
     const t = await harness.seedTask({
       status: 'review', qaAgentId: 'qa-1', signalToken: 'tok123456789', latestHeadSha,
-      passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
+      reviewHeadAnchorSha: latestHeadSha, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
     });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id });
     harness.stubEnsureSession(harness.manager);
@@ -234,13 +221,48 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     expect(detachedSpy).toHaveBeenCalledWith('/tmp/qa-repo', t.branch, latestHeadSha);
   });
 
+  it('keeps same-task context when a start dispatch is retried', async () => {
+    const t = await harness.seedTask({
+      title: 'Already delivered title',
+      description: 'Already delivered description',
+      signalToken: 'dispatch12345',
+    });
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    harness.stubEnsureSession(harness.manager, { sessionRef: TEST_SESSION_REF });
+    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(t.id);
+    const clearSpy = vi.mocked((
+      harness.manager as unknown as {
+        clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void>;
+      }
+    ).clearRuntimeForDispatchBoundary);
+    const rememberSpy = vi.spyOn(
+      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
+      'rememberTaskContext',
+    ).mockResolvedValue(undefined);
+    let prompt = '';
+    harness.stubInject(harness.manager, async (_tmux, _pane, value) => {
+      prompt = value;
+      return { acked: true, composerDelivered: true };
+    });
+
+    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).resolves.toBe(true);
+
+    expect(clearSpy).not.toHaveBeenCalled();
+    expect(rememberSpy).not.toHaveBeenCalled();
+    expect(prompt).toContain(`task: ${t.id}`);
+    expect(prompt).toContain('phase: develop');
+    expect(prompt).not.toContain('Already delivered title');
+    expect(prompt).not.toContain('Already delivered description');
+    expect(prompt).not.toContain('Protocol:');
+  });
+
   it('refreshes a moved PR head and retries the exact detached checkout once', async () => {
     const oldHeadSha = 'a'.repeat(40);
     const newHeadSha = 'b'.repeat(40);
     const t = await harness.seedTask({
       status: 'review', qaAgentId: 'qa-1', prNumber: 17,
       platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
-      signalToken: 'tok123456789', latestHeadSha: oldHeadSha,
+      signalToken: 'tok123456789', latestHeadSha: oldHeadSha, reviewHeadAnchorSha: oldHeadSha,
     });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id });
     harness.stubEnsureSession(harness.manager, { freshRuntime: true });
@@ -278,32 +300,42 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
       harness.manager as unknown as {
         clearRuntimeForDispatchBoundary: (
           tmuxManager: TmuxManager,
-          paneId: string,
+          pane: ReturnType<typeof paneRefOf>,
           agentId: string,
           runtime: AgentConfig['runtime'],
+          sessionRef: typeof TEST_SESSION_REF,
           revalidateOwner: () => Promise<void>,
         ) => Promise<void>;
       }
     ).clearRuntimeForDispatchBoundary.bind(harness.manager);
 
-    await expect(clearBoundary(tmux, '%0', 'dev-1', 'claude-code', revalidate))
+    await expect(clearBoundary(
+      tmux,
+      paneRefOf('%0', 'dev-1'),
+      'dev-1',
+      'claude-code',
+      TEST_SESSION_REF,
+      revalidate,
+    ))
       .rejects.toThrow('Runtime rejected /clear');
 
-    expect(tmux.sendKeysLiteral).toHaveBeenCalledWith('%0', '/clear');
+    expect(tmux.sendKeysLiteral).toHaveBeenCalledWith(paneRefOf('%0', 'dev-1'), '/clear');
     expect(revalidate).toHaveBeenCalledTimes(1);
   });
 
-  it('does not retag stale skills when task-boundary /clear fails', async () => {
+  it('does not inject or remember a task when the required context reset fails', async () => {
     const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     vi.spyOn(harness.manager, 'ensureSession').mockResolvedValue({
       ok: true,
       createdSession: false,
       freshRuntime: false,
-      skillsStale: true,
+      sessionRef: TEST_SESSION_REF,
+      pane: paneRefOf('%0', 'dev-1'),
       paneId: '%0',
       workdir: '/tmp/repo',
     });
+    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(null);
     vi.spyOn(
       harness.manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
       'waitForReplPromptReady',
@@ -312,20 +344,29 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
       harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
       'clearRuntimeForDispatchBoundary',
     ).mockRejectedValue(new Error('Runtime rejected /clear'));
-    const tagSpy = vi.spyOn(
-      harness.manager as unknown as { tagSessionSkillsVersion: (...args: unknown[]) => Promise<void> },
-      'tagSessionSkillsVersion',
+    const rememberSpy = vi.spyOn(
+      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
+      'rememberTaskContext',
     ).mockResolvedValue(undefined);
+    const injectSpy = vi.spyOn(
+      harness.manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
+      'injectAndAwaitAck',
+    );
 
     await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
       name: 'EnsureSessionError',
       partial: expect.objectContaining({ handled: true }),
     });
-    expect(tagSpy).not.toHaveBeenCalled();
+    expect(injectSpy).not.toHaveBeenCalled();
+    expect(rememberSpy).not.toHaveBeenCalled();
   });
 
   it('warns but keeps the delivered dispatch when both marker-clear and the hold fail', async () => {
-    const t = await harness.seedTask({ id: 'task-deliver-hold-fails', branch: 'bx/task-deliver-hold-fails' });
+    const t = await harness.seedTask({
+      id: 'task-deliver-hold-fails',
+      branch: 'bx/task-deliver-hold-fails',
+      signalToken: 'dispatch12345',
+    });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.acquireAgentLock('dev-1');
     harness.stubEnsureSession(harness.manager);
@@ -347,7 +388,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
   });
 
   it('releases the binding and lock after parking the Workdir when paste fails definitively', async () => {
-    const t = await harness.seedTask();
+    const t = await harness.seedTask({ signalToken: 'dispatch12345' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.acquireAgentLock('dev-1');
     harness.stubEnsureSession(harness.manager);
@@ -383,7 +424,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
   });
 
   it('leaves the new owner untouched when the agent was reassigned while the paste was failing', async () => {
-    const t = await harness.seedTask();
+    const t = await harness.seedTask({ signalToken: 'dispatch12345' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.acquireAgentLock('dev-1');
     harness.stubEnsureSession(harness.manager);
@@ -398,7 +439,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
   });
 
   it('rethrows the paste error even when the cleanup write itself fails', async () => {
-    const t = await harness.seedTask();
+    const t = await harness.seedTask({ signalToken: 'dispatch12345' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.acquireAgentLock('dev-1');
     harness.stubEnsureSession(harness.manager);
@@ -421,8 +462,12 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
 });
 
 describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
-  async function seedContinueFix(): Promise<TaskState> {
-    const t = await harness.seedTask({ status: 'fixing', signalToken: 'tok123456789' });
+  async function seedContinueFix(overrides: Partial<TaskState> = {}): Promise<TaskState> {
+    const t = await harness.seedTask({
+      status: 'fixing',
+      signalToken: 'tok123456789',
+      ...overrides,
+    });
     await harness.seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       workdir: '/tmp/repo/.baxian-worktrees/wt',
@@ -457,7 +502,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   it('unbound phase is skipped when the agent is bound to a different task', async () => {
     const t = await harness.seedTask({
       status: 'review', signalToken: 'tok123456789',
-      passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
+      reviewHeadAnchorSha: 'a'.repeat(40), passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
     });
     await harness.seedAgent({
       id: 'qa-1', taskId: 'other-task', paneId: '%0',
@@ -479,52 +524,103 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
       .resolves.toBe(true);
   });
 
-  it('clears and retags stale skill context before continuation injection', async () => {
-    const t = await seedContinueFix();
+  it.each([
+    { context: 'unknown', marker: null },
+    { context: 'another task', marker: 'task-before-this-one' },
+  ])('clears $context context, injects the full continuation, then remembers the task', async ({ marker }) => {
+    const t = await seedContinueFix({
+      title: 'Context boundary title',
+      description: 'Context boundary description',
+    });
     const order: string[] = [];
+    let prompt = '';
     harness.stubEnsureSession(harness.manager, {
-      skillsStale: true,
       pane: paneRefOf('%0', 'dev-1'),
       sessionRef: TEST_SESSION_REF,
     });
+    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(marker);
     const clearSpy = vi.spyOn(
       harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
       'clearRuntimeForDispatchBoundary',
     ).mockImplementation(async (...args) => {
       order.push('clear');
-      await (args[4] as () => Promise<void>)();
+      await (args[5] as () => Promise<void>)();
     });
-    const tagSpy = vi.spyOn(
-      harness.manager as unknown as { tagSessionSkillsVersion: (...args: unknown[]) => Promise<void> },
-      'tagSessionSkillsVersion',
+    const rememberSpy = vi.spyOn(
+      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
+      'rememberTaskContext',
     ).mockImplementation(async () => {
-      order.push('tag');
+      order.push('remember');
     });
-    harness.stubInject(harness.manager, async () => {
+    harness.stubInject(harness.manager, async (_tmux, _paneId, value) => {
       order.push('inject');
+      prompt = value;
       return { acked: true, composerDelivered: true };
     });
 
     await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(true);
-    expect(order).toEqual(['clear', 'tag', 'inject']);
+    expect(order).toEqual(['clear', 'inject', 'remember']);
+    expect(prompt).toContain('title: Context boundary title');
+    expect(prompt).toContain('Context boundary description');
     expect(clearSpy).toHaveBeenCalledOnce();
-    expect(tagSpy).toHaveBeenCalledWith(expect.any(TmuxManager), 'dev-1', TEST_SESSION_REF);
+    expect(rememberSpy).toHaveBeenCalledWith(
+      expect.any(TmuxManager),
+      'dev-1',
+      TEST_SESSION_REF,
+      t.id,
+    );
   });
 
-  it('does not retag or inject when stale continuation context cannot be cleared', async () => {
-    const t = await seedContinueFix();
+  it('keeps same-task context and sends only the next phase increment', async () => {
+    const t = await seedContinueFix({
+      title: 'Preserved context title',
+      description: 'Preserved context description',
+    });
+    let prompt = '';
     harness.stubEnsureSession(harness.manager, {
-      skillsStale: true,
       pane: paneRefOf('%0', 'dev-1'),
       sessionRef: TEST_SESSION_REF,
     });
+    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(t.id);
+    const clearSpy = vi.mocked((
+      harness.manager as unknown as {
+        clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void>;
+      }
+    ).clearRuntimeForDispatchBoundary);
+    const rememberSpy = vi.spyOn(
+      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
+      'rememberTaskContext',
+    ).mockResolvedValue(undefined);
+    harness.stubInject(harness.manager, async (_tmux, _paneId, value) => {
+      prompt = value;
+      return { acked: true, composerDelivered: true };
+    });
+
+    await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(true);
+    expect(clearSpy).not.toHaveBeenCalled();
+    expect(rememberSpy).not.toHaveBeenCalled();
+    expect(prompt).toContain(`task: ${t.id}`);
+    expect(prompt).toContain('phase: fix');
+    expect(prompt).toContain('token: tok123456789');
+    expect(prompt).not.toContain('Preserved context title');
+    expect(prompt).not.toContain('Preserved context description');
+    expect(prompt).not.toContain('Protocol:');
+  });
+
+  it('does not remember or inject when unknown continuation context cannot be cleared', async () => {
+    const t = await seedContinueFix();
+    harness.stubEnsureSession(harness.manager, {
+      pane: paneRefOf('%0', 'dev-1'),
+      sessionRef: TEST_SESSION_REF,
+    });
+    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(null);
     vi.spyOn(
       harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
       'clearRuntimeForDispatchBoundary',
-    ).mockRejectedValue(new Error('skill refresh clear failed'));
-    const tagSpy = vi.spyOn(
-      harness.manager as unknown as { tagSessionSkillsVersion: (...args: unknown[]) => Promise<void> },
-      'tagSessionSkillsVersion',
+    ).mockRejectedValue(new Error('context reset failed'));
+    const rememberSpy = vi.spyOn(
+      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
+      'rememberTaskContext',
     ).mockResolvedValue(undefined);
     const injectSpy = vi.spyOn(
       harness.manager as unknown as { injectAndAwaitAck: InjectAckFn },
@@ -532,8 +628,8 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     ).mockResolvedValue({ acked: true, composerDelivered: true });
 
     await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix'))
-      .rejects.toThrow('skill refresh clear failed');
-    expect(tagSpy).not.toHaveBeenCalled();
+      .rejects.toThrow('context reset failed');
+    expect(rememberSpy).not.toHaveBeenCalled();
     expect(injectSpy).not.toHaveBeenCalled();
   });
 
@@ -659,15 +755,14 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     warnSpy.mockRestore();
   });
 
-  it.each([
-    { name: 'PromptSizeError → prompt_too_large', err: new PromptSizeError(999_999), reason: 'prompt_too_large' },
-    { name: 'RequiredSkillsMissingError → required_skills_missing', err: new RequiredSkillsMissingError(['x']), reason: 'required_skills_missing' },
-  ])('maps $name', async ({ err, reason }) => {
+  it('maps PromptSizeError to prompt_too_large', async () => {
     const t = await seedContinueFix();
     harness.stubEnsureSession(harness.manager);
-    stubImagePathsThrow(harness.manager, err);
+    stubImagePathsThrow(harness.manager, new PromptSizeError(999_999));
 
-    await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix')).rejects.toMatchObject({ reason });
+    await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix')).rejects.toMatchObject({
+      reason: 'prompt_too_large',
+    });
   });
 
   it.each([
@@ -707,7 +802,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   it('skips the paste when an unbound-phase agent gets reassigned pre-paste', async () => {
     const t = await harness.seedTask({
       status: 'review', signalToken: 'tok123456789',
-      passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
+      reviewHeadAnchorSha: 'a'.repeat(40), passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
     });
     await harness.seedAgent({
       id: 'qa-1', taskId: t.id, paneId: '%0',

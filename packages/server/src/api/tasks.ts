@@ -338,7 +338,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       ? undefined
       : app.ctx.agentManager.platformBindingFields(task.projectId).platformBinding;
     const bindingIntact = binding !== undefined && live !== undefined
-      && binding.mode === live.mode && binding.repoKey === live.repoKey && binding.tool === live.tool;
+      && binding.repoKey === live.repoKey;
     const driver = bindingIntact ? app.ctx.agentManager.platformDriverFor(task.projectId) : undefined;
     if (!driver || binding === undefined) {
       return { status: 200, body: { available: false, reason: 'driver-unavailable', items: empty } };
@@ -363,7 +363,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
         ...(timeline.truncated ? { truncated: true } : {}),
         ...(timeline.fetchedAt ? { fetchedAt: timeline.fetchedAt } : {}),
         autoRefresh,
-        ...(autoRefresh ? { autoRefreshIntervalMs: app.ctx.config.server.githubPollIntervalMs } : {}),
+        ...(autoRefresh ? { autoRefreshIntervalMs: app.ctx.config.server.platformPollIntervalMs } : {}),
       },
     };
   };

@@ -30,7 +30,7 @@ function qaIdFor(devId: string): string {
 }
 
 function createProject(id: string, extra: Record<string, unknown> = {}): ReturnType<typeof post> {
-  return post('/api/projects', { id, repo: 'a/b', ...extra });
+  return post('/api/projects', { id, repo: 'https://github.com/a/b.git', ...extra });
 }
 function addAgent(
   projectId: string,
@@ -127,7 +127,7 @@ afterEach(async () => {
 
 describe('POST /api/projects', () => {
   it('creates a new project with empty agent array', async () => {
-    const response = await post('/api/projects', { id: 'newproj', repo: 'baxian-ai/baxian', merge: null });
+    const response = await post('/api/projects', { id: 'newproj', repo: 'https://github.com/baxian-ai/baxian.git', merge: null });
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
     expect(body.project.id).toBe('newproj');
@@ -151,7 +151,7 @@ describe('POST /api/projects', () => {
     } as never;
     app.ctx.stateDir = tempDir;
 
-    const response = await post('/api/projects', { id: 'hot', repo: 'a/b' });
+    const response = await post('/api/projects', { id: 'hot', repo: 'https://github.com/a/b.git' });
     expect(response.statusCode).toBe(201);
 
     expect(agentReplace).toHaveBeenCalledTimes(1);
@@ -162,45 +162,45 @@ describe('POST /api/projects', () => {
     const entries = reconcile.mock.calls[0][0] as Array<{ projectId: string; repoUrl: string; statePath: string }>;
     const added = entries.find(e => e.projectId === 'hot');
     expect(added).toBeDefined();
-    expect(added!.repoUrl).toBe('a/b');
-    expect(added!.statePath).toContain('poller-a%2Fb.json');
+    expect(added!.repoUrl).toBe('https://github.com/a/b.git');
+    expect(added!.statePath).toContain('poller-https%3A%2F%2Fgithub.com%2Fa%2Fb.git.json');
   });
 
   it('skips poller reconciliation when the platform deps are unavailable', async () => {
     const reconcile = vi.fn();
     app.ctx.poller = { reconcile, reschedule: vi.fn(), stop: vi.fn() } as never;
     app.ctx.platformEntryDeps = undefined;
-    const res = await post('/api/projects', { id: 'nopath', repo: 'c/d' });
+    const res = await post('/api/projects', { id: 'nopath', repo: 'https://github.com/c/d.git' });
     expect(res.statusCode).toBe(201);
     expect(reconcile).not.toHaveBeenCalled();
   });
 
   it('defaults merge to null when omitted', async () => {
-    const response = await post('/api/projects', { id: 'p2', repo: 'a/b' });
+    const response = await post('/api/projects', { id: 'p2', repo: 'https://github.com/a/b.git' });
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
     expect(body.project.merge).toBeNull();
   });
 
   it('persists specApproval when provided and rejects invalid values', async () => {
-    const ok = await post('/api/projects', { id: 'specproj', repo: 'a/spec', specApproval: 'human' });
+    const ok = await post('/api/projects', { id: 'specproj', repo: 'https://github.com/a/spec.git', specApproval: 'human' });
     expect(ok.statusCode).toBe(201);
     expect(JSON.parse(ok.body).project.specApproval).toBe('human');
     expect(app.ctx.config.project.find(p => p.id === 'specproj')?.specApproval).toBe('human');
 
-    const omitted = await post('/api/projects', { id: 'specless', repo: 'a/specless' });
+    const omitted = await post('/api/projects', { id: 'specless', repo: 'https://github.com/a/specless.git' });
     expect(omitted.statusCode).toBe(201);
     expect(JSON.parse(omitted.body).project.specApproval).toBeUndefined();
 
-    const bad = await post('/api/projects', { id: 'specbad', repo: 'a/specbad', specApproval: 'qa' });
+    const bad = await post('/api/projects', { id: 'specbad', repo: 'https://github.com/a/specbad.git', specApproval: 'qa' });
     expect(bad.statusCode).toBe(400);
   });
 
   it.each([
-    ['non-github repo without gitCli driver → 400', { id: 'gitlabproj', repo: 'https://gitlab.example.com/team/proj.git' }, 400],
-    ['duplicate project id → 409', { id: 'proj', repo: 'a/b' }, 409],
+    ['non-GitHub repository → 400', { id: 'gitlabproj', repo: 'https://gitlab.example.com/team/proj.git' }, 400],
+    ['duplicate project id → 409', { id: 'proj', repo: 'https://github.com/a/b.git' }, 409],
     ['invalid repo format → 400', { id: 'badrepo', repo: 'not-a-valid-repo' }, 400],
-    ['empty id → 400', { id: '', repo: 'a/b' }, 400],
+    ['empty id → 400', { id: '', repo: 'https://github.com/a/b.git' }, 400],
   ] as const)('%s', async (_label, body, status) => {
     const response = await post('/api/projects', body);
     expect(response.statusCode).toBe(status);
@@ -217,52 +217,19 @@ describe('POST /api/projects', () => {
     }
   });
 
-  it('persists a submitted gitCli declaration onto the created project', async () => {
+  it('rejects unknown project fields instead of silently ignoring them', async () => {
     const response = await post('/api/projects', {
       id: 'withcli',
       repo: 'https://github.com/example-owner/example-repo.git',
       merge: null,
-      gitCli: { tool: 'gh', notes: 'runs behind :8443' },
-    });
-    expect(response.statusCode).toBe(201);
-    expect(JSON.parse(response.body).project.gitCli).toEqual({ tool: 'gh', notes: 'runs behind :8443' });
-    const written = JSON.parse(await readFile(configPath, 'utf-8')) as BaxianConfig;
-    expect(written.project.find(p => p.id === 'withcli')?.gitCli).toEqual({ tool: 'gh', notes: 'runs behind :8443' });
-  });
-
-  it('creates a project from a non-github git URL (stored verbatim, incl. subgroup paths)', async () => {
-    for (const [id, repo] of [
-      ['glproj', 'https://gitlab.example.com/team/proj.git'],
-      ['glsub', 'https://gitlab.example.com/team/sub/proj.git'],
-    ] as const) {
-      const response = await post('/api/projects', {
-        id,
-        repo,
-        merge: null,
-        gitCli: { tool: 'glab' },
-      });
-      expect.soft(response.statusCode, repo).toBe(201);
-      expect.soft(JSON.parse(response.body).project.repo, repo).toBe(repo);
-    }
-  });
-
-  it('rejects a non-github SSH repo because its platform driver needs an HTTP API endpoint', async () => {
-    const response = await post('/api/projects', {
-      id: 'glssh',
-      repo: 'ssh://git@gitlab.example.com:2222/team/other.git',
-      merge: null,
-      gitCli: { tool: 'glab' },
+      provider: 'github',
     });
     expect(response.statusCode).toBe(400);
-    const body = JSON.parse(response.body) as {
-      error: string;
-      details: Array<{ path: string; message: string }>;
-    };
-    expect(body.error).toBe('Invalid config');
-    expect(body.details).toContainEqual(expect.objectContaining({
-      path: 'project[1].repo',
-      message: expect.stringMatching(/require an http\(s\):\/\//),
-    }));
+    expect(JSON.parse(response.body).details).toContainEqual({
+      path: 'provider',
+      message: 'unknown project field',
+    });
+    expect(app.ctx.config.project.some(project => project.id === 'withcli')).toBe(false);
   });
 
   it('writes to baxian.json with backup', async () => {
@@ -277,7 +244,7 @@ describe('POST /api/projects', () => {
 
   it('returns 500 when no config path is configured', async () => {
     app.ctx.configPath = undefined;
-    const response = await post('/api/projects', { id: 'x', repo: 'a/b' });
+    const response = await post('/api/projects', { id: 'x', repo: 'https://github.com/a/b.git' });
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toMatch(/No config path/);
   });
@@ -292,7 +259,7 @@ describe('POST /api/projects', () => {
     vi.spyOn(loaderModule, 'prepareConfig').mockImplementation(() => {
       throw new Error('kaboom');
     });
-    const response = await post('/api/projects', { id: 'boom', repo: 'a/b' });
+    const response = await post('/api/projects', { id: 'boom', repo: 'https://github.com/a/b.git' });
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toBe('internal_error');
     expect(app.ctx.config.project.some(p => p.id === 'boom')).toBe(false);
@@ -392,16 +359,9 @@ describe('POST /api/projects/:id/checks', () => {
 
   it('adds a server-host check group for effective git projects even with zero agents', async () => {
     await createProject('proj-a');
-    const gitPlatform = {
-      tool: 'gh', minToolVersion: '1.9.0', steps: [],
-      renderCtx: { scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'user/repo', binary: 'gh' },
-      driverFor: () => ({ runOp: async () => [{}] }),
-    };
-    const ctxSpy = vi.spyOn(app.ctx.agentManager, 'agentGitPreflightContext')
-      .mockReturnValue(gitPlatform as never);
     const driverSpy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
-      runPreflightSteps: async () => [{ step: 'driver-preflight-1', ok: true, message: 'gh OK' }],
-      runOp: async () => [{ defaultBranch: 'main', pushPermitted: false }],
+      runPreflightSteps: async () => [{ step: 'github-auth', ok: true, message: 'gh OK' }],
+      projectView: async () => ({ defaultBranch: 'main', pushPermitted: false }),
     } as never);
     const response = await post('/api/projects/proj-a/checks', {});
     expect(response.statusCode).toBe(201);
@@ -409,7 +369,6 @@ describe('POST /api/projects/:id/checks', () => {
     expect(body.server).toBeDefined();
     const push = body.server!.results.find(r => r.step === 'platform-push');
     expect(push?.ok).toBe(false);
-    ctxSpy.mockRestore();
     driverSpy.mockRestore();
   });
 
@@ -418,15 +377,15 @@ describe('POST /api/projects/:id/checks', () => {
       { step: 'gh', ok: true, message: 'GitHub CLI authenticated' },
     ]);
     vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
-      runPreflightSteps: async () => [{ step: 'driver-preflight-1', ok: true, message: 'gh OK' }],
-      runOp: async () => [{ defaultBranch: 'main', pushPermitted: true }],
+      runPreflightSteps: async () => [{ step: 'github-auth', ok: true, message: 'gh OK' }],
+      projectView: async () => ({ defaultBranch: 'main', pushPermitted: true }),
     } as never);
 
     const response = await post('/api/projects/proj/checks', {});
 
     expect(response.statusCode).toBe(201);
     expect(runSpy).toHaveBeenCalledTimes(2);
-    expect(Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[6]]))).toEqual({
+    expect(Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[5]]))).toEqual({
       dev: { requireGitPush: true },
       qa: { requireGitPush: false },
     });
@@ -439,43 +398,22 @@ describe('POST /api/projects/:id/checks', () => {
     ]));
   });
 
-  it('passes the git platform context to dev and qa participants', async () => {
-    const gitPlatform = {
-      tool: 'gh', minToolVersion: '2.40.0', steps: [], agentCommands: [],
-      renderCtx: { scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'owner/repo', binary: 'gh' },
-      driverFor: () => ({ runOp: async () => [{}] }),
-    };
-    vi.spyOn(app.ctx.agentManager, 'agentGitPreflightContext').mockReturnValue(gitPlatform as never);
-    vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
-      runPreflightSteps: async () => [],
-      runOp: async () => [{ defaultBranch: 'main', pushPermitted: true }],
-    } as never);
-    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([]);
-
-    const response = await post('/api/projects/proj/checks', {});
-
-    expect(response.statusCode).toBe(201);
-    const contexts = Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[5]]));
-    expect(contexts.dev).toBe(gitPlatform);
-    expect(contexts.qa).toBe(gitPlatform);
-  });
-
-  it('checks gh for an automatic-workdir QA because bootstrap clones through gh', async () => {
+  it('checks GitHub access for an automatic-workdir QA', async () => {
     app.ctx.config.project[0]!.agent[0]![1]!.workdir = undefined;
     app.ctx.agentManager.replaceConfig(app.ctx.config);
     const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
       { step: 'gh', ok: true, message: 'GitHub CLI authenticated' },
     ]);
     vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
-      runPreflightSteps: async () => [{ step: 'driver-preflight-1', ok: true, message: 'gh OK' }],
-      runOp: async () => [{ defaultBranch: 'main', pushPermitted: true }],
+      runPreflightSteps: async () => [{ step: 'github-auth', ok: true, message: 'gh OK' }],
+      projectView: async () => ({ defaultBranch: 'main', pushPermitted: true }),
     } as never);
 
     const response = await post('/api/projects/proj/checks', {});
 
     expect(response.statusCode).toBe(201);
     const qaCall = runSpy.mock.calls.find(call => call[1].role === 'qa');
-    expect(qaCall?.[6]).toEqual({ requireGitPush: false });
+    expect(qaCall?.[5]).toEqual({ requireGitPush: false });
   });
 
 });
@@ -755,15 +693,23 @@ describe('POST /api/projects/:projectId/agents', () => {
 
   it('returns 409 when omitted and explicit default SSH ports share a Workdir', async () => {
     await createProject('shared-ssh-wd');
+    app.ctx.config = {
+      ...app.ctx.config,
+      host: [
+        { id: 'box-default', hostname: 'box.example.com', user: 'git' },
+        { id: 'box-22', hostname: 'box.example.com', user: 'git', port: 22 },
+      ],
+    };
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
     expect((await addAgent('shared-ssh-wd', devAgent('shared-ssh-wd-1', {
       mode: 'remote',
-      host: { hostname: 'box.example.com', user: 'git' },
+      host: 'box-default',
       workdir: '/srv/baxian-shared',
     }))).statusCode).toBe(201);
 
     const response = await addAgent('shared-ssh-wd', devAgent('shared-ssh-wd-2', {
       mode: 'remote',
-      host: { hostname: 'box.example.com', user: 'git', port: 22 },
+      host: 'box-22',
       workdir: '/srv/baxian-shared',
     }));
 
@@ -773,15 +719,23 @@ describe('POST /api/projects/:projectId/agents', () => {
 
   it('returns 409 when distinct SSH ports still share a host account and Workdir', async () => {
     await createProject('shared-port-wd');
+    app.ctx.config = {
+      ...app.ctx.config,
+      host: [
+        { id: 'box-22', hostname: 'box.example.com', user: 'git', port: 22 },
+        { id: 'box-2222', hostname: 'box.example.com', user: 'git', port: 2222 },
+      ],
+    };
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
     expect((await addAgent('shared-port-wd', devAgent('shared-port-wd-1', {
       mode: 'remote',
-      host: { hostname: 'box.example.com', user: 'git', port: 22 },
+      host: 'box-22',
       workdir: '/srv/baxian-shared',
     }))).statusCode).toBe(201);
 
     const response = await addAgent('shared-port-wd', devAgent('shared-port-wd-2', {
       mode: 'remote',
-      host: { hostname: 'box.example.com', user: 'git', port: 2222 },
+      host: 'box-2222',
       workdir: '/srv/baxian-shared',
     }));
 
@@ -1717,7 +1671,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockImplementation(async () => {
       app.ctx.config = {
         ...app.ctx.config,
-        project: [...app.ctx.config.project, { id: 'concurrent', repo: 'x/y', merge: null, agent: [] }],
+        project: [...app.ctx.config.project, { id: 'concurrent', repo: 'https://github.com/x/y.git', merge: null, agent: [] }],
       };
     });
 
@@ -2781,7 +2735,7 @@ describe('DELETE /api/projects/:id', () => {
 
   it('deleting one project preserves siblings', async () => {
     await createProject('keep-me');
-    await createProject('drop-me', { repo: 'c/d' });
+    await createProject('drop-me', { repo: 'https://github.com/c/d.git' });
     const response = await del('/api/projects/drop-me');
     expect(response.statusCode).toBe(200);
     const ids = app.ctx.config.project.map(p => p.id);

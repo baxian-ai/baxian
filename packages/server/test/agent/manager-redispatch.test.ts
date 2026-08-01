@@ -10,7 +10,7 @@ const harness = useManagerSuiteHarness();
 
 describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
   function restartManager(): AgentManager {
-    return harness.createManager({ config: harness.config, skillRegistry: harness.freshSkillRegistry() });
+    return harness.createManager({ config: harness.config });
   }
 
   function spyDispatch(m: AgentManager): {

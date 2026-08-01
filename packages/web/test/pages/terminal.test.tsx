@@ -17,7 +17,7 @@ describe('Terminal page', () => {
     useProjectsMock.mockReturnValue({
       projects: [{
         id: 'proj',
-        repo: 'owner/repo',
+        repo: 'https://github.com/owner/repo.git',
         merge: null,
         agent: [[{ id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' }]],
       }],

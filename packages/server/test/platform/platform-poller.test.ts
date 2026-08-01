@@ -3,13 +3,16 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  PlatformPoller, type PlatformDriver, type PlatformTaskView,
+  PlatformPoller, type PlatformTaskView,
 } from '../../src/platform/platform-poller.js';
 import { platformPollerStatePath, CommentCursorStore } from '../../src/platform/comment-cursor.js';
-import { DriverOpError, type OpVars } from '../../src/platform/git-driver.js';
-import type { CommentSourceOp } from '../../src/platform/types.js';
+import {
+  DriverOpError,
+  type CommentSource,
+  type PlatformEvent,
+  type PlatformDriver,
+} from '../../src/platform/types.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
-import type { MappedEvent } from '../../src/platform/types.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
 import { repoIdentityKey } from '../../src/shared/git-url.js';
@@ -24,10 +27,10 @@ const T0 = Date.parse('2026-07-17T12:00:00Z');
 const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 const OLD_TS = iso(T0 - 120_000);
 
-const SOURCES: CommentSourceOp[] = [
-  { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u' } },
-  { key: 'inline-comments', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u', discussionId: { sources: ['r'], optional: true } } },
-  { key: 'reviews', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u', reviewState: { sources: ['s'], optional: true } } },
+const SOURCES: CommentSource[] = [
+  { key: 'issue-comments', category: 'top-level' },
+  { key: 'inline-comments', category: 'threaded' },
+  { key: 'reviews', category: 'reviews' },
 ];
 
 const prRow = (over: Partial<Record<string, unknown>> = {}): NormalizedRow => ({
@@ -43,8 +46,7 @@ class FakeDriver implements PlatformDriver {
   visibilityLagMs = 5000;
   commentSources = SOURCES;
   defaultBranch: string | (() => string) = 'main';
-  projectViewExtra: Record<string, unknown> = {};
-  runPreflightSteps?: () => Promise<Array<{ step: string; ok: boolean; message: string }>>;
+  projectViewExtra: Record<string, unknown> = { pushPermitted: true };
   projectViewError?: Error;
   listPrsRows: NormalizedRow[] = [];
   listPrsPages?: NormalizedRow[][];
@@ -55,26 +57,28 @@ class FakeDriver implements PlatformDriver {
   comments: Record<string, NormalizedRow[] | Error> = {};
   calls: string[] = [];
 
-  async runOp(opName: string, vars: OpVars = {}): Promise<NormalizedRow[]> {
-    this.calls.push(opName);
-    if (opName === 'projectView') {
-      if (this.projectViewError) throw this.projectViewError;
-      const value = typeof this.defaultBranch === 'function' ? this.defaultBranch() : this.defaultBranch;
-      return [{ defaultBranch: value, ...this.projectViewExtra }];
-    }
-    if (opName === 'prView') {
-      const seq = this.prViewSeq.get(vars.prNumber!);
-      if (seq !== undefined && seq.length > 0) return [seq.shift()!];
-      const row = this.prViews.get(vars.prNumber!);
-      if (row === undefined) throw new Error(`no prView fixture for #${vars.prNumber}`);
-      if (row instanceof Error) throw row;
-      return [row];
-    }
-    throw new Error(`unexpected op ${opName}`);
+  async runPreflightSteps(): Promise<Array<{ step: string; ok: boolean; message: string }>> {
+    return [];
   }
 
-  async runListPrs(
-    _vars: OpVars,
+  async projectView(): Promise<NormalizedRow> {
+    this.calls.push('projectView');
+    if (this.projectViewError) throw this.projectViewError;
+    const value = typeof this.defaultBranch === 'function' ? this.defaultBranch() : this.defaultBranch;
+    return { defaultBranch: value, ...this.projectViewExtra };
+  }
+
+  async prView(prNumber: number): Promise<NormalizedRow> {
+    this.calls.push('prView');
+    const seq = this.prViewSeq.get(prNumber);
+    if (seq !== undefined && seq.length > 0) return seq.shift()!;
+    const row = this.prViews.get(prNumber);
+    if (row === undefined) throw new Error(`no prView fixture for #${prNumber}`);
+    if (row instanceof Error) throw row;
+    return row;
+  }
+
+  async listPrs(
     shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean,
   ): Promise<NormalizedRow[]> {
     this.calls.push('listPrs');
@@ -94,20 +98,26 @@ class FakeDriver implements PlatformDriver {
     return this.listPrsRows;
   }
 
-  async runCommentSource(source: CommentSourceOp): Promise<NormalizedRow[]> {
+  async listComments(source: CommentSource): Promise<NormalizedRow[]> {
     this.calls.push(`listComments:${source.key}`);
     const rows = this.comments[source.key] ?? [];
     if (rows instanceof Error) throw rows;
     return rows;
   }
+
+  async branchView(): Promise<NormalizedRow> { throw new Error('unexpected branchView'); }
+  async postComment(): Promise<void> { throw new Error('unexpected postComment'); }
+  async mergePr(): Promise<void> { throw new Error('unexpected mergePr'); }
+  async closePr(): Promise<void> { throw new Error('unexpected closePr'); }
+  async deleteBranch(): Promise<void> { throw new Error('unexpected deleteBranch'); }
 }
 
 let dir = '';
 let driver: FakeDriver;
 type PlatformTaskFixture = PlatformTaskView;
 let tasks: PlatformTaskFixture[];
-let events: MappedEvent[];
-let failEventMatch: ((e: MappedEvent) => boolean) | undefined;
+let events: PlatformEvent[];
+let failEventMatch: ((e: PlatformEvent) => boolean) | undefined;
 let clockNow = T0;
 
 function makePoller(extra: Partial<ConstructorParameters<typeof PlatformPoller>[0]> = {}) {
@@ -181,7 +191,7 @@ describe('PlatformPoller: adoption predicate', () => {
   it('persists adoption delivery so an unbound server task is emitted only once across cycles and reloads', async () => {
     tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' }];
     driver.listPrsRows = [prRow()];
-    const onEvent = vi.fn((_projectId: string, event: MappedEvent) => {
+    const onEvent = vi.fn((_projectId: string, event: PlatformEvent) => {
       events.push(event);
       if (event.type === 'pr.created') tasks[0]!.prNumber = event.data.prNumber as number;
     });
@@ -648,15 +658,6 @@ describe('PlatformPoller: comment flow', () => {
     expect(ofType('pr.updated').map(e => e.data.commentId)).toEqual(['701']);
   });
 
-  it('drops system rows from every channel', async () => {
-    driver.comments['issue-comments'] = [
-      comment('s1', 'added 3 commits', OLD_TS, { system: true }),
-      comment('h1', 'human words', OLD_TS, { system: false }),
-    ];
-    await makePoller().poll();
-    expect(ofType('pr.updated').map(e => e.data.commentId)).toEqual(['h1']);
-  });
-
   it('logs undated rows once per generation and re-logs for a new owner task', async () => {
     const warns: string[] = [];
     const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
@@ -885,7 +886,7 @@ describe('PlatformPoller: source key lifecycle', () => {
   it('drops removed source cursors so a re-added key rescans from zero', async () => {
     tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
     driver.prViews.set(42, prRow());
-    const extra: CommentSourceOp = { key: 'extra', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u' } };
+    const extra: CommentSource = { key: 'extra', category: 'top-level' };
     driver.commentSources = [...SOURCES, extra];
     driver.comments['extra'] = [comment('9', 'seen once')];
     const poller = makePoller();
