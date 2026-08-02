@@ -67,10 +67,6 @@ describe('AgentManager dispatch', () => {
       harness.manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
       'waitForReplPromptReady',
     ).mockResolvedValue(undefined);
-    vi.spyOn(
-      harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForDispatchBoundary',
-    ).mockResolvedValue(undefined);
   }
 
   function useWorkdirRunner(): void {
@@ -384,57 +380,6 @@ describe('AgentManager dispatch', () => {
       new ReplNotReadyError('%0', 'codex', '', 'busy'),
       { passToken: 'tokNF1234567' },
     )).resolves.toBeNull();
-    expect(harness.manager.getPendingDispatchRetry(t.id)).toBeUndefined();
-  });
-
-  it('startSession recheck 边界段遇忙同样登记 pending 而非 hold', async () => {
-    harness.manager = await makeManagedCloneManager();
-    const t = await harness.seedTask({
-      id: 'task-busyb', branch: 'bx/task-busyb', status: 'review',
-      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 8, qaAgentId: 'qa-1', signalToken: 'tokB12345678',
-    });
-    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
-    await harness.acquireAgentLock('qa-1', t.id);
-
-    mockEnsureSession();
-    vi.spyOn(
-      harness.manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
-      'switchToVerifiedReviewHead',
-    ).mockResolvedValue(undefined);
-    vi.spyOn(
-      harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForDispatchBoundary',
-    ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', '', 'stable idle not confirmed within 5000ms'));
-
-    await expect(harness.manager.startSession(t.id, 'qa-1', 'recheck', {
-      dispatchPassToken: 'tokB12345678',
-    })).rejects.toMatchObject({
-      partial: expect.objectContaining({ handled: true, busyPending: true }),
-    });
-    expect((await harness.agentStore.get('qa-1'))?.status).toBeUndefined();
-    expect(harness.manager.getPendingDispatchRetry(t.id)).toMatchObject({ kind: 'qa-recheck', agentId: 'qa-1' });
-  });
-
-  it('startSession develop 边界段遇忙保持既有 hold 语义（非 QA 相位不登记 pending）', async () => {
-    harness.manager = await makeManagedCloneManager();
-    const t = await harness.seedTask({ id: 'task-busyd', branch: 'bx/task-busyd' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
-    await harness.acquireAgentLock('dev-1', t.id);
-
-    mockEnsureSession();
-    vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue();
-    vi.spyOn(
-      harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForDispatchBoundary',
-    ).mockRejectedValue(new ReplNotReadyError('%0', 'claude-code', '', 'stable idle not confirmed within 5000ms'));
-
-    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
-      partial: expect.objectContaining({ handled: true }),
-    });
-    expect(await harness.agentStore.get('dev-1')).toMatchObject({
-      status: 'awaiting_human',
-      awaitingPhase: 'checkout-preparation-failed',
-    });
     expect(harness.manager.getPendingDispatchRetry(t.id)).toBeUndefined();
   });
 

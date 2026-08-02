@@ -289,8 +289,3 @@ function buildTaskBody(args: TaskBodyArgs): string {
   }
   return body;
 }
-
-export interface PostMergeCleanupContext {
-  taskId: string;
-  branch: string;
-}

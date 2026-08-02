@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.ts';
 import { AgentCard } from '../components/agent-card.tsx';
@@ -8,7 +8,7 @@ import { Modal } from '../components/modal.tsx';
 import { ReviewConversation } from '../components/review-conversation.tsx';
 import { useToast } from '../components/toast.tsx';
 import { useConfirm } from '../components/confirm-dialog.tsx';
-import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath } from '../components/task-status.tsx';
+import { TaskStatusBadge, formatTaskTimestamp, getTaskAttentionCopy, taskDetailPath } from '../components/task-status.tsx';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
@@ -40,6 +40,16 @@ function positivePrNumber(value: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+function TechnicalDetails({ children }: { children: ReactNode }) {
+  const t = useT();
+  return (
+    <details className="mt-2 text-xs text-og-500">
+      <summary className="cursor-pointer select-none text-accent">{t.common.technicalDetails}</summary>
+      <div className="mt-1 whitespace-pre-wrap break-words font-mono">{children}</div>
+    </details>
+  );
+}
+
 export function TaskDetail() {
   const { taskId = '' } = useParams<{ id: string; taskId: string }>();
   return <TaskDetailView key={taskId} taskId={taskId} />;
@@ -66,11 +76,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const [codeComments, setCodeComments] = useState('');
   const [override, setOverride] = useState<TaskState | null>(null);
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
-  const { projects } = useProjects();
+  const { projects, error: projectsError } = useProjects();
   const { data: agents, loaded: agentsLoaded, error: agentsErrorPayload } = useAgents();
   const { activeAgentId, activateAgentCard } = useActiveAgentCard();
   const task = override ?? streamed;
   const error = errorPayload?.message ?? null;
+  const project = task ? projects?.find(candidate => candidate.id === task.projectId) : undefined;
+  const mergeMode = project === undefined ? 'unknown' : project.merge === 'auto' ? 'auto' : 'manual';
+  const projectsLoading = projects === null && projectsError === null;
   const agentsById = useMemo(
     () => new Map((agents ?? []).map((agent) => [agent.id, agent])),
     [agents],
@@ -86,12 +99,37 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     setOverride(updated);
   };
 
+  const actionError = (err: unknown) => ({
+    body: t.taskDetail.actionFailedBody,
+    details: err instanceof Error ? err.message : String(err),
+  });
+
+  const advanceActionLabel = (currentTask: TaskState, executor?: 'dev' | 'qa') => {
+    const selected = executor ?? (currentTask.status === 'review' ? 'qa' : 'dev');
+    if (currentTask.status === 'pending') {
+      return currentTask.preferredAgentId === '' ? t.taskDetail.editTask : t.taskDetail.startTask;
+    }
+    if (selected === 'qa' && currentTask.status !== 'review') return t.taskDetail.startReview;
+    if (currentTask.status === 'review') return t.taskDetail.restartReview;
+    if (currentTask.status === 'approved') return t.taskDetail.retryPreMergeCheck;
+    return t.taskDetail.retryCurrentStep;
+  };
+
+  const mergeActionLabel = () => {
+    if (projectsLoading) return t.taskDetail.loadingMergeSetting;
+    if (mergeMode === 'auto') return t.taskDetail.confirmAndMerge;
+    if (mergeMode === 'manual') return t.taskDetail.confirmComplete;
+    return t.taskDetail.confirmResult;
+  };
+
   const handleCancel = async () => {
     if (!task) return;
     const isTerminal = TASK_TERMINAL_STATUS_SET.has(task.status);
     const ok = await confirmDialog({
       title: t.taskDetail.cancelConfirmTitle(task.id),
-      ...(isTerminal ? { body: t.taskDetail.cancelConfirmBodyTerminal } : {}),
+      body: isTerminal
+        ? t.taskDetail.cancelConfirmBodyTerminal
+        : t.taskDetail.cancelConfirmBodyActive,
       confirmLabel: t.taskDetail.cancelConfirmLabel,
       cancelLabel: t.common.backText,
     });
@@ -105,7 +143,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         title: updated.status === 'cancelled' ? t.taskDetail.cancelledToastTitle : t.taskDetail.cancelCleanupToastTitle,
       });
     } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.cancelFailedTitle, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.cancelFailedTitle, ...actionError(err) });
     } finally {
       setCancelling(false);
     }
@@ -129,7 +167,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       setReviewRecoveryOpen(false);
       show({ kind: 'success', title: t.taskDetail.advanceSucceededTitle });
     } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.advanceFailedTitle, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.advanceFailedTitle, ...actionError(err) });
     } finally {
       setAdvancing(false);
     }
@@ -137,7 +175,12 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleAdvance = async (executor?: 'dev' | 'qa') => {
     if (!task) return;
+    if (task.status === 'pending' && task.preferredAgentId === '') {
+      setEditOpen(true);
+      return;
+    }
     const selected = executor ?? (task.status === 'review' ? 'qa' : 'dev');
+    const actionLabel = advanceActionLabel(task, selected);
     if (selected === 'qa' && needsGitReviewRecovery(task)) {
       setReviewRecoveryStage(task.phase ?? 'spec');
       setReviewRecoveryActorId(task.replyActorId ?? '');
@@ -148,19 +191,27 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     if (task.postApproveRevoked) {
       const confirmed = await confirmDialog({
         title: t.taskDetail.advanceRevokedConfirmTitle,
-        body: t.taskDetail.advanceRevokedConfirmBody,
-        confirmLabel: t.taskDetail.advance,
+        body: task.postApproveRevoked.reason === 'request-changes'
+          ? t.taskDetail.advanceRevokedRequestChangesBody
+          : t.taskDetail.advanceRevokedRetryLimitBody,
+        confirmLabel: actionLabel,
       });
       if (!confirmed) return;
       await dispatchAdvance(task, selected, { confirmRevoked: true });
       return;
     }
     const ok = await confirmDialog({
-      title: t.taskDetail.advanceConfirmTitle,
-      body: selected === 'qa'
-        ? t.taskDetail.advanceQaConfirmBody(task.id)
-        : t.taskDetail.advanceDevConfirmBody(task.id),
-      confirmLabel: t.taskDetail.advance,
+      title: t.taskDetail.advanceConfirmTitle(actionLabel),
+      body: task.status === 'pending'
+        ? t.taskDetail.startTaskConfirmBody(task.id, task.preferredAgentId)
+        : selected === 'qa' && task.status === 'review'
+          ? t.taskDetail.restartReviewConfirmBody(task.id)
+          : selected === 'qa'
+            ? t.taskDetail.startReviewConfirmBody(task.id)
+            : task.status === 'approved'
+              ? t.taskDetail.retryPreMergeConfirmBody
+              : t.taskDetail.retryCurrentStepConfirmBody(task.id),
+      confirmLabel: actionLabel,
     });
     if (!ok) return;
     await dispatchAdvance(task, selected);
@@ -173,7 +224,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       body: task.status === 'merged'
         ? t.taskDetail.retryConfirmBodyMerged
         : t.taskDetail.retryConfirmBodyDefault,
-      confirmLabel: t.common.retry,
+      confirmLabel: t.taskDetail.retryTask,
     });
     if (!ok) return;
     setRetrying(true);
@@ -182,7 +233,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       show({ kind: 'success', title: t.taskDetail.retryCreatedToastTitle(fresh.id) });
       navigate(taskDetailPath(fresh.projectId, fresh.id));
     } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.retryFailedTitle, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.retryFailedTitle, ...actionError(err) });
     } finally {
       setRetrying(false);
     }
@@ -197,7 +248,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       commitTaskExternal(updated);
       show({ kind: 'success', title: t.taskDetail.markCompleteToastTitle });
     } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.markCompleteFailedTitle, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.markCompleteFailedTitle, ...actionError(err) });
     } finally {
       setCompleting(false);
     }
@@ -212,7 +263,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       commitTaskExternal(updated);
       show({ kind: 'success', title: t.taskDetail.continuedToastTitle(updated.reviewRound) });
     } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.continueFailedTitle, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.continueFailedTitle, ...actionError(err) });
     } finally {
       setContinuing(false);
     }
@@ -233,7 +284,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       setSpecComments('');
       show({ kind: 'success', title: toast.success });
     } catch (err) {
-      show({ kind: 'error', title: toast.failure, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: toast.failure, ...actionError(err) });
     } finally {
       setSpecSubmitting(false);
     }
@@ -287,7 +338,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       show({
         kind: 'error',
         title: t.taskDetail.codeVerdictFailedTitle,
-        body: err instanceof Error ? err.message : String(err),
+        ...actionError(err),
       });
     } finally {
       setCodeSubmitting(false);
@@ -299,15 +350,31 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   };
 
   const handleConfirmGate = async () => {
-    if (!task) return;
-    if (!(await confirmDialog({ title: t.taskDetail.confirmGateConfirmTitle(task.id), body: t.taskDetail.confirmGateConfirmBody, confirmLabel: t.taskDetail.confirmComplete }))) return;
+    if (!task || projectsLoading) return;
+    const prNumber = task.prNumber ?? 0;
+    const title = mergeMode === 'auto'
+      ? t.taskDetail.confirmAutoMergeTitle(prNumber)
+      : mergeMode === 'manual'
+        ? t.taskDetail.confirmManualCompleteTitle
+        : t.taskDetail.confirmResultTitle;
+    const body = mergeMode === 'auto'
+      ? t.taskDetail.confirmAutoMergeBody(prNumber)
+      : mergeMode === 'manual'
+        ? t.taskDetail.confirmManualCompleteBody(prNumber)
+        : t.taskDetail.confirmResultBody;
+    if (!(await confirmDialog({ title, body, confirmLabel: mergeActionLabel() }))) return;
     setCompleting(true);
     try {
       const updated = await api.tasks.verdict(task.id, { action: 'confirm-merge' });
       commitTaskExternal(updated);
-      show({ kind: 'success', title: t.taskDetail.confirmedToastTitle(updated.status) });
+      show({
+        kind: 'success',
+        title: updated.status === 'merged'
+          ? t.taskDetail.confirmedMergedToastTitle
+          : t.taskDetail.confirmedCompleteToastTitle,
+      });
     } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.confirmFailedTitle, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.confirmFailedTitle, ...actionError(err) });
     } finally {
       setCompleting(false);
     }
@@ -428,8 +495,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 onChange={(event) => setReviewRecoveryStage(event.target.value as TaskPhase)}
                 className={inputCls}
               >
-                <option value="spec">{t.review.phaseLabel.spec}</option>
-                <option value="code">{t.review.phaseLabel.code}</option>
+                <option value="spec">{t.taskDetail.reviewRecoveryStageSpec}</option>
+                <option value="code">{t.taskDetail.reviewRecoveryStageCode}</option>
               </select>
             </div>
             <div>
@@ -464,6 +531,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const showSpecMaxRounds = task.status === 'max_rounds' && isSpecStagePhase(task.phase);
     const prHref = safeExternalHref(task.prUrl);
     const branchUrl = branchTreeUrl(prHref ?? undefined, task.branch ?? '');
+    const attentionCopy = task.attention ? getTaskAttentionCopy(t, task.attention) : null;
 
     return (
       <div>
@@ -471,39 +539,46 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         {task.branchCleanupPending && (
           <div className="mb-4 rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
             <div className="font-semibold">{t.taskDetail.branchCleanupPendingTitle}</div>
-            <div className="mt-1 text-og-700">{task.branchCleanupPending.reason}</div>
+            <div className="mt-1 text-og-700">{t.taskDetail.branchCleanupPendingBody}</div>
+            <TechnicalDetails>{task.branchCleanupPending.reason}</TechnicalDetails>
           </div>
         )}
         {task.branchCleanupSkipped && (
           <div className="mb-4 rounded-md border border-hairline bg-og-25 px-3 py-2.5 text-xs text-og-700">
             <div className="font-semibold">{t.taskDetail.branchCleanupSkippedTitle}</div>
-            <div className="mt-1">{task.branchCleanupSkipped.reason}</div>
+            <div className="mt-1">{t.taskDetail.branchCleanupSkippedBody}</div>
+            <TechnicalDetails>{task.branchCleanupSkipped.reason}</TechnicalDetails>
           </div>
         )}
         {isUnassigned && (
           <div className="mb-4 rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
             {task.status === 'pending'
               ? t.taskDetail.unassignedPendingNotice
-              : t.taskDetail.unassignedReadonlyNotice(t.status[task.status] ?? task.status)}
+              : t.taskDetail.unassignedReadonlyNotice}
           </div>
         )}
 
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <span className={`${STATUS_BADGE_COLORS[task.status]} text-sm`} title={task.status}>{t.status[task.status] ?? task.status}</span>
-          <span className="text-sm text-og-500">{t.taskDetail.reviewRoundPrefix}<span className="text-og-800">{task.reviewRound}</span>{t.taskDetail.reviewRoundSuffix}</span>
-          <span className="text-sm text-og-500">{t.taskDetail.specRoundPrefix}<span className="text-og-800">{task.specReviewRound ?? 0}</span>{t.taskDetail.specRoundSuffix}</span>
+          <TaskStatusBadge task={task} className="text-sm" />
+          {(task.specReviewRound ?? 0) > 0 && (
+            <span className="text-sm text-og-500">{t.taskDetail.specReviewRound(task.specReviewRound ?? 0)}</span>
+          )}
+          {task.reviewRound > 0 && (
+            <span className="text-sm text-og-500">{t.taskDetail.codeReviewRound(task.reviewRound)}</span>
+          )}
         </div>
         <div className="mb-4 flex flex-wrap items-center gap-2">{renderActions(task)}</div>
         <div className="mb-4 text-sm text-og-500">
           {t.taskDetail.createdAtPrefix}{formatTaskTimestamp(task.createdAt, false)}{t.taskDetail.updatedAtPrefix}{formatTaskTimestamp(task.updatedAt, false)}
         </div>
 
-        {task.attention && (
+        {task.attention && attentionCopy && (
           <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft p-4 text-sm text-accent">
-            <div className="font-semibold">{task.attention.reason}</div>
-            <div className="mt-1 whitespace-pre-wrap text-og-700">{task.attention.runbook}</div>
+            <div className="font-semibold">{attentionCopy.title}</div>
+            <div className="mt-1 text-og-700">{attentionCopy.guidance}</div>
             <div className="mt-1 text-xs text-og-500">{formatTaskTimestamp(task.attention.occurredAt)}</div>
             <div className="mt-3 flex flex-wrap gap-2">{renderAttentionActions(task)}</div>
+            <TechnicalDetails>{`${task.attention.reason}\n${task.attention.runbook}`}</TechnicalDetails>
           </div>
         )}
 
@@ -530,8 +605,17 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           <div id="task-verdict-controls" className="mb-4 rounded-lg border border-accent/25 bg-accent-soft p-4 text-sm text-accent">
             <div className="font-semibold">{t.taskDetail.mergeReadyBannerTitle}</div>
             <div className="mt-1 text-og-700">
-              {t.taskDetail.mergeReadyBannerBody}
+              {mergeMode === 'auto'
+                ? t.taskDetail.mergeReadyAutoBody(task.prNumber ?? 0)
+                : mergeMode === 'manual'
+                  ? t.taskDetail.mergeReadyManualBody(task.prNumber ?? 0)
+                  : projectsLoading
+                    ? t.taskDetail.mergeReadyLoadingBody
+                    : t.taskDetail.mergeReadyUnknownBody}
             </div>
+            {mergeMode === 'unknown' && projectsError && (
+              <TechnicalDetails>{projectsError}</TechnicalDetails>
+            )}
             {prHref && (
               <a
                 href={prHref}
@@ -651,7 +735,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             onClick={handleSpecReject}
             title={specComments.trim() === ''
               ? t.taskDetail.specRejectTitleEmpty
-              : t.taskDetail.specRejectTitleReady('Dev')}
+              : t.taskDetail.specRejectTitleReady}
             className="btn-secondary"
           >
             {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specReject}
@@ -705,27 +789,27 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             onClick={() => void handleAdvance()}
             className="btn-primary"
           >
-            {advancing ? t.taskDetail.advancing : t.taskDetail.advance}
+            {advancing ? t.taskDetail.advancing : advanceActionLabel(currentTask)}
           </button>
         );
       }
       if (action === 'verdict') {
         return (
           <button key={action} type="button" onClick={focusVerdictControls} className="btn-primary">
-            {t.taskDetail.verdict}
+            {t.taskDetail.handleReview}
           </button>
         );
       }
       if (action === 'cancel') {
         return (
           <button key={action} type="button" disabled={cancelling} onClick={handleCancel} className="btn-secondary">
-            {cancelling ? t.taskDetail.cancelling : t.common.cancel}
+            {cancelling ? t.taskDetail.cancelling : t.taskDetail.cancelConfirmLabel}
           </button>
         );
       }
       return (
         <button key={action} type="button" disabled={retrying} onClick={handleRetry} className="btn-secondary">
-          {retrying ? t.common.retrying : t.common.retry}
+          {retrying ? t.common.retrying : t.taskDetail.retryTask}
         </button>
       );
     });
@@ -735,7 +819,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     if (projects === null) {
       return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">{t.common.loading}</div>;
     }
-    const project = projects.find((p) => p.id === task.projectId);
     const team = project?.agent.find((g) => g.some((a) => a.id === task.devAgentId))
       ?? (task.qaAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.qaAgentId)) : undefined);
     const devConfig = team?.find((a) => a.role === 'dev' && a.id === task.devAgentId);
@@ -790,17 +873,18 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const editEnabled = task.status === 'pending';
     const terminal = RETRYABLE_STATUSES.has(task.status);
     const retryEnabled = terminal && !!task.preferredAgentId;
-    const advanceEnabled = ['pending', 'in_progress', 'fixing', 'review', 'approved'].includes(task.status);
+    const isUnassigned = task.preferredAgentId === '';
+    const advanceEnabled = ['pending', 'in_progress', 'fixing', 'review', 'approved'].includes(task.status)
+      && !(task.status === 'pending' && isUnassigned);
     const qaAdvanceEnabled = (task.status === 'in_progress' || task.status === 'fixing')
       && task.qaAgentId !== undefined;
     const completeEnabled = isCodeMaxRounds && task.prNumber !== undefined;
     const continueEnabled = completeEnabled && !!task.agentId;
-    const isUnassigned = task.preferredAgentId === '';
 
     return (
       <>
         <button type="button" disabled={!editEnabled} onClick={() => setEditOpen(true)} className="btn-secondary">
-          {t.common.edit}
+          {t.taskDetail.editTask}
         </button>
         <button
           type="button"
@@ -809,7 +893,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           title={t.taskDetail.cancelForceTitle}
           className="btn-secondary"
         >
-          {cancelling ? t.taskDetail.cancelling : t.common.cancel}
+          {cancelling ? t.taskDetail.cancelling : t.taskDetail.cancelConfirmLabel}
         </button>
         {terminal && task.replacementTaskId === undefined && (
           <button
@@ -819,7 +903,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             title={isUnassigned ? t.taskDetail.retryDisabledUnassignedTitle : t.taskDetail.retryEnabledTitle}
             className="btn-secondary"
           >
-            {retrying ? t.common.retrying : t.common.retry}
+            {retrying ? t.common.retrying : t.taskDetail.retryTask}
           </button>
         )}
         {advanceEnabled && (
@@ -829,7 +913,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             onClick={() => void handleAdvance()}
             className="btn-primary"
           >
-            {advancing ? t.taskDetail.advancing : t.taskDetail.advance}
+            {advancing ? t.taskDetail.advancing : advanceActionLabel(task)}
           </button>
         )}
         {qaAdvanceEnabled && (
@@ -839,7 +923,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             onClick={() => void handleAdvance('qa')}
             className="btn-secondary"
           >
-            {t.taskDetail.advanceToQa}
+            {advanceActionLabel(task, 'qa')}
           </button>
         )}
         {isCodeMaxRounds && (
@@ -867,12 +951,12 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         {isGate && (
           <button
             type="button"
-            disabled={completing}
+            disabled={completing || projectsLoading}
             onClick={handleConfirmGate}
-            title={t.taskDetail.confirmButtonTitle}
+            title={projectsLoading ? t.taskDetail.confirmLoadingTitle : t.taskDetail.confirmButtonTitle}
             className="btn-primary"
           >
-            {completing ? t.taskDetail.confirming : t.taskDetail.confirmMerge}
+            {completing ? t.taskDetail.confirming : mergeActionLabel()}
           </button>
         )}
       </>
@@ -884,7 +968,7 @@ function AgentSlotPlaceholder({ role }: { role: 'dev' | 'qa' }) {
   const t = useT();
   return (
     <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">
-      {t.taskDetail.noAgentSlot(role === 'dev' ? 'Dev' : 'QA')}
+      {t.taskDetail.noAgentSlot(role)}
     </div>
   );
 }

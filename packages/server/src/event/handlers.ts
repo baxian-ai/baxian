@@ -1435,24 +1435,7 @@ export function registerEventHandlers(
     const { task: transitioned } = result;
 
     const qaAgentId = requireTaskQaAgentId(transitioned, 'pr.merged');
-    if (transitioned.prNumber && transitioned.branch) {
-      await manager.dispatchPostMergeCleanup(qaAgentId, {
-        taskId: transitioned.id,
-        branch: transitioned.branch,
-      }).catch(err => console.warn(
-        `[EventHandler] pr.merged dispatchPostMergeCleanup(QA=${qaAgentId}) failed:`,
-        err,
-      ));
-    } else {
-      try {
-        await manager.releaseAgentForTask(qaAgentId, transitioned.id, 'idle');
-      } catch (err) {
-        console.error(
-          `[EventHandler] pr.merged releaseAgentForTask(QA=${qaAgentId}) failed:`,
-          err,
-        );
-      }
-    }
+    manager.startTaskAgentRelease(qaAgentId, transitioned.id);
 
     try {
       await manager.cleanupAfterMerge(transitioned.id);

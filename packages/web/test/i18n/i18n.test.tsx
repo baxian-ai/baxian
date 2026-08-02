@@ -99,11 +99,11 @@ describe('getMessages', () => {
     expect(getMessages().settings.entry).toBe('系统设置');
   });
 
-  it('describes Advance as sending the current instruction again', () => {
+  it('describes retry actions in user-facing terms', () => {
     syncLocaleFromConfig('zh-CN');
     const taskDetail = getMessages().taskDetail;
-    expect(taskDetail.advanceDevConfirmBody('task-1')).toContain('重新发送给 Dev');
-    expect(taskDetail.advanceQaConfirmBody('task-1')).toContain('重新发送给 QA');
+    expect(taskDetail.retryCurrentStepConfirmBody('task-1')).toContain('重新交给开发 Agent');
+    expect(taskDetail.restartReviewConfirmBody('task-1')).toContain('重新交给评审 Agent');
   });
 });
 

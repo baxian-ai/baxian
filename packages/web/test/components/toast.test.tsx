@@ -2,19 +2,29 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, act } from '@testing-library/react';
 import { ToastProvider, useToast } from '../../src/components/toast.tsx';
 
-function Trigger() {
+function Trigger({ technical = false }: { technical?: boolean }) {
   const { show } = useToast();
   return (
-    <button type="button" onClick={() => show({ kind: 'success', title: 'hi' })}>
+    <button
+      type="button"
+      onClick={() => show(technical
+        ? {
+            kind: 'error',
+            title: 'Couldn’t start this step',
+            body: 'Refresh the page before trying again.',
+            details: 'review agent returned conflict-409',
+          }
+        : { kind: 'success', title: 'hi' })}
+    >
       go
     </button>
   );
 }
 
-function renderWithToast() {
+function renderWithToast(technical = false) {
   render(
     <ToastProvider>
-      <Trigger />
+      <Trigger technical={technical} />
     </ToastProvider>,
   );
   fireEvent.click(screen.getByText('go'));
@@ -37,6 +47,14 @@ describe('Toast layout (mobile)', () => {
     expect(region.className).toContain('inset-x-4');
     expect(region.className).toContain('items-end');
     expect(region.className).not.toContain('right-4');
+  });
+
+  it('keeps raw action errors in collapsed technical details', () => {
+    renderWithToast(true);
+    expect(screen.getByText('Refresh the page before trying again.')).toBeTruthy();
+    const details = screen.getByText('Technical details').closest('details')!;
+    expect(details.hasAttribute('open')).toBe(false);
+    expect(details.textContent).toContain('review agent returned conflict-409');
   });
 });
 

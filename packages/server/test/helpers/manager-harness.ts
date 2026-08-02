@@ -207,10 +207,6 @@ async function createManagerSuiteHarness(tempDir: string) {
       target as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
       'waitForReplPromptReady',
     ).mockResolvedValue(undefined);
-    vi.spyOn(
-      target as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForDispatchBoundary',
-    ).mockResolvedValue(undefined);
     vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
     vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue(undefined);
     vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);

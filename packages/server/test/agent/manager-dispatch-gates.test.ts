@@ -1,12 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import type { AgentConfig, TaskState } from '../../src/shared/index.js';
+import type { TaskState } from '../../src/shared/index.js';
 import { AgentManager, EnsureSessionError } from '../../src/agent/manager.js';
 import { PromptSizeError } from '../../src/agent/prompt.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from '../../src/agent/branch.js';
 import { DriverOpError } from '../../src/platform/types.js';
 import {
-  createManagerSuiteRunner,
   paneRefOf,
   TEST_SESSION_REF,
   useManagerSuiteHarness,
@@ -230,11 +229,6 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     harness.stubEnsureSession(harness.manager, { sessionRef: TEST_SESSION_REF });
     vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(t.id);
-    const clearSpy = vi.mocked((
-      harness.manager as unknown as {
-        clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void>;
-      }
-    ).clearRuntimeForDispatchBoundary);
     const rememberSpy = vi.spyOn(
       harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
       'rememberTaskContext',
@@ -247,13 +241,45 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
 
     await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).resolves.toBe(true);
 
-    expect(clearSpy).not.toHaveBeenCalled();
     expect(rememberSpy).not.toHaveBeenCalled();
     expect(prompt).toContain(`task: ${t.id}`);
     expect(prompt).toContain('phase: develop');
     expect(prompt).not.toContain('Already delivered title');
     expect(prompt).not.toContain('Already delivered description');
     expect(prompt).not.toContain('Protocol:');
+  });
+
+  it('injects the full start prompt without /clear, then remembers the task on a task switch', async () => {
+    const t = await harness.seedTask({
+      title: 'Switched-to title',
+      description: 'Switched-to description',
+      signalToken: 'dispatch12345',
+    });
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    harness.stubEnsureSession(harness.manager, { sessionRef: TEST_SESSION_REF });
+    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue('task-before-this-one');
+    const sendKeysSpy = vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
+    const rememberSpy = vi.spyOn(
+      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
+      'rememberTaskContext',
+    ).mockResolvedValue(undefined);
+    let prompt = '';
+    harness.stubInject(harness.manager, async (_tmux, _pane, value) => {
+      prompt = value;
+      return { acked: true, composerDelivered: true };
+    });
+
+    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).resolves.toBe(true);
+
+    expect(sendKeysSpy).not.toHaveBeenCalledWith(expect.anything(), '/clear');
+    expect(prompt).toContain('title: Switched-to title');
+    expect(prompt).toContain('Switched-to description');
+    expect(rememberSpy).toHaveBeenCalledWith(
+      expect.any(TmuxManager),
+      'dev-1',
+      TEST_SESSION_REF,
+      t.id,
+    );
   });
 
   it('refreshes a moved PR head and retries the exact detached checkout once', async () => {
@@ -277,88 +303,6 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     expect(detachedSpy).toHaveBeenNthCalledWith(1, '/tmp/qa-repo', t.branch, oldHeadSha);
     expect(detachedSpy).toHaveBeenNthCalledWith(2, '/tmp/qa-repo', t.branch, newHeadSha);
     expect((await harness.taskStore.get(t.id))?.latestHeadSha).toBe(newHeadSha);
-  });
-
-  it('fails closed when the runtime rejects task-boundary /clear', async () => {
-    const tmux = new TmuxManager(createManagerSuiteRunner());
-    vi.spyOn(
-      harness.manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
-      'waitForReplPromptReady',
-    ).mockResolvedValue(undefined);
-    vi.spyOn(tmux, 'clearComposerDraft').mockResolvedValue(undefined);
-    vi.spyOn(tmux, 'captureSettledSnapshot').mockResolvedValue('before');
-    vi.spyOn(tmux, 'readPaneTitle').mockResolvedValue('');
-    vi.spyOn(tmux, 'sendKeysLiteral').mockResolvedValue(undefined);
-    vi.spyOn(tmux, 'sendEnter').mockResolvedValue(undefined);
-    vi.spyOn(tmux, 'waitSubmitAck').mockResolvedValue(undefined);
-    vi.spyOn(
-      harness.manager as unknown as { hasRuntimeSlashCommandRejection: (...args: unknown[]) => Promise<boolean> },
-      'hasRuntimeSlashCommandRejection',
-    ).mockResolvedValue(true);
-    const revalidate = vi.fn(async () => undefined);
-    const clearBoundary = (
-      harness.manager as unknown as {
-        clearRuntimeForDispatchBoundary: (
-          tmuxManager: TmuxManager,
-          pane: ReturnType<typeof paneRefOf>,
-          agentId: string,
-          runtime: AgentConfig['runtime'],
-          sessionRef: typeof TEST_SESSION_REF,
-          revalidateOwner: () => Promise<void>,
-        ) => Promise<void>;
-      }
-    ).clearRuntimeForDispatchBoundary.bind(harness.manager);
-
-    await expect(clearBoundary(
-      tmux,
-      paneRefOf('%0', 'dev-1'),
-      'dev-1',
-      'claude-code',
-      TEST_SESSION_REF,
-      revalidate,
-    ))
-      .rejects.toThrow('Runtime rejected /clear');
-
-    expect(tmux.sendKeysLiteral).toHaveBeenCalledWith(paneRefOf('%0', 'dev-1'), '/clear');
-    expect(revalidate).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not inject or remember a task when the required context reset fails', async () => {
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    vi.spyOn(harness.manager, 'ensureSession').mockResolvedValue({
-      ok: true,
-      createdSession: false,
-      freshRuntime: false,
-      sessionRef: TEST_SESSION_REF,
-      pane: paneRefOf('%0', 'dev-1'),
-      paneId: '%0',
-      workdir: '/tmp/repo',
-    });
-    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(null);
-    vi.spyOn(
-      harness.manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
-      'waitForReplPromptReady',
-    ).mockResolvedValue(undefined);
-    vi.spyOn(
-      harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForDispatchBoundary',
-    ).mockRejectedValue(new Error('Runtime rejected /clear'));
-    const rememberSpy = vi.spyOn(
-      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
-      'rememberTaskContext',
-    ).mockResolvedValue(undefined);
-    const injectSpy = vi.spyOn(
-      harness.manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
-      'injectAndAwaitAck',
-    );
-
-    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
-      name: 'EnsureSessionError',
-      partial: expect.objectContaining({ handled: true }),
-    });
-    expect(injectSpy).not.toHaveBeenCalled();
-    expect(rememberSpy).not.toHaveBeenCalled();
   });
 
   it('warns but keeps the delivered dispatch when both marker-clear and the hold fail', async () => {
@@ -527,7 +471,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   it.each([
     { context: 'unknown', marker: null },
     { context: 'another task', marker: 'task-before-this-one' },
-  ])('clears $context context, injects the full continuation, then remembers the task', async ({ marker }) => {
+  ])('injects the full continuation without /clear, then remembers the task on $context context', async ({ marker }) => {
     const t = await seedContinueFix({
       title: 'Context boundary title',
       description: 'Context boundary description',
@@ -539,13 +483,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
       sessionRef: TEST_SESSION_REF,
     });
     vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(marker);
-    const clearSpy = vi.spyOn(
-      harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForDispatchBoundary',
-    ).mockImplementation(async (...args) => {
-      order.push('clear');
-      await (args[5] as () => Promise<void>)();
-    });
+    const sendKeysSpy = vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
     const rememberSpy = vi.spyOn(
       harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
       'rememberTaskContext',
@@ -559,10 +497,10 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     });
 
     await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(true);
-    expect(order).toEqual(['clear', 'inject', 'remember']);
+    expect(order).toEqual(['inject', 'remember']);
     expect(prompt).toContain('title: Context boundary title');
     expect(prompt).toContain('Context boundary description');
-    expect(clearSpy).toHaveBeenCalledOnce();
+    expect(sendKeysSpy).not.toHaveBeenCalledWith(expect.anything(), '/clear');
     expect(rememberSpy).toHaveBeenCalledWith(
       expect.any(TmuxManager),
       'dev-1',
@@ -582,11 +520,6 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
       sessionRef: TEST_SESSION_REF,
     });
     vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(t.id);
-    const clearSpy = vi.mocked((
-      harness.manager as unknown as {
-        clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void>;
-      }
-    ).clearRuntimeForDispatchBoundary);
     const rememberSpy = vi.spyOn(
       harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
       'rememberTaskContext',
@@ -597,7 +530,6 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     });
 
     await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(true);
-    expect(clearSpy).not.toHaveBeenCalled();
     expect(rememberSpy).not.toHaveBeenCalled();
     expect(prompt).toContain(`task: ${t.id}`);
     expect(prompt).toContain('phase: fix');
@@ -605,32 +537,6 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     expect(prompt).not.toContain('Preserved context title');
     expect(prompt).not.toContain('Preserved context description');
     expect(prompt).not.toContain('Protocol:');
-  });
-
-  it('does not remember or inject when unknown continuation context cannot be cleared', async () => {
-    const t = await seedContinueFix();
-    harness.stubEnsureSession(harness.manager, {
-      pane: paneRefOf('%0', 'dev-1'),
-      sessionRef: TEST_SESSION_REF,
-    });
-    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(null);
-    vi.spyOn(
-      harness.manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForDispatchBoundary',
-    ).mockRejectedValue(new Error('context reset failed'));
-    const rememberSpy = vi.spyOn(
-      harness.manager as unknown as { rememberTaskContext: (...args: unknown[]) => Promise<void> },
-      'rememberTaskContext',
-    ).mockResolvedValue(undefined);
-    const injectSpy = vi.spyOn(
-      harness.manager as unknown as { injectAndAwaitAck: InjectAckFn },
-      'injectAndAwaitAck',
-    ).mockResolvedValue({ acked: true, composerDelivered: true });
-
-    await expect(harness.manager.continueSession(t.id, 'dev-1', 'fix'))
-      .rejects.toThrow('context reset failed');
-    expect(rememberSpy).not.toHaveBeenCalled();
-    expect(injectSpy).not.toHaveBeenCalled();
   });
 
   it('restores the task branch checkout when a dev continuation left it and the tree is clean', async () => {

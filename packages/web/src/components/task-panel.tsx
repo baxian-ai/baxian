@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api.ts';
-import { TaskStatusDot, shortTaskId, taskDetailPath } from './task-status.tsx';
+import { TaskStatusBadge, getTaskAttentionCopy, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { useT } from '../i18n/index.tsx';
 import { useToast } from './toast.tsx';
 import {
@@ -148,8 +148,8 @@ export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelPro
       className={`flex flex-col rounded-lg border border-hairline bg-surface ${className}`}
     >
       <div>
-        <LiveSection title="IN PROGRESS" section={active} emptyHint={t.taskPanel.emptyInProgress} />
-        <LiveSection title="PENDING" section={pending} emptyHint={t.taskPanel.emptyPending} />
+        <LiveSection title={t.taskPanel.inProgressTitle} section={active} emptyHint={t.taskPanel.emptyInProgress} />
+        <LiveSection title={t.taskPanel.pendingTitle} section={pending} emptyHint={t.taskPanel.emptyPending} />
 
         <div>
           <button
@@ -158,7 +158,7 @@ export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelPro
             aria-expanded={doneExpanded}
             className="flex w-full items-center justify-between px-3 py-2 text-left text-xs font-normal uppercase tracking-[0.05em] text-og-500 transition-colors hover:bg-og-50/40"
           >
-            <span>DONE</span>
+            <span>{t.taskPanel.doneTitle}</span>
             <span className="font-normal normal-case text-accent">{doneExpanded ? t.taskPanel.collapse : t.taskPanel.view}</span>
           </button>
           {doneExpanded && <DoneBody state={done} />}
@@ -234,9 +234,21 @@ function TaskRow({ task }: { task: TaskState }) {
   const { show } = useToast();
   const [advancing, setAdvancing] = useState(false);
   const round = isSpecStagePhase(task.phase) ? (task.specReviewRound ?? 0) : task.reviewRound;
+  const isUnassignedPending = task.status === 'pending' && task.preferredAgentId === '';
+  const advanceLabel = isUnassignedPending
+    ? t.taskDetail.editTask
+    : task.status === 'pending'
+      ? t.taskDetail.startTask
+      : task.status === 'review'
+        ? t.taskDetail.restartReview
+        : task.status === 'approved'
+          ? t.taskDetail.retryPreMergeCheck
+          : t.taskDetail.retryCurrentStep;
+  const attentionCopy = task.attention ? getTaskAttentionCopy(t, task.attention) : null;
   const openTask = () => navigate(taskDetailPath(task.projectId, task.id));
   const advance = async () => {
-    if (task.postApproveRevoked
+    if (isUnassignedPending
+      || task.postApproveRevoked
       || (task.status === 'review' && needsGitReviewRecovery(task))) {
       openTask();
       return;
@@ -249,7 +261,8 @@ function TaskRow({ task }: { task: TaskState }) {
       show({
         kind: 'error',
         title: t.taskDetail.advanceFailedTitle,
-        body: err instanceof Error ? err.message : String(err),
+        body: t.taskDetail.actionFailedBody,
+        details: err instanceof Error ? err.message : String(err),
       });
     } finally {
       setAdvancing(false);
@@ -261,15 +274,19 @@ function TaskRow({ task }: { task: TaskState }) {
         <button type="button" onClick={openTask} className="flex min-w-0 flex-1 items-center gap-2 text-left">
           <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
           <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
-          {isSpecStagePhase(task.phase) && <span className="pill pill-review shrink-0">{task.phase}</span>}
-          <span aria-label={t.agents.round(round)} className="shrink-0 text-xs text-og-400">R{round}</span>
-          <TaskStatusDot status={task.status} />
+          {round > 0 && (
+            <span aria-label={t.agents.round(round)} className="shrink-0 text-xs text-og-400">
+              {t.taskPanel.round(round)}
+            </span>
+          )}
+          <TaskStatusBadge task={task} className="shrink-0" />
         </button>
       </div>
-      {task.attention && (
+      {task.attention && attentionCopy && (
         <div className="mt-2 rounded border border-accent/25 bg-accent-soft/60 px-2 py-1.5 text-xs text-accent">
-          <button type="button" onClick={openTask} className="block w-full truncate text-left" title={task.attention.runbook}>
-            <span className="font-mono">{task.attention.reason}</span> · {task.attention.runbook}
+          <button type="button" onClick={openTask} className="block w-full text-left">
+            <span className="font-medium">{attentionCopy.title}</span>
+            <span className="mt-0.5 block text-og-700">{attentionCopy.guidance}</span>
           </button>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {task.attention.recommendedActions.map(action => (
@@ -281,15 +298,21 @@ function TaskRow({ task }: { task: TaskState }) {
                 className={action === 'advance' ? 'btn-primary' : 'btn-secondary'}
               >
                 {action === 'advance'
-                  ? advancing ? t.taskDetail.advancing : t.taskDetail.advance
+                  ? advancing ? t.taskDetail.advancing : advanceLabel
                   : action === 'verdict'
-                    ? t.taskDetail.verdict
+                    ? t.taskDetail.handleReview
                     : action === 'cancel'
-                      ? t.common.cancel
-                      : t.common.retry}
+                      ? t.taskDetail.cancelConfirmLabel
+                      : t.taskDetail.retryTask}
               </button>
             ))}
           </div>
+          <details className="mt-1.5 text-og-500">
+            <summary className="cursor-pointer select-none text-accent">{t.common.technicalDetails}</summary>
+            <div className="mt-1 whitespace-pre-wrap break-words font-mono">
+              {task.attention.reason}{'\n'}{task.attention.runbook}
+            </div>
+          </details>
         </div>
       )}
     </div>

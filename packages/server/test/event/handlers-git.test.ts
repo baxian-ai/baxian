@@ -462,12 +462,12 @@ describe('pr.merged (git)', () => {
     expect(cleanup).toHaveBeenCalledWith('task-1');
   });
 
-  it('dispatches post-merge cleanup to the snapshotted QA', async () => {
+  it('schedules the snapshotted QA release in the background after merge', async () => {
     await taskStore.set(gitTask({
       status: 'merge-ready', reviewRound: 1, prNumber: 42, qaAgentId: 'qa-1',
     }));
     vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-    const dispatch = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
+    const release = vi.spyOn(manager, 'startTaskAgentRelease').mockImplementation(() => {});
 
     await eventBus.emit({
       id: '', type: 'pr.merged', timestamp: new Date().toISOString(),
@@ -475,7 +475,7 @@ describe('pr.merged (git)', () => {
       data: { prNumber: 42, branch: 'bx/task-1' },
     });
 
-    expect(dispatch).toHaveBeenCalledWith('qa-1', { taskId: 'task-1', branch: 'bx/task-1' });
+    expect(release).toHaveBeenCalledWith('qa-1', 'task-1');
   });
 
   it('persistently fails a premature tracked-PR merge, clears its review lease, and stops its watcher', async () => {

@@ -1,49 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import type { AgentRuntime, BaxianConfig } from '../../src/shared/index.js';
 import { EnsureSessionError } from '../../src/agent/manager.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
 import { BranchManager } from '../../src/agent/branch.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { fakeRunner } from '../helpers/fake-runner.js';
-import { makeConfig } from '../helpers/fixtures.js';
-
-function devRuntimeConfig(runtime: AgentRuntime): BaxianConfig {
-  const config = makeConfig();
-  config.project[0]!.agent = config.project[0]!.agent.map(team =>
-    team.map(agent => (agent.id === 'dev-1' ? { ...agent, runtime } : agent)));
-  return config;
-}
 
 const NOW = '2026-05-14T05:00:00.000Z';
-
-function compactRunner(
-  execs: string[],
-  onExec?: (cmd: string) => void | Promise<void>,
-  busyCaptures = 3,
-  frames = {
-    busy: '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n',
-    idle: '⏵⏵ bypass permissions on /tmp/repo\n\n>',
-  },
-): CommandRunner {
-  let busyLeft = 0;
-  return paneRunner(execs, () => {
-    if (busyLeft > 0) {
-      busyLeft--;
-      return frames.busy;
-    }
-    return frames.idle;
-  }, async cmd => {
-    if (cmd.includes('send-keys') && cmd.includes("'Enter'")) busyLeft = busyCaptures;
-    if (onExec) await onExec(cmd);
-  });
-}
-
-function smallPaneClaudeCompactRunner(execs: string[]): CommandRunner {
-  return compactRunner(execs, undefined, 2, {
-    busy: '✽ Grooving… (5m 21s · thinking)\n',
-    idle: '✻ Worked for 31s\n\n❯ \n',
-  });
-}
 
 function recordingRunner(
   execs: string[],
@@ -58,14 +20,12 @@ function recordingRunner(
   });
 }
 
-function paneRunner(
+function idlePaneRunner(
   execs: string[],
-  capture: () => string | Promise<string>,
   onExec?: (cmd: string) => void | Promise<void>,
-  process?: string,
 ): CommandRunner {
   return fakeRunner({
-    agents: { 'dev-1': { paneId: '%5', ...(process ? { process } : {}) } },
+    agents: { 'dev-1': { paneId: '%5' } },
     onExec: async cmd => {
       execs.push(cmd);
       if (onExec) await onExec(cmd);
@@ -74,13 +34,11 @@ function paneRunner(
       match: 'capture-pane',
       reply: async cmd => {
         const header = cmd.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
-        return { stdout: `${header}\n${await capture()}` };
+        return { stdout: `${header}\n⏵⏵ bypass permissions on /tmp/repo\n\n>` };
       },
     }],
   });
 }
-
-const capturePaneRunner = paneRunner;
 
 function captureInjection(into: string[]): (cmd: string) => void {
   return (cmd: string) => {
@@ -89,24 +47,20 @@ function captureInjection(into: string[]): (cmd: string) => void {
   };
 }
 
-async function waitUntilAsync(predicate: () => Promise<boolean>, timeoutMs = 1000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await predicate()) return;
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  throw new Error('waitUntilAsync: predicate never became true');
-}
 const harness = useManagerSuiteHarness();
 
-describe('AgentManager dispatchPostMergeCleanup', () => {
+describe('AgentManager post-merge release', () => {
   it('keeps the binding and lock when no runtime pane is available for safe release', async () => {
     const execs: string[] = [];
     harness.manager = harness.createManager({ runnerFactory: () => recordingRunner(execs) });
+    await harness.seedTask({ id: 'task-x', agentId: 'dev-1', branch: 'bx/task-x', status: 'merged' });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-x' });
 
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'task-x', branch: 'bx/task-x' });
+    await harness.manager.cleanupAfterMerge('task-x');
 
+    await vi.waitFor(async () => {
+      expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('branch-cleanup-pending');
+    });
     expect(await harness.agentStore.get('dev-1')).toMatchObject({
       taskId: 'task-x',
       status: 'awaiting_human',
@@ -115,42 +69,151 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('runs the full cycle: idle → /clear → release, with NO agent dialogue', async () => {
+  it('releases the dev agent without any pane dialogue: no /clear, no prompt injection', async () => {
     const execs: string[] = [];
     const promptInjections: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs, captureInjection(promptInjections)) });
+    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs, captureInjection(promptInjections)) });
     harness.setCompactTiming(harness.manager);
+    await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/merged-task', status: 'merged' });
     await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
+    await harness.manager.cleanupAfterMerge('merged-task');
 
+    await vi.waitFor(async () => {
+      expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    });
     const joined = execs.join('\n');
     expect(promptInjections).toEqual([]);
     expect(joined).not.toMatch(/tmux (load|paste)-buffer/);
-    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect(joined).not.toMatch(/\/compact/);
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(joined).not.toContain('/clear');
+    expect(joined).not.toContain('/compact');
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('skips the pane /clear when a DELETE→recreate bumps the generation mid-flight (ABA: reused pane id)', async () => {
+  it('treats a runtime that exited to a shell as absent: releases and drops the pane binding', async () => {
     const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
+    harness.manager = harness.createManager({
+      runnerFactory: () => fakeRunner({
+        agents: { 'dev-1': { paneId: '%5', process: 'zsh' } },
+        onExec: async cmd => { execs.push(cmd); },
+      }),
+    });
+    await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/merged-task', status: 'merged' });
     await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
-    let bumped = false;
-    const realGet = harness.agentStore.get.bind(harness.agentStore);
-    vi.spyOn(harness.agentStore, 'get').mockImplementation(async (id: string) => {
-      const s = await realGet(id);
-      if (id === 'dev-1' && !bumped) { bumped = true; harness.manager.bumpDeletionGeneration('dev-1'); }
-      return s;
+    await harness.manager.cleanupAfterMerge('merged-task');
+
+    await vi.waitFor(async () => {
+      expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    });
+    const binding = await harness.agentStore.get('dev-1');
+    expect(binding?.status).not.toBe('awaiting_human');
+    expect(binding?.paneId).toBeUndefined();
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
+    expect(execs.join('\n')).not.toContain('send-keys');
+  });
+
+  it('holds instead of releasing when a non-runtime, non-shell process owns the pane', async () => {
+    const execs: string[] = [];
+    harness.manager = harness.createManager({
+      runnerFactory: () => fakeRunner({
+        agents: { 'dev-1': { paneId: '%5', process: 'vim' } },
+        onExec: async cmd => { execs.push(cmd); },
+      }),
+    });
+    await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/merged-task', status: 'merged' });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
+    const cleanupSpy = vi.mocked(BranchManager.prototype.cleanupTaskBranch);
+    const parkSpy = vi.mocked(BranchManager.prototype.parkOnDefaultDetached);
+
+    await harness.manager.cleanupAfterMerge('merged-task');
+
+    await vi.waitFor(async () => {
+      expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('branch-cleanup-pending');
+    });
+    const binding = await harness.agentStore.get('dev-1');
+    expect(binding).toMatchObject({
+      taskId: 'merged-task',
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+    });
+    expect(binding?.awaitingReason).toContain('non-runtime foreground process (vim)');
+    expect(binding?.paneId).toBe('%5');
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
+    expect(cleanupSpy).not.toHaveBeenCalled();
+    expect(parkSpy).not.toHaveBeenCalled();
+    expect(execs.join('\n')).not.toContain('send-keys');
+  });
+
+  it('waits for the pane mutex before probing and releasing', async () => {
+    const execs: string[] = [];
+    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs) });
+    harness.setCompactTiming(harness.manager);
+    await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/merged-task', status: 'merged' });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
+    const guard = (harness.manager as unknown as { compactInFlight: Set<string> }).compactInFlight;
+    guard.add('dev-1');
+
+    await harness.manager.cleanupAfterMerge('merged-task');
+    await new Promise(r => setTimeout(r, 50));
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBe('merged-task');
+
+    guard.delete('dev-1');
+    await vi.waitFor(async () => {
+      expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    });
+    expect(guard.has('dev-1')).toBe(false);
+  });
+
+  it('never force-deletes a local branch during post-merge release', async () => {
+    const execs: string[] = [];
+    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs) });
+    harness.setCompactTiming(harness.manager);
+    await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/task-merge', status: 'merged' });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main-clone', taskId: 'merged-task' });
+
+    await harness.manager.cleanupAfterMerge('merged-task');
+
+    await vi.waitFor(async () => {
+      expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    });
+    expect(execs.join('\n')).not.toContain('git branch -D');
+  });
+
+  it('holds taskId on the binding during local branch cleanup and releases after', async () => {
+    const execs: string[] = [];
+    let taskIdDuringCheckoutCleanup: string | undefined;
+    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs) });
+    harness.setCompactTiming(harness.manager);
+    await harness.seedTask({ id: 'merged-task', branch: 'bx/merged-task', status: 'merged', agentId: 'dev-1' });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'merged-task' });
+    vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {
+      taskIdDuringCheckoutCleanup = (await harness.agentStore.get('dev-1'))?.taskId;
+      return { status: 'deleted' };
     });
 
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
+    await harness.manager.cleanupAfterMerge('merged-task');
+
+    await vi.waitFor(async () => {
+      expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    });
+    expect(taskIdDuringCheckoutCleanup).toBe('merged-task');
+  });
+
+  it('bails without touching the agent when its binding has moved to a different task', async () => {
+    const execs: string[] = [];
+    harness.manager = harness.createManager({ runnerFactory: () => recordingRunner(execs) });
+    await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/task-merge', status: 'merged' });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'next-task' });
+
+    await harness.manager.cleanupAfterMerge('merged-task');
     await new Promise(r => setTimeout(r, 50));
 
-    expect(execs.join('\n')).not.toMatch(/send-keys.*\/clear/);
+    const joined = execs.join('\n');
+    expect(joined).not.toContain('git fetch --prune origin');
+    expect(joined).not.toContain('send-keys');
+    const binding = await harness.agentStore.get('dev-1');
+    expect(binding?.taskId).toBe('next-task');
   });
 
   it('regreetHeldAgent aborts without injecting when a DELETE→recreate bumps the generation', async () => {
@@ -199,170 +262,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
   });
 
-  it('temporarily claims an exact lock before cleaning an unbound idle agent', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () =>
-      !(await harness.agentStore.get('dev-1'))?.taskId && !(await harness.lockManager.isLocked('dev-1')),
-    );
-
-    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
-  });
-
-  it('releases after post-merge clear when a small claude pane hides the footer ready anchor', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => smallPaneClaudeCompactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
-  });
-
-  it('never force-deletes a local branch during post-merge cleanup', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main-clone', taskId: 'merged-task' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/task-merge' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-    expect(execs.join('\n')).not.toContain('git branch -D');
-    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-  });
-
-  it('holds taskId on the binding during local branch cleanup and releases after', async () => {
-    const execs: string[] = [];
-    let taskIdDuringCheckoutCleanup: string | undefined;
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedTask({ id: 'merged-task', branch: 'bx/merged-task', status: 'merged' });
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'merged-task' });
-    vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {
-      taskIdDuringCheckoutCleanup = (await harness.agentStore.get('dev-1'))?.taskId;
-      return { status: 'deleted' };
-    });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-    expect(taskIdDuringCheckoutCleanup).toBe('merged-task');
-    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
-  });
-
-  it('post-merge wrap-up never invokes the retired force-delete path', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'merged-task' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-    const joined = execs.join('\n');
-    expect(joined).not.toContain('git branch -D');
-    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect(joined).not.toMatch(/\/compact/);
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
-  });
-
-  it('releases a binding without workdir because branch deletion is centralized elsewhere', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-    const joined = execs.join('\n');
-    expect(joined).not.toContain('git branch -D');
-    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
-  });
-
-  it('treats a fast /clear (busy seen only briefly) as success, not a failed start', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs, undefined, 1) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-    const binding = await harness.agentStore.get('dev-1');
-    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect(binding?.taskId).toBeUndefined();
-    expect(binding?.status).not.toBe('awaiting_human');
-  });
-
-  it('sends the shared /clear command for an opencode runtime', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({
-      config: devRuntimeConfig('opencode'),
-      runnerFactory: () => paneRunner(execs, () => 'tab agents  ctrl+p commands', undefined, 'opencode'),
-    });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-    const joined = execs.join('\n');
-    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
-    expect(joined).not.toMatch(/send-keys -l -t %5 '\\''\/new'\\''/);
-  });
-
-  it.each([
-    ['codex', '/clear', `• Unrecognized command '/clear'. Type "/" for a list of supported commands.\n› `],
-    ['opencode', '/clear', 'No matching items\n\n/new\n\ntab agents  ctrl+p commands'],
-    ['qodercli', '/clear', 'x Unknown skill: clear\n\n> Type your message or @path/to/file'],
-  ] as const)(
-    'detects the %s unrecognized-command screen as a rejected clear instead of silent success',
-    async (runtime, clearCommand, rejectionScreen) => {
-      const execs: string[] = [];
-      harness.manager = harness.createManager({
-        config: devRuntimeConfig(runtime),
-        runnerFactory: () => paneRunner(execs, () => rejectionScreen, undefined, runtime),
-      });
-      harness.setCompactTiming(harness.manager);
-      await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
-
-      await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-      await waitUntilAsync(async () => !(await harness.agentStore.get('dev-1'))?.taskId);
-
-      const sends = execs.filter(cmd => cmd.includes(`send-keys -l -t %5 '\\''${clearCommand}'\\''`));
-      expect(sends).toHaveLength(2);
-    },
-  );
-
-  it('bails without touching the agent when its binding has moved to a different task', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager, 50, 5);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'next-task' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/task-merge' });
-    await new Promise(r => setTimeout(r, 60));
-
-    const joined = execs.join('\n');
-    expect(joined).not.toContain('git fetch --prune origin');
-    expect(joined).not.toContain("send-keys -l -t %5 '\\''/clear'\\''");
-    const binding = await harness.agentStore.get('dev-1');
-    expect(binding?.taskId).toBe('next-task');
-  });
-
-  it('dispatchPendingTask refuses an agent still bound to a just-merged task (post-merge cleanup in flight → Start disabled)', async () => {
+  it('dispatchPendingTask refuses an agent still bound to a just-merged task (post-merge release in flight → Start disabled)', async () => {
     await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task' });
     await harness.seedTask({ id: 'next-task', status: 'pending', agentId: 'dev-1', preferredAgentId: 'dev-1' });
 
@@ -422,113 +322,5 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
     expect((await harness.taskStore.get('pend-qa'))?.status).toBe('pending');
-  });
-
-  it('keeps the binding and exact lock when runtime idleness cannot be proven', async () => {
-    const execs: string[] = [];
-    const alwaysBusy = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
-    harness.manager = harness.createManager({ runnerFactory: () => capturePaneRunner(execs, () => alwaysBusy) });
-    harness.setCompactTiming(harness.manager, 50, 5);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => (await harness.agentStore.get('dev-1'))?.awaitingPhase === 'post-merge-cleanup-not-idle', 5000);
-
-    const binding = await harness.agentStore.get('dev-1');
-    expect(binding).toMatchObject({
-      taskId: 'merged-task',
-      status: 'awaiting_human',
-      awaitingPhase: 'post-merge-cleanup-not-idle',
-    });
-    expect(await harness.lockManager.isOwner('dev-1', 'merged-task', binding!.lockToken!)).toBe(true);
-  });
-
-  it('does not write taskId when paneId changes between initial read and update (race with retry/restart)', async () => {
-    const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => compactRunner(execs) });
-    harness.setCompactTiming(harness.manager);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5' });
-
-    const origUpdate = harness.agentStore.update.bind(harness.agentStore);
-    vi.spyOn(harness.agentStore, 'update').mockImplementationOnce(async (id, cb) => {
-      const cur = await harness.agentStore.get(id);
-      if (cur) await harness.agentStore.set({ ...cur, paneId: '%99' });
-      return origUpdate(id, cb);
-    });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await new Promise(r => setTimeout(r, 60));
-
-    const binding = await harness.agentStore.get('dev-1');
-    expect(binding?.taskId).toBeUndefined();
-    expect(binding?.paneId).toBe('%99');
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
-    expect(execs.join('\n')).not.toContain('git fetch');
-    expect(execs.join('\n')).not.toContain('/clear');
-  });
-
-  it('stops touching the pane on retry when binding is released/rebound between attempts', async () => {
-    const execs: string[] = [];
-    const BUSY = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
-    let captureCount = 0;
-    let rebindExecIdx = -1;
-    harness.manager = harness.createManager({
-      runnerFactory: () => capturePaneRunner(execs, async () => {
-        captureCount++;
-        if (captureCount === 3) {
-          const cur = await harness.agentStore.get('dev-1');
-          if (cur) await harness.agentStore.set({ ...cur, taskId: 'new-review-task', updatedAt: new Date().toISOString() });
-          rebindExecIdx = execs.length;
-        }
-        return BUSY;
-      }),
-    });
-    harness.setCompactTiming(harness.manager, 50, 5);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await new Promise(r => setTimeout(r, 500));
-
-    expect(execs.filter(c => c.includes('send-keys') && c.includes('C-c'))).toHaveLength(1);
-    expect(rebindExecIdx).toBeGreaterThanOrEqual(0);
-    expect(execs.slice(rebindExecIdx).filter(c => c.includes('send-keys'))).toHaveLength(0);
-    const binding = await harness.agentStore.get('dev-1');
-    expect(binding?.taskId).toBe('new-review-task');
-  });
-
-  it('stops touching the pane when the same task acquires a newer lock generation', async () => {
-    const execs: string[] = [];
-    const busy = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
-    let captureCount = 0;
-    let generationChangedAt = -1;
-    harness.manager = harness.createManager({
-      runnerFactory: () => capturePaneRunner(execs, async () => {
-        captureCount++;
-        if (captureCount === 3) {
-          const current = (await harness.agentStore.get('dev-1'))!;
-          await harness.lockManager.releaseIfOwner('dev-1', 'merged-task', current.lockToken!);
-          const newToken = await harness.lockManager.acquire('dev-1', 'merged-task');
-          expect(newToken).toBeTruthy();
-          await harness.agentStore.update('dev-1', state => ({
-            ...state!,
-            lockToken: newToken!,
-            updatedAt: new Date().toISOString(),
-          }));
-          generationChangedAt = execs.length;
-        }
-        return busy;
-      }),
-    });
-    harness.setCompactTiming(harness.manager, 50, 5);
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
-
-    await harness.manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await new Promise(r => setTimeout(r, 500));
-
-    expect(generationChangedAt).toBeGreaterThanOrEqual(0);
-    expect(execs.slice(generationChangedAt).filter(c => c.includes('send-keys'))).toHaveLength(0);
-    const binding = await harness.agentStore.get('dev-1');
-    expect(binding?.taskId).toBe('merged-task');
-    expect(await harness.lockManager.isOwner('dev-1', 'merged-task', binding!.lockToken!)).toBe(true);
   });
 });

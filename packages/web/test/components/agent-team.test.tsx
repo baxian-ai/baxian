@@ -116,13 +116,11 @@ describe('AgentTeam', () => {
     expect(idCell.getAttribute('title')).toBe('task-001');
     expect(within(region).getByText('梳理绑定逻辑')).toBeTruthy();
     const taskButton = within(region).getByRole('button', { name: /梳理绑定逻辑/ });
-    const round = within(taskButton).getByText('Round 0');
-    const status = within(taskButton).getByText('In progress');
-    expect(round.className).not.toContain('pill');
+    const status = within(taskButton).getByText('Developing');
+    expect(within(taskButton).queryByText('Round 0')).toBeNull();
     expect(status.className).toContain('pill-live');
-    expect(round.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(status.nextElementSibling).toBeNull();
-    expect(within(taskButton).queryByRole('img', { name: 'in_progress' })).toBeNull();
+    expect(within(taskButton).queryByRole('img')).toBeNull();
     expect(within(region).getAllByText('dev-1').length).toBeGreaterThanOrEqual(1);
     expect(within(region).getAllByText('qa-1').length).toBeGreaterThanOrEqual(1);
     fireEvent.click(taskButton);

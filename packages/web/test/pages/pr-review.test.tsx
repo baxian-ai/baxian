@@ -79,7 +79,7 @@ describe('PrReviewPage', () => {
 
     renderAt('/tasks/task-1/pr-review');
 
-    expect(await screen.findByText('Spec review')).toBeTruthy();
+    expect(await screen.findByText('Plan review')).toBeTruthy();
     expect(screen.queryByText('Code review')).toBeNull();
   });
 
@@ -243,7 +243,7 @@ describe('PrReviewPage', () => {
   it('shows a reason message when records are unavailable', async () => {
     ghMock.mockResolvedValue({ available: false, reason: 'no-pr', items: [] } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
-    expect(await screen.findByText(/has no PR yet/)).toBeTruthy();
+    expect(await screen.findByText(/does not have a PR yet/)).toBeTruthy();
   });
 
   it('shows an empty state when the conversation has no items', async () => {

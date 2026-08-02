@@ -205,91 +205,63 @@ describe('recover()', () => {
     expect(watchSpy).toHaveBeenCalledWith('dev-1');
   });
 
-  it('redrives post-merge cleanup for a recovered merged-task binding', async () => {
+  it('releases a recovered merged-task binding directly, with the refreshed pane persisted first', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
     await seedRecoveryTask({ id: 'task-merged', prNumber: 42, reviewRound: 1, status: 'merged' });
     vi.spyOn(manager, 'ensureSession').mockResolvedValue({
       ok: true, createdSession: false, freshRuntime: false, paneId: '%1',
       pane: { session: REF, paneId: '%1', claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
     });
-    let paneIdSeenByCleanup: string | undefined;
-    const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockImplementation(async (agentId, ctx) => {
-      paneIdSeenByCleanup = (await agentStore.get(agentId))?.paneId;
-      await manager.releaseAgentForTask(agentId, ctx.taskId, 'idle');
+    const realRelease = manager.releaseAgentForTask.bind(manager);
+    let paneIdSeenByRelease: string | undefined;
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async (agentId, taskId, mode, opts) => {
+      paneIdSeenByRelease = (await agentStore.get(agentId))?.paneId;
+      return realRelease(agentId, taskId, mode, opts);
     });
 
     await manager.recover();
 
-    expect(cleanupSpy).toHaveBeenCalledWith('dev-1', {
-      taskId: 'task-merged',
-      branch: 'bx/task-merged',
-    });
-    expect(paneIdSeenByCleanup).toBe('%1');
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-merged', 'idle');
+    expect(paneIdSeenByRelease).toBe('%1');
     const state = await agentStore.get('dev-1');
     expect(state?.taskId).toBeUndefined();
     expect(canDispatchWithBinding(state)).toBe(true);
   });
 
-  it('redrives context compaction for a recovered done-task binding (terminal without pr)', async () => {
+  it('releases a recovered done-task binding (terminal without pr)', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-done', paneId: '%0' });
     await seedRecoveryTask({ id: 'task-done', status: 'done' });
     mockEnsureSessionOk();
-    let paneIdSeenByCompaction: string | undefined;
-    const compactSpy = vi.spyOn(
-      manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
-      'runPostMergeCompaction',
-    ).mockImplementation(async (_tmux, _pane, agentId, taskId) => {
-      paneIdSeenByCompaction = (await agentStore.get(agentId as string))?.paneId;
-      await manager.releaseAgentForTask(agentId as string, taskId as string, 'idle');
-    });
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
 
     await manager.recover();
 
-    await vi.waitFor(async () => {
-      expect(compactSpy).toHaveBeenCalled();
-      expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    });
-    expect(paneIdSeenByCompaction).toBe('%1');
-    expect(compactSpy.mock.calls[0]?.[2]).toBe('dev-1');
-    expect(compactSpy.mock.calls[0]?.[3]).toBe('task-done');
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-done', 'idle');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
-  it('redrives context compaction for a recovered merged binding without a PR (branch merge)', async () => {
+  it('releases a recovered merged QA binding without a PR (branch merge)', async () => {
     await seedAgent({ id: 'qa-1', taskId: 'task-branch-merged', paneId: '%0' });
     await seedRecoveryTask({
       id: 'task-branch-merged', status: 'merged',
       preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1',
     });
     mockEnsureSessionOk();
-    const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
-    const compactSpy = vi.spyOn(
-      manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
-      'runPostMergeCompaction',
-    ).mockImplementation(async (_tmux, _pane, agentId, taskId) => {
-      await manager.releaseAgentForTask(agentId as string, taskId as string, 'idle');
-    });
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
 
     await manager.recover();
 
-    await vi.waitFor(async () => {
-      expect(compactSpy).toHaveBeenCalled();
-      expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    });
-    expect(cleanupSpy).not.toHaveBeenCalled();
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-branch-merged', 'idle');
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
   });
 
-  it('releases a recovered cancelled-task binding without compaction', async () => {
+  it('releases a recovered cancelled-task binding', async () => {
     await runRecovery({
       agents: [{ id: 'dev-1', taskId: 'task-gone', paneId: '%0' }],
       tasks: [{ id: 'task-gone', status: 'cancelled' }],
     });
-    const compactSpy = vi.spyOn(
-      manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
-      'runPostMergeCompaction',
-    );
 
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(compactSpy).not.toHaveBeenCalled();
   });
 
   it('preserves Held state (status=awaiting_human + awaitingPhase/Reason/Since) when recovering an ack_unknown agent with active bound task', async () => {
@@ -355,6 +327,42 @@ describe('recover()', () => {
 
     await expectRolledBack('task-1', 'dev-1');
     expect((await taskStore.get('task-1'))?.agentId).toBe('');
+    expect(watchSpy).not.toHaveBeenCalled();
+  });
+
+  it('releases a pending bootstrap binding when the next recovery succeeds', async () => {
+    await seedAgent({
+      id: 'dev-1', taskId: 'task-pending', bootstrappingTaskId: 'task-pending', paneId: '%0',
+    });
+    await seedRecoveryTask({ id: 'task-pending', status: 'pending' });
+    await acquireBoundLock('dev-1');
+    vi.spyOn(manager, 'ensureSession')
+      .mockRejectedValueOnce(new EnsureSessionError(
+        { createdSession: false, agentId: 'dev-1' },
+        'git fetch failed: transient network error',
+      ))
+      .mockResolvedValue({
+        ok: true, createdSession: false, freshRuntime: false, paneId: '%1',
+        pane: { session: REF, paneId: '%1', claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
+      } as never);
+
+    await manager.recover();
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-pending',
+      status: 'awaiting_human',
+      awaitingPhase: 'recovery-failed',
+    });
+    expect((await taskStore.get('task-pending'))?.attention).toMatchObject({ reason: 'recovery-failed' });
+
+    const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
+    await manager.recover();
+
+    expect((await taskStore.get('task-pending'))?.status).toBe('pending');
+    expect((await taskStore.get('task-pending'))?.attention).toBeUndefined();
+    expect(await agentStore.get('dev-1')).toMatchObject({ id: 'dev-1' });
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
     expect(watchSpy).not.toHaveBeenCalled();
   });
 
@@ -611,9 +619,169 @@ describe('recover()', () => {
       status: 'awaiting_human',
       awaitingPhase: 'recovery-failed',
     });
-    expect((await taskStore.get('task-1'))?.status).toBe('failed');
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect(events.some(e => e.type === 'human.intervention' && e.agentId === 'dev-1')).toBe(true);
+  });
+
+  it('keeps the task and partner alive with actionable attention when recovery fails', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'task-1', paneId: '%0', startedAt: NOW });
+    await seedAgent({ id: 'qa-1', taskId: 'task-1', paneId: '%2', startedAt: NOW });
+    await seedRecoveryTask({ id: 'task-1', status: 'review', reviewRound: 1 });
+    vi.spyOn(manager, 'ensureSession').mockImplementation(async (agentId) => {
+      if (agentId === 'dev-1') {
+        throw new EnsureSessionError(
+          { createdSession: false, agentId },
+          "git fetch failed: cannot lock ref 'refs/remotes/origin/HEAD'",
+        );
+      }
+      return {
+        ok: true, createdSession: false, freshRuntime: false, paneId: '%2',
+        pane: { session: REF, paneId: '%2', claim: agentId }, sessionRef: REF, workdir: '/tmp/repo',
+      } as never;
+    });
+
+    await manager.recover();
+
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('review');
+    expect(task?.attention).toMatchObject({
+      reason: 'recovery-failed',
+      recommendedActions: ['verdict', 'cancel'],
+    });
+    expect(task?.attention?.runbook).toMatch(/Resume/);
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-1',
+      status: 'awaiting_human',
+      awaitingPhase: 'recovery-failed',
+    });
+    expect((await agentStore.get('qa-1'))?.taskId).toBe('task-1');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+    expect(await lockManager.isLocked('qa-1')).toBe(true);
+    expect(events.some(e => e.type === 'task.updated'
+      && (e.data as { status?: string }).status === 'failed')).toBe(false);
+  });
+
+  it('keeps shared attention until every recovery-failed participant is resumed', async () => {
+    registerEventHandlers(eventBus, manager);
+    await seedAgent({ id: 'dev-1', taskId: 'task-1', paneId: '%0', startedAt: NOW });
+    await seedAgent({ id: 'qa-1', taskId: 'task-1', paneId: '%2', startedAt: NOW });
+    await seedRecoveryTask({ id: 'task-1', status: 'review', reviewRound: 1 });
+    vi.spyOn(manager, 'ensureSession').mockImplementation(async (agentId) => {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        'git fetch failed: transient network error',
+      );
+    });
+
+    await manager.recover();
+
+    expect((await taskStore.get('task-1'))?.attention).toMatchObject({
+      reason: 'recovery-failed',
+      recommendedActions: expect.arrayContaining(['advance']),
+    });
+    await manager.resumeAgent('dev-1');
+    expect((await taskStore.get('task-1'))?.attention).toMatchObject({ reason: 'recovery-failed' });
+    await manager.resumeAgent('qa-1');
+    expect((await taskStore.get('task-1'))?.attention).toBeUndefined();
+  });
+
+  it('releases a failed pending bootstrap on Resume so Advance can dispatch it again', async () => {
+    registerEventHandlers(eventBus, manager);
+    await seedAgent({
+      id: 'dev-1', taskId: 'task-pending', paneId: '%0', startedAt: NOW,
+      bootstrappingTaskId: 'task-pending',
+    });
+    await seedRecoveryTask({ id: 'task-pending', status: 'pending' });
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
+      { createdSession: false, agentId: 'dev-1' },
+      'git fetch failed: transient network error',
+    ));
+
+    await manager.recover();
+
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-pending',
+      status: 'awaiting_human',
+      awaitingPhase: 'recovery-failed',
+    });
+    expect((await taskStore.get('task-pending'))?.attention?.recommendedActions).toContain('advance');
+
+    await expect(manager.resumeAgent('dev-1')).resolves.toMatchObject({
+      resumed: true,
+      releasedBinding: true,
+    });
+    expect(canDispatchWithBinding(await agentStore.get('dev-1'))).toBe(true);
+    expect((await taskStore.get('task-pending'))?.attention).toBeUndefined();
+
+    const start = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    const advanced = await manager.advanceTask('task-pending');
+    expect(advanced.status).toBe('in_progress');
+    expect(start).toHaveBeenCalledWith('task-pending', 'dev-1', 'develop');
+  });
+
+  it('does not attach recovery actions to a terminal task', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'task-done', paneId: '%0', startedAt: NOW });
+    await seedRecoveryTask({ id: 'task-done', status: 'done' });
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
+      { createdSession: false, agentId: 'dev-1' },
+      'git fetch failed: transient network error',
+    ));
+
+    await manager.recover();
+
+    await manager.recordTaskAttention({
+      id: '', type: 'human.intervention', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-done',
+      data: { phase: 'recovery-failed', note: 'should stay agent-scoped' },
+    });
+
+    expect((await taskStore.get('task-done'))?.attention).toBeUndefined();
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-done',
+      status: 'awaiting_human',
+      awaitingPhase: 'recovery-failed',
+    });
+    const intervention = events.find(e => e.type === 'human.intervention'
+      && e.agentId === 'dev-1'
+      && (e.data as { phase?: string }).phase === 'recovery-failed');
+    expect(intervention?.taskId).toBeUndefined();
+  });
+
+  it('does not tell an unbound failed agent to Resume', async () => {
+    await seedAgent({ id: 'dev-1', paneId: '%0' });
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
+      { createdSession: false, agentId: 'dev-1' },
+      'git fetch failed: transient network error',
+    ));
+
+    await manager.recover();
+
+    const intervention = events.find(e => e.type === 'human.intervention'
+      && e.agentId === 'dev-1'
+      && (e.data as { phase?: string }).phase === 'recovery-failed');
+    expect(intervention?.taskId).toBeUndefined();
+    expect((intervention?.data as { note?: string }).note).toMatch(/Inspect or recreate/);
+    expect((intervention?.data as { note?: string }).note).not.toMatch(/Resume/);
+    expect((await agentStore.get('dev-1'))?.status).not.toBe('awaiting_human');
+  });
+
+  it('lets Advance replay an active Dev task after the recovery hold is resumed', async () => {
+    registerEventHandlers(eventBus, manager);
+    await seedAgent({ id: 'dev-1', taskId: 'task-1', paneId: '%0', startedAt: NOW });
+    await seedRecoveryTask({ id: 'task-1' });
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
+      { createdSession: false, agentId: 'dev-1' },
+      'git fetch failed: transient network error',
+    ));
+    await manager.recover();
+
+    await expect(manager.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: true });
+    const replay = vi.spyOn(manager, 'redispatchTaskPromptAfterReplRestart').mockResolvedValue(true);
+    const advanced = await manager.advanceTask('task-1');
+
+    expect(replay).toHaveBeenCalledWith('dev-1', 'task-1');
+    expect(advanced.status).toBe('in_progress');
   });
 });
 
@@ -945,29 +1113,34 @@ describe('setupRecoveredSpecSignals()', () => {
 });
 
 describe('recover() deferred branches', () => {
-  it('skips the post-merge redrive when the binding refresh does not land', async () => {
+  it('skips the terminal-binding release when the binding refresh does not land', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
     await seedRecoveryTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
     mockEnsureSessionOk();
     vi.spyOn(agentStore, 'update').mockImplementationOnce(async () => {});
-    const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     await manager.recover();
 
-    expect(cleanupSpy).not.toHaveBeenCalled();
+    expect(releaseSpy).not.toHaveBeenCalledWith('dev-1', 'task-merged', 'idle');
   });
 
-  it('falls through to the release path when the post-merge redrive throws', async () => {
+  it('falls through to the held-binding release path when the terminal release throws', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
     await seedRecoveryTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
     await acquireBoundLock('dev-1');
     mockEnsureSessionOk();
-    vi.spyOn(manager, 'dispatchPostMergeCleanup').mockRejectedValue(new Error('cleanup exploded'));
+    const realRelease = manager.releaseAgentForTask.bind(manager);
+    let threw = false;
+    vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async (agentId, taskId, mode, opts) => {
+      if (!threw) { threw = true; throw new Error('release exploded'); }
+      return realRelease(agentId, taskId, mode, opts);
+    });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await manager.recover();
 
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('dispatchPostMergeCleanup'))).toBe(true);
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('releaseAgentForTask'))).toBe(true);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
     warnSpy.mockRestore();
@@ -1037,7 +1210,7 @@ describe('recover() deferred branches', () => {
     warnSpy.mockRestore();
   });
 
-  it('holds the orphan binding on recovery failure even when killSession fails, then fails the bound task', async () => {
+  it('holds the orphan binding on recovery failure even when killSession fails, keeping the task alive', async () => {
     const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockRejectedValue(new Error('kill refused'));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -1062,7 +1235,7 @@ describe('recover() deferred branches', () => {
     expect(state?.paneId).toBeUndefined();
     expect(state).toMatchObject({ taskId: 'task-1', status: 'awaiting_human' });
     expect(await lockManager.isLocked('dev-1')).toBe(true);
-    expect((await taskStore.get('task-1'))?.status).toBe('failed');
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
     expect(events.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'recovery-failed')).toBe(true);
     warnSpy.mockRestore();

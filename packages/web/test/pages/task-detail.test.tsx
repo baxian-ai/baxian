@@ -112,6 +112,8 @@ const PROJECT: ProjectConfig = {
   ]],
 };
 
+const ACTION_FAILED_BODY = 'Refresh the page to confirm the current task status before trying again.';
+
 function setTask(task: TaskState | null, opts: { loaded?: boolean; error?: { code: string; message: string } | null } = {}): void {
   useTaskMock.mockReturnValue({ data: task, loaded: opts.loaded ?? true, error: opts.error ?? null });
 }
@@ -120,8 +122,8 @@ function setTasks(map: Record<string, TaskState>): void {
   useTaskMock.mockImplementation((id: string) => ({ data: map[id] ?? null, loaded: true, error: null }));
 }
 
-function setProjects(projects: ProjectConfig[] | null): void {
-  useProjectsMock.mockReturnValue({ projects, error: null, refresh: vi.fn() });
+function setProjects(projects: ProjectConfig[] | null, error: string | null = null): void {
+  useProjectsMock.mockReturnValue({ projects, error, refresh: vi.fn() });
 }
 
 function LocationProbe() {
@@ -198,33 +200,32 @@ describe('TaskDetail page — header & info', () => {
     expect(within(heading).getByText('task-010').className).toContain('text-og-400');
     expect(within(heading).getByText('Clean tests')).toBeTruthy();
 
-    expect(within(container.querySelector('section')!).getByText('Approved').className).toContain('pill');
+    expect(within(container.querySelector('section')!).getByText('Running pre-merge checks').className).toContain('pill');
     expect(container.textContent).toContain('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00');
     expect(container.textContent).toContain('Task body here');
-    expect(container.textContent).toContain('Review round 1');
-    expect(container.textContent).toContain('Spec round 0');
+    expect(container.textContent).toContain('Code review · round 1');
+    expect(container.textContent).not.toContain('Plan review · round 0');
     expect(container.textContent).toContain('Branch:');
     expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
   });
 
-  it('shows regular-weight Round/Spec counts beside the status pill', () => {
+  it('shows regular-weight plan/code review counts beside the status pill', () => {
     const { container } = open({ reviewRound: 3, specReviewRound: 2 });
-    const status = within(container.querySelector('section')!).getByText('Approved').parentElement!;
-    expect(within(status).getByText('3').className).not.toContain('font-semibold');
-    expect(within(status).getByText('2').className).not.toContain('font-semibold');
+    const status = within(container.querySelector('section')!).getByText('Running pre-merge checks').parentElement!;
+    expect(within(status).getByText('Code review · round 3').className).not.toContain('font-semibold');
+    expect(within(status).getByText('Plan review · round 2').className).not.toContain('font-semibold');
   });
 
   it('keeps status, review rounds, and timestamps at body size', () => {
     const { container } = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
     const section = container.querySelector('section')!;
-    const row = within(section).getByText('Max rounds reached').parentElement!;
-    const round = within(row).getByText((_, el) => el?.textContent === 'Review round 10');
-    const spec = within(row).getByText((_, el) => el?.textContent === 'Spec round 0');
+    const row = within(section).getByText('Code review needs a decision').parentElement!;
+    const round = within(row).getByText('Code review · round 10');
     const timestamps = within(section).getByText('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00');
 
-    expect(within(row).getByText('Max rounds reached').className).toContain('text-sm');
+    expect(within(row).getByText('Code review needs a decision').className).toContain('text-sm');
     expect(round.className).toContain('text-sm');
-    expect(spec.className).toContain('text-sm');
+    expect(within(row).queryByText('Plan review · round 0')).toBeNull();
     expect(timestamps.className).toContain('text-sm');
     expect(timestamps.className).not.toContain('text-xs');
   });
@@ -255,7 +256,9 @@ describe('TaskDetail page — header & info', () => {
       },
     });
 
-    expect(screen.getByText('Local branch cleanup is pending')).toBeTruthy();
+    expect(screen.getByText('The local task branch was kept for now')).toBeTruthy();
+    expect(screen.getByText('Baxian could not safely remove the local task branch, so it kept the branch to avoid losing work.')).toBeTruthy();
+    expect(screen.getByText('Technical details')).toBeTruthy();
     expect(screen.getByText('runtime is not idle; local branch cleanup deferred')).toBeTruthy();
   });
 
@@ -268,22 +271,24 @@ describe('TaskDetail page — header & info', () => {
       },
     });
 
-    expect(screen.getByText('Local branch was preserved')).toBeTruthy();
+    expect(screen.getByText('The local task branch was kept')).toBeTruthy();
+    expect(screen.getByText('Baxian deliberately kept the local task branch. You can inspect or remove it later.')).toBeTruthy();
+    expect(screen.getByText('Technical details')).toBeTruthy();
     expect(screen.getByText('remote branch is absent; preserving the local branch without retry')).toBeTruthy();
   });
 
   it('places the action buttons on their own row below the status capsule, not in the title', () => {
     const { container } = open({ status: 'pending' });
     const section = container.querySelector('section')!;
-    const actionsRow = screen.getByRole('button', { name: 'Edit' }).parentElement!;
+    const actionsRow = screen.getByRole('button', { name: 'Edit task' }).parentElement!;
     expect(container.querySelector('h1')!.contains(actionsRow)).toBe(false);
     expect(section.contains(actionsRow)).toBe(true);
-    const capsuleRow = within(section).getByText('Pending').parentElement!;
+    const capsuleRow = within(section).getByText('Waiting to start').parentElement!;
     expect(capsuleRow.compareDocumentPosition(actionsRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  const QA_BANNER = 'QA agent approved · Confirming feedback';
-  const MERGE_BANNER = 'PR ready · Awaiting your confirmation';
+  const QA_BANNER = 'Code review passed · Running final checks';
+  const MERGE_BANNER = 'Review complete · Confirm the result';
   it.each([
     { status: 'approved', shown: QA_BANNER, hidden: MERGE_BANNER },
     { status: 'merge-ready', shown: MERGE_BANNER, hidden: QA_BANNER },
@@ -422,13 +427,13 @@ describe('TaskDetail page — actions & states', () => {
     expect(screen.getByTestId('loc').textContent).toBe('/elsewhere');
   });
 
-  it('Edit opens the edit modal overlay', () => {
+  it('Edit task opens the edit modal overlay', () => {
     open({ status: 'pending' });
-    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit task' }));
     expect(screen.getByTestId('edit-modal')).toBeTruthy();
   });
 
-  it('Retry creates a fresh task and navigates to its detail page', async () => {
+  it('Run task again creates a fresh task and navigates to its detail page', async () => {
     setTasks({
       'task-010': makeTask({ id: 'task-010', status: 'merged' }),
       'task-011': makeTask({ id: 'task-011', status: 'pending' }),
@@ -436,29 +441,29 @@ describe('TaskDetail page — actions & states', () => {
     tasksRetryMock.mockResolvedValue(makeTask({ id: 'task-011', projectId: 'baxian', status: 'pending' }));
     renderPage('task-010');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Run task again' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Retry task task-010?')).toBeTruthy();
-    expect(within(dialog).getByText('The task is merged. Retrying creates a new task from scratch with the same title/description.')).toBeTruthy();
+    expect(within(dialog).getByText('Run task task-010 again?')).toBeTruthy();
+    expect(within(dialog).getByText('The PR is already merged. Baxian will create a new task with the same title and description and start it from the beginning.')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Retry' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Run task again' }));
     });
 
     expect(tasksRetryMock).toHaveBeenCalledWith('task-010');
     expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-011');
   });
 
-  it('does not offer another Retry after the terminal task records its replacement', () => {
+  it('does not offer another run after the terminal task records its replacement', () => {
     open({ status: 'failed', replacementTaskId: 'task-011' });
 
-    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Run task again' })).toBeNull();
   });
 
   it('Cancel confirms and calls the update api', async () => {
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'cancelled' }));
     open({ status: 'in_progress' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
     const dialog = await findConfirmDialog();
     expect(within(dialog).getByText('Cancel task task-010?')).toBeTruthy();
     await act(async () => {
@@ -471,9 +476,9 @@ describe('TaskDetail page — actions & states', () => {
     'Cancel stays clickable at non-terminal status %s with the force-cancel tooltip',
     (status) => {
       open({ status });
-      const cancel = screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement;
+      const cancel = screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement;
       expect(cancel.disabled).toBe(false);
-      expect(cancel.title).toBe('Force-cancels the task from any state; interrupts and releases its agents');
+      expect(cancel.title).toBe('Stops the task and releases its development and review agents');
     },
   );
 
@@ -481,9 +486,9 @@ describe('TaskDetail page — actions & states', () => {
     'Cancel stays clickable at terminal status %s for stale-binding cleanup',
     (status) => {
       open({ status });
-      const cancel = screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement;
+      const cancel = screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement;
       expect(cancel.disabled).toBe(false);
-      expect(cancel.title).toBe('Force-cancels the task from any state; interrupts and releases its agents');
+      expect(cancel.title).toBe('Stops the task and releases its development and review agents');
     },
   );
 
@@ -491,7 +496,7 @@ describe('TaskDetail page — actions & states', () => {
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'merged' }));
     open({ status: 'merged' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
     const dialog = await findConfirmDialog();
     expect(within(dialog).getByText(/its status will not change/)).toBeTruthy();
     await act(async () => {
@@ -499,14 +504,14 @@ describe('TaskDetail page — actions & states', () => {
     });
 
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Cleaned up stale agent bindings for the task' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Released the remaining agent links' });
   });
 
   it('Cancel force-cancels a task that is under review', async () => {
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'cancelled' }));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
     await settleConfirmDialog('Cancel task');
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
@@ -521,7 +526,7 @@ describe('TaskDetail page — actions & states', () => {
     });
     renderPage('task-010', { extra: <GoTo to="/project/baxian/task/task-011" /> });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
     await settleConfirmDialog('Cancel task');
     expect(screen.getByText('AAA')).toBeTruthy();
 
@@ -539,23 +544,23 @@ describe('TaskDetail page — actions & states', () => {
 
     it('code-phase shows the two human verdicts and the warning without legacy actions', () => {
       openMaxRounds();
-      expect(screen.getByRole('button', { name: 'Pass and merge' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Fix another round' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Accept current version and merge' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Continue revising' })).toBeTruthy();
       expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
-      expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
-      expect(screen.getByText(/Review round limit reached \(round 10\)/)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'Run task again' })).toBeNull();
+      expect(screen.getByText('Code review still has open questions after 10 rounds')).toBeTruthy();
     });
 
     it.each([
       {
-        button: 'Fix another round',
-        confirm: 'Fix another round',
+        button: 'Continue revising',
+        confirm: 'Continue revising',
         action: 'continue',
         resolved: makeTask({ status: 'fixing', reviewRound: 11 }),
       },
       {
-        button: 'Pass and merge',
-        confirm: 'Pass and merge',
+        button: 'Accept current version and merge',
+        confirm: 'Accept current version and merge',
         action: 'complete',
         resolved: makeTask({ status: 'merged' }),
       },
@@ -570,18 +575,18 @@ describe('TaskDetail page — actions & states', () => {
 
     it('spec-phase hides code and legacy review actions', () => {
       openMaxRounds({ phase: 'spec' });
-      expect(screen.queryByRole('button', { name: 'Pass and merge' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Accept current version and merge' })).toBeNull();
       expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
-      expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
-      expect(screen.getByText(/Spec review round limit reached \(round 0\)/)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'Run task again' })).toBeNull();
+      expect(screen.getByText('Plan review still has open questions after 0 rounds')).toBeTruthy();
     });
 
     it('spec-phase renders the verdict controls: approve starts coding', async () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openMaxRounds({ phase: 'spec', specReviewRound: 10 });
 
-      fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
-      await settleConfirmDialog('Approve Spec');
+      fireEvent.click(screen.getByRole('button', { name: 'Approve plan and start development' }));
+      await settleConfirmDialog('Approve plan');
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'approve' });
     });
 
@@ -589,11 +594,11 @@ describe('TaskDetail page — actions & states', () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'fixing', phase: 'spec', maxRoundsContinues: 1 }));
       openMaxRounds({ phase: 'spec', specReviewRound: 10 });
 
-      const reject = screen.getByRole('button', { name: 'Reject Spec' }) as HTMLButtonElement;
+      const reject = screen.getByRole('button', { name: 'Request plan changes' }) as HTMLButtonElement;
       expect(reject.disabled).toBe(true);
-      fireEvent.change(screen.getByPlaceholderText(/[Rr]ejection comments/), { target: { value: '按分歧点再收敛一轮' } });
+      fireEvent.change(screen.getByPlaceholderText(/What needs to change/), { target: { value: '按分歧点再收敛一轮' } });
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Reject Spec' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Request plan changes' }));
       });
 
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
@@ -609,90 +614,95 @@ describe('TaskDetail page — actions & states', () => {
       open({ status: 'spec-ready', phase: 'spec', specReviewRound: 1, prNumber: undefined, prUrl: undefined, ...overrides });
     }
 
-    it('shows the Spec requires human review card with both actions; Reject disabled until comments filled', () => {
+    it('shows the plan approval card with both actions; change request is disabled until comments are filled', () => {
       openSpecReady();
-      expect(screen.getByText('Spec requires human review')).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Approve Spec and start coding' })).toBeTruthy();
-      const reject = screen.getByRole('button', { name: 'Reject Spec' }) as HTMLButtonElement;
+      expect(screen.getByText('Plan ready for your approval')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Approve plan and start development' })).toBeTruthy();
+      const reject = screen.getByRole('button', { name: 'Request plan changes' }) as HTMLButtonElement;
       expect(reject.disabled).toBe(true);
-      fireEvent.change(screen.getByPlaceholderText(/[Rr]ejection comments/), { target: { value: '补充回滚方案' } });
-      expect((screen.getByRole('button', { name: 'Reject Spec' }) as HTMLButtonElement).disabled).toBe(false);
-      expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.change(screen.getByPlaceholderText(/What needs to change/), { target: { value: '补充回滚方案' } });
+      expect((screen.getByRole('button', { name: 'Request plan changes' }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement).disabled).toBe(false);
     });
 
-    it('Approve Spec confirms and submits an approve verdict', async () => {
+    it('Approve plan confirms and submits an approve verdict', async () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openSpecReady();
 
-      fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Approve plan and start development' }));
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Approve Spec and start coding?')).toBeTruthy();
-      expect(within(dialog).getByText('Task task-010 will move into the coding phase.')).toBeTruthy();
+      expect(within(dialog).getByText('Approve the plan and start development?')).toBeTruthy();
+      expect(within(dialog).getByText('Task task-010 will start development using this plan.')).toBeTruthy();
       await act(async () => {
-        fireEvent.click(within(dialog).getByRole('button', { name: 'Approve Spec' }));
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Approve plan' }));
       });
 
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'approve' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec approved; coding started' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Plan approved; development started' });
     });
 
-    it('Reject Spec submits request-changes with the comments', async () => {
+    it('Request plan changes submits request-changes with the comments', async () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'fixing' }));
       openSpecReady();
 
-      fireEvent.change(screen.getByPlaceholderText(/[Rr]ejection comments/), { target: { value: ' 边界场景没有覆盖 ' } });
+      fireEvent.change(screen.getByPlaceholderText(/What needs to change/), { target: { value: ' 边界场景没有覆盖 ' } });
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Reject Spec' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Request plan changes' }));
       });
 
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
         action: 'request-changes',
         comments: '边界场景没有覆盖',
       });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec rejected; Dev agent is revising' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Change request sent; the development agent is revising the plan' });
     });
 
     it('verdict failure surfaces an error toast', async () => {
       tasksVerdictMock.mockRejectedValue(new Error('task-010 is fixing'));
       openSpecReady();
 
-      fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
-      await settleConfirmDialog('Approve Spec');
+      fireEvent.click(screen.getByRole('button', { name: 'Approve plan and start development' }));
+      await settleConfirmDialog('Approve plan');
 
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to approve Spec', body: 'task-010 is fixing' });
+      expect(toastShowMock).toHaveBeenCalledWith({
+        kind: 'error',
+        title: 'Couldn’t approve the plan',
+        body: ACTION_FAILED_BODY,
+        details: 'task-010 is fixing',
+      });
     });
   });
 
 });
 
 describe('TaskDetail page — advance', () => {
-  it('dispatches a pending task to its selected Dev agent through the unified endpoint', async () => {
+  it('starts a pending task with its selected development agent through the unified endpoint', async () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'in_progress' }));
     open({ status: 'pending' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
-    await settleConfirmDialog('Advance');
+    fireEvent.click(screen.getByRole('button', { name: 'Start task' }));
+    await settleConfirmDialog('Start task');
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
       executor: 'dev',
       agentId: 'bx-dev',
     });
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Task advanced' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Current step started' });
   });
 
-  it('replays a review instruction to QA through the unified endpoint', async () => {
+  it('restarts review through the unified endpoint', async () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', reviewRound: 2 }));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restart review' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText(/current review instruction to QA/)).toBeTruthy();
-    await settleConfirmDialog('Advance');
+    expect(within(dialog).getByText(/sent to the review agent again/)).toBeTruthy();
+    await settleConfirmDialog('Restart review');
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', { executor: 'qa' });
   });
 
-  it('collects delivery proof before advancing an unconfirmed delivery to QA', async () => {
+  it('collects PR details before starting an unconfirmed review', async () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', phase: 'code' }));
     open({
       status: 'in_progress',
@@ -702,16 +712,16 @@ describe('TaskDetail page — advance', () => {
       replyActorStatus: 'provisional',
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Advance to QA' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Advance to QA with delivery proof' });
-    const stage = within(dialog).getByLabelText('Delivered stage (required)') as HTMLSelectElement;
-    const actor = within(dialog).getByLabelText('Platform actor ID (required)') as HTMLInputElement;
+    fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
+    const stage = within(dialog).getByLabelText('PR contains (required)') as HTMLSelectElement;
+    const actor = within(dialog).getByLabelText('PR author’s GitHub user ID (required)') as HTMLInputElement;
     expect(stage.value).toBe('spec');
     expect(actor.value).toBe('99');
     fireEvent.change(stage, { target: { value: 'code' } });
     fireEvent.change(actor, { target: { value: ' 77 ' } });
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm delivery and advance' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Save and start review' }));
     });
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
@@ -721,7 +731,7 @@ describe('TaskDetail page — advance', () => {
     });
   });
 
-  it('does not submit delivery recovery without a platform actor', async () => {
+  it('does not restore review without the PR author’s GitHub user ID', async () => {
     open({
       status: 'in_progress',
       phase: undefined,
@@ -730,13 +740,13 @@ describe('TaskDetail page — advance', () => {
       replyActorStatus: undefined,
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Advance to QA' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Advance to QA with delivery proof' });
+    fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
     const submit = within(dialog).getByRole('button', {
-      name: 'Confirm delivery and advance',
+      name: 'Save and start review',
     }) as HTMLButtonElement;
     expect(submit.disabled).toBe(true);
-    fireEvent.change(within(dialog).getByLabelText('Platform actor ID (required)'), {
+    fireEvent.change(within(dialog).getByLabelText('PR author’s GitHub user ID (required)'), {
       target: { value: '   ' },
     });
     expect(submit.disabled).toBe(true);
@@ -758,14 +768,14 @@ describe('TaskDetail page — advance', () => {
       replyActorStatus: undefined,
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Advance to QA' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Advance to QA with delivery proof' });
+    fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
     const submit = within(dialog).getByRole('button', {
-      name: 'Confirm delivery and advance',
+      name: 'Save and start review',
     }) as HTMLButtonElement;
     fireEvent.change(within(dialog).getByLabelText('PR number (required)'), { target: { value: '73' } });
-    fireEvent.change(within(dialog).getByLabelText('Delivered stage (required)'), { target: { value: 'code' } });
-    fireEvent.change(within(dialog).getByLabelText('Platform actor ID (required)'), { target: { value: '77' } });
+    fireEvent.change(within(dialog).getByLabelText('PR contains (required)'), { target: { value: 'code' } });
+    fireEvent.change(within(dialog).getByLabelText('PR author’s GitHub user ID (required)'), { target: { value: '77' } });
     await act(async () => {
       fireEvent.click(submit);
     });
@@ -778,7 +788,7 @@ describe('TaskDetail page — advance', () => {
     });
   });
 
-  it('requires an explicit confirmation before lifting a revoked post-approve gate', async () => {
+  it('requires an explicit confirmation before retrying revoked pre-merge checks', async () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'approved' }));
     open({
       status: 'approved',
@@ -789,10 +799,11 @@ describe('TaskDetail page — advance', () => {
       },
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry pre-merge checks' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Lift the post-approve gate and advance?')).toBeTruthy();
-    await settleConfirmDialog('Advance');
+    expect(within(dialog).getByText('Check the PR again and continue finishing?')).toBeTruthy();
+    expect(within(dialog).getByText(/New feedback appeared after the review passed/)).toBeTruthy();
+    await settleConfirmDialog('Retry pre-merge checks');
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
       executor: 'dev',
@@ -804,105 +815,177 @@ describe('TaskDetail page — advance', () => {
     tasksAdvanceMock.mockRejectedValue(new Error('qa is busy'));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
-    await settleConfirmDialog('Advance');
+    fireEvent.click(screen.getByRole('button', { name: 'Restart review' }));
+    await settleConfirmDialog('Restart review');
 
     expect(toastShowMock).toHaveBeenCalledWith({
       kind: 'error',
-      title: 'Failed to advance',
-      body: 'qa is busy',
+      title: 'Couldn’t start this step',
+      body: ACTION_FAILED_BODY,
+      details: 'qa is busy',
     });
   });
 
   it.each(['merged', 'done', 'failed', 'cancelled'] as const)(
-    'does not offer Advance for terminal status %s',
+    'does not offer a current-step action for terminal status %s',
     (status) => {
       open({ status });
-      expect(screen.queryByRole('button', { name: 'Advance' })).toBeNull();
+      expect(screen.queryByRole('button', { name: /^(Start task|Start review|Restart review|Retry current step|Retry pre-merge checks)$/ })).toBeNull();
     },
   );
 });
 
 describe('TaskDetail page — action failures surface error toasts', () => {
-  it('Cancel failure shows Cancel failed and re-enables the button', async () => {
+  it('Cancel failure shows a friendly error and re-enables the button', async () => {
     tasksUpdateMock.mockRejectedValue(new Error('cancel nope'));
     open({ status: 'in_progress' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
     await settleConfirmDialog('Cancel task');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to cancel', body: 'cancel nope' });
-    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(toastShowMock).toHaveBeenCalledWith({
+      kind: 'error',
+      title: 'Couldn’t cancel the task',
+      body: ACTION_FAILED_BODY,
+      details: 'cancel nope',
+    });
+    expect((screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('Retry on a cancelled task uses the fresh-start prompt and reports failure without navigating', async () => {
+  it('Run task again on a cancelled task uses the fresh-start prompt and reports failure without navigating', async () => {
     tasksRetryMock.mockRejectedValue(new Error('retry nope'));
     open({ status: 'cancelled' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Run task again' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Retry task task-010?')).toBeTruthy();
-    expect(within(dialog).getByText('This creates a new task from scratch; the old task is kept as history.')).toBeTruthy();
+    expect(within(dialog).getByText('Run task task-010 again?')).toBeTruthy();
+    expect(within(dialog).getByText('Baxian will create a new task and start it from the beginning. This task remains in the history.')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Retry' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Run task again' }));
     });
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to retry', body: 'retry nope' });
+    expect(toastShowMock).toHaveBeenCalledWith({
+      kind: 'error',
+      title: 'Couldn’t start the new task',
+      body: ACTION_FAILED_BODY,
+      details: 'retry nope',
+    });
     expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-010');
   });
 
-  it('Pass and merge failure reports the verdict action', async () => {
+  it('Accept current version failure reports the verdict action', async () => {
     tasksVerdictMock.mockRejectedValue(new Error('merge conflict'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Pass and merge' }));
-    await settleConfirmDialog('Pass and merge');
+    fireEvent.click(screen.getByRole('button', { name: 'Accept current version and merge' }));
+    await settleConfirmDialog('Accept current version and merge');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to pass and merge', body: 'merge conflict' });
+    expect(toastShowMock).toHaveBeenCalledWith({
+      kind: 'error',
+      title: 'Couldn’t accept and merge the current version',
+      body: ACTION_FAILED_BODY,
+      details: 'merge conflict',
+    });
   });
 
-  it('Fix another round failure reports the verdict action', async () => {
+  it('Continue revising failure reports the verdict action', async () => {
     tasksVerdictMock.mockRejectedValue(new Error('dev is gone'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Fix another round' }));
-    await settleConfirmDialog('Fix another round');
+    fireEvent.click(screen.getByRole('button', { name: 'Continue revising' }));
+    await settleConfirmDialog('Continue revising');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start another fix round', body: 'dev is gone' });
+    expect(toastShowMock).toHaveBeenCalledWith({
+      kind: 'error',
+      title: 'Couldn’t start another revision',
+      body: ACTION_FAILED_BODY,
+      details: 'dev is gone',
+    });
   });
 });
 
 describe('TaskDetail page — human confirmation gates', () => {
-  it('merge-ready gate renders the PR banner and submits a confirm-merge verdict', async () => {
+  it('waits for project settings before enabling confirmation', () => {
+    setProjects(null);
+    open({ status: 'merge-ready' });
+
+    expect(screen.getByText('Loading the project’s merge setting. Confirmation will be available when it is ready.')).toBeTruthy();
+    const button = screen.getByRole('button', { name: 'Loading merge setting…' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe('Wait for the project merge setting before confirming');
+    fireEvent.click(button);
+    expect(tasksVerdictMock).not.toHaveBeenCalled();
+  });
+
+  it('warns that confirmation may merge the PR when project settings are unavailable', async () => {
+    setProjects(null, 'project settings request failed');
+    open({ status: 'merge-ready' });
+
+    expect(screen.getByText(/Confirming may merge the PR immediately/)).toBeTruthy();
+    const details = screen.getByText('Technical details').closest('details')!;
+    expect(within(details).getByText('project settings request failed')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm result' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText(/Confirming may merge the PR immediately/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(tasksVerdictMock).not.toHaveBeenCalled();
+  });
+
+  it('manual merge mode explains that the PR stays open and submits a confirm-merge verdict', async () => {
     tasksVerdictMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
     open({ status: 'merge-ready' });
 
-    expect(screen.getByText('PR ready · Awaiting your confirmation')).toBeTruthy();
+    expect(screen.getByText('Review complete · Confirm the result')).toBeTruthy();
+    expect(screen.getByText(/you will still need to merge PR #55 on the code platform/)).toBeTruthy();
     expect(screen.getByRole('link', { name: 'View PR #55' })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm merge' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm complete' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Confirm task task-010 is complete?')).toBeTruthy();
+    expect(within(dialog).getByText('Confirm this result is complete?')).toBeTruthy();
+    expect(within(dialog).getByText(/PR #55 will remain open/)).toBeTruthy();
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm complete' }));
     });
 
     expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'confirm-merge' });
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Confirmed (done)' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Task marked complete' });
+  });
+
+  it('automatic merge mode clearly confirms and merges the PR', async () => {
+    setProjects([{ ...PROJECT, merge: 'auto' }]);
+    tasksVerdictMock.mockResolvedValue(makeTask({ status: 'merged', updatedAt: '2026-05-11T00:00:00.000Z' }));
+    open({ status: 'merge-ready' });
+
+    expect(screen.getByText(/confirming will merge it and finish the task/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm and merge' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('Confirm and merge PR #55?')).toBeTruthy();
+    expect(within(dialog).getByText('Baxian will merge PR #55, finish the task, and release its agents.')).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm and merge' }));
+    });
+
+    expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'confirm-merge' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'PR merged; task complete' });
   });
 
   it('Confirm is skipped when the confirm dialog is cancelled and reports failures', async () => {
     open({ status: 'merge-ready' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm merge' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm complete' }));
     await settleConfirmDialog('Cancel');
     expect(tasksVerdictMock).not.toHaveBeenCalled();
 
     tasksVerdictMock.mockRejectedValue(new Error('gate says no'));
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm merge' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm complete' }));
     await settleConfirmDialog('Confirm complete');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to confirm', body: 'gate says no' });
+    expect(toastShowMock).toHaveBeenCalledWith({
+      kind: 'error',
+      title: 'Couldn’t confirm the result',
+      body: ACTION_FAILED_BODY,
+      details: 'gate says no',
+    });
   });
 
 });
@@ -919,21 +1002,46 @@ describe('TaskDetail page — human attention and code verdict', () => {
       },
     });
 
-    expect(screen.getByText('review-verdict-overdue')).toBeTruthy();
-    expect(screen.getByText('Inspect the QA review and submit a verdict.')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Verdict' })).toBeTruthy();
-    expect(screen.getAllByRole('button', { name: 'Cancel' }).length).toBeGreaterThan(0);
+    expect(screen.getByText('Review needs your attention')).toBeTruthy();
+    expect(screen.getByText('Review the PR and the discussion below, then confirm the result or request changes.')).toBeTruthy();
+    const details = screen.getByText('Technical details').closest('details')!;
+    expect(within(details).getByText(/review-verdict-overdue/)).toBeTruthy();
+    expect(within(details).getByText(/Inspect the QA review and submit a verdict/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Cancel task' }).length).toBeGreaterThan(0);
+  });
+
+  it('starts an assigned pending task from its attention action', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'in_progress' }));
+    open({
+      status: 'pending',
+      attention: {
+        reason: 'delivery-not-confirmed',
+        runbook: 'Retry task delivery.',
+        occurredAt: '2026-05-10T12:00:00.000Z',
+        recommendedActions: ['advance'],
+      },
+    });
+
+    const attention = screen.getByText('The next step did not start').parentElement!;
+    fireEvent.click(within(attention).getByRole('button', { name: 'Start task' }));
+    await settleConfirmDialog('Start task');
+
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
+      executor: 'dev',
+      agentId: 'bx-dev',
+    });
   });
 
   it('submits a code-review pass with the optional comments through the unified endpoint', async () => {
     tasksVerdictMock.mockResolvedValue(makeTask({ status: 'review' }));
     open({ status: 'review' });
 
-    fireEvent.change(screen.getByPlaceholderText(/Change request/), {
+    fireEvent.change(screen.getByPlaceholderText(/What needs to change/), {
       target: { value: 'Validated the edge case' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Pass' }));
-    await settleConfirmDialog('Pass');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm pass' }));
+    await settleConfirmDialog('Confirm pass');
 
     expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
       action: 'pass',
@@ -952,21 +1060,45 @@ describe('TaskDetail page — unassigned tasks', () => {
   it('pending unassigned task explains how to assign a dev', () => {
     setTask(makeTask({ status: 'pending', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText(/This task has no Dev agent assigned/)).toBeTruthy();
+    expect(screen.getByText('Choose a development agent with “Edit task”, or start this task from an idle development agent card.')).toBeTruthy();
+    expect(screen.getByText('Unassigned')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Start task' })).toBeNull();
+    expect((screen.getByRole('button', { name: 'Edit task' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('terminal unassigned task disables Retry with the unassigned tooltip', () => {
+  it('opens editing instead of advancing from an unassigned pending attention action', () => {
+    open({
+      status: 'pending',
+      preferredAgentId: '',
+      agentId: '',
+      qaAgentId: undefined,
+      attention: {
+        reason: 'delivery-not-confirmed',
+        runbook: 'Retry task delivery.',
+        occurredAt: '2026-05-10T12:00:00.000Z',
+        recommendedActions: ['advance'],
+      },
+    });
+
+    const attention = screen.getByText('The next step did not start').parentElement!;
+    fireEvent.click(within(attention).getByRole('button', { name: 'Edit task' }));
+
+    expect(screen.getByTestId('edit-modal')).toBeTruthy();
+    expect(tasksAdvanceMock).not.toHaveBeenCalled();
+  });
+
+  it('terminal unassigned task disables running again with the unassigned tooltip', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
+    const retry = screen.getByRole('button', { name: 'Run task again' }) as HTMLButtonElement;
     expect(retry.disabled).toBe(true);
-    expect(retry.title).toBe('Task has no Dev agent assigned; cannot retry');
+    expect(retry.title).toBe('Choose a development agent before running this task again');
   });
 
   it('terminal unassigned task explains the current status is read-only', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText('Task has no Dev agent assigned. Current status: "Cancelled". Read-only.')).toBeTruthy();
+    expect(screen.getByText('No development agent is assigned. This task can only be viewed in its current state.')).toBeTruthy();
   });
 });
 
@@ -1028,14 +1160,14 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     }]);
     setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('No QA agent')).toBeTruthy();
+    expect(screen.getByText('No review agent')).toBeTruthy();
     expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
   });
 
   it('does not attach a team QA that was not snapshotted on the task', () => {
     setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('No QA agent')).toBeTruthy();
+    expect(screen.getByText('No review agent')).toBeTruthy();
     const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
     expect(cards.map((card) => card.getAttribute('data-role'))).toEqual(['dev']);
   });
@@ -1044,7 +1176,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][1]]] }]);
     setTask(makeTask({ agentId: 'ghost-dev', preferredAgentId: 'ghost-dev', qaAgentId: 'bx-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('No Dev agent')).toBeTruthy();
+    expect(screen.getByText('No development agent')).toBeTruthy();
     const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
     expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-qa']);
   });

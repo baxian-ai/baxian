@@ -6,7 +6,7 @@ import { AgentCard, type TerminalMode } from './agent-card.tsx';
 import { api } from '../api.ts';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useToast } from './toast.tsx';
-import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath } from './task-status.tsx';
+import { TaskStatusBadge, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { useT } from '../i18n/index.tsx';
 
 interface AgentTeamProps {
@@ -85,8 +85,10 @@ export function AgentTeam({
                   <span className="truncate text-og-1000">{task.title}</span>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <span className="shrink-0 text-xs text-og-500">{t.agents.round(round)}</span>
-                  <span className={`${STATUS_BADGE_COLORS[task.status]} shrink-0`} title={task.status}>{t.status[task.status] ?? task.status}</span>
+                  {round > 0 && (
+                    <span className="shrink-0 text-xs text-og-500">{t.agents.round(round)}</span>
+                  )}
+                  <TaskStatusBadge task={task} className="shrink-0" />
                 </div>
               </button>
             );

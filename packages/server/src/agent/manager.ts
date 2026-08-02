@@ -88,6 +88,7 @@ import {
   runtimeBusyCheck,
   hasRuntimeReadyView,
   hasReplProcTitle,
+  isShellProcTitle,
   hasOscTitleWorking,
   hasOscTitleIdle,
   screenAllowsTitleIdle,
@@ -112,7 +113,6 @@ import {
   buildGreetingPrompt,
   PromptSizeError,
   MAX_PROMPT_BYTES_ROUTE_LIMIT,
-  type PostMergeCleanupContext,
 } from './prompt.js';
 import { ApiError } from '../errors.js';
 import { prepareConfig } from '../config/loader.js';
@@ -475,6 +475,14 @@ function cancelPhaseDowngrades(prev: string | undefined, next: string): boolean 
 }
 
 const REGREET_REQUIRED_HOLD_PHASES = new Set<string>(['greeting_failed']);
+
+const RECOVERY_FAILED_AGENT_RUNBOOK =
+  'Fix the agent Workdir (or wait for the transient failure to clear), then Resume the agent.';
+const RECOVERY_FAILED_TASK_RUNBOOK =
+  'Fix the agent Workdir (or wait for the transient failure to clear), '
+  + 'then Resume the agent and use the recommended action on the task page.';
+const RECOVERY_FAILED_UNBOUND_RUNBOOK =
+  'Inspect or recreate the agent runtime before dispatching work to it.';
 
 const CHECKOUT_HOLD_PHASES = new Set([
   'dirty-workdir',
@@ -1113,7 +1121,7 @@ export class AgentManager {
     } catch (err) {
       console.warn(
         `[AgentManager] prompt for ${agentId}/${taskId} was delivered, but its context marker could not be saved; ` +
-        `the next phase will clear once and resend the full task:`,
+        `the next phase will resend the full task context:`,
         err,
       );
     }
@@ -2319,7 +2327,7 @@ export class AgentManager {
         };
         try {
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
-          const runtime = await this.inspectReleaseRuntime(tmux, agentId);
+          const runtime = await this.inspectReleaseRuntime(tmux, agentId, agentRuntimeKindFor(cfg));
           if (runtime.kind === 'hold') return hold(runtime.reason);
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
           if (runtime.kind === 'pane') {
@@ -3378,7 +3386,11 @@ export class AgentManager {
         return { resumed: false, releasedBinding: false, reason };
       }
       const now = new Date().toISOString();
-      const shouldReleaseBinding = shouldReleaseHeldBinding(state, boundTask);
+      const pendingRecoveryBootstrap = state.awaitingPhase === 'recovery-failed'
+        && state.taskId !== undefined
+        && state.bootstrappingTaskId === state.taskId
+        && boundTask?.status === 'pending';
+      const shouldReleaseBinding = pendingRecoveryBootstrap || shouldReleaseHeldBinding(state, boundTask);
       if (shouldReleaseBinding && state.taskId) {
         return {
           resumed: true,
@@ -3633,6 +3645,7 @@ export class AgentManager {
   private async inspectReleaseRuntime(
     tmux: TmuxManager,
     agentId: string,
+    runtime: AgentRuntimeKind,
   ): Promise<ReleaseRuntime> {
     let sessionAlive: boolean;
     try {
@@ -3647,8 +3660,9 @@ export class AgentManager {
     }
     if (!sessionAlive) return { kind: 'absent' };
 
+    let pane: PaneRef;
     try {
-      return { kind: 'pane', pane: await this.resolveClaimedPane(tmux, agentId) };
+      pane = await this.resolveClaimedPane(tmux, agentId);
     } catch (err) {
       if (err instanceof PaneGoneError) {
         return {
@@ -3663,6 +3677,21 @@ export class AgentManager {
           `${err instanceof Error ? err.message : String(err)}`,
       };
     }
+    try {
+      const proc = await tmux.displayMessage(pane, '#{pane_current_command}');
+      if (!hasReplProcTitle(proc, runtime)) {
+        if (isShellProcTitle(proc)) return { kind: 'absent' };
+        return {
+          kind: 'hold',
+          reason:
+            `Runtime pane is running a non-runtime foreground process (${proc}); ` +
+            `refusing checkout cleanup while the Workdir may be in use`,
+        };
+      }
+    } catch {
+      // proc probe unavailable: fall through to the pane path; the idle wait decides
+    }
+    return { kind: 'pane', pane };
   }
 
   private async interruptPaneAndWaitReady(
@@ -3904,7 +3933,6 @@ export class AgentManager {
   async failTasksForAgent(
     agentId: string,
     reason: string,
-    opts: { deferPartnerCleanup?: boolean } = {},
   ): Promise<{ failedTaskIds: string[]; projectIds: string[] }> {
     const failed = await this.withTaskLock(async () => {
       const tasks = await this.taskStore.list({});
@@ -3934,9 +3962,7 @@ export class AgentManager {
     }
     const failedTaskIds = failed.map(t => t.id);
     const projectIds = [...new Set(failed.map(t => t.projectId))];
-    if (!opts.deferPartnerCleanup) {
-      await this.releasePartnersAndDrain(agentId, failedTaskIds, projectIds);
-    }
+    await this.releasePartnersAndDrain(agentId, failedTaskIds, projectIds);
     return { failedTaskIds, projectIds };
   }
 
@@ -4713,6 +4739,7 @@ export class AgentManager {
           ? event.data.reason
           : 'human-intervention';
       const reason = reasonValue.trim() || 'human-intervention';
+      if (reason === 'recovery-failed' && TERMINAL_STATUSES.includes(task.status)) return;
       const previousPhase = typeof event.data.previousPhase === 'string'
         ? event.data.previousPhase.trim()
         : '';
@@ -4726,6 +4753,13 @@ export class AgentManager {
       if (clearedReason) {
         if (task.attention?.reason !== clearedReason
           || Date.parse(event.timestamp) < Date.parse(task.attention.occurredAt)) return;
+        for (const participantId of [task.agentId, task.qaAgentId]) {
+          if (!participantId || participantId === event.agentId) continue;
+          const participant = await this.agentStore.get(participantId);
+          if (participant?.taskId === task.id
+            && participant.status === 'awaiting_human'
+            && participant.awaitingPhase === clearedReason) return;
+        }
         const next = { ...task, updatedAt: new Date().toISOString() };
         delete next.attention;
         await this.taskStore.set(next);
@@ -4758,9 +4792,14 @@ export class AgentManager {
           ? ['cancel']
           : ['retry'];
       } else if (task.status === 'review') {
+        const qa = task.qaAgentId ? await this.agentStore.get(task.qaAgentId) : null;
+        const qaBound = qa?.taskId === task.id;
+        const qaAdvanceable = !qaBound
+          || (qa.status === 'awaiting_human'
+            && (qa.awaitingPhase === 'recovery-failed' || isRecoverableQaDispatchHold(qa)));
         recommendedActions = isSpecStagePhase(task.phase)
-          ? ['advance', 'cancel']
-          : ['advance', 'verdict', 'cancel'];
+          ? (qaAdvanceable ? ['advance', 'cancel'] : ['cancel'])
+          : (qaAdvanceable ? ['advance', 'verdict', 'cancel'] : ['verdict', 'cancel']);
       } else if (task.status === 'spec-ready' || task.status === 'merge-ready') {
         recommendedActions = ['verdict', 'cancel'];
       } else {
@@ -4771,6 +4810,9 @@ export class AgentManager {
       if (task.attention
         && task.attention.reason === reason
         && task.attention.runbook === runbook
+        && task.attention.recommendedActions.length === recommendedActions.length
+        && task.attention.recommendedActions.every((action, index) =>
+          action === recommendedActions[index])
         && Date.parse(task.attention.occurredAt) >= Date.parse(occurredAt)) return;
       await this.taskStore.set({
         ...task,
@@ -6932,6 +6974,7 @@ export class AgentManager {
           projectId,
           taskId: undefined,
           lockToken: undefined,
+          bootstrappingTaskId: undefined,
           updatedAt: now,
         };
       });
@@ -7517,46 +7560,6 @@ export class AgentManager {
     );
   }
 
-  private async clearRuntimeForDispatchBoundary(
-    tmux: TmuxManager,
-    pane: PaneRef,
-    agentId: string,
-    runtime: AgentConfig['runtime'],
-    sessionRef: TmuxSessionRef,
-    revalidate: () => Promise<void>,
-  ): Promise<void> {
-    await this.acquireCompactGuard(agentId);
-    try {
-      await this.waitForReplPromptReady(tmux, pane, runtime, this.cleanComposerWaitMs, { stableIdle: true });
-      await revalidate();
-      await tmux.clearComposerDraft(pane);
-      const baseline = await tmux.captureSettledSnapshot(pane, {
-        timeoutMs: this.dispatchSettleTimeoutMs,
-      });
-      const baselineTitle = await tmux.readPaneTitle(pane);
-      await this.setSessionOptions(
-        tmux,
-        agentId,
-        sessionRef,
-        [[TASK_CONTEXT_SESSION_OPTION, '']],
-      );
-      await tmux.sendKeysLiteral(pane, '/clear');
-      await tmux.sendEnter(pane);
-      await tmux.waitSubmitAck(pane, baseline, runtime, {
-        timeoutMs: this.dispatchAckTimeoutMs,
-        baselineTitle,
-        acceptComposerChange: true,
-      });
-      await this.waitForReplPromptReady(tmux, pane, runtime, this.dispatchAckTimeoutMs, { stableIdle: true });
-      if (await this.hasRuntimeSlashCommandRejection(tmux, pane, runtime, '/clear')) {
-        throw new Error('Runtime rejected /clear at the dispatch boundary; refusing to reuse prior context');
-      }
-      await revalidate();
-    } finally {
-      this.compactInFlight.delete(agentId);
-    }
-  }
-
   private async persistTaskImages(
     taskId: string,
     images: { bytes: Buffer; ext: string }[],
@@ -8023,16 +8026,6 @@ export class AgentManager {
         if (task.branchLocalCleaned) await this.clearBranchLocalCleaned(taskId);
       }
       await assertOwner();
-      if (!ensure.freshRuntime && !reuseTaskContext) {
-        await this.clearRuntimeForDispatchBoundary(
-          tmux,
-          pane,
-          agentId,
-          agent.runtime,
-          ensure.sessionRef,
-          assertOwner,
-        );
-      }
     } catch (err) {
       const busyPend = await this.queueQaBusyPendingRetry(taskId, agentId, phase, ensure.createdSession, err, { passToken: opts.dispatchPassToken, pendingBudget: opts.dispatchPendingBudget });
       if (busyPend) throw busyPend;
@@ -8818,39 +8811,6 @@ export class AgentManager {
     const guardBeforeInject =
       opts.guardBeforeInject ?? (phase === 'post-approve' ? postApprovePassStillLive : undefined);
 
-    if (!ensure.freshRuntime && !reuseTaskContext) {
-      const revalidateContextReset = async (): Promise<void> => {
-        const [currentTask, currentAgent] = await Promise.all([
-          this.taskStore.get(taskId),
-          this.agentStore.get(agentId),
-        ]);
-        const taskStillDispatchable = currentTask !== null
-          && !TERMINAL_STATUSES.includes(currentTask.status)
-          && (opts.bypassTaskStatusGate || expectedStatuses.includes(currentTask.status));
-        const bindingStillDispatchable = PHASE_REQUIRES_AGENT_BOUND_TO_TASK[phase]
-          ? currentAgent?.taskId === taskId
-          : currentAgent?.taskId === undefined || currentAgent.taskId === taskId;
-        if (!taskStillDispatchable
-          || !bindingStillDispatchable
-          || currentAgent?.lockToken !== lockToken
-          || currentAgent.workdir !== verifiedWorkdir) {
-          throw new Error(`Task or agent ownership changed while resetting context for ${phase} dispatch`);
-        }
-        await this.assertTaskLockOwner(agentId, taskId, lockToken);
-        if (guardBeforeInject && !(await guardBeforeInject())) {
-          throw new Error(`Task generation changed while resetting context for ${phase} dispatch`);
-        }
-      };
-      await this.clearRuntimeForDispatchBoundary(
-        tmux,
-        pane,
-        agentId,
-        agent.runtime,
-        ensure.sessionRef,
-        revalidateContextReset,
-      );
-    }
-
     if (opts.armBeforeInject && !(await opts.armBeforeInject())) {
       return false;
     }
@@ -8914,6 +8874,44 @@ export class AgentManager {
     return true;
   }
 
+  private async clearRecoveredBootstrapHold(state: AgentBindingFacts): Promise<void> {
+    if (!state.taskId || !state.awaitingPhase) return;
+    let cleared = false;
+    await this.agentStore.update(state.id, (latest) => {
+      if (!latest || latest.taskId !== undefined) return AGENT_STORE_NOOP;
+      if (latest.awaitingPhase !== state.awaitingPhase
+        || latest.awaitingSince !== state.awaitingSince
+        || latest.awaitingNonce !== state.awaitingNonce) return AGENT_STORE_NOOP;
+      const {
+        status: _status,
+        awaitingPhase: _phase,
+        awaitingReason: _reason,
+        awaitingSince: _since,
+        awaitingNonce: _nonce,
+        ...ready
+      } = latest;
+      cleared = true;
+      return { ...ready, updatedAt: new Date().toISOString() };
+    });
+    if (!cleared) return;
+    const intervention: BaxianEvent = {
+      id: '',
+      type: 'human.intervention',
+      timestamp: new Date().toISOString(),
+      projectId: state.projectId,
+      agentId: state.id,
+      taskId: state.taskId,
+      data: { phase: 'resumed', previousPhase: state.awaitingPhase, releasedBinding: true },
+    };
+    await this.safeEmit(intervention);
+    await this.recordTaskAttention(intervention).catch(err => {
+      console.warn(
+        `[recover] could not clear ${state.awaitingPhase} attention for ${state.id}/${state.taskId}:`,
+        err,
+      );
+    });
+  }
+
   private async rollbackUndeliveredBootstrap(
     state: AgentBindingFacts,
   ): Promise<boolean> {
@@ -8926,6 +8924,16 @@ export class AgentManager {
     }
     const boundTask = await this.taskStore.get(state.taskId);
     if (!boundTask) return false;
+
+    if (boundTask.status === 'pending') {
+      console.warn(
+        `[recover] agent ${state.id} retained a pending bootstrap binding for ${state.taskId}; releasing it`,
+      );
+      await this.rollbackFailedDispatch(state.taskId, state.id, undefined, state.lockToken);
+      const released = (await this.agentStore.get(state.id))?.taskId !== state.taskId;
+      if (released) await this.clearRecoveredBootstrapHold(state);
+      return released;
+    }
 
     if (boundTask.status === 'spec-ready' && isSpecStagePhase(boundTask.phase)) {
       if (state.id === boundTask.devAgentId && state.id !== boundTask.agentId) {
@@ -8981,11 +8989,7 @@ export class AgentManager {
       `(prompt never ack'd); rolling the task back to pending`,
     );
     await this.rollbackFailedDispatch(state.taskId, state.id, undefined, state.lockToken);
-    await this.agentStore.update(state.id, (latest) => {
-      if (!latest || latest.status !== 'awaiting_human') return AGENT_STORE_NOOP;
-      const { status: _s, awaitingPhase: _p, awaitingReason: _r, awaitingSince: _a, ...rest } = latest;
-      return { ...rest, updatedAt: new Date().toISOString() };
-    });
+    await this.clearRecoveredBootstrapHold(state);
     return true;
   }
 
@@ -9098,7 +9102,6 @@ export class AgentManager {
     });
     const states = await this.agentStore.list();
     await this.releaseOrphanedLocks(states);
-    const deferredCleanups: Array<{ failingAgentId: string; failedTaskIds: string[]; projectIds: string[] }> = [];
 
     for (const state of states) {
       const agentConfig = this.getAgentConfig(state.id);
@@ -9180,17 +9183,11 @@ export class AgentManager {
             ) {
               continue;
             }
-            if (boundTask.status === 'merged' && boundTask.prNumber != null && boundTask.branch) {
-              await this.dispatchPostMergeCleanup(state.id, {
-                taskId: boundTask.id,
-                branch: boundTask.branch,
-              });
-              continue;
-            }
-            if (this.startCompactionThenRelease(recovered.id, recovered, boundTask.id)) continue;
+            await this.releaseAgentForTask(state.id, boundTask.id, 'idle');
+            continue;
           } catch (cleanupErr) {
             console.warn(
-              `[recover] dispatchPostMergeCleanup(${state.id}, ${boundTask.id}) failed:`,
+              `[recover] releaseAgentForTask(${state.id}, ${boundTask.id}) failed:`,
               cleanupErr,
             );
           }
@@ -9263,6 +9260,17 @@ export class AgentManager {
         }
         const message = err instanceof Error ? err.message : String(err);
         console.warn(`[recover] ensureSession failed for agent=${state.id}: ${message}`);
+        const boundTask = state.taskId ? await this.taskStore.get(state.taskId) : null;
+        const attentionTaskId = state.taskId
+          && boundTask
+          && !TERMINAL_STATUSES.includes(boundTask.status)
+          ? state.taskId
+          : undefined;
+        const runbook = attentionTaskId
+          ? RECOVERY_FAILED_TASK_RUNBOOK
+          : state.taskId
+            ? RECOVERY_FAILED_AGENT_RUNBOOK
+            : RECOVERY_FAILED_UNBOUND_RUNBOOK;
         await this.agentStore.update(state.id, (latest) => {
           if (!latest) return AGENT_STORE_NOOP;
           return {
@@ -9278,16 +9286,6 @@ export class AgentManager {
             updatedAt: new Date().toISOString(),
           };
         });
-        const cleanup = await this.failTasksForAgent(
-          state.id,
-          `recovery: ${message}`,
-          { deferPartnerCleanup: true },
-        );
-        deferredCleanups.push({
-          failingAgentId: state.id,
-          failedTaskIds: cleanup.failedTaskIds,
-          projectIds: cleanup.projectIds,
-        });
         await this.recordError({
           agentId: state.id,
           projectId: state.projectId,
@@ -9296,15 +9294,29 @@ export class AgentManager {
           reason: 'RECOVERY_ENSURE_SESSION_FAILED',
           message,
           observation: { phase: 'recovery-failed' },
-          recommendation: 'Inspect or recreate the tmux session, then retry the affected task.',
+          recommendation: runbook,
         });
-        await this.emitIntervention(state.projectId, state.id, state.taskId, { phase: 'recovery-failed', error: message });
+        const intervention: BaxianEvent = {
+          id: '',
+          type: 'human.intervention',
+          timestamp: new Date().toISOString(),
+          projectId: state.projectId,
+          agentId: state.id,
+          ...(attentionTaskId ? { taskId: attentionTaskId } : {}),
+          data: { phase: 'recovery-failed', error: message, note: runbook },
+        };
+        await this.safeEmit(intervention);
+        if (attentionTaskId) {
+          await this.recordTaskAttention(intervention).catch(attentionErr => {
+            console.warn(
+              `[recover] recordTaskAttention for ${state.id}/${attentionTaskId} failed:`,
+              attentionErr,
+            );
+          });
+        }
       }
     }
 
-    for (const c of deferredCleanups) {
-      await this.releasePartnersAndDrain(c.failingAgentId, c.failedTaskIds, c.projectIds);
-    }
     await this.recoverClaimedGitReviewDispatches().catch(err => {
       console.warn('[AgentManager] recover: claimed git review recovery failed:', err);
     });
@@ -10565,118 +10577,24 @@ export class AgentManager {
     const dev = this.getAgentConfig(task.agentId);
     if (!dev) return;
     this.phaseSignalWatcher?.stop(taskId);
-    if (task.prNumber && task.branch) {
-      const ctx: PostMergeCleanupContext = {
-        taskId: task.id,
-        branch: task.branch,
-      };
-      await this.dispatchPostMergeCleanup(task.agentId, ctx).catch(err =>
-        console.warn(
-          `[AgentManager] cleanupAfterMerge: dispatchPostMergeCleanup(${task.agentId}) failed:`,
-          err,
-        ),
-      );
-    } else {
-      await this.releaseAgentForTask(task.agentId, taskId, 'idle').catch(err =>
-        console.warn(
-          `[AgentManager] cleanupAfterMerge: releaseAgentForTask(${task.agentId}, ${taskId}) failed:`,
-          err,
-        ),
-      );
-    }
+    this.startTaskAgentRelease(task.agentId, taskId);
   }
 
-  async dispatchPostMergeCleanup(
+  startTaskAgentRelease(
     agentId: string,
-    ctx: PostMergeCleanupContext,
-  ): Promise<void> {
-    const agent = this.getAgentConfig(agentId);
-    if (!agent) return;
-    const genAtEntry = this.deletionGenerationOf(agentId);
-    const state = await this.agentStore.get(agentId);
-    if (!state) return;
-    if (state.taskId && state.taskId !== ctx.taskId) return;
-    if (state.creationToken) return;
-    if (state.status === 'awaiting_human') return;
-    if (!state.paneId) {
-      await this.releasePostMergeAgent(agentId, ctx.taskId);
-      return;
-    }
-
-    if (!state.taskId) {
-      if (this.isDeletionInFlight(agentId)) return;
-      const lockToken = await this.lockManager.acquire(agentId, ctx.taskId);
-      if (!lockToken) return;
-      const commit = await this.agentStore.update(agentId, (existing) => {
-        if (!existing) return AGENT_STORE_NOOP;
-        if (!this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
-        if (existing.taskId && existing.taskId !== ctx.taskId) return AGENT_STORE_NOOP;
-        if (existing.creationToken) return AGENT_STORE_NOOP;
-        if (existing.status === 'awaiting_human') return AGENT_STORE_NOOP;
-        if (existing.paneId !== state.paneId) return AGENT_STORE_NOOP;
-        return {
-          ...existing,
-          taskId: ctx.taskId,
-          lockToken,
-          updatedAt: new Date().toISOString(),
-        };
-      }).catch(async (err) => {
-        await this.lockManager.releaseIfOwner(agentId, ctx.taskId, lockToken).catch((releaseErr) => {
-          console.warn(`[AgentManager] postMergeCleanup(${agentId}): lock release after commit failure also failed:`, releaseErr);
-        });
-        throw err;
-      });
-      if (commit !== 'committed') {
-        await this.lockManager.releaseIfOwner(agentId, ctx.taskId, lockToken);
-        return;
-      }
-      const fresh = await this.agentStore.get(agentId);
-      if (fresh?.taskId !== ctx.taskId || fresh.lockToken !== lockToken) {
-        await this.lockManager.releaseIfOwner(agentId, ctx.taskId, lockToken);
-        return;
-      }
-    }
-
-    if (!this.deletionGateOpen(agentId, genAtEntry)) return;
-    const runner = this.createRunnerFor(agent);
-    const tmux = new TmuxManager(runner);
-    const runtime = agentRuntimeKindFor(agent);
-    const expectedPaneId = state.paneId;
+    taskId: string,
+    opts: { allowAwaitingHuman?: boolean } = {},
+  ): void {
     void (async () => {
-      if (!this.deletionGateOpen(agentId, genAtEntry)) return;
-      const pane = await this.resolveClaimedPane(tmux, agentId, expectedPaneId);
-      await this.runPostMergeCompaction(tmux, pane, agentId, ctx.taskId, runtime);
+      await this.acquireCompactGuard(agentId);
+      try {
+        await this.releaseAgentForTask(agentId, taskId, 'idle', opts);
+      } finally {
+        this.compactInFlight.delete(agentId);
+      }
     })().catch(err =>
-      console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) failed:`, err),
+      console.warn(`[AgentManager] background release(${agentId}, ${taskId}) failed:`, err),
     );
-  }
-
-  private async releasePostMergeAgent(agentId: string, taskId: string): Promise<void> {
-    const state = await this.agentStore.get(agentId);
-    if (state?.taskId !== taskId) return;
-    try {
-      await this.releaseAgentForTask(agentId, taskId, 'idle');
-    } catch (err) {
-      console.warn(
-        `[AgentManager] releasePostMergeAgent: releaseAgentForTask(${agentId}, ${taskId}) failed:`,
-        err,
-      );
-    }
-  }
-
-  private async runPostMergeCompaction(
-    tmux: TmuxManager,
-    pane: PaneRef,
-    agentId: string,
-    originalTaskId: string,
-    runtime: AgentRuntimeKind,
-  ): Promise<void> {
-    await this.acquireCompactGuard(agentId);
-    try {
-      await this.runPostMergeCompactionSteps(tmux, pane, agentId, originalTaskId, runtime);
-    } finally {
-      this.compactInFlight.delete(agentId);
-    }
   }
 
   private async acquireCompactGuard(agentId: string): Promise<void> {
@@ -10698,192 +10616,6 @@ export class AgentManager {
     if (this.compactInFlight.has(agentId)) return false;
     this.compactInFlight.add(agentId);
     return true;
-  }
-
-  private async runPostMergeCompactionSteps(
-    tmux: TmuxManager,
-    pane: PaneRef,
-    agentId: string,
-    originalTaskId: string,
-    runtime: AgentRuntimeKind,
-  ): Promise<void> {
-    const paneId = pane.paneId;
-    const initial = await this.agentStore.get(agentId);
-    if (!initial || initial.taskId !== originalTaskId || initial.paneId !== paneId) return;
-    const lockToken = await this.resolveTaskLockToken(initial, originalTaskId);
-    if (!lockToken) return;
-    const bindingStillOurs = async (): Promise<boolean> => {
-      const s = await this.agentStore.get(agentId);
-      return !!s
-        && s.taskId === originalTaskId
-        && s.lockToken === lockToken
-        && s.paneId === paneId
-        && await this.lockManager.isOwner(agentId, originalTaskId, lockToken);
-    };
-    if (!await bindingStillOurs()) return;
-
-    let cleared = false;
-    let clearError: unknown;
-    try {
-      cleared = await this.sendPostMergeSlashCommand(tmux, pane, agentId, runtime, bindingStillOurs);
-    } catch (err) {
-      clearError = err;
-    }
-    if (!cleared) {
-      if (await this.recoverPostMergeExitedRuntime(
-        tmux,
-        pane,
-        agentId,
-        originalTaskId,
-        lockToken,
-        runtime,
-      )) {
-        cleared = true;
-      } else if (!await bindingStillOurs()) {
-        return;
-      } else if (
-        clearError instanceof Error
-        && clearError.message.includes('runtime rejected /clear')
-      ) {
-        try {
-          await this.waitForReplPromptReady(tmux, pane, runtime, this.compactIdleWaitMs);
-        } catch (err) {
-          clearError = err;
-        }
-        if (clearError instanceof Error && !clearError.message.includes('runtime rejected /clear')) {
-          await this.markAwaitingHuman(
-            agentId,
-            'post-merge-cleanup-not-idle',
-            `Task finished, but the runtime could not be proven idle after /clear: ${clearError.message}`,
-            { expectedTaskId: originalTaskId },
-          );
-          return;
-        }
-      } else {
-        const reason = clearError instanceof Error ? clearError.message : String(clearError ?? 'unknown error');
-        await this.markAwaitingHuman(
-          agentId,
-          'post-merge-cleanup-not-idle',
-          `Task finished, but /clear and the runtime idle check did not complete safely: ${reason}`,
-          { expectedTaskId: originalTaskId },
-        );
-        return;
-      }
-    }
-    await this.releasePostMergeAgent(agentId, originalTaskId);
-  }
-
-  private async recoverPostMergeExitedRuntime(
-    tmux: TmuxManager,
-    pane: PaneRef,
-    agentId: string,
-    taskId: string,
-    lockToken: string,
-    runtime: AgentRuntimeKind,
-  ): Promise<boolean> {
-    const paneId = pane.paneId;
-    let paneExists = true;
-    try {
-      if (hasReplProcTitle(await tmux.displayMessage(pane, '#{pane_current_command}'), runtime)) return false;
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      if (!/no server running|session not found|can't find (?:pane|session)|no such (?:pane|session)/i.test(detail)) {
-        return false;
-      }
-      paneExists = false;
-    }
-    const state = await this.agentStore.get(agentId);
-    if (
-      !state
-      || state.taskId !== taskId
-      || state.lockToken !== lockToken
-      || state.paneId !== paneId
-      || !(await this.lockManager.isOwner(agentId, taskId, lockToken))
-    ) return false;
-    try {
-      if (paneExists) await tmux.sendKeysToPane(pane, 'C-c');
-      const ensure = await this.ensureSession(agentId, 'runtime');
-      if (!ensure.freshRuntime) return false;
-      await this.agentStore.update(agentId, (existing) => {
-        if (!existing || existing.taskId !== taskId || existing.lockToken !== lockToken) {
-          return AGENT_STORE_NOOP;
-        }
-        if (existing.paneId === ensure.paneId && existing.workdir === ensure.workdir) {
-          return AGENT_STORE_NOOP;
-        }
-        return {
-          ...existing,
-          paneId: ensure.paneId,
-          workdir: ensure.workdir,
-          updatedAt: new Date().toISOString(),
-        };
-      });
-      const current = await this.agentStore.get(agentId);
-      return current?.taskId === taskId
-        && current.lockToken === lockToken
-        && current.paneId === ensure.paneId
-        && await this.lockManager.isOwner(agentId, taskId, lockToken);
-    } catch (err) {
-      console.warn(`[AgentManager] recoverPostMergeExitedRuntime(${agentId}, ${taskId}) failed:`, err);
-      return false;
-    }
-  }
-
-  private async sendPostMergeSlashCommand(
-    tmux: TmuxManager,
-    pane: PaneRef,
-    agentId: string,
-    runtime: AgentRuntimeKind,
-    bindingStillOurs: () => Promise<boolean>,
-  ): Promise<boolean> {
-    let rejection: Error | undefined;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      if (!await bindingStillOurs()) return false;
-      await tmux.clearComposerDraft(pane);
-      await this.waitForReplPromptReady(tmux, pane, runtime, this.compactIdleWaitMs);
-      if (!await bindingStillOurs()) return false;
-      await tmux.sendKeysLiteral(pane, '/clear');
-      await tmux.sendEnter(pane);
-      await new Promise(r => setTimeout(r, this.compactIdlePollMs));
-      await this.waitForReplPromptReady(tmux, pane, runtime, this.compactIdleWaitMs);
-      if (!await bindingStillOurs()) return false;
-
-      if (!await this.hasRuntimeSlashCommandRejection(tmux, pane, runtime, '/clear')) return true;
-
-      rejection = new Error('runtime rejected /clear; the clear did not take effect');
-      if (attempt < 2) {
-        console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) /clear rejected; retrying`);
-        await new Promise(r => setTimeout(r, this.compactIdlePollMs));
-      }
-    }
-    throw rejection ?? new Error('runtime rejected /clear');
-  }
-
-  private async hasRuntimeSlashCommandRejection(
-    tmux: TmuxManager,
-    pane: PaneRef,
-    runtime: AgentRuntimeKind,
-    command: '/compact' | '/clear',
-  ): Promise<boolean> {
-    const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
-    return this.runtimeSlashCommandRejectedPatterns(runtime, command).some(re => re.test(cap));
-  }
-
-  private runtimeSlashCommandRejectedPatterns(runtime: AgentRuntimeKind, command: '/compact' | '/clear'): RegExp[] {
-    const busyToast = new RegExp(
-      `["'“”‘’]?${command}["'“”‘’]?\\s+is disabled while a task is in progress\\.`,
-      'i',
-    );
-    switch (runtime) {
-      case 'claude-code':
-        return [busyToast];
-      case 'codex':
-        return [busyToast, new RegExp(`Unrecognized command '${command}'`, 'i')];
-      case 'opencode':
-        return [busyToast, /No matching items/i];
-      case 'qodercli':
-        return [busyToast, new RegExp(`Unknown skill: ${command.slice(1)}`, 'i')];
-    }
   }
 
   private async waitForReplPromptReady(
@@ -12203,31 +11935,8 @@ export class AgentManager {
       if (!id) continue;
       const state = await this.agentStore.get(id);
       if (!state || state.taskId !== taskId) continue;
-      if (this.startCompactionThenRelease(id, state, taskId)) continue;
-      await this.releaseAgentForTask(id, taskId, 'idle', { allowAwaitingHuman: true })
-        .catch(err => {
-          console.warn(`[AgentManager] confirm release ${id} failed:`, err);
-        });
+      this.startTaskAgentRelease(id, taskId, { allowAwaitingHuman: true });
     }
-  }
-
-  private startCompactionThenRelease(
-    agentId: string,
-    state: AgentBindingFacts,
-    taskId: string,
-  ): boolean {
-    const expectedPaneId = state.paneId;
-    if (!expectedPaneId || state.status === 'awaiting_human' || state.creationToken) return false;
-    const cfg = this.getAgentConfig(agentId);
-    if (!cfg) return false;
-    const tmux = new TmuxManager(this.createRunnerFor(cfg));
-    void (async () => {
-      const pane = await this.resolveClaimedPane(tmux, agentId, expectedPaneId);
-      await this.runPostMergeCompaction(tmux, pane, agentId, taskId, agentRuntimeKindFor(cfg));
-    })().catch(err =>
-      console.warn(`[AgentManager] releaseTaskAgents compaction(${agentId}) failed:`, err),
-    );
-    return true;
   }
 
 }

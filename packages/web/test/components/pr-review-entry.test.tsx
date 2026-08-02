@@ -59,7 +59,7 @@ describe('PrReviewEntry', () => {
     expect(screen.getByText(/dev · fix: thing/)).toBeTruthy();
   });
 
-  it('labels a git spec-phase timeline as Spec review', async () => {
+  it('labels a git spec-phase timeline as Plan review', async () => {
     ghMock.mockResolvedValue({
       available: true,
       prNumber: 7,
@@ -68,11 +68,11 @@ describe('PrReviewEntry', () => {
 
     renderEntry(task({ phase: 'spec', specReviewRound: 1 }));
 
-    expect(await screen.findByText('Spec review')).toBeTruthy();
+    expect(await screen.findByText('Plan review')).toBeTruthy();
     expect(screen.queryByText('Code review')).toBeNull();
   });
 
-  it('marks dev and QA role labels as colored text, not pills', async () => {
+  it('marks development and review role labels as colored text, not pills', async () => {
     ghMock.mockResolvedValue({
       available: true,
       items: [
@@ -81,10 +81,10 @@ describe('PrReviewEntry', () => {
       ],
     } as PrReviewConversation);
     renderEntry(task());
-    const qa = await screen.findByText('QA');
+    const qa = await screen.findByText('Review agent');
     expect(qa.className).toContain('text-og-600');
     expect(qa.className).not.toContain('pill');
-    const dev = screen.getByText('Dev');
+    const dev = screen.getByText('Development agent');
     expect(dev.className).toContain('text-og-600');
     expect(dev.className).not.toContain('pill');
   });
@@ -98,8 +98,8 @@ describe('PrReviewEntry', () => {
     expect(await screen.findByText('In progress')).toBeTruthy();
     expect(screen.getByText('Comment')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · please recheck/)).toBeTruthy();
-    expect(screen.getByText('Dev')).toBeTruthy();
-    expect(screen.queryByText('QA')).toBeNull();
+    expect(screen.getByText('Development agent')).toBeTruthy();
+    expect(screen.queryByText('Review agent')).toBeNull();
   });
 
   it('keeps the author visible for inline replies', async () => {
@@ -120,10 +120,10 @@ describe('PrReviewEntry', () => {
     renderEntry(task());
     expect(await screen.findByText('Response')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · src\/a\.ts:42 · please recheck this line/)).toBeTruthy();
-    expect(screen.getByText('Dev')).toBeTruthy();
+    expect(screen.getByText('Development agent')).toBeTruthy();
   });
 
-  it('styles the Code review title and QA marker like Round x: compact and non-bold', async () => {
+  it('styles the Code review title and review-agent marker like Round x: compact and non-bold', async () => {
     ghMock.mockResolvedValue({
       available: true,
       items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
@@ -133,7 +133,7 @@ describe('PrReviewEntry', () => {
     expect(title.className).toContain('text-xs');
     expect(title.className).not.toContain('font-medium');
     expect(title.className).not.toContain('font-semibold');
-    const qa = await screen.findByText('QA');
+    const qa = await screen.findByText('Review agent');
     expect(qa.className).toContain('text-xs');
     expect(qa.className).not.toContain('font-semibold');
     expect(qa.className).not.toContain('font-medium');
@@ -319,12 +319,12 @@ describe('PrReviewEntry', () => {
   it('shows unavailable reasons and falls back unknown reasons to no-pr', async () => {
     ghMock.mockResolvedValueOnce({ available: false, reason: 'driver-unavailable', items: [] } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText(/driver/i)).toBeTruthy();
+    expect(await screen.findByText(/code-platform/i)).toBeTruthy();
 
     cleanup();
     ghMock.mockResolvedValueOnce({ available: false, reason: 'unexpected', items: [] } as unknown as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText(/has no PR yet/)).toBeTruthy();
+    expect(await screen.findByText(/does not have a PR yet/)).toBeTruthy();
   });
 
   it('shows a fetch failure when github review loading fails', async () => {

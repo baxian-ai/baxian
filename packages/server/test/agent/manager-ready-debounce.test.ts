@@ -4,17 +4,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentManager } from '../../src/agent/manager.js';
 import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
-import {
-  createManagerHarness,
-  paneRefOf,
-  TEST_SESSION_REF,
-} from '../helpers/manager-harness.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
 import { fakeRunner } from '../helpers/fake-runner.js';
 
 const CODEX_IDLE = '› \n\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
 const CODEX_BUSY = '• Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
-const OPENCODE_IDLE = 'Ask anything...\n\ntab agents  ctrl+p commands\n';
-const OPENCODE_UNKNOWN_COMMAND = 'No matching items\n\n/new\n\ntab agents  ctrl+p commands\n';
 
 type WaitOpts = { stableIdle?: boolean };
 type WaitFn = (tmux: TmuxManager, paneId: string, runtime: string, timeoutMs: number, opts?: WaitOpts) => Promise<void>;
@@ -26,20 +20,6 @@ let tmux: TmuxManager;
 function waitReady(timeoutMs: number, opts?: WaitOpts): Promise<void> {
   const fn = (manager as unknown as { waitForReplPromptReady: WaitFn }).waitForReplPromptReady.bind(manager) as WaitFn;
   return fn(tmux, '%0', 'codex', timeoutMs, opts);
-}
-
-function dispatchBoundary(pane: ReturnType<typeof paneRefOf>, runtime: string): Promise<void> {
-  const fn = (manager as unknown as {
-    clearRuntimeForDispatchBoundary(
-      t: TmuxManager,
-      p: ReturnType<typeof paneRefOf>,
-      a: string,
-      r: string,
-      s: typeof TEST_SESSION_REF,
-      rv: () => Promise<void>,
-    ): Promise<void>;
-  }).clearRuntimeForDispatchBoundary.bind(manager);
-  return fn(tmux, pane, pane.claim, runtime, TEST_SESSION_REF, async () => undefined);
 }
 
 function mockFrames(frames: string[], opts: { cycle?: boolean } = {}): ReturnType<typeof vi.spyOn> {
@@ -65,9 +45,6 @@ beforeEach(async () => {
   Object.assign(manager, {
     compactIdlePollMs: 1,
     readyStableSpacingMs: 1,
-    cleanComposerWaitMs: 30,
-    dispatchAckTimeoutMs: 30,
-    dispatchSettleTimeoutMs: 30,
   });
   tmux = new TmuxManager(runner);
   vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
@@ -117,107 +94,5 @@ describe('waitForReplPromptReady stableIdle 去抖', () => {
     const spy = mockFrames([CODEX_IDLE]);
     await expect(waitReady(200)).resolves.toBeUndefined();
     expect(spy.mock.calls.length).toBe(1);
-  });
-});
-
-describe('任务边界注入前的稳定就绪门', () => {
-  it('假 idle 帧不放行 /clear：就绪未确证前不发送任何按键', async () => {
-    mockFrames([CODEX_BUSY, CODEX_IDLE, CODEX_BUSY, CODEX_IDLE], { cycle: true });
-    const clearDraft = vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockResolvedValue(undefined);
-    const sendLiteral = vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
-    const sendEnter = vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'captureSettledSnapshot').mockResolvedValue(CODEX_IDLE);
-    vi.spyOn(TmuxManager.prototype, 'waitSubmitAck').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-
-    const boundary = (manager as unknown as {
-      clearRuntimeForDispatchBoundary(
-        t: TmuxManager,
-        p: ReturnType<typeof paneRefOf>,
-        a: string,
-        r: 'codex',
-        s: typeof TEST_SESSION_REF,
-        rv: () => Promise<void>,
-      ): Promise<void>;
-    }).clearRuntimeForDispatchBoundary.bind(manager);
-
-    await expect(boundary(
-      tmux,
-      paneRefOf('%0', 'qa-1'),
-      'qa-1',
-      'codex',
-      TEST_SESSION_REF,
-      async () => undefined,
-    ))
-      .rejects.toBeInstanceOf(ReplNotReadyError);
-    expect(clearDraft).not.toHaveBeenCalled();
-    expect(sendLiteral).not.toHaveBeenCalled();
-    expect(sendEnter).not.toHaveBeenCalled();
-  });
-
-  it('稳定 idle 后正常执行 /clear 边界流程', async () => {
-    mockFrames([CODEX_IDLE]);
-    const clearDraft = vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockResolvedValue(undefined);
-    const sendLiteral = vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'captureSettledSnapshot').mockResolvedValue(CODEX_IDLE);
-    vi.spyOn(TmuxManager.prototype, 'waitSubmitAck').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'setSessionOptionsIfAlive').mockResolvedValue('applied');
-
-    const boundary = (manager as unknown as {
-      clearRuntimeForDispatchBoundary(
-        t: TmuxManager,
-        p: ReturnType<typeof paneRefOf>,
-        a: string,
-        r: 'codex',
-        s: typeof TEST_SESSION_REF,
-        rv: () => Promise<void>,
-      ): Promise<void>;
-    }).clearRuntimeForDispatchBoundary.bind(manager);
-    const pane = paneRefOf('%0', 'qa-1');
-
-    await expect(boundary(
-      tmux,
-      pane,
-      'qa-1',
-      'codex',
-      TEST_SESSION_REF,
-      async () => undefined,
-    )).resolves.toBeUndefined();
-    expect(clearDraft).toHaveBeenCalled();
-    expect(sendLiteral).toHaveBeenCalledWith(pane, '/clear');
-  });
-
-  it('opencode 边界清场与其他 runtime 一样发送 /clear', async () => {
-    mockFrames([OPENCODE_IDLE]);
-    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('opencode');
-    vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockResolvedValue(undefined);
-    const sendLiteral = vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'captureSettledSnapshot').mockResolvedValue(OPENCODE_IDLE);
-    vi.spyOn(TmuxManager.prototype, 'waitSubmitAck').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'setSessionOptionsIfAlive').mockResolvedValue('applied');
-    const pane = paneRefOf('%0', 'dev-1');
-
-    await expect(dispatchBoundary(pane, 'opencode')).resolves.toBeUndefined();
-    expect(sendLiteral).toHaveBeenCalledWith(pane, '/clear');
-    expect(sendLiteral).not.toHaveBeenCalledWith(pane, '/new');
-  });
-
-  it('opencode 边界清场看到 unknown-command 画面时 fail-closed，不放行 dispatch', async () => {
-    mockFrames([OPENCODE_UNKNOWN_COMMAND]);
-    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('opencode');
-    vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'captureSettledSnapshot').mockResolvedValue(OPENCODE_UNKNOWN_COMMAND);
-    vi.spyOn(TmuxManager.prototype, 'waitSubmitAck').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    vi.spyOn(TmuxManager.prototype, 'setSessionOptionsIfAlive').mockResolvedValue('applied');
-
-    await expect(dispatchBoundary(paneRefOf('%0', 'dev-1'), 'opencode'))
-      .rejects.toThrow(/Runtime rejected \/clear at the dispatch boundary/);
   });
 });

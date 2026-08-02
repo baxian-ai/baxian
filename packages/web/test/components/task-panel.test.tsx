@@ -54,7 +54,7 @@ function mockDoneOnly(page: ReturnType<typeof donePage>): void {
 }
 
 function clickDone(): void {
-  fireEvent.click(screen.getByRole('button', { name: /DONE/ }));
+  fireEvent.click(screen.getByRole('button', { name: /Finished/ }));
 }
 
 function doneCalls() {
@@ -85,8 +85,8 @@ describe('TaskPanel', () => {
       task({ id: 'task-020', status: 'pending', title: 'pending one' }),
     ]);
 
-    const activeSection = screen.getByRole('region', { name: 'IN PROGRESS' });
-    const pendingSection = screen.getByRole('region', { name: 'PENDING' });
+    const activeSection = screen.getByRole('region', { name: 'In progress' });
+    const pendingSection = screen.getByRole('region', { name: 'Waiting to start' });
     expect(within(activeSection).getByText('active one')).toBeTruthy();
     expect(within(pendingSection).getByText('pending one')).toBeTruthy();
     expect(activeSection.compareDocumentPosition(pendingSection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -102,11 +102,11 @@ describe('TaskPanel', () => {
       task({ id: 'task-051', status: 'review', updatedAt: '2026-05-18T00:00:00Z' }),
       task({ id: 'hotfix-x', status: 'fixing', updatedAt: '2026-05-20T00:00:00Z' }),
     ]);
-    const pending = screen.getByRole('region', { name: 'PENDING' });
+    const pending = screen.getByRole('region', { name: 'Waiting to start' });
     expect(within(pending).getAllByText(/^\d+$/).map((el) => el.textContent)).toEqual([
       '001', '002', '003',
     ]);
-    const active = screen.getByRole('region', { name: 'IN PROGRESS' });
+    const active = screen.getByRole('region', { name: 'In progress' });
     expect(within(active).getAllByText(/^(hotfix-x|\d+)$/).map((el) => el.textContent)).toEqual([
       'hotfix-x', '051', '050',
     ]);
@@ -116,12 +116,12 @@ describe('TaskPanel', () => {
     const { rerender } = renderPanel([
       task({ id: 'task-007', status: 'in_progress', reviewRound: 0, title: 'evolving' }),
     ]);
-    const active = screen.getByRole('region', { name: 'IN PROGRESS' });
+    const active = screen.getByRole('region', { name: 'In progress' });
     const initialRow = within(active).getByRole('button', { name: /evolving/ });
-    const initialRound = within(initialRow).getByText('R0');
-    const initialDot = within(initialRow).getByRole('img', { name: 'in_progress' });
-    expect(initialRound.compareDocumentPosition(initialDot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(initialDot.nextElementSibling).toBeNull();
+    const initialStatus = initialRow.querySelector('[data-status="in_progress"]') as HTMLElement;
+    expect(within(initialRow).queryByText('Round 0')).toBeNull();
+    expect(initialStatus.textContent).toBe('Developing');
+    expect(initialStatus.nextElementSibling).toBeNull();
 
     rerender(
       <MemoryRouter>
@@ -131,13 +131,14 @@ describe('TaskPanel', () => {
         />
       </MemoryRouter>,
     );
-    const activeAfter = screen.getByRole('region', { name: 'IN PROGRESS' });
+    const activeAfter = screen.getByRole('region', { name: 'In progress' });
     const updatedRow = within(activeAfter).getByRole('button', { name: /evolving/ });
-    const updatedRound = within(updatedRow).getByText('R1');
-    const updatedDot = within(updatedRow).getByRole('img', { name: 'review' });
-    expect(updatedRound.compareDocumentPosition(updatedDot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(updatedDot.nextElementSibling).toBeNull();
-    expect(within(activeAfter).queryByRole('img', { name: 'in_progress' })).toBeNull();
+    const updatedRound = within(updatedRow).getByText('Round 1');
+    const updatedStatus = updatedRow.querySelector('[data-status="review"]') as HTMLElement;
+    expect(updatedRound.compareDocumentPosition(updatedStatus) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(updatedStatus.textContent).toBe('Reviewing code');
+    expect(updatedStatus.nextElementSibling).toBeNull();
+    expect(activeAfter.querySelector('[data-status="in_progress"]')).toBeNull();
 
     rerender(
       <MemoryRouter>
@@ -147,7 +148,7 @@ describe('TaskPanel', () => {
     expect(screen.queryByText('evolving')).toBeNull();
   });
 
-  it('shows zero spec review round before the rightmost status dot', () => {
+  it('hides a zero plan-review round and still uses the plan status label', () => {
     renderPanel([
       task({
         id: 'task-008',
@@ -159,14 +160,11 @@ describe('TaskPanel', () => {
       }),
     ]);
 
-    const active = screen.getByRole('region', { name: 'IN PROGRESS' });
+    const active = screen.getByRole('region', { name: 'In progress' });
     const row = within(active).getByRole('button', { name: /spec flow/ });
-    const round = within(row).getByText('R0');
-    const dot = within(row).getByRole('img', { name: 'review' });
-    expect(within(row).getByText('spec')).toBeTruthy();
-    expect(within(row).queryByText('R4')).toBeNull();
-    expect(round.compareDocumentPosition(dot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(dot.nextElementSibling).toBeNull();
+    expect(within(row).queryByText('Round 0')).toBeNull();
+    expect(within(row).queryByText('Round 4')).toBeNull();
+    expect(within(row).getByText('Reviewing plan')).toBeTruthy();
   });
 
   it('client-paginates a long section: shows 20 + Load more, then reveals the rest', () => {
@@ -174,7 +172,7 @@ describe('TaskPanel', () => {
       task({ id: `task-${String(i + 1).padStart(3, '0')}`, status: 'pending' }),
     );
     renderPanel(many);
-    const pending = screen.getByRole('region', { name: 'PENDING' });
+    const pending = screen.getByRole('region', { name: 'Waiting to start' });
     expect(within(pending).getAllByText(/^\d+$/).length).toBe(20);
 
     fireEvent.click(within(pending).getByRole('button', { name: 'Load more' }));
@@ -239,14 +237,14 @@ describe('TaskPanel', () => {
     mockDoneOnly(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
     renderPanel([]);
 
-    expect(screen.getByRole('button', { name: /DONE/ }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('button', { name: /Finished/ }).getAttribute('aria-expanded')).toBe('true');
     expect(await screen.findByText('shipped')).toBeTruthy();
     expect(doneCalls().some((c) => (c[1]?.offset ?? 0) === 0)).toBe(true);
   });
 
   it('keeps the DONE section collapsed by default without querying', () => {
     renderPanel([]);
-    expect(screen.getByRole('button', { name: /DONE/ }).getAttribute('aria-expanded')).toBe('false');
+    expect(screen.getByRole('button', { name: /Finished/ }).getAttribute('aria-expanded')).toBe('false');
     expect(pageMock).not.toHaveBeenCalled();
   });
 
@@ -262,11 +260,9 @@ describe('TaskPanel', () => {
 
   it('uses the compact panel chrome and keeps the header/close control outside the panel', () => {
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
-    expect(screen.getByRole('region', { name: 'IN PROGRESS' })).toBeTruthy();
-    expect(screen.getByRole('region', { name: 'PENDING' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /DONE/ })).toBeTruthy();
-    expect(screen.queryByRole('region', { name: 'In Progress' })).toBeNull();
-    expect(screen.queryByRole('region', { name: 'Pending' })).toBeNull();
+    expect(screen.getByRole('region', { name: 'In progress' })).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Waiting to start' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Finished/ })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Refresh task list' })).toBeNull();
     expect(screen.queryByRole('button', { name: '+ New task' })).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Tasks' })).toBeNull();
@@ -275,36 +271,36 @@ describe('TaskPanel', () => {
 
   it('renders the section titles in normal weight, not bold', () => {
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
-    for (const name of ['IN PROGRESS', 'PENDING']) {
+    for (const name of ['In progress', 'Waiting to start']) {
       const title = screen.getByRole('region', { name }).firstElementChild as HTMLElement;
       expect(title.textContent).toContain(name);
       expect(title.className).toContain('font-normal');
       expect(title.className).not.toContain('font-semibold');
     }
-    const done = screen.getByRole('button', { name: /DONE/ });
+    const done = screen.getByRole('button', { name: /Finished/ });
     expect(done.className).toContain('font-normal');
     expect(done.className).not.toContain('font-semibold');
   });
 
-  it('renders each live status as a colored dot whose label is the status (hover text)', () => {
-    renderPanel([
+  it('renders each live status as a readable colored pill', () => {
+    const { container } = renderPanel([
       task({ id: 'task-001', status: 'in_progress' }),
       task({ id: 'task-002', status: 'review' }),
       task({ id: 'task-003', status: 'fixing' }),
       task({ id: 'task-004', status: 'approved' }),
       task({ id: 'task-005', status: 'pending' }),
     ]);
-    expect(screen.queryByText('in_progress')).toBeNull();
-    expect(screen.getByRole('img', { name: 'in_progress' }).className).toContain('bg-success');
-    expect(screen.getByRole('img', { name: 'review' }).className).toContain('bg-accent');
-    expect(screen.getByRole('img', { name: 'fixing' }).className).toContain('bg-warn');
-    expect(screen.getByRole('img', { name: 'approved' }).className).toContain('bg-success');
-    const pendingDot = screen.getByRole('img', { name: 'pending' });
-    expect(pendingDot.className).toContain('bg-og-300');
-    expect(pendingDot.getAttribute('title')).toBe('pending');
+    expect((container.querySelector('[data-status="in_progress"]') as HTMLElement).className).toContain('pill-live');
+    expect((container.querySelector('[data-status="review"]') as HTMLElement).className).toContain('pill-review');
+    expect((container.querySelector('[data-status="fixing"]') as HTMLElement).className).toContain('pill-warn');
+    expect((container.querySelector('[data-status="approved"]') as HTMLElement).className).toContain('pill-live');
+    const pendingBadge = container.querySelector('[data-status="pending"]') as HTMLElement;
+    expect(pendingBadge.className).toContain('pill');
+    expect(pendingBadge.textContent).toBe('Waiting to start');
+    expect(pendingBadge.getAttribute('title')).toBe('Waiting to start');
   });
 
-  it('colors terminal DONE status dots by outcome', async () => {
+  it('colors terminal status pills by outcome', async () => {
     mockDoneOnly(donePage([
       task({ id: 'task-090', status: 'merged' }),
       task({ id: 'task-091', status: 'max_rounds' }),
@@ -313,17 +309,17 @@ describe('TaskPanel', () => {
     ]));
     renderPanel([]);
     clickDone();
-    expect((await screen.findByRole('img', { name: 'merged' })).className).toContain('bg-success');
-    expect(screen.getByRole('img', { name: 'max_rounds' }).className).toContain('bg-warn');
-    expect(screen.getByRole('img', { name: 'failed' }).className).toContain('bg-danger');
-    expect(screen.getByRole('img', { name: 'cancelled' }).className).toContain('bg-og-300');
+    expect((await screen.findByText('PR merged')).className).toContain('pill-live');
+    expect(screen.getByText('Code review needs a decision').className).toContain('pill-warn');
+    expect(screen.getByText('Couldn’t complete').className).toContain('pill-danger');
+    expect(screen.getByText('Cancelled').className).toContain('pill');
   });
 
   it('gives the DONE divider the same hairline as the live sections', () => {
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
-    const doneWrapper = screen.getByRole('button', { name: /DONE/ }).parentElement!;
+    const doneWrapper = screen.getByRole('button', { name: /Finished/ }).parentElement!;
     expect(doneWrapper.className).not.toContain('border-t-2');
-    const pending = screen.getByRole('region', { name: 'PENDING' });
+    const pending = screen.getByRole('region', { name: 'Waiting to start' });
     expect(pending.className).toContain('border-b');
     expect(pending.className).toContain('border-hairline');
   });
@@ -338,14 +334,14 @@ describe('TaskPanel', () => {
 
   it('clicking a task row navigates to its detail page', () => {
     renderPanel([task({ id: 'task-042', status: 'in_progress', title: 'pick me' })]);
-    const active = screen.getByRole('region', { name: 'IN PROGRESS' });
+    const active = screen.getByRole('region', { name: 'In progress' });
     fireEvent.click(within(active).getByRole('button', { name: /pick me/ }));
     expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-042');
   });
 
   it('shortens the task id to its number and keeps the full id as hover text', () => {
     renderPanel([task({ id: 'task-042', status: 'in_progress', title: 'pick me' })]);
-    const active = screen.getByRole('region', { name: 'IN PROGRESS' });
+    const active = screen.getByRole('region', { name: 'In progress' });
     const idCell = within(active).getByText('042');
     expect(idCell.getAttribute('title')).toBe('task-042');
     expect(within(active).queryByText('task-042')).toBeNull();
@@ -370,26 +366,30 @@ describe('TaskPanel', () => {
       });
     }
 
-    it('renders the durable reason, runbook and recommended operations', () => {
+    it('shows friendly guidance while keeping the durable reason and runbook in technical details', () => {
       renderPanel([attentiveTask(['advance', 'verdict', 'cancel', 'retry'])]);
 
-      expect(screen.getByText(/review-verdict-overdue/)).toBeTruthy();
-      expect(screen.getByTitle('Inspect the current QA review.')).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Advance' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Verdict' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
+      expect(screen.getByText('Review needs your attention')).toBeTruthy();
+      expect(screen.getByText('Review the PR and the discussion below, then confirm the result or request changes.')).toBeTruthy();
+      const details = screen.getByText('Technical details').closest('details')!;
+      expect(details.hasAttribute('open')).toBe(false);
+      expect(within(details).getByText(/review-verdict-overdue/)).toBeTruthy();
+      expect(within(details).getByText(/Inspect the current QA review/)).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Restart review' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Cancel task' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Run task again' })).toBeTruthy();
     });
 
     it('runs Advance directly and keeps the task detail route for the other operations', async () => {
       advanceMock.mockResolvedValue(attentiveTask(['advance', 'verdict']));
       renderPanel([attentiveTask(['advance', 'verdict'])]);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Restart review' }));
       await waitFor(() => expect(advanceMock).toHaveBeenCalledWith('task-100'));
       expect(navigateMock).not.toHaveBeenCalled();
 
-      fireEvent.click(screen.getByRole('button', { name: 'Verdict' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
       expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
     });
 
@@ -404,7 +404,21 @@ describe('TaskPanel', () => {
         },
       }]);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Advance' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Retry pre-merge checks' }));
+
+      expect(advanceMock).not.toHaveBeenCalled();
+      expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
+    });
+
+    it('opens task detail instead of dispatching an unassigned pending task', () => {
+      renderPanel([{
+        ...attentiveTask(['advance']),
+        status: 'pending',
+        agentId: '',
+        preferredAgentId: '',
+      }]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Edit task' }));
 
       expect(advanceMock).not.toHaveBeenCalled();
       expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');

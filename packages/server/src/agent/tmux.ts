@@ -318,6 +318,10 @@ export function hasReplProcTitle(current: string, runtime: AgentRuntimeKind): bo
   return REPL_PROC_TITLES[runtime].test(current);
 }
 
+export function isShellProcTitle(current: string): boolean {
+  return SHELL_PROC_TITLES.test(current);
+}
+
 const ESC_TO_INTERRUPT_TAIL_LINES = 8;
 const CLAUDE_IDLE_COMPOSER_TAIL_LINES = 6;
 const ESC_TO_INTERRUPT_RE = /esc to interru(?:pt|p(?:…|\.{3})?)/i;

@@ -1,17 +1,30 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
-import type { TaskStatus } from '../../src/shared/index.js';
+import type { TaskState } from '../../src/shared/index.js';
 import {
-  TaskStatusDot,
+  TaskStatusBadge,
   formatTaskTimestamp,
+  getTaskAttentionCopy,
   shortTaskId,
   taskDetailPath,
   taskStatusLabel,
 } from '../../src/components/task-status.tsx';
-import { __resetI18nForTests, syncLocaleFromConfig } from '../../src/i18n/index.tsx';
+import { __resetI18nForTests, getMessages, syncLocaleFromConfig } from '../../src/i18n/index.tsx';
 
 afterEach(() => cleanup());
 afterEach(() => __resetI18nForTests());
+
+function attention(
+  reason: string,
+  recommendedActions: NonNullable<TaskState['attention']>['recommendedActions'],
+): NonNullable<TaskState['attention']> {
+  return {
+    reason,
+    runbook: 'Inspect the task.',
+    occurredAt: '2026-05-10T12:00:00.000Z',
+    recommendedActions,
+  };
+}
 
 describe('shortTaskId', () => {
   it('strips the task- prefix down to the number, preserving zero padding', () => {
@@ -29,44 +42,6 @@ describe('shortTaskId', () => {
   it('returns "" instead of crashing on malformed (null/undefined) ids', () => {
     expect(shortTaskId(null as unknown as string)).toBe('');
     expect(shortTaskId(undefined as unknown as string)).toBe('');
-  });
-});
-
-describe('TaskStatusDot', () => {
-  it('renders an img-role dot whose label and title are the status (hover text)', () => {
-    render(<TaskStatusDot status="review" />);
-    const dot = screen.getByRole('img', { name: 'review' });
-    expect(dot.getAttribute('title')).toBe('review');
-    expect(dot.className).toContain('rounded-full');
-  });
-
-  it('maps every status to a color, sharing one color across same-semantic statuses', () => {
-    const cases: Array<[Parameters<typeof TaskStatusDot>[0]['status'], string]> = [
-      ['pending', 'bg-og-300'],
-      ['cancelled', 'bg-og-300'],
-      ['in_progress', 'bg-success'],
-      ['fixing', 'bg-warn'],
-      ['merged', 'bg-success'],
-      ['done', 'bg-success'],
-      ['review', 'bg-accent'],
-      ['approved', 'bg-success'],
-      ['spec-ready', 'bg-warn'],
-      ['merge-ready', 'bg-warn'],
-      ['failed', 'bg-danger'],
-      ['max_rounds', 'bg-warn'],
-    ];
-    for (const [status, cls] of cases) {
-      cleanup();
-      render(<TaskStatusDot status={status} />);
-      expect(screen.getByRole('img', { name: status }).className).toContain(cls);
-    }
-  });
-
-  it('falls back to a visible grey dot for an unknown status (still labeled via hover)', () => {
-    render(<TaskStatusDot status={'whatever' as TaskStatus} />);
-    const dot = screen.getByRole('img', { name: 'whatever' });
-    expect(dot.className).toContain('bg-og-300');
-    expect(dot.getAttribute('title')).toBe('whatever');
   });
 });
 
@@ -111,12 +86,52 @@ describe('formatTaskTimestamp', () => {
 
 describe('taskStatusLabel', () => {
   it('returns the English label by default (no I18nProvider / default locale)', () => {
-    expect(taskStatusLabel('pending')).toBe('Pending');
+    expect(taskStatusLabel('pending')).toBe('Waiting to start');
   });
 
   it('returns the Chinese label after syncLocaleFromConfig switches locale to zh-CN', () => {
     syncLocaleFromConfig('zh-CN');
-    expect(taskStatusLabel('pending')).toBe('待处理');
+    expect(taskStatusLabel('pending')).toBe('待开始');
+  });
+
+  it('uses phase and assignment context to describe what is happening', () => {
+    expect(taskStatusLabel({ status: 'pending', preferredAgentId: '' })).toBe('Unassigned');
+    expect(taskStatusLabel({ status: 'in_progress', phase: 'spec' })).toBe('Drafting plan');
+    expect(taskStatusLabel({ status: 'in_progress', phase: 'code' })).toBe('Developing');
+    expect(taskStatusLabel({ status: 'review', phase: 'code' })).toBe('Reviewing code');
+    expect(taskStatusLabel({ status: 'fixing', phase: 'spec' })).toBe('Revising plan');
+    expect(taskStatusLabel({ status: 'max_rounds', phase: 'code' })).toBe('Code review needs a decision');
+  });
+});
+
+describe('TaskStatusBadge', () => {
+  it('shows a readable contextual pill while preserving the machine status as data', () => {
+    render(<TaskStatusBadge task={{ status: 'review', phase: 'spec' }} />);
+    const badge = screen.getByText('Reviewing plan');
+    expect(badge.className).toContain('pill-review');
+    expect(badge.getAttribute('data-status')).toBe('review');
+    expect(badge.getAttribute('title')).toBe('Reviewing plan');
+  });
+});
+
+describe('getTaskAttentionCopy', () => {
+  it.each([
+    ['confirm-merge-timeout', 'The final checks could not finish'],
+    ['review-verdict-overdue', 'Review needs your attention'],
+    ['runtime-session-missing', 'The linked agent was interrupted'],
+    ['delivery-not-confirmed', 'The next step did not start'],
+    ['unexpected-condition', 'This task needs your attention'],
+  ])('maps %s to a user-facing title', (reason, title) => {
+    expect(getTaskAttentionCopy(getMessages(), attention(reason, ['cancel'])).title).toBe(title);
+  });
+
+  it('selects guidance by recommended-action priority and has retry/cancel fallbacks', () => {
+    expect(getTaskAttentionCopy(getMessages(), attention('unknown', ['retry', 'advance', 'verdict'])).guidance)
+      .toBe('Review the PR and the discussion below, then confirm the result or request changes.');
+    expect(getTaskAttentionCopy(getMessages(), attention('unknown', ['retry'])).guidance)
+      .toBe('This task cannot continue in its current run. Run it again from the beginning when you are ready.');
+    expect(getTaskAttentionCopy(getMessages(), attention('unknown', ['cancel'])).guidance)
+      .toBe('Review the task details, then cancel it if you no longer want it to continue.');
   });
 });
 

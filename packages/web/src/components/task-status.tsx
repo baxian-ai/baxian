@@ -1,8 +1,67 @@
-import type { TaskStatus } from '../shared/index.js';
-import { getMessages } from '../i18n/index.tsx';
+import type { TaskPhase, TaskState, TaskStatus } from '../shared/index.js';
+import { getMessages, useT } from '../i18n/index.tsx';
 
-export function taskStatusLabel(status: TaskStatus): string {
-  return getMessages().status[status] ?? status;
+interface TaskStatusContext {
+  status: TaskStatus;
+  phase?: TaskPhase;
+  preferredAgentId?: string;
+}
+
+function resolveTaskStatusLabel(
+  messages: ReturnType<typeof getMessages>,
+  input: TaskStatus | TaskStatusContext,
+): string {
+  const context = typeof input === 'string' ? { status: input } : input;
+  const { status, phase } = context;
+
+  if (status === 'pending' && context.preferredAgentId === '') {
+    return messages.statusContext.pendingUnassigned;
+  }
+  if (status === 'in_progress') {
+    if (phase === 'spec') return messages.statusContext.inProgressSpec;
+    if (phase === 'code') return messages.statusContext.inProgressCode;
+  }
+  if (status === 'review') {
+    if (phase === 'spec') return messages.statusContext.reviewSpec;
+    if (phase === 'code') return messages.statusContext.reviewCode;
+  }
+  if (status === 'fixing') {
+    if (phase === 'spec') return messages.statusContext.fixingSpec;
+    if (phase === 'code') return messages.statusContext.fixingCode;
+  }
+  if (status === 'max_rounds') {
+    if (phase === 'spec') return messages.statusContext.maxRoundsSpec;
+    if (phase === 'code') return messages.statusContext.maxRoundsCode;
+  }
+  return messages.status[status] ?? status;
+}
+
+export function taskStatusLabel(input: TaskStatus | TaskStatusContext): string {
+  return resolveTaskStatusLabel(getMessages(), input);
+}
+
+export function getTaskAttentionCopy(
+  messages: ReturnType<typeof getMessages>,
+  attention: NonNullable<TaskState['attention']>,
+): { title: string; guidance: string } {
+  const { reason, recommendedActions } = attention;
+  const title = /confirm-merge|post-approve|merge/.test(reason)
+    ? messages.taskDetail.attentionMergeTitle
+    : /review|verdict/.test(reason)
+      ? messages.taskDetail.attentionReviewTitle
+      : /runtime|session|recovery|tmux|repl/.test(reason)
+        ? messages.taskDetail.attentionAgentTitle
+        : /dispatch|delivery|pr-created/.test(reason)
+          ? messages.taskDetail.attentionHandoffTitle
+          : messages.taskDetail.attentionDefaultTitle;
+  const guidance = recommendedActions.includes('verdict')
+    ? messages.taskDetail.attentionVerdictGuidance
+    : recommendedActions.includes('advance')
+      ? messages.taskDetail.attentionAdvanceGuidance
+      : recommendedActions.includes('retry')
+        ? messages.taskDetail.attentionRetryGuidance
+        : messages.taskDetail.attentionCancelGuidance;
+  return { title, guidance };
 }
 
 export const STATUS_BADGE_COLORS: Record<TaskStatus, string> = {
@@ -20,29 +79,23 @@ export const STATUS_BADGE_COLORS: Record<TaskStatus, string> = {
   cancelled: 'pill',
 };
 
-const STATUS_DOT_COLORS: Record<TaskStatus, string> = {
-  pending: 'bg-og-300',
-  in_progress: 'bg-success',
-  review: 'bg-accent',
-  fixing: 'bg-warn',
-  'spec-ready': 'bg-warn',
-  approved: 'bg-success',
-  'merge-ready': 'bg-warn',
-  merged: 'bg-success',
-  done: 'bg-success',
-  failed: 'bg-danger',
-  max_rounds: 'bg-warn',
-  cancelled: 'bg-og-300',
-};
-
-export function TaskStatusDot({ status }: { status: TaskStatus }) {
+export function TaskStatusBadge({
+  task,
+  className = '',
+}: {
+  task: TaskStatusContext;
+  className?: string;
+}) {
+  const messages = useT();
+  const label = resolveTaskStatusLabel(messages, task);
   return (
     <span
-      role="img"
-      aria-label={status}
-      title={status}
-      className={`inline-block h-2 w-2 shrink-0 rounded-full ${STATUS_DOT_COLORS[status] ?? 'bg-og-300'}`}
-    />
+      className={`${STATUS_BADGE_COLORS[task.status] ?? 'pill'} ${className}`}
+      title={label}
+      data-status={task.status}
+    >
+      {label}
+    </span>
   );
 }
 

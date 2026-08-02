@@ -57,11 +57,11 @@ it('shows baxian as the Project ID placeholder', async () => {
   expect((screen.getByLabelText('Project ID') as HTMLInputElement).placeholder).toBe('baxian');
 });
 
-it('defaults Spec review to Human review and submits specApproval human', async () => {
+it('requires the user to approve the plan by default and submits specApproval human', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  expect((screen.getByLabelText('Human review (default)') as HTMLInputElement).checked).toBe(true);
-  expect((screen.getByLabelText('Auto-start coding after QA approval') as HTMLInputElement).checked).toBe(false);
+  expect((screen.getByLabelText('Require your approval (default)') as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByLabelText('Start development automatically after plan review') as HTMLInputElement).checked).toBe(false);
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'specproj' } });
   fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/example-owner/example-repo.git' } });
   await act(async () => {
@@ -75,12 +75,12 @@ it('defaults Spec review to Human review and submits specApproval human', async 
   });
 });
 
-it('omits specApproval when Auto-start coding after QA approval is selected', async () => {
+it('omits specApproval when automatic development after plan review is selected', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'autoproj' } });
   fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/example-owner/example-repo.git' } });
-  fireEvent.click(screen.getByLabelText('Auto-start coding after QA approval'));
+  fireEvent.click(screen.getByLabelText('Start development automatically after plan review'));
   await act(async () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
@@ -91,14 +91,14 @@ it('omits specApproval when Auto-start coding after QA approval is selected', as
   });
 });
 
-it('resets Spec review to Human review when the modal reopens', async () => {
+it('resets plan approval to require user confirmation when the modal reopens', async () => {
   const { rerender } = render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.click(screen.getByLabelText('Auto-start coding after QA approval'));
-  expect((screen.getByLabelText('Auto-start coding after QA approval') as HTMLInputElement).checked).toBe(true);
+  fireEvent.click(screen.getByLabelText('Start development automatically after plan review'));
+  expect((screen.getByLabelText('Start development automatically after plan review') as HTMLInputElement).checked).toBe(true);
   rerender(<CreateProjectModal open={false} onClose={() => {}} onCreated={() => {}} />);
   rerender(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
-  await waitFor(() => expect((screen.getByLabelText('Human review (default)') as HTMLInputElement).checked).toBe(true));
+  await waitFor(() => expect((screen.getByLabelText('Require your approval (default)') as HTMLInputElement).checked).toBe(true));
 });
 
 it.each([

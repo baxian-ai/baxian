@@ -8,6 +8,7 @@ interface ToastInput {
   kind: ToastKind;
   title: string;
   body?: string;
+  details?: string;
   durationMs?: number;
 }
 
@@ -113,6 +114,12 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               <div className="flex-1">
                 <div className="text-sm font-semibold">{item.title}</div>
                 {item.body && <div className="mt-1 whitespace-pre-line text-xs text-og-700">{item.body}</div>}
+                {item.details && (
+                  <details className="mt-1 text-xs text-og-500">
+                    <summary className="cursor-pointer select-none text-accent">{t.common.technicalDetails}</summary>
+                    <div className="mt-1 whitespace-pre-wrap break-words font-mono">{item.details}</div>
+                  </details>
+                )}
               </div>
               <button
                 type="button"

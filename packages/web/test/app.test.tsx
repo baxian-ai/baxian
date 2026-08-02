@@ -390,7 +390,7 @@ describe('Task completion notifications', () => {
       await Promise.resolve();
     });
     expect(notification.instances).toHaveLength(1);
-    expect(notification.instances[0].options?.body).toContain('Status: Merged');
+    expect(notification.instances[0].options?.body).toContain('Status: PR merged');
   });
 
   it('drops an in-flight completion confirmation when its own project is removed', async () => {
@@ -507,7 +507,7 @@ describe('Task completion notifications', () => {
       await Promise.resolve();
     });
     expect(notification.instances).toHaveLength(1);
-    expect(notification.instances[0].options?.body).toContain('Status: Merged');
+    expect(notification.instances[0].options?.body).toContain('Status: PR merged');
 
     await act(async () => {
       resolvers[0](makeTask({ status: 'merged' }));
@@ -633,7 +633,7 @@ describe('Task completion notifications', () => {
     expect(notification.instances[0].title).toContain('Task completed: Ship notifications');
     expect(notification.instances[0].options?.body).toContain('Project: proj · https://github.com/acme/demo.git');
     expect(notification.instances[0].options?.body).toContain('Task: task-188 · Ship notifications');
-    expect(notification.instances[0].options?.body).toContain('Status: Merged');
+    expect(notification.instances[0].options?.body).toContain('Status: PR merged');
   });
 
   it('does not notify when the disappeared task is terminal but not completed', async () => {
@@ -679,7 +679,7 @@ describe('Task completion notifications', () => {
 
       await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(2));
       await waitFor(() => expect(notification.instances).toHaveLength(1));
-      expect(notification.instances[0].options?.body).toContain('Status: Done');
+      expect(notification.instances[0].options?.body).toContain('Status: Complete');
     } finally {
       warn.mockRestore();
     }
