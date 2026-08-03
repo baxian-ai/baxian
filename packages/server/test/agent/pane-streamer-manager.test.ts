@@ -364,7 +364,7 @@ describe('owner reconciliation (manager-level, fenced writes)', () => {
           return { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
         }
         return {
-          stdout: `${state.w} ${state.h} ${state.status} ${state.mode} ${state.gen}|${state.pid}|${state.start}|${state.sid}|${state.claim}|${state.version}|${state.cap}\n`,
+          stdout: `${state.w} ${state.h} ${state.status} ${state.mode} ${state.gen}|${state.pid}|${state.start}|${state.sid}|${state.claim}|${state.version}|${state.cap}|${state.sid}\n`,
           stderr: '',
           exitCode: 0,
         };

@@ -126,7 +126,7 @@ export interface WindowGeometry {
 
 const WINDOW_GEOMETRY_FORMAT =
   '#{window_width} #{window_height} #{status} #{window-size} ' +
-  '#{@bx_owner_gen}|#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}|#{version}|#{e|<=:1,2}';
+  '#{@bx_owner_gen}|#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}|#{version}|#{e|<=:1,2}|#{session_id}';
 
 const TMUX_VERSION_RE = /^(?:next-)?(\d+)\.(\d+)/;
 
@@ -164,7 +164,7 @@ export function parseStatusLines(raw: string): number {
 
 export function parseWindowGeometry(stdout: string): WindowGeometry {
   const line = stdout.replace(/\n+$/, '');
-  const m = /^(\d+) (\d+) (\S+) (\S*) ([^|]*)\|(\d+)\|(\d+)\|(\$\d+)\|([^|]*)\|([^|]*)\|(.*)$/.exec(line);
+  const m = /^(\d+) (\d+) (\S+) (\S*) ([^|]*)\|(\d+)\|(\d+)\|(\$\d+)\|([^|]*)\|([^|]*)\|(.*)\|(\$\d+)$/.exec(line);
   if (!m) {
     throw new Error(`tmux: unparseable window geometry ${JSON.stringify(line)}`);
   }
@@ -192,6 +192,12 @@ export function parseWindowGeometry(stdout: string): WindowGeometry {
     claim,
     ownerWriteCapability: classifyOwnerWriteCapability(versionRaw, probeRaw),
   };
+}
+
+// The trailing #{session_id} slot sits after every user-controllable field, so smuggled '|' can never shift it.
+function isNoTargetGeometryExpansion(stdout: string): boolean {
+  const parts = stdout.replace(/\n+$/, '').split('|');
+  return parts.length >= 8 && parts[parts.length - 1] === '';
 }
 
 export class SessionAbsentError extends Error {
@@ -908,7 +914,12 @@ export class TmuxManager {
       `tmux display-message -p -t ${shellQuote(`=${name}:`)} ${shellQuote(WINDOW_GEOMETRY_FORMAT)}`,
       opts,
     );
-    if (result.exitCode === 0) return parseWindowGeometry(result.stdout);
+    if (result.exitCode === 0) {
+      if (isNoTargetGeometryExpansion(result.stdout)) {
+        throw new SessionAbsentError(name, `no-target expansion: ${result.stdout.trim()}`);
+      }
+      return parseWindowGeometry(result.stdout);
+    }
     if (tmuxProbeOutcomeUnknown(result)) {
       throw new TmuxOutcomeUnknownError(`tmux getWindowGeometry ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }

@@ -2627,8 +2627,8 @@ describe('hasActiveSpinnerInTail (active-region-scoped, used for stuck-busy)', (
   });
 });
 
-describe('window geometry read (eleven-field single read)', () => {
-  const GEOM_LINE = '200 50 on latest 42|123|1700000000|$7|dev-1|3.6a|1\n';
+describe('window geometry read (twelve-field single read)', () => {
+  const GEOM_LINE = '200 50 on latest 42|123|1700000000|$7|dev-1|3.6a|1|$7\n';
 
   it('getWindowGeometry issues one display-message carrying geometry, owner state, identity, claim, version, and the feature probe', async () => {
     const runner = mockRunner();
@@ -2638,7 +2638,7 @@ describe('window geometry read (eleven-field single read)', () => {
     const cmd = lastCmd(runner);
     expect(cmd).toContain("display-message -p -t '=dev-1:'");
     expect(cmd).toContain('#{window_width} #{window_height} #{status} #{window-size}');
-    expect(cmd).toContain('#{@bx_owner_gen}|#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}|#{version}|#{e|<=:1,2}');
+    expect(cmd).toContain('#{@bx_owner_gen}|#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}|#{version}|#{e|<=:1,2}|#{session_id}');
     expect(runner.exec.mock.calls.at(-1)?.[1]).toEqual({ timeout: 1234 });
     expect(geom).toEqual({
       width: 200,
@@ -2664,16 +2664,67 @@ describe('window geometry read (eleven-field single read)', () => {
     expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
   });
 
+  it('getWindowGeometry: tmux >= 3.6 no-target expansion (exit 0, empty session_id) is typed absent, not unparseable', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: '  on latest |2491|1784128830|||3.6a|1|\n', stderr: '', exitCode: 0 });
+    const tmux = new TmuxManager(runner);
+    await expect(tmux.getWindowGeometry('dev-1')).rejects.toBeInstanceOf(SessionAbsentError);
+  });
+
+  it('getWindowGeometry: no-target expansion polluted by a global @-option smuggling pipes is STILL typed absent', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: '  on latest ||||84630|1785741685|||3.6a|1|\n', stderr: '', exitCode: 0 });
+    const tmux = new TmuxManager(runner);
+    await expect(tmux.getWindowGeometry('dev-1')).rejects.toBeInstanceOf(SessionAbsentError);
+  });
+
+  it('getWindowGeometry: an empty-tailed line without the format separators is unparseable, NOT absent', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: 'x|\n', stderr: '', exitCode: 0 });
+    const tmux = new TmuxManager(runner);
+    const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(SessionAbsentError);
+    expect((err as Error).message).toMatch(/unparseable/);
+  });
+
+  it('getWindowGeometry: unclaimed session (empty claim, session_id present) is NOT mistaken for absent', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: '80 24 on manual |9|8|$1||3.6a|1|$1\n', stderr: '', exitCode: 0 });
+    const tmux = new TmuxManager(runner);
+    const geom = await tmux.getWindowGeometry('dev-1');
+    expect(geom.ref.sessionId).toBe('$1');
+    expect(geom.claim).toBe('');
+  });
+
+  it('getWindowGeometry: live session whose owner-gen option smuggles pipes stays fail-closed (unparseable, NOT absent)', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: '80 24 on latest ||||55388|1785690647|$0||3.6a|1|$0\n', stderr: '', exitCode: 0 });
+    const tmux = new TmuxManager(runner);
+    const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(SessionAbsentError);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/unparseable/);
+  });
+
+  it('getWindowGeometry: exit 0 with empty stdout is unparseable, NOT absent', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
+    const tmux = new TmuxManager(runner);
+    const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(SessionAbsentError);
+    expect((err as Error).message).toMatch(/unparseable/);
+  });
+
   it.each([
-    ['off status → 0 lines', '120 40 off latest |1|2|$3|dev-1|3.6a|1', 0],
-    ['on status → 1 line', '120 40 on latest |1|2|$3|dev-1|3.6a|1', 1],
-    ['multi-row status "3" → 3 lines', '120 40 3 latest |1|2|$3|dev-1|3.6a|1', 3],
+    ['off status → 0 lines', '120 40 off latest |1|2|$3|dev-1|3.6a|1|$3', 0],
+    ['on status → 1 line', '120 40 on latest |1|2|$3|dev-1|3.6a|1|$3', 1],
+    ['multi-row status "3" → 3 lines', '120 40 3 latest |1|2|$3|dev-1|3.6a|1|$3', 3],
   ])('parseWindowGeometry: %s', (_name, line, statusLines) => {
     expect(parseWindowGeometry(line).statusLines).toBe(statusLines);
   });
 
   it('parseWindowGeometry: unset owner gen is null; empty claim is preserved (unclaimed session)', () => {
-    const geom = parseWindowGeometry('80 24 on manual |9|8|$1||3.1c|#{e|<=:1,2}');
+    const geom = parseWindowGeometry('80 24 on manual |9|8|$1||3.1c|#{e|<=:1,2}|$1');
     expect(geom.ownerGen).toBeNull();
     expect(geom.sizeMode).toBe('manual');
     expect(geom.claim).toBe('');
@@ -2693,10 +2744,11 @@ describe('window geometry read (eleven-field single read)', () => {
 
   it.each([
     ['garbage', 'not a geometry line'],
-    ['unknown status value', '80 24 blinking latest |1|2|$3|dev-1|3.6a|1'],
-    ['non-numeric owner gen', '80 24 on latest abc|1|2|$3|dev-1|3.6a|1'],
-    ['zero width', '0 24 on latest |1|2|$3|dev-1|3.6a|1'],
+    ['unknown status value', '80 24 blinking latest |1|2|$3|dev-1|3.6a|1|$3'],
+    ['non-numeric owner gen', '80 24 on latest abc|1|2|$3|dev-1|3.6a|1|$3'],
+    ['zero width', '0 24 on latest |1|2|$3|dev-1|3.6a|1|$3'],
     ['missing claim/version fields (old nine-field line)', '80 24 on latest |1|2|$3|1'],
+    ['missing trailing session_id slot (pre-sentinel line)', '120 40 on latest |1|2|$3|dev-1|3.6a|1'],
   ])('parseWindowGeometry rejects %s', (_name, line) => {
     expect(() => parseWindowGeometry(line)).toThrow();
   });

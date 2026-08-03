@@ -62,7 +62,7 @@ async function startApp(opts?: {
             return { stdout: `4242|1700000000|$1|${name}\n`, stderr: '', exitCode: 0 };
           }
           if (cmd.includes('display-message')) {
-            return { stdout: '200 50 on latest |4242|1700000000|$1|dev-1|3.0a|#{e|<=:1,2}\n', stderr: '', exitCode: 0 };
+            return { stdout: '200 50 on latest |4242|1700000000|$1|dev-1|3.0a|#{e|<=:1,2}|$1\n', stderr: '', exitCode: 0 };
           }
           return { stdout: '', stderr: '', exitCode: 0 };
         }),
