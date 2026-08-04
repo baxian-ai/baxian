@@ -26,12 +26,14 @@ class FakeTerminal {
     },
   };
 
+  host: HTMLElement | null = null;
+
   constructor(opts?: Record<string, unknown>) {
     this.opts = opts ?? {};
     fakeTerminals.push(this);
   }
   loadAddon(): void { }
-  open(): void { }
+  open(host: HTMLElement): void { this.host = host; }
   onData(cb: (data: string) => void): void {
     this.onDataCallback = cb;
   }
@@ -539,6 +541,49 @@ describe('PaneTerminal', () => {
     expect(scrollState.value).toBe(474);
   });
 
+  it('preview anchor uses the measured .xterm-screen row height, not the 18px estimate', async () => {
+    const { scrollState, term } = await mountWithScrollAnchor({
+      scroll: { clientHeight: 108 },
+      props: { mode: 'preview', interactive: false, maxLines: 6 },
+      cursorY: 42,
+      handshake: { cols: 200, rows: 50, data: 'AAA' },
+    });
+    attachXtermScreen(term.host!, 1050);
+    act(() => {
+      term.emitRender();
+    });
+    expect(scrollState.value).toBe(795);
+  });
+
+  it('preview anchor falls back to the 18px estimate when .xterm-screen has no measurable height', async () => {
+    const { scrollState, term } = await mountWithScrollAnchor({
+      scroll: { clientHeight: 108 },
+      props: { mode: 'preview', interactive: false, maxLines: 6 },
+      cursorY: 42,
+      handshake: { cols: 200, rows: 50, data: 'AAA' },
+    });
+    attachXtermScreen(term.host!, 0);
+    act(() => {
+      term.emitRender();
+    });
+    expect(scrollState.value).toBe(666);
+  });
+
+  it('preview anchor falls back to the 18px estimate when the terminal reports zero rows', async () => {
+    const { scrollState, term } = await mountWithScrollAnchor({
+      scroll: { clientHeight: 108 },
+      props: { mode: 'preview', interactive: false, maxLines: 6 },
+      cursorY: 42,
+      handshake: { cols: 200, rows: 50, data: 'AAA' },
+    });
+    attachXtermScreen(term.host!, 1050);
+    term.rows = 0;
+    act(() => {
+      term.emitRender();
+    });
+    expect(scrollState.value).toBe(666);
+  });
+
   it('preview re-anchors when its card becomes measurable after the first snapshot', async () => {
     const { _resetPaneStreamClientForTest, PaneStreamClient } =
       await import('../../src/stores/pane-stream-store.ts');
@@ -932,6 +977,13 @@ function stubScroll(overrides: { scrollHeight?: number; clientHeight?: number } 
   return state;
 }
 
+function attachXtermScreen(host: HTMLElement, heightPx: number): void {
+  const screen = document.createElement('div');
+  screen.className = 'xterm-screen';
+  screen.getBoundingClientRect = () => ({ height: heightPx } as DOMRect);
+  host.appendChild(screen);
+}
+
 async function deliverHandshake(
   ws: MockWebSocket,
   sid: string,
@@ -997,7 +1049,7 @@ async function mountWithScrollAnchor(spec: {
   props: PaneProps;
   cursorY: number;
   handshake?: { cols?: number; rows?: number; data?: string };
-}): Promise<{ scrollState: ScrollStub }> {
+}): Promise<{ scrollState: ScrollStub; term: FakeTerminal }> {
   const scrollState = stubScroll(spec.scroll ?? {});
   onTestFinished(() => scrollState.restore());
   await installPaneStreamForTest();
@@ -1006,7 +1058,7 @@ async function mountWithScrollAnchor(spec: {
   await flushMacrotask();
   const ws = lastMockWs()!;
   await deliverHandshake(ws, subscriberIdOf(ws), spec.handshake);
-  return { scrollState };
+  return { scrollState, term };
 }
 
 async function renderDeferredPane(

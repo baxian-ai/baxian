@@ -136,8 +136,10 @@ export function PaneTerminal({
     const term = termRef.current;
     if (!el || !term) return;
     if (el.clientHeight <= 0) return;
-    const cursorY = term.buffer.active.cursorY;
-    const cursorBottomPx = (cursorY + 1) * TERMINAL_LINE_HEIGHT_PX;
+    // xterm 实际行高是实测 cell 高 × lineHeight（约 21px），不是 fontSize × lineHeight ≈ 18px；常量仅作未渲染时的 fallback
+    const screenH = el.querySelector('.xterm-screen')?.getBoundingClientRect().height ?? 0;
+    const cellH = screenH > 0 && term.rows > 0 ? screenH / term.rows : TERMINAL_LINE_HEIGHT_PX;
+    const cursorBottomPx = (term.buffer.active.cursorY + 1) * cellH;
     el.scrollTop = Math.max(0, cursorBottomPx - el.clientHeight);
   };
   const schedulePreviewScrollToCursor = (): void => {
