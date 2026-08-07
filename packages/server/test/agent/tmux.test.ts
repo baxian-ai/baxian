@@ -205,9 +205,42 @@ describe('TmuxManager', () => {
       expect(cmd).toContain('BX_KILL_REFUSED');
     });
 
-    it('reports refused without killing when the generation/claim check fails server-side', async () => {
-      primeExec('BX_KILL_REFUSED\n');
+    it('reports refused when the by-id recheck proves the session still exists', async () => {
+      primeExec('BX_KILL_REFUSED\n', '');
       expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('refused');
+      expect(lastCmd(runner)).toBe("tmux has-session -t '$7'");
+    });
+
+    it('skips the recheck when the kill succeeds (single tmux call)', async () => {
+      primeExec('');
+      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('killed');
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('reclassifies REFUSED as absent when tmux >= 3.6 silently accepted a missing target', async () => {
+      primeExec('BX_KILL_REFUSED\n');
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $7", exitCode: 1 });
+      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('absent');
+    });
+
+    it('reclassifies REFUSED as absent when the server died before the recheck', async () => {
+      primeExec('BX_KILL_REFUSED\n');
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 });
+      expect(await tmux.killSessionRef(REF, { kind: 'unclaimed' })).toBe('absent');
+    });
+
+    it('throws outcome-unknown when the recheck fails transiently (never fabricates refused or absent)', async () => {
+      primeExec('BX_KILL_REFUSED\n');
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
+      await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' }))
+        .rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
+    });
+
+    it('throws a hard error when the recheck fails in an unrecognized way', async () => {
+      primeExec('BX_KILL_REFUSED\n');
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'server exited unexpectedly', exitCode: 1 });
+      await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' }))
+        .rejects.toThrow(/recheck unexpected exit 1/);
     });
 
     it('treats a vanished session as absent (idempotent)', async () => {
@@ -249,7 +282,7 @@ describe('TmuxManager', () => {
     });
 
     it('unclaimed reports refused without killing when the server declines', async () => {
-      primeExec('BX_KILL_REFUSED\n');
+      primeExec('BX_KILL_REFUSED\n', '');
       expect(await tmux.killSessionRef(REF, { kind: 'unclaimed' })).toBe('refused');
     });
 

@@ -14,12 +14,6 @@ interface Props {
 }
 
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
-const REPO_SEGMENT = '[A-Za-z0-9_-][A-Za-z0-9._-]*';
-const REPO_URL_PATTERNS = [
-  new RegExp(`^https://github\\.com/${REPO_SEGMENT}/${REPO_SEGMENT}(?:\\.git)?/?$`),
-  new RegExp(`^ssh://git@github\\.com/${REPO_SEGMENT}/${REPO_SEGMENT}(?:\\.git)?/?$`),
-  new RegExp(`^git@github\\.com:${REPO_SEGMENT}/${REPO_SEGMENT}(?:\\.git)?/?$`),
-];
 
 export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const t = useT();
@@ -65,16 +59,11 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
 
   const validate = (): boolean => {
     const errs: { id?: string; repo?: string } = {};
-    const normalizedRepo = repo.trim();
     if (!id) errs.id = t.createProject.required;
     else if (!ID_PATTERN.test(id)) errs.id = t.common.idFormatError;
     else if (existingIds.has(id)) errs.id = t.createProject.idTakenError;
 
-    const repoValid = REPO_URL_PATTERNS.some(re => re.test(normalizedRepo));
-    if (!repo) errs.repo = t.createProject.required;
-    else if (!repoValid) {
-      errs.repo = t.createProject.repoFormatError;
-    }
+    if (!repo.trim()) errs.repo = t.createProject.required;
     setFieldErrors(errs);
     return Object.keys(errs).length === 0;
   };

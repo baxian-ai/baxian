@@ -151,6 +151,12 @@ describe('AgentManager.ensureSession', () => {
     });
     return async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('has-session')) {
+        const idM = cmd.match(/-t '(\$\d+)'/);
+        if (idM) {
+          return [...tmuxSessions.values()].some(sess => sess.sessionId === idM[1])
+            ? { stdout: '', stderr: '', exitCode: 0 }
+            : { stdout: '', stderr: `can't find session: ${idM[1]}`, exitCode: 1 };
+        }
         const m = cmd.match(/'=([^']+)'/);
         const name = m?.[1] ?? '';
         return tmuxSessions.has(name)

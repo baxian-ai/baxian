@@ -15,7 +15,7 @@ import {
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
-import { repoIdentityKey } from '../../src/shared/git-url.js';
+import { repoIdentityKey } from '../../src/platform/driver-host.js';
 
 const REPO = 'https://github.com/owner/repo';
 const SHA1 = '1'.repeat(40);
@@ -102,7 +102,8 @@ class FakeDriver implements PlatformDriver {
     this.calls.push(`listComments:${source.key}`);
     const rows = this.comments[source.key] ?? [];
     if (rows instanceof Error) throw rows;
-    return rows;
+    // The real boundary rebuilds rows per call (validateRows); scan-side projection must not mutate this fake's state.
+    return rows.map(row => ({ ...row }));
   }
 
   async branchView(): Promise<NormalizedRow> { throw new Error('unexpected branchView'); }

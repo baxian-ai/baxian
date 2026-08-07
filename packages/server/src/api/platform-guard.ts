@@ -1,5 +1,5 @@
 import type { BaxianConfig } from '../shared/types.js';
-import { repoIdentityKey } from '../shared/git-url.js';
+import { repoIdentityKey } from '../platform/driver-host.js';
 import type { AgentManager } from '../agent/manager.js';
 
 export interface GitBindingBlocker {

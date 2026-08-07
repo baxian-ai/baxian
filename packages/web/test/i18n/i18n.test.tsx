@@ -105,6 +105,15 @@ describe('getMessages', () => {
     expect(taskDetail.retryCurrentStepConfirmBody('task-1')).toContain('重新交给开发 Agent');
     expect(taskDetail.restartReviewConfirmBody('task-1')).toContain('重新交给评审 Agent');
   });
+
+  it('keeps the review-recovery actor prompt platform-neutral (plugins may use string IDs)', () => {
+    for (const locale of ['en-US', 'zh-CN'] as const) {
+      syncLocaleFromConfig(locale);
+      const taskDetail = getMessages().taskDetail;
+      expect(taskDetail.reviewRecoveryActorLabel).not.toContain('GitHub');
+      expect(taskDetail.reviewRecoveryActorPlaceholder).not.toContain('GitHub');
+    }
+  });
 });
 
 describe('provider side effects', () => {

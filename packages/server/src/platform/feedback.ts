@@ -51,7 +51,11 @@ export async function scanCommentSourcesOnce(
         for (const row of pageRows) projectCommentRow(row);
         return pageRows;
       });
-      if (!pagedInline && collector !== undefined) collector.admitPage(source, rows);
+      // A driver may return everything without ever calling projectPage; rows must still come out projected.
+      if (!pagedInline) {
+        collector?.admitPage(source, rows);
+        for (const row of rows) projectCommentRow(row);
+      }
       scans.push({ key: source.key, sourceClass: source.category, ok: true, scanStartedAt, rows });
     } catch (error) {
       scans.push({ key: source.key, sourceClass: source.category, ok: false, scanStartedAt, rows: [] });

@@ -1,4 +1,4 @@
-import { SHA_HEX_SOURCE } from './types.js';
+import { PLATFORM_ACTOR_ID_MAX_BYTES, SHA_HEX_SOURCE } from './types.js';
 
 export type NormalizedRow = Record<string, unknown>;
 
@@ -14,7 +14,7 @@ export const LINE_SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
 const SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
 const TIMESTAMP_SHAPE_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
 
-type MapFieldKind = 'id' | 'prNumber' | 'sha' | 'timestamp' | 'state' | 'boolean' | 'integer' | 'string';
+type MapFieldKind = 'id' | 'actorId' | 'prNumber' | 'sha' | 'timestamp' | 'state' | 'boolean' | 'integer' | 'string';
 const MAP_FIELD_KINDS: Readonly<Record<string, MapFieldKind>> = {
   prNumber: 'prNumber',
   prUrl: 'string', branch: 'string', targetBranch: 'string', title: 'string', body: 'string',
@@ -23,7 +23,7 @@ const MAP_FIELD_KINDS: Readonly<Record<string, MapFieldKind>> = {
   headSha: 'sha', commitSha: 'sha',
   mergedAt: 'timestamp', updatedAt: 'timestamp', createdAt: 'timestamp',
   sourceProjectId: 'id', targetProjectId: 'id', remoteProjectId: 'id', id: 'id', discussionId: 'id', parentId: 'id',
-  authorId: 'id', prAuthorId: 'id',
+  authorId: 'actorId', prAuthorId: 'actorId',
   draft: 'boolean', pushPermitted: 'boolean',
   line: 'integer', originalLine: 'integer',
 };
@@ -49,6 +49,12 @@ const REQUIRED_NON_NULL: Record<string, readonly string[]> = {
   listComments: ['id'],
 };
 
+// undefined = field never mapped (rejected); explicit null keeps its documented meaning.
+const REQUIRED_MAPPED: Record<string, Readonly<Record<string, string>>> = {
+  listPrs: { sourceProjectId: 'use null when the source repository is gone' },
+  prView: { sourceProjectId: 'use null when the source repository is gone' },
+};
+
 function normalizeField(field: string, value: unknown): { ok: true; value: unknown } | { ok: false; reason: string } {
   if (value === null || value === undefined) return { ok: true, value };
   switch (MAP_FIELD_KINDS[field]) {
@@ -56,6 +62,14 @@ function normalizeField(field: string, value: unknown): { ok: true; value: unkno
       if (typeof value === 'number' && Number.isSafeInteger(value)) return { ok: true, value: String(value) };
       if (typeof value === 'string' && LINE_SAFE_ID_RE.test(value)) return { ok: true, value };
       return { ok: false, reason: `must be a safe integer or line-safe string (got ${JSON.stringify(value)})` };
+    case 'actorId': {
+      const id = normalizeField('id', value);
+      if (!id.ok) return id;
+      if (typeof id.value === 'string' && id.value.length > PLATFORM_ACTOR_ID_MAX_BYTES) {
+        return { ok: false, reason: `must be at most ${PLATFORM_ACTOR_ID_MAX_BYTES} characters (got ${id.value.length})` };
+      }
+      return id;
+    }
     case 'prNumber':
       if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return { ok: true, value };
       return { ok: false, reason: `must be a positive safe integer (got ${JSON.stringify(value)})` };
@@ -85,14 +99,17 @@ function normalizeField(field: string, value: unknown): { ok: true; value: unkno
 export function validateRows(
   opName: string,
   rows: Record<string, unknown>[],
-  opts?: { sourceKey?: string },
+  opts?: { sourceKey?: string; requireMapped?: Readonly<Record<string, string>> },
 ): NormalizedRow[] {
   const label = opts?.sourceKey === undefined ? opName : `${opName}[${opts.sourceKey}]`;
   const violations: string[] = [];
   const required = REQUIRED_NON_NULL[opName] ?? [];
+  const requiredMapped = { ...REQUIRED_MAPPED[opName], ...opts?.requireMapped };
   const normalized = rows.map((row, i) => {
     const out: NormalizedRow = {};
     for (const [field, value] of Object.entries(row)) {
+      // versionTimeOf trusts a numeric versionTime blindly; only the internal projection may write it.
+      if (field === 'versionTime') continue;
       const r = normalizeField(field, value);
       if (r.ok) {
         out[field] = r.value;
@@ -103,6 +120,11 @@ export function validateRows(
     for (const field of required) {
       if (out[field] === null || out[field] === undefined) {
         violations.push(`row ${i} field '${field}': required, got ${JSON.stringify(row[field] ?? null)}`);
+      }
+    }
+    for (const [field, hint] of Object.entries(requiredMapped)) {
+      if (out[field] === undefined) {
+        violations.push(`row ${i} field '${field}': missing (${hint})`);
       }
     }
     return out;

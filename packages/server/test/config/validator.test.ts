@@ -1,7 +1,13 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import { validateConfig } from '../../src/config/validator.js';
+import { registerPlatformProvider, resetPlatformProviders } from '../../src/platform/driver-host.js';
 import type { BaxianConfig, AgentConfig, ProjectConfig, MergeStrategy, SpecApprovalStrategy } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
+import { makePlatformProvider } from '../helpers/fixtures.js';
+
+afterEach(() => {
+  resetPlatformProviders();
+});
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   const id = overrides.id ?? 'dev-1';
@@ -210,6 +216,25 @@ describe('validateConfig', () => {
     }
   });
 
+  it('surfaces plugin matcher ambiguity as a repository validation error', () => {
+    const claimingProvider = (platform: string) =>
+      makePlatformProvider({ platform, claimPrefix: 'https://dup.example/' });
+    registerPlatformProvider(claimingProvider('a.example'));
+    registerPlatformProvider(claimingProvider('b.example'));
+
+    const errors = repoErrors('https://dup.example/group/proj.git');
+    expect(errors.some(error => /claimed by multiple platform plugins \(a\.example, b\.example\)/.test(error.message))).toBe(true);
+  });
+
+  it('surfaces a malformed plugin claim as a repository validation error instead of throwing', () => {
+    registerPlatformProvider(makePlatformProvider({
+      platform: 'broken.example',
+      normalizeRepoUrl: () => 42 as unknown as string,
+    }));
+    const errors = repoErrors('https://broken.example/group/proj.git');
+    expect(errors.some(error => /invalid repo slug — fix or uninstall that plugin/.test(error.message))).toBe(true);
+  });
+
   it('rejects non-github repos with an unsafe host (path traversal / command injection)', () => {
     const bad = [
       'https://../group/proj.git',
@@ -224,13 +249,17 @@ describe('validateConfig', () => {
   });
 
   it('rejects project.repo with embedded credentials (http(s) userinfo OR ssh secret — must not be stored)', () => {
+    registerPlatformProvider(makePlatformProvider({ platform: 'corp.example' }));
     for (const repo of [
       'https://oauth2:TOKEN@github.com/group/proj.git',
       'https://TOKEN@github.com/group/proj.git',
       'ssh://git:TOKEN@github.com/group/proj.git',
+      'https://oauth2:TOKEN@corp.example/group/proj.git',
     ]) {
       const errs = repoErrors(repo);
-      expect.soft(errs.some(error => /must not embed credentials/.test(error.message)), repo).toBe(true);
+      const hit = errs.find(error => /must not embed credentials/.test(error.message));
+      expect.soft(hit, repo).toBeDefined();
+      expect.soft(hit?.message, repo).not.toMatch(/GITHUB_TOKEN/);
     }
   });
 

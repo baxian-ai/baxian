@@ -5,7 +5,7 @@ import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { CommentCursorStore, platformPollerStatePath } from '../../src/platform/comment-cursor.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
-import { repoIdentityKey } from '../../src/shared/git-url.js';
+import { repoIdentityKey } from '../../src/platform/driver-host.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 
 const REPO = 'https://github.com/owner/repo';

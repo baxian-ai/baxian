@@ -1,51 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  hasEmbeddedCredentials,
-  isGitHubRepo,
-  normalizeRepoUrl,
-  redactGitCredentials,
-  repoIdentityKey,
-  repoSlug,
-} from '../../src/shared/index.js';
-
-const URLS = [
-  'https://github.com/Owner/Repo.git',
-  'git@github.com:Owner/Repo.git',
-  'ssh://git@github.com/Owner/Repo.git',
-];
-
-describe('GitHub repository URLs', () => {
-  it('accepts the supported full URL forms and extracts the slug', () => {
-    for (const url of URLS) {
-      expect.soft(isGitHubRepo(url), url).toBe(true);
-      expect.soft(normalizeRepoUrl(url), url).toBe('Owner/Repo');
-      expect.soft(repoSlug(url), url).toBe('Owner/Repo');
-    }
-  });
-
-  it('rejects shorthands, other hosts, insecure HTTP, ports, and malformed paths', () => {
-    for (const url of [
-      'owner/repo',
-      'https://gitlab.com/owner/repo.git',
-      'http://github.com/owner/repo.git',
-      'https://github.com:443/owner/repo.git',
-      'ssh://git@github.com:22/owner/repo.git',
-      'https://github.com/group/sub/repo.git',
-      'not-a-url',
-      '',
-    ]) {
-      expect.soft(isGitHubRepo(url), url).toBe(false);
-      expect.soft(normalizeRepoUrl(url), url).toBeNull();
-    }
-  });
-
-  it('uses one case-insensitive identity for every supported spelling', () => {
-    for (const url of URLS) {
-      expect(repoIdentityKey(url)).toBe('github.com/owner/repo');
-    }
-    expect(repoIdentityKey('owner/repo')).toBe('owner/repo');
-  });
-});
+import { hasEmbeddedCredentials, redactGitCredentials } from '../../src/shared/index.js';
 
 describe('credential safety', () => {
   it('detects embedded HTTP and SSH URL secrets', () => {

@@ -3,7 +3,7 @@ import { computeBackoffMs } from '../timing/backoff.js';
 import { computePollerHealth } from './poller-health.js';
 import type { PollerSnapshot } from '../shared/types.js';
 import { BRANCH_PREFIX } from '../shared/constants.js';
-import { repoIdentityKey } from '../shared/git-url.js';
+import { repoIdentityKey } from './driver-host.js';
 import { TASK_TERMINAL_STATUS_SET } from '../shared/constants.js';
 import type { TaskState } from '../shared/types.js';
 import { DriverOpError, type PlatformDriver, type PlatformEvent } from './types.js';

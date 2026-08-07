@@ -1,9 +1,10 @@
 import { isAbsolute, normalize } from 'node:path';
 import {
   CONTROL_CHAR_RE,
-  hasEmbeddedCredentials, isGitHubRepo, isRecord, repoIdentityKey, repoSlug,
+  hasEmbeddedCredentials, isRecord,
   type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type SpecApprovalStrategy,
 } from '../shared/index.js';
+import { AmbiguousRepoClaimError, InvalidRepoClaimError, resolveRepo, type ResolvedRepo } from '../platform/driver-host.js';
 import { mayShareHostAccount, resolveAgentHost } from '../agent/runner.js';
 
 export interface ValidationError {
@@ -17,7 +18,6 @@ const VALID_MODES: AgentMode[] = ['local', 'remote'];
 const VALID_MERGE: MergeStrategy[] = ['auto', null];
 const VALID_SPEC_APPROVAL: Array<SpecApprovalStrategy | undefined> = ['human', null, undefined];
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
-const REPO_SLUG_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const TOP_LEVEL_FIELDS = new Set(['language', 'review', 'server', 'host', 'project']);
 const REVIEW_FIELDS = new Set(['rounds']);
 const SERVER_FIELDS = new Set([
@@ -80,8 +80,13 @@ export function collectUnknownConfigErrors(config: Record<string, unknown>): Val
   return errors;
 }
 
-function isValidRepo(repo: string): boolean {
-  return isGitHubRepo(repo) && REPO_SLUG_PATTERN.test(repoSlug(repo));
+function resolveRepoForValidation(repo: string): ResolvedRepo | AmbiguousRepoClaimError | InvalidRepoClaimError | null {
+  try {
+    return resolveRepo(repo);
+  } catch (err) {
+    if (err instanceof AmbiguousRepoClaimError || err instanceof InvalidRepoClaimError) return err;
+    throw err;
+  }
 }
 
 export function validateConfig(config: BaxianConfig): ValidationError[] {
@@ -220,8 +225,9 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
 function validatePlatformRepoUniqueness(config: BaxianConfig, errors: ValidationError[]): void {
   const seen = new Map<string, string>();
   config.project.forEach((project, i) => {
-    if (!nonEmptyString(project.repo) || !isGitHubRepo(project.repo)) return;
-    const norm = repoIdentityKey(project.repo);
+    const resolved = nonEmptyString(project.repo) ? resolveRepoForValidation(project.repo) : null;
+    if (resolved === null || resolved instanceof Error) return;
+    const norm = resolved.identityKey;
     const prev = seen.get(norm);
     if (prev !== undefined) {
       errors.push({
@@ -276,14 +282,30 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
         path: `${path}.repo`,
         message:
           'project.repo must not embed credentials in the URL (e.g. "https://user:token@host/…" '
-          + 'or "ssh://user:secret@host/…"). Configure auth via a git credential helper, an SSH key, '
-          + 'or GITHUB_TOKEN so the secret stays out of the config file, API responses, and logs.',
+          + 'or "ssh://user:secret@host/…"). Configure auth via a git credential helper or an SSH key '
+          + 'so the secret stays out of the config file, API responses, and logs.',
       });
-    } else if (!isValidRepo(project.repo)) {
-      errors.push({
-        path: `${path}.repo`,
-        message: 'project.repo must be a full github.com HTTPS or SSH Git URL with an owner/repository path',
-      });
+    } else {
+      const resolved = resolveRepoForValidation(project.repo);
+      if (resolved instanceof AmbiguousRepoClaimError) {
+        errors.push({
+          path: `${path}.repo`,
+          message: `${resolved.message} — uninstall one of the conflicting plugins or change project.repo`,
+        });
+      } else if (resolved instanceof InvalidRepoClaimError) {
+        errors.push({
+          path: `${path}.repo`,
+          message: `${resolved.message} — fix or uninstall that plugin`,
+        });
+      } else if (resolved === null) {
+        errors.push({
+          path: `${path}.repo`,
+          message:
+            'project.repo is not recognized by any installed platform — built-in GitHub accepts a full github.com '
+            + 'HTTPS or SSH Git URL with an owner/repository path; other platforms need their plugin installed '
+            + '(baxian plugin install <package>)',
+        });
+      }
     }
     if (!VALID_MERGE.includes(project.merge)) {
       errors.push({ path: `${path}.merge`, message: 'project.merge must be "auto" or null' });

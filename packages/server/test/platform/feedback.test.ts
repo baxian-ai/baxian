@@ -161,6 +161,27 @@ describe('scanCommentSourcesOnce with a timeline collector', () => {
     expect(rowBodyDigest(scanned)).toBe(sha256Hex('hello world'));
   });
 
+  it('projects rows even when the driver never calls projectPage', async () => {
+    const source: CommentSource = { key: 'issue-comments', category: 'top-level' };
+    const collector = new TimelineCollector([source]);
+    const scans = await scanCommentSourcesOnce(
+      {
+        commentSources: [source],
+        listComments: async () => [{ id: 'c1', body: 'plain return', createdAt: TS, updatedAt: TS }],
+      },
+      7,
+      () => Date.now(),
+      undefined,
+      collector,
+    );
+    const scanned = scans[0]!.rows[0]!;
+    expect(scanned.body).toBeUndefined();
+    expect(rowBodyDigest(scanned)).toBe(sha256Hex('plain return'));
+    expect(collector.assemble().items).toEqual([
+      expect.objectContaining({ id: 'c1', body: 'plain return' }),
+    ]);
+  });
+
   it('reports a failing source to the collector while the scan itself stays fail-closed', async () => {
     const collector = new TimelineCollector(sources);
     const scans = await scanCommentSourcesOnce(

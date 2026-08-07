@@ -10,7 +10,8 @@ import {
   execOutcomeUnknown,
 } from './net-exec.js';
 import type { AgentMode, HostConfig } from '../shared/index.js';
-import { normalizeRepoUrl, redactGitCredentials } from '../shared/index.js';
+import { redactGitCredentials } from '../shared/index.js';
+import { resolveRepo } from '../platform/driver-host.js';
 
 export interface RepoStoreCache {
   homes: Map<string, string>;
@@ -525,9 +526,9 @@ export class RepoStore {
   }
 
   private originMatches(originUrl: string): boolean {
-    const expected = normalizeRepoUrl(this.repo);
-    const actual = normalizeRepoUrl(originUrl);
-    return expected !== null && actual !== null && expected.toLowerCase() === actual.toLowerCase();
+    const expected = resolveRepo(this.repo);
+    const actual = resolveRepo(originUrl);
+    return expected !== null && actual !== null && expected.identityKey === actual.identityKey;
   }
 
   private async probeDirExists(absRepoPath: string): Promise<boolean> {

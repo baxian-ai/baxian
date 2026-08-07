@@ -4,7 +4,7 @@ import { BODY_DIGEST_SOURCE, sha256Hex } from './body-digest.js';
 import { rowBodyDigest } from './markers.js';
 import { versionTimeOf, type NormalizedRow } from './row-schema.js';
 import { isRecord } from '../shared/index.js';
-import { repoIdentityKey } from '../shared/git-url.js';
+import { repoIdentityKey } from './driver-host.js';
 
 export interface SourceCursorView {
   watermarkTime: number | null;

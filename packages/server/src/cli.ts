@@ -7,6 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { type HostConfig } from './shared/index.js';
 import { startServer } from './index.js';
+import { resolveHome } from './config/loader.js';
+import { BUILTIN_PLATFORMS } from './platform/driver-host.js';
+import {
+  installPlatformPlugin,
+  platformPluginStatuses,
+  uninstallPlatformPlugin,
+} from './platform/plugin-loader.js';
 import { shellQuote, wrapRemoteCommand, sshTarget, resolveAgentHost } from './agent/runner.js';
 
 export interface TtyDimensions {
@@ -201,6 +208,8 @@ export function readPackageVersion(): string {
   }
 }
 
+const HOME_OPTION = ['--home <dir>', 'Instance home directory (default ~/.baxian or BAXIAN_HOME)'] as const;
+
 export function buildCli(): Command {
   const program = new Command();
 
@@ -219,7 +228,7 @@ export function buildCli(): Command {
   program
     .command('start', { isDefault: true })
     .description('Start the baxian server (default command)')
-    .option('--home <dir>', 'Instance home directory (default ~/.baxian or BAXIAN_HOME)')
+    .option(...HOME_OPTION)
     .action(async (opts) => {
       await startServer(opts.home);
     });
@@ -387,6 +396,50 @@ export function buildCli(): Command {
         console.log(`Cancelled task ${result.id} (status: ${result.status})`);
       }),
     );
+
+  const pluginCommand = program.command('plugin').description('Platform plugin management');
+
+  pluginCommand
+    .command('install <package>')
+    .description('Download a platform plugin package from npm and install it (restart the server to activate)')
+    .option(...HOME_OPTION)
+    .option('--registry <url>', 'npm registry to download from (defaults to your npm config)')
+    .action((spec: string, opts: { home?: string; registry?: string }) =>
+      withErrors(async () => {
+        const plugin = await installPlatformPlugin(resolveHome(opts.home), spec, opts.registry);
+        console.log(`Installed ${plugin.name}@${plugin.version} (platform: ${plugin.platform}).`);
+        console.log('Restart the baxian server to activate it.');
+      }));
+
+  pluginCommand
+    .command('uninstall <package>')
+    .description('Uninstall a platform plugin (restart the server to apply)')
+    .option(...HOME_OPTION)
+    .action((name: string, opts: { home?: string }) =>
+      withErrors(async () => {
+        await uninstallPlatformPlugin(resolveHome(opts.home), name);
+        console.log(`Uninstalled ${name}. Reinstall with "baxian plugin install ${name}" to undo.`);
+        console.log('Restart the baxian server to apply; repositories only that plugin recognized will fail config validation until reconfigured.');
+      }));
+
+  pluginCommand
+    .command('status')
+    .description('Show installed platform plugins and whether they load')
+    .option(...HOME_OPTION)
+    .action((opts: { home?: string }) =>
+      withErrors(async () => {
+        const statuses = await platformPluginStatuses(resolveHome(opts.home));
+        if (statuses.length === 0) {
+          console.log('No platform plugins installed.');
+        } else {
+          console.log('NAME\tVERSION\tPLATFORM\tSTATUS');
+          console.log('----\t-------\t--------\t------');
+          for (const status of statuses) {
+            console.log(`${status.name}\t${status.version}\t${status.ok ? status.platform : '-'}\t${status.ok ? 'ok' : `error: ${status.error}`}`);
+          }
+        }
+        console.log(`Built-in: ${BUILTIN_PLATFORMS.join(', ')}. Plugins take effect at server start.`);
+      }));
 
   program
     .command('check <project>')

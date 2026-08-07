@@ -35,7 +35,6 @@ import {
   effectiveTaskReviewRound,
   isSpecStagePhase,
   isTaskOpen,
-  repoIdentityKey,
   taskAttentionGeneration,
   taskGenerationGuard,
   taskReviewRound,
@@ -45,6 +44,7 @@ import {
   buildProjectDriver,
   buildProjectPromptContext,
   makeDriverExec,
+  repoIdentityKey,
 } from '../platform/driver-host.js';
 import {
   DriverOpError,

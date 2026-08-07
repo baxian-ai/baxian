@@ -1,6 +1,5 @@
 import { shellQuote } from '../agent/runner.js';
 import { CONTROL_CHAR_RE, isValidBranchName } from '../shared/constants.js';
-import { isGitHubRepo, repoSlug } from '../shared/git-url.js';
 import { isRecord } from '../shared/index.js';
 import { parseJsonPagedPage, parseJsonResponse } from './response-parser.js';
 import { validateRows, type NormalizedRow } from './row-schema.js';
@@ -14,6 +13,7 @@ import {
   type DriverExecResult,
   type PlatformAgentPrompts,
   type PlatformDriver,
+  type PlatformProvider,
 } from './types.js';
 
 const DRIVER_MAX_BUFFER = 64 * 1024 * 1024;
@@ -58,15 +58,21 @@ const ERROR_MATCHERS: Array<{ class: string; regexes: RegExp[] }> = [
   { class: 'NOT_FOUND', regexes: [/HTTP 404/, /Not Found/] },
 ];
 
-export interface GitHubRunContext {
-  repoPath: string;
+const GITHUB_REPO_URL_RE =
+  /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+?)(?:\.git)?\/?$/;
+
+// Repo names may start with a dot ('.github'), but '.'/'..' would rewrite the REST path on URL normalization.
+function normalizeGitHubRepoUrl(url: string): string | null {
+  const slug = url.trim().match(GITHUB_REPO_URL_RE)?.[1].toLowerCase() ?? null;
+  return slug === null || /\/\.\.?$/.test(slug) ? null : slug;
 }
 
-export function buildGitHubRunContext(repoUrl: string): GitHubRunContext {
-  const repo = repoUrl.trim();
-  if (!isGitHubRepo(repo)) throw new Error(`GitHub driver requires a github.com repository URL: ${repo}`);
-  return { repoPath: repoSlug(repo) };
-}
+export const githubProvider: PlatformProvider = {
+  platform: GITHUB_HOST,
+  normalizeRepoUrl: normalizeGitHubRepoUrl,
+  createDriver: (repoSlug, exec) => new GitHubDriver(repoSlug, exec),
+  prompts: GITHUB_AGENT_PROMPTS,
+};
 
 type FieldMap = Readonly<Record<string, string>>;
 
@@ -138,9 +144,11 @@ function tail(value: string): string {
   return value.length > STDERR_TAIL_CHARS ? value.slice(-STDERR_TAIL_CHARS) : value;
 }
 
+// An explicit null on the path (deleted fork source) stays null; undefined means "field missing" and the row boundary rejects it.
 function pathValue(value: unknown, path: string): unknown {
   let current = value;
   for (const segment of path.split('.')) {
+    if (current === null) return null;
     if (!isRecord(current) || !Object.hasOwn(current, segment)) return undefined;
     current = current[segment];
   }
@@ -201,7 +209,7 @@ export class GitHubDriver implements PlatformDriver {
   readonly commentSources = COMMENT_SOURCES;
 
   constructor(
-    private readonly ctx: GitHubRunContext,
+    private readonly repoPath: string,
     private readonly exec: DriverExec,
   ) {}
 
@@ -225,12 +233,12 @@ export class GitHubDriver implements PlatformDriver {
 
   async prView(prNumber: number): Promise<NormalizedRow> {
     requirePrNumber(prNumber);
-    const result = await this.execGitHub('prView', ['gh', 'api', `repos/${this.ctx.repoPath}/pulls/${prNumber}`]);
+    const result = await this.execGitHub('prView', ['gh', 'api', `repos/${this.repoPath}/pulls/${prNumber}`]);
     return this.single('prView', projectPayload(parseJsonResponse(result.stdout), PR_VIEW_FIELDS));
   }
 
   async projectView(): Promise<NormalizedRow> {
-    const result = await this.execGitHub('projectView', ['gh', 'api', `repos/${this.ctx.repoPath}`]);
+    const result = await this.execGitHub('projectView', ['gh', 'api', `repos/${this.repoPath}`]);
     return this.single('projectView', projectPayload(parseJsonResponse(result.stdout), PROJECT_FIELDS));
   }
 
@@ -243,7 +251,10 @@ export class GitHubDriver implements PlatformDriver {
       '-f', `refName=refs/heads/${branch}`,
       '-f', `query=${BRANCH_VIEW_QUERY}`,
     ], undefined, true);
-    return this.single('branchView', projectPayload(parseJsonResponse(result.stdout), BRANCH_FIELDS));
+    const row = this.single('branchView', projectPayload(parseJsonResponse(result.stdout), BRANCH_FIELDS));
+    // GraphQL reports a deleted branch as ref: null; the contract wants headSha omitted (null would read as "branch exists").
+    if (row.headSha === null) delete row.headSha;
+    return row;
   }
 
   async postComment(prNumber: number, body: string): Promise<void> {
@@ -251,7 +262,7 @@ export class GitHubDriver implements PlatformDriver {
     validateCommentBody(body);
     await this.execGitHub(
       'comment',
-      ['gh', 'api', '-X', 'POST', `repos/${this.ctx.repoPath}/issues/${prNumber}/comments`, '-F', 'body=@-'],
+      ['gh', 'api', '-X', 'POST', `repos/${this.repoPath}/issues/${prNumber}/comments`, '-F', 'body=@-'],
       Buffer.from(body, 'utf8'),
     );
   }
@@ -260,7 +271,7 @@ export class GitHubDriver implements PlatformDriver {
     requirePrNumber(prNumber);
     requireSha(expectedHeadSha);
     await this.execGitHub('merge', [
-      'gh', 'api', '-X', 'PUT', `repos/${this.ctx.repoPath}/pulls/${prNumber}/merge`,
+      'gh', 'api', '-X', 'PUT', `repos/${this.repoPath}/pulls/${prNumber}/merge`,
       '-f', 'merge_method=squash', '-f', `sha=${expectedHeadSha}`,
     ]);
   }
@@ -268,7 +279,7 @@ export class GitHubDriver implements PlatformDriver {
   async closePr(prNumber: number): Promise<void> {
     requirePrNumber(prNumber);
     await this.execGitHub('close', [
-      'gh', 'api', '-X', 'PATCH', `repos/${this.ctx.repoPath}/pulls/${prNumber}`, '-f', 'state=closed',
+      'gh', 'api', '-X', 'PATCH', `repos/${this.repoPath}/pulls/${prNumber}`, '-f', 'state=closed',
     ]);
   }
 
@@ -291,7 +302,7 @@ export class GitHubDriver implements PlatformDriver {
   ): Promise<NormalizedRow[]> {
     return this.runPaged(
       'listPrs',
-      page => ['gh', 'api', `repos/${this.ctx.repoPath}/pulls?state=all&sort=updated&direction=desc&per_page=10&page=${page}`],
+      page => ['gh', 'api', `repos/${this.repoPath}/pulls?state=all&sort=updated&direction=desc&per_page=10&page=${page}`],
       PR_LIST_FIELDS,
       { pageCap: LIST_PRS_PAGE_CAP, capBehavior: 'stop', idField: 'prNumber', shouldStop },
     );
@@ -310,16 +321,24 @@ export class GitHubDriver implements PlatformDriver {
     requirePrNumber(prNumber);
     const collection = source.key === 'issue-comments' ? 'issues' : 'pulls';
     const suffix = source.key === 'issue-comments' ? 'comments' : source.key === 'inline-comments' ? 'comments' : 'reviews';
+    // API thread roots lack in_reply_to_id entirely; the contract wants explicit null (undefined = plugin forgot the field).
+    const projectRoots = source.key !== 'inline-comments' ? projectPage : (pageRows: NormalizedRow[]) => {
+      for (const row of pageRows) {
+        if (row.discussionId === undefined) row.discussionId = null;
+        if (row.parentId === undefined) row.parentId = null;
+      }
+      return projectPage === undefined ? pageRows : projectPage(pageRows);
+    };
     return this.runPaged(
       'listComments',
-      page => ['gh', 'api', `repos/${this.ctx.repoPath}/${collection}/${prNumber}/${suffix}?per_page=100&page=${page}`],
+      page => ['gh', 'api', `repos/${this.repoPath}/${collection}/${prNumber}/${suffix}?per_page=100&page=${page}`],
       fields,
       {
         pageCap: COMMENT_SOURCE_PAGE_CAP,
         capBehavior: 'fail',
         idField: 'id',
         sourceKey: source.key,
-        projectPage,
+        projectPage: projectRoots,
         shouldStop,
       },
     );

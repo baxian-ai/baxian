@@ -715,7 +715,7 @@ describe('TaskDetail page — advance', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
     const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
     const stage = within(dialog).getByLabelText('PR contains (required)') as HTMLSelectElement;
-    const actor = within(dialog).getByLabelText('PR author’s GitHub user ID (required)') as HTMLInputElement;
+    const actor = within(dialog).getByLabelText('PR author’s platform user ID (required)') as HTMLInputElement;
     expect(stage.value).toBe('spec');
     expect(actor.value).toBe('99');
     fireEvent.change(stage, { target: { value: 'code' } });
@@ -731,7 +731,7 @@ describe('TaskDetail page — advance', () => {
     });
   });
 
-  it('does not restore review without the PR author’s GitHub user ID', async () => {
+  it('does not restore review without the PR author’s platform user ID', async () => {
     open({
       status: 'in_progress',
       phase: undefined,
@@ -746,7 +746,7 @@ describe('TaskDetail page — advance', () => {
       name: 'Save and start review',
     }) as HTMLButtonElement;
     expect(submit.disabled).toBe(true);
-    fireEvent.change(within(dialog).getByLabelText('PR author’s GitHub user ID (required)'), {
+    fireEvent.change(within(dialog).getByLabelText('PR author’s platform user ID (required)'), {
       target: { value: '   ' },
     });
     expect(submit.disabled).toBe(true);
@@ -775,7 +775,7 @@ describe('TaskDetail page — advance', () => {
     }) as HTMLButtonElement;
     fireEvent.change(within(dialog).getByLabelText('PR number (required)'), { target: { value: '73' } });
     fireEvent.change(within(dialog).getByLabelText('PR contains (required)'), { target: { value: 'code' } });
-    fireEvent.change(within(dialog).getByLabelText('PR author’s GitHub user ID (required)'), { target: { value: '77' } });
+    fireEvent.change(within(dialog).getByLabelText('PR author’s platform user ID (required)'), { target: { value: '77' } });
     await act(async () => {
       fireEvent.click(submit);
     });

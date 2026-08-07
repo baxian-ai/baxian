@@ -1,3 +1,4 @@
+import type { PlatformProvider } from '../../src/platform/types.js';
 import type { AgentConfig, BaxianConfig, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
@@ -45,6 +46,22 @@ export function makeConfig(overrides: ConfigOverrides = {}): BaxianConfig {
     server: { ...defaults.server, ...cloned.server },
     host: cloned.host ?? defaults.host,
     project: cloned.project ?? defaults.project,
+  };
+}
+
+export function makePlatformProvider(
+  overrides: Partial<PlatformProvider> & { platform: string; claimPrefix?: string },
+): PlatformProvider {
+  const { claimPrefix, ...rest } = overrides;
+  const prefix = claimPrefix ?? `https://${overrides.platform}/`;
+  return {
+    normalizeRepoUrl: url =>
+      (url.startsWith(prefix) ? url.slice(prefix.length).replace(/\.git$/, '') : null),
+    createDriver: () => {
+      throw new Error('makePlatformProvider stub does not create drivers');
+    },
+    prompts: { common: 'c', publish: 'p', feedback: 'f', review: 'r' },
+    ...rest,
   };
 }
 

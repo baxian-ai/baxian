@@ -1,4 +1,5 @@
-import { repoIdentityKey, TASK_TERMINAL_STATUS_SET, type BaxianConfig, type ProjectConfig, type TaskState } from '../shared/index.js';
+import { TASK_TERMINAL_STATUS_SET, type BaxianConfig, type ProjectConfig, type TaskState } from '../shared/index.js';
+import { repoIdentityKey } from './driver-host.js';
 import type { PlatformPollerEntryInit } from './platform-poller.js';
 import type { PlatformDriver } from './types.js';
 

@@ -25,10 +25,11 @@ import { registerEventHandlers, recoverGitPostApprovePending } from './event/han
 import { PlatformPoller, platformTaskView, type PlatformPollerOptions } from './platform/platform-poller.js';
 import { PrConversationCache } from './platform/pr-conversation-cache.js';
 import { platformPollerStatePath } from './platform/comment-cursor.js';
-import { buildProjectDriver, makeDriverExec } from './platform/driver-host.js';
+import { buildProjectDriver, makeDriverExec, repoIdentityKey } from './platform/driver-host.js';
+import { loadPlatformPlugins } from './platform/plugin-loader.js';
 import { createRunner, resolveAgentHost } from './agent/runner.js';
 import type { AgentRuntimeConfig, HostConfig } from './shared/index.js';
-import { CONFIG_FILE, repoIdentityKey } from './shared/index.js';
+import { CONFIG_FILE } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import { PeriodicTaskRunner } from './timing/periodic-task-runner.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
@@ -86,6 +87,9 @@ export function createPlatformPollerOptions(
 export async function startServer(home?: string): Promise<void> {
   const stateDir = resolveHome(home);
   const cfgPath = join(stateDir, CONFIG_FILE);
+  for (const plugin of await loadPlatformPlugins(stateDir)) {
+    console.log(`[startup] platform plugin ${plugin.name}@${plugin.version} active (platform: ${plugin.platform})`);
+  }
   if (await createDefaultConfig(cfgPath)) {
     console.log(`Initialized config at ${cfgPath}`);
   }

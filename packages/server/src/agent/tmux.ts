@@ -841,7 +841,15 @@ export class TmuxManager {
       opts,
     );
     if (result.exitCode === 0) {
-      return result.stdout.includes(REFUSED_MARKER) ? 'refused' : 'killed';
+      if (!result.stdout.includes(REFUSED_MARKER)) return 'killed';
+      // tmux >= 3.6 runs the else branch for a missing -t target, so REFUSED may mean absent; ids are unique per server generation, and an id reused after a restart only errs toward 'refused'.
+      const probe = await run(this.runner, `tmux has-session -t ${shellQuote(ref.sessionId)}`, opts);
+      if (probe.exitCode === 0) return 'refused';
+      if (tmuxProbeOutcomeUnknown(probe)) {
+        throw new TmuxOutcomeUnknownError(`tmux killSessionRef ${ref.sessionId} recheck outcome unknown (transient): exit ${probe.exitCode}: ${probe.stderr}`);
+      }
+      if (probe.exitCode === 1 && isSessionAbsent(probe.stderr)) return 'absent';
+      throw new Error(`tmux killSessionRef ${ref.sessionId} recheck unexpected exit ${probe.exitCode}: ${probe.stderr}`);
     }
     if (tmuxProbeOutcomeUnknown(result)) {
       throw new TmuxOutcomeUnknownError(`tmux killSessionRef ${ref.sessionId} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);

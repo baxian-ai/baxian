@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { PlatformPoller, platformTaskView, type PlatformTaskView } from '../../src/platform/platform-poller.js';
 import { platformPollerStatePath } from '../../src/platform/comment-cursor.js';
-import { GitHubDriver, buildGitHubRunContext } from '../../src/platform/github-driver.js';
+import { GitHubDriver } from '../../src/platform/github-driver.js';
 import type { DriverExec } from '../../src/platform/types.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
@@ -72,7 +72,7 @@ describe('PlatformPoller over the GitHub driver (fake gh)', () => {
       };
       throw new Error(`no gh fixture for: ${cmd}`);
     };
-    const driver = new GitHubDriver(buildGitHubRunContext('git@github.com:owner/repo.git'), exec);
+    const driver = new GitHubDriver('owner/repo', exec);
     poller = new PlatformPoller({
       onEvent: (_p, event) => { events.push(event); },
       tasks: async () => tasks,
@@ -274,7 +274,7 @@ async function lifecycleHarness() {
   };
 
   const repo = 'git@github.com:owner/repo.git';
-  const driver = new GitHubDriver(buildGitHubRunContext(repo), exec);
+  const driver = new GitHubDriver('owner/repo', exec);
   const config = makeConfig({
     review: { rounds: 3 },
     project: [{

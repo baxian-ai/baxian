@@ -101,19 +101,25 @@ it('resets plan approval to require user confirmation when the modal reopens', a
   await waitFor(() => expect((screen.getByLabelText('Require your approval (default)') as HTMLInputElement).checked).toBe(true));
 });
 
-it.each([
-  ['single token, no slash', 'justaname'],
-  ['contains a space', 'https://gitlab.example.com/group/ proj'],
-  ['scheme only, no path', 'https://gitlab.example.com'],
-  ['non-github SSH URL', 'ssh://git@gitlab.example.com/group/proj.git'],
-  ['non-github scp URL', 'git@gitlab.example.com:group/proj.git'],
-  ['multi-segment path', 'https://github.com/group/subgroup/proj.git'],
-  ['query suffix', 'https://github.com/group/proj.git?token=x'],
-  ['fragment suffix', 'https://github.com/group/proj.git#readme'],
-])('rejects %s with the URL-format field error', async (_label, repo) => {
+it('submits a non-GitHub repository URL and leaves platform validation to the server', async () => {
+  const repo = 'https://git.corp.example/group/subgroup/proj.git';
   await renderAndFill(repo);
+  expect(createMock).toHaveBeenCalledWith({ id: 'newproj', repo, merge: null, specApproval: 'human' });
+});
+
+it('surfaces the server-side repository validation error', async () => {
+  createMock.mockRejectedValue(new Error(
+    'project[0].repo: project.repo is not recognized by any installed platform',
+  ));
+  await renderAndFill('justaname');
+  expect(createMock).toHaveBeenCalled();
+  expect(await screen.findByText(/not recognized by any installed platform/)).toBeTruthy();
+});
+
+it('keeps blocking an empty repository URL client-side', async () => {
+  await renderAndFill('   ');
   expect(createMock).not.toHaveBeenCalled();
-  expect(screen.getByText(/full github\.com HTTPS or SSH Git URL/)).toBeTruthy();
+  expect(screen.getByText('Required')).toBeTruthy();
 });
 
 it('surfaces a config load failure instead of silently rendering the github default', async () => {

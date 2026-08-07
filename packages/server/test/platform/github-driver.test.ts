@@ -1,14 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  buildGitHubRunContext,
   GITHUB_AGENT_PROMPTS,
   GitHubDriver,
+  githubProvider,
 } from '../../src/platform/github-driver.js';
 import type { DriverExecResult } from '../../src/platform/types.js';
 import { DriverInputError, DriverOpError, safeDriverErrorText } from '../../src/platform/types.js';
 import { RowSchemaError } from '../../src/platform/row-schema.js';
 
-const REPO = 'https://github.com/owner/repo.git';
 const SHA = 'a'.repeat(40);
 
 function result(stdout = '', exitCode = 0, stderr = ''): DriverExecResult {
@@ -21,7 +20,7 @@ function harness(outputs: DriverExecResult[]) {
     calls.push({ command, stdin: opts.stdin });
     return outputs.shift() ?? result('[]');
   });
-  return { driver: new GitHubDriver(buildGitHubRunContext(REPO), exec), calls, exec };
+  return { driver: githubProvider.createDriver('owner/repo', exec), calls, exec };
 }
 
 describe('GitHubDriver', () => {
@@ -46,6 +45,36 @@ describe('GitHubDriver', () => {
     }));
     expect(calls[0]!.command).toContain("GH_HOST='github.com'");
     expect(calls[0]!.command).toContain('repos/owner/repo/pulls/42');
+  });
+
+  it('keeps a deleted fork source explicit as null instead of dropping the field', async () => {
+    const { driver } = harness([result(JSON.stringify({
+      html_url: 'https://github.com/owner/repo/pull/43',
+      head: { ref: 'bx/task-2', sha: SHA, repo: null },
+      base: { ref: 'main', repo: { id: 10 } },
+      state: 'open',
+      draft: false,
+      merged_at: null,
+      user: { login: 'alice', id: 7 },
+      mergeable_state: 'clean',
+    }))]);
+    await expect(driver.prView(43)).resolves.toEqual(expect.objectContaining({
+      sourceProjectId: null,
+      targetProjectId: '10',
+    }));
+  });
+
+  it('fills explicit null thread roots for inline comments without in_reply_to_id', async () => {
+    const { driver } = harness([
+      result(JSON.stringify([{
+        id: 31, body: 'root', user: { login: 'bob', id: 8 },
+        created_at: '2026-08-05T00:00:00Z', updated_at: '2026-08-05T00:00:00Z',
+        path: 'a.ts', line: 3,
+      }])),
+      result('[]'),
+    ]);
+    const rows = await driver.listComments({ key: 'inline-comments', category: 'threaded' }, 42);
+    expect(rows[0]).toMatchObject({ id: '31', discussionId: null, parentId: null });
   });
 
   it('passes comment text through stdin and rejects empty, NUL, or oversized bodies', async () => {
@@ -190,10 +219,57 @@ describe('GitHubDriver', () => {
   });
 });
 
-describe('buildGitHubRunContext', () => {
-  it('accepts supported GitHub URL forms and rejects bare or non-GitHub repositories', () => {
-    expect(buildGitHubRunContext('git@github.com:Owner/Repo.git')).toEqual({ repoPath: 'Owner/Repo' });
-    expect(() => buildGitHubRunContext('owner/repo')).toThrow(/github.com repository URL/);
-    expect(() => buildGitHubRunContext('https://gitlab.com/owner/repo.git')).toThrow(/github.com repository URL/);
+describe('githubProvider', () => {
+  it('normalizes every supported URL form to one lowercase slug', () => {
+    for (const url of [
+      'https://github.com/Owner/Repo.git',
+      'https://github.com/Owner/Repo',
+      'https://github.com/Owner/Repo/',
+      'git@github.com:Owner/Repo.git',
+      'ssh://git@github.com/Owner/Repo.git',
+      '  https://github.com/Owner/Repo.git  ',
+    ]) {
+      expect.soft(githubProvider.normalizeRepoUrl(url), url).toBe('owner/repo');
+    }
+  });
+
+  it('accepts dot-prefixed repo names but rejects bare dot segments', () => {
+    for (const [url, slug] of [
+      ['https://github.com/org/.github', 'org/.github'],
+      ['https://github.com/org/.github.git', 'org/.github'],
+      ['git@github.com:org/.github-private.git', 'org/.github-private'],
+    ] as const) {
+      expect.soft(githubProvider.normalizeRepoUrl(url), url).toBe(slug);
+    }
+    for (const url of [
+      'https://github.com/org/.',
+      'https://github.com/org/..',
+      'https://github.com/org/...git',
+    ]) {
+      expect.soft(githubProvider.normalizeRepoUrl(url), url).toBeNull();
+    }
+  });
+
+  it('rejects shorthands, other hosts, insecure HTTP, ports, and malformed paths', () => {
+    for (const url of [
+      'owner/repo',
+      'https://gitlab.com/owner/repo.git',
+      'http://github.com/owner/repo.git',
+      'https://github.com:443/owner/repo.git',
+      'ssh://git@github.com:22/owner/repo.git',
+      'https://github.com/group/sub/repo.git',
+      'https://github.com/.dot/repo.git',
+      'not-a-url',
+      '',
+    ]) {
+      expect.soft(githubProvider.normalizeRepoUrl(url), url).toBeNull();
+    }
+  });
+
+  it('builds a GitHubDriver bound to the canonical slug', () => {
+    const driver = githubProvider.createDriver('owner/repo', async () => result('[]'));
+    expect(driver).toBeInstanceOf(GitHubDriver);
+    expect(githubProvider.platform).toBe('github.com');
+    expect(githubProvider.prompts).toBe(GITHUB_AGENT_PROMPTS);
   });
 });

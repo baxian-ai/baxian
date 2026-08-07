@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { PLATFORM_ACTOR_ID_MAX_BYTES } from '../platform/types.js';
 
 export type PhaseSignalKind =
   | 'pr-created'
@@ -69,7 +70,7 @@ export function createSignalToken(): string {
 export function decodeSignalActorId(actorB64: string): string | undefined {
   if (!/^[A-Za-z0-9_-]+$/.test(actorB64) || actorB64.length % 4 === 1) return undefined;
   const bytes = Buffer.from(actorB64, 'base64url');
-  if (bytes.length === 0 || bytes.length > 128) return undefined;
+  if (bytes.length === 0 || bytes.length > PLATFORM_ACTOR_ID_MAX_BYTES) return undefined;
   const text = bytes.toString('utf8');
   if (!Buffer.from(text, 'utf8').equals(bytes)) return undefined;
   for (const ch of text) {

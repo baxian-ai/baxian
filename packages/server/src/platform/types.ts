@@ -3,6 +3,8 @@ import type { NormalizedRow } from './row-schema.js';
 
 const SAFE_ERROR_SUMMARY_CHARS = 200;
 export const COMMENT_BODY_MAX_BYTES = 64 * 1024;
+// Shared with the completion-signal decoder: an actor id that rows accept must survive the signal round-trip.
+export const PLATFORM_ACTOR_ID_MAX_BYTES = 128;
 
 export interface PlatformEvent {
   type: EventType;
@@ -11,7 +13,8 @@ export interface PlatformEvent {
   taskId?: string;
 }
 
-export type CommentSourceClass = 'reviews' | 'threaded' | 'top-level';
+export const COMMENT_SOURCE_CLASSES = ['top-level', 'threaded', 'reviews'] as const;
+export type CommentSourceClass = (typeof COMMENT_SOURCE_CLASSES)[number];
 
 export interface CommentSource {
   key: string;
@@ -61,6 +64,27 @@ export interface PlatformDriver {
   mergePr(prNumber: number, expectedHeadSha: string): Promise<void>;
   closePr(prNumber: number): Promise<void>;
   deleteBranch(remoteProjectId: string, branch: string, expectedHeadSha: string): Promise<void>;
+}
+
+export interface PlatformProvider {
+  readonly platform: string;
+  normalizeRepoUrl(url: string): string | null;
+  createDriver(repoSlug: string, exec: DriverExec): PlatformDriver;
+  readonly prompts: PlatformAgentPrompts;
+}
+
+export const PLATFORM_PLUGIN_API_VERSION = 1;
+
+export interface PlatformPluginHost {
+  readonly DriverOpError: typeof DriverOpError;
+  readonly DriverInputError: typeof DriverInputError;
+  readonly validateCommentBody: (body: string) => void;
+  readonly shellQuote: (value: string) => string;
+}
+
+export interface PlatformPlugin {
+  readonly apiVersion: typeof PLATFORM_PLUGIN_API_VERSION;
+  readonly provider: PlatformProvider;
 }
 
 export class DriverOpError extends Error {
