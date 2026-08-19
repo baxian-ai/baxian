@@ -134,8 +134,8 @@ function GoTo({ to }: { to: string }) {
   return <button type="button" onClick={() => navigate(to)}>goto</button>;
 }
 
-function renderPage(taskId = 'task-010', opts: { entries?: string[]; index?: number; extra?: ReactNode } = {}) {
-  return render(
+function pageTree(taskId = 'task-010', opts: { entries?: string[]; index?: number; extra?: ReactNode } = {}) {
+  return (
     <MemoryRouter initialEntries={opts.entries ?? [`/project/baxian/task/${taskId}`]} initialIndex={opts.index}>
       <ConfirmProvider>
         {opts.extra}
@@ -145,8 +145,12 @@ function renderPage(taskId = 'task-010', opts: { entries?: string[]; index?: num
         </Routes>
         <LocationProbe />
       </ConfirmProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderPage(taskId = 'task-010', opts: { entries?: string[]; index?: number; extra?: ReactNode } = {}) {
+  return render(pageTree(taskId, opts));
 }
 
 async function findConfirmDialog(): Promise<HTMLElement> {
@@ -985,6 +989,8 @@ describe('TaskDetail page — human attention and code verdict', () => {
     expect(within(details).getByText(/Inspect the QA review and submit a verdict/)).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
     expect(screen.getAllByRole('button', { name: 'Cancel task' }).length).toBeGreaterThan(0);
+    expect(screen.getByText('Code review needs your decision')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Confirm pass' })).toBeTruthy();
   });
 
   it('starts an assigned pending task from its attention action', async () => {
@@ -1009,9 +1015,45 @@ describe('TaskDetail page — human attention and code verdict', () => {
     });
   });
 
+  it('keeps the code verdict panel collapsed while QA is still reviewing', () => {
+    open({ status: 'review', phase: 'code' });
+    expect(screen.queryByText('Code review needs your decision')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Confirm pass' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
+  });
+
+  it('opens the code verdict panel from the Handle review action', () => {
+    open({ status: 'review', phase: 'code' });
+    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
+    expect(screen.getByText('Code review needs your decision')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Confirm pass' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Handle review' })).toBeNull();
+  });
+
+  it('collapses the code verdict panel again when the next review round starts', () => {
+    const { rerender } = open({ status: 'review', phase: 'code', reviewRound: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
+    expect(screen.getByRole('button', { name: 'Confirm pass' })).toBeTruthy();
+
+    setTask(makeTask({ status: 'fixing', phase: 'code', reviewRound: 1 }));
+    rerender(pageTree());
+    setTask(makeTask({ status: 'review', phase: 'code', reviewRound: 2 }));
+    rerender(pageTree());
+
+    expect(screen.queryByRole('button', { name: 'Confirm pass' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
+  });
+
+  it('does not offer Handle review during plan review', () => {
+    open({ status: 'review', phase: 'spec' });
+    expect(screen.queryByRole('button', { name: 'Handle review' })).toBeNull();
+    expect(screen.queryByText('Code review needs your decision')).toBeNull();
+  });
+
   it('submits a code-review pass with the optional comments through the unified endpoint', async () => {
     tasksVerdictMock.mockResolvedValue(makeTask({ status: 'review' }));
     open({ status: 'review' });
+    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
 
     fireEvent.change(screen.getByPlaceholderText(/What needs to change/), {
       target: { value: 'Validated the edge case' },
@@ -1027,6 +1069,7 @@ describe('TaskDetail page — human attention and code verdict', () => {
 
   it('requires comments before submitting code-review changes', () => {
     open({ status: 'review' });
+    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
     expect((screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement).disabled).toBe(true);
     expect(tasksVerdictMock).not.toHaveBeenCalled();
   });

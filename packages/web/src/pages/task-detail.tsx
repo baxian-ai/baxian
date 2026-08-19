@@ -40,6 +40,10 @@ function positivePrNumber(value: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+function isCodeReviewing(task: TaskState): boolean {
+  return task.status === 'review' && !isSpecStagePhase(task.phase);
+}
+
 function TechnicalDetails({ children }: { children: ReactNode }) {
   const t = useT();
   return (
@@ -73,12 +77,16 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const [specComments, setSpecComments] = useState('');
   const [codeSubmitting, setCodeSubmitting] = useState(false);
   const [codeComments, setCodeComments] = useState('');
+  const [codeVerdictOpen, setCodeVerdictOpen] = useState(false);
   const [override, setOverride] = useState<TaskState | null>(null);
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects, error: projectsError } = useProjects();
   const { data: agents, loaded: agentsLoaded, error: agentsErrorPayload } = useAgents();
   const { activeAgentId, activateAgentCard } = useActiveAgentCard();
   const task = override ?? streamed;
+  const codeReviewing = task !== null && isCodeReviewing(task);
+  const showCodeVerdictPanel = codeReviewing
+    && (codeVerdictOpen || task?.attention?.recommendedActions.includes('verdict') === true);
   const error = errorPayload?.message ?? null;
   const project = task ? projects?.find(candidate => candidate.id === task.projectId) : undefined;
   const mergeMode = project === undefined ? 'unknown' : project.merge === 'auto' ? 'auto' : 'manual';
@@ -93,6 +101,10 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       setOverride(null);
     }
   }, [override, streamed]);
+
+  useEffect(() => {
+    setCodeVerdictOpen(false);
+  }, [task?.status, task?.reviewRound]);
 
   const commitTaskExternal = (updated: TaskState) => {
     setOverride(updated);
@@ -505,7 +517,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const showApprovedAction = task.status === 'approved' && task.prNumber !== undefined;
     const showMergeReadyAction = task.status === 'merge-ready' && task.prNumber !== undefined;
     const showSpecReadyAction = task.status === 'spec-ready';
-    const showCodeReviewAction = task.status === 'review' && !isSpecStagePhase(task.phase);
+    const showCodeReviewAction = showCodeVerdictPanel;
     const showCodeMaxRounds = task.status === 'max_rounds' && !isSpecStagePhase(task.phase);
     const showSpecMaxRounds = task.status === 'max_rounds' && isSpecStagePhase(task.phase);
     const prHref = safeExternalHref(task.prUrl);
@@ -859,6 +871,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       && task.qaAgentId !== undefined;
     const completeEnabled = isCodeMaxRounds && task.prNumber !== undefined;
     const continueEnabled = completeEnabled && !!task.agentId;
+    const codeVerdictEntryEnabled = codeReviewing && !showCodeVerdictPanel;
 
     return (
       <>
@@ -903,6 +916,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             className="btn-secondary"
           >
             {advanceActionLabel(task, 'qa')}
+          </button>
+        )}
+        {codeVerdictEntryEnabled && (
+          <button type="button" onClick={() => setCodeVerdictOpen(true)} className="btn-secondary">
+            {t.taskDetail.handleReview}
           </button>
         )}
         {isCodeMaxRounds && (
