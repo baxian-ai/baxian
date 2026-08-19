@@ -81,13 +81,13 @@ describe('AgentManager post-merge release', () => {
 
     await vi.waitFor(async () => {
       expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+      expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
     });
     const joined = execs.join('\n');
     expect(promptInjections).toEqual([]);
     expect(joined).not.toMatch(/tmux (load|paste)-buffer/);
     expect(joined).not.toContain('/clear');
     expect(joined).not.toContain('/compact');
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('treats a runtime that exited to a shell as absent: releases and drops the pane binding', async () => {
@@ -105,11 +105,11 @@ describe('AgentManager post-merge release', () => {
 
     await vi.waitFor(async () => {
       expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+      expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
     });
     const binding = await harness.agentStore.get('dev-1');
     expect(binding?.status).not.toBe('awaiting_human');
     expect(binding?.paneId).toBeUndefined();
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
     expect(execs.join('\n')).not.toContain('send-keys');
   });
 

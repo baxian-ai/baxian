@@ -98,6 +98,57 @@ describe('PlatformConnectivityBanner', () => {
     expect(screen.getByText(/user\/down/)).not.toBeNull();
   });
 
+  it('reports access denied instead of unreachable when the failed poller was refused by the platform', () => {
+    pollersState.data = [snapshot({
+      repo: 'https://github.com/user/locked.git',
+      health: 'failed',
+      consecutiveFailures: 3,
+      lastErrorClass: 'ACCESS_DENIED',
+      lastErrorMessage: 'github-auth: GitHub CLI has no valid credentials for the user running baxian on this host.',
+    })];
+    render(<PlatformConnectivityBanner />);
+    expect(screen.getByText(/Platform access denied/)).not.toBeNull();
+    expect(screen.getByText(/user\/locked/)).not.toBeNull();
+    expect(screen.queryByText(/Platform unreachable/)).toBeNull();
+  });
+
+  it('reports access denied as soon as a degraded poller is refused, before it reaches failed', () => {
+    pollersState.data = [snapshot({
+      repo: 'https://github.com/user/locked.git',
+      health: 'degraded',
+      consecutiveFailures: 1,
+      lastErrorClass: 'ACCESS_DENIED',
+    })];
+    render(<PlatformConnectivityBanner />);
+    expect(screen.getByText(/Platform access denied/)).not.toBeNull();
+    expect(screen.queryByText(/Platform polling degraded/)).toBeNull();
+  });
+
+  it('prefers a refused poller over an earlier unreachable one so the manual fix is never masked', () => {
+    pollersState.data = [
+      snapshot({ repo: 'https://github.com/user/down.git', health: 'failed', consecutiveFailures: 5 }),
+      snapshot({ repo: 'https://github.com/user/locked.git', health: 'failed', consecutiveFailures: 3, lastErrorClass: 'ACCESS_DENIED' }),
+    ];
+    render(<PlatformConnectivityBanner />);
+    expect(screen.getByText(/Platform access denied/)).not.toBeNull();
+    expect(screen.getByText(/user\/locked/)).not.toBeNull();
+    expect(screen.queryByText(/Platform unreachable/)).toBeNull();
+  });
+
+  it('shows the driver-supplied recovery instruction instead of a hard-coded platform command', () => {
+    pollersState.data = [snapshot({
+      repo: 'https://corp.example/team/repo.git',
+      health: 'failed',
+      consecutiveFailures: 3,
+      lastErrorClass: 'ACCESS_DENIED',
+      lastErrorMessage: 'corp-auth: run corp-cli login on the server host',
+    })];
+    render(<PlatformConnectivityBanner />);
+    const banner = screen.getByText(/Platform access denied/);
+    expect(banner.textContent).toContain('corp-cli login on the server host');
+    expect(banner.textContent).not.toContain('gh auth login');
+  });
+
   it('surfaces the last poll error as a tooltip for diagnosis', () => {
     pollersState.data = [
       snapshot({

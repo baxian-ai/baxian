@@ -523,6 +523,7 @@ export const zhCN: Messages = {
     restartTimeout: '重启超时（30s 未恢复）。请检查日志或手动执行 baxian start --home <dir>',
     platformDegraded: (repo) => `平台轮询降级（${repo}）——评审与 PR 更新可能延迟，连通恢复后自动跟上`,
     platformUnreachable: (repo) => `平台无法访问（${repo}）——任务推进暂停，连通恢复后自动继续`,
+    platformAccessDenied: (repo, detail) => `平台拒绝访问（${repo}）——凭证失效或权限不足，任务推进暂停，需人工修复凭证后才会恢复。${detail ?? ''}`,
     platformRateLimited: (repo, until) => `平台轮询触发限流（${repo}），将于 ${new Date(until).toLocaleTimeString()} 后自动恢复`,
   },
   terminal: {

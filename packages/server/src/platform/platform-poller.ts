@@ -6,7 +6,7 @@ import { BRANCH_PREFIX } from '../shared/constants.js';
 import { repoIdentityKey } from './driver-host.js';
 import { TASK_TERMINAL_STATUS_SET } from '../shared/constants.js';
 import type { TaskState } from '../shared/types.js';
-import { DriverOpError, type PlatformDriver, type PlatformEvent } from './types.js';
+import { DriverOpError, type PlatformDriver, type PlatformEvent, type PreflightStep } from './types.js';
 import type { NormalizedRow } from './row-schema.js';
 import { versionTimeOf } from './row-schema.js';
 import { CommentCursorStore } from './comment-cursor.js';
@@ -126,6 +126,11 @@ interface InternalEntry extends PlatformPollerEntryInit {
 interface CycleFailure {
   message: string;
   errorClass?: string;
+}
+
+// message and class must come from the same failure, or the UI pairs an unrelated diagnostic with a classified cause
+function representativeFailure(failures: CycleFailure[]): CycleFailure {
+  return failures.find(f => f.errorClass !== undefined) ?? failures[0]!;
 }
 
 class RateLimitAbort extends Error {
@@ -336,7 +341,8 @@ export class PlatformPoller {
       const failures = await this.pollCycle(entry);
       entry.rateLimit = undefined;
       if (failures.length > 0) {
-        this.recordFailure(entry, failures[0].message, failures.find(f => f.errorClass !== undefined)?.errorClass);
+        const rep = representativeFailure(failures);
+        this.recordFailure(entry, rep.message, rep.errorClass);
         throw new CycleFailuresError(`platform poll: ${failures.length} failure(s); first: ${failures[0].message}`);
       }
       entry.status.consecutiveFailures = 0;
@@ -351,11 +357,8 @@ export class PlatformPoller {
         entry.rateLimit = { until: this.now() + backoffMs, attempt };
         const nonRateLimit = e.failures.filter(f => f.errorClass !== 'RATE_LIMIT');
         if (nonRateLimit.length > 0) {
-          this.recordFailure(
-            entry,
-            nonRateLimit[0].message,
-            nonRateLimit.find(f => f.errorClass !== undefined)?.errorClass ?? 'RATE_LIMIT',
-          );
+          const rep = representativeFailure(nonRateLimit);
+          this.recordFailure(entry, rep.message, rep.errorClass ?? 'RATE_LIMIT');
           throw new CycleFailuresError(
             `platform poll: rate limited (backing off ${backoffMs}ms) after ${nonRateLimit.length} failure(s); first: ${nonRateLimit[0].message}`,
           );
@@ -464,7 +467,7 @@ export class PlatformPoller {
     }
 
     if (entry.preflightPassed !== true) {
-      let steps: Array<{ step: string; ok: boolean; message: string }>;
+      let steps: PreflightStep[];
       try {
         steps = await entry.driver.runPreflightSteps();
         this.assertEntryActive(entry);
@@ -476,7 +479,7 @@ export class PlatformPoller {
       const bad = steps.find(s => !s.ok);
       if (bad !== undefined) {
         entry.defaultBranchStale += 1;
-        fail(bad.step, new Error(bad.message));
+        fail(bad.step, new DriverOpError(bad.message, { opName: bad.step, errorClass: bad.errorClass }));
         return failures;
       }
     }

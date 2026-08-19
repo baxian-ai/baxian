@@ -11,6 +11,7 @@ import {
   type CommentSource,
   type PlatformEvent,
   type PlatformDriver,
+  type PreflightStep,
 } from '../../src/platform/types.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
@@ -57,7 +58,7 @@ class FakeDriver implements PlatformDriver {
   comments: Record<string, NormalizedRow[] | Error> = {};
   calls: string[] = [];
 
-  async runPreflightSteps(): Promise<Array<{ step: string; ok: boolean; message: string }>> {
+  async runPreflightSteps(): Promise<PreflightStep[]> {
     return [];
   }
 
@@ -1206,6 +1207,56 @@ describe('PlatformPoller: server-track preflight gate', () => {
 
     await poller.poll();
     expect(calls).toBe(2);
+  });
+
+  it('carries the errorClass of a failed step into the snapshot so the UI can tell refused from unreachable', async () => {
+    driver.runPreflightSteps = async () => [{
+      step: 'github-auth', ok: false, errorClass: 'ACCESS_DENIED', message: 'fix credentials on this host',
+    }];
+    const poller = makePoller();
+    await poller.poll();
+    const snap = poller.snapshots()[0]!;
+    expect(snap.lastErrorClass).toBe('ACCESS_DENIED');
+    expect(snap.lastErrorMessage).toBe('github-auth: fix credentials on this host');
+    expect(snap.rateLimitedUntil).toBeUndefined();
+  });
+
+  it('pairs lastErrorMessage with the failure that supplied lastErrorClass, not an earlier unclassified one', async () => {
+    const prune = vi.spyOn(CommentCursorStore.prototype, 'pruneSources')
+      .mockRejectedValue(new Error('cursor persistence unavailable'));
+    driver.runPreflightSteps = async () => [{
+      step: 'github-auth', ok: false, errorClass: 'ACCESS_DENIED', message: 'fix credentials on this host',
+    }];
+    try {
+      const poller = makePoller();
+      await poller.poll();
+      const snap = poller.snapshots()[0]!;
+      expect(snap.lastErrorClass).toBe('ACCESS_DENIED');
+      expect(snap.lastErrorMessage).toBe('github-auth: fix credentials on this host');
+    } finally {
+      prune.mockRestore();
+    }
+  });
+
+  it('keeps message and class paired when a rate limit aborts a cycle that already saw a refusal', async () => {
+    const prune = vi.spyOn(CommentCursorStore.prototype, 'pruneSources')
+      .mockRejectedValue(new Error('cursor persistence unavailable'));
+    driver.projectViewError = new DriverOpError('op projectView failed (exit 1, class ACCESS_DENIED): HTTP 401', {
+      opName: 'projectView', errorClass: 'ACCESS_DENIED', exitCode: 1,
+    });
+    driver.listPrsError = new DriverOpError('op listPrs failed (exit 1, class RATE_LIMIT): HTTP 429', {
+      opName: 'listPrs', errorClass: 'RATE_LIMIT', exitCode: 1,
+    });
+    try {
+      const poller = makePoller();
+      await poller.poll();
+      const snap = poller.snapshots()[0]!;
+      expect(snap.rateLimitedUntil).toBeDefined();
+      expect(snap.lastErrorClass).toBe('ACCESS_DENIED');
+      expect(snap.lastErrorMessage).toBe('projectView: op projectView failed (exit 1, class ACCESS_DENIED): HTTP 401');
+    } finally {
+      prune.mockRestore();
+    }
   });
 
   it('backs off when the preflight itself is rate limited instead of hammering every cycle', async () => {

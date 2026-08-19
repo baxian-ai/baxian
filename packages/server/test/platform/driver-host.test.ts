@@ -247,6 +247,10 @@ describe('driver row validation boundary', () => {
       buildOn('pf.example', { ...numericIdDriver(GOOD_PR), runPreflightSteps } as PlatformDriver);
     const ok = withPreflight(async () => [{ step: 'auth', ok: true, message: 'signed in' }]);
     await expect(ok.runPreflightSteps()).resolves.toEqual([{ step: 'auth', ok: true, message: 'signed in' }]);
+    const classified = withPreflight(async () => [{ step: 'auth', ok: false, message: 'log in', errorClass: 'ACCESS_DENIED' }]);
+    await expect(classified.runPreflightSteps()).resolves.toEqual([
+      { step: 'auth', ok: false, message: 'log in', errorClass: 'ACCESS_DENIED' },
+    ]);
     const cases: Array<[unknown, RegExp]> = [
       [null, /runPreflightSteps must return an array \(got null\)/],
       ['ready', /runPreflightSteps must return an array \(got string\)/],
@@ -254,6 +258,7 @@ describe('driver row validation boundary', () => {
       [[{ step: 'auth', ok: true, message: 'x' }, { step: 7, ok: true, message: 'x' }], /runPreflightSteps\[1\]\.step must be a string/],
       [[{ step: 'auth', ok: 'false', message: 'x' }], /runPreflightSteps\[0\]\.ok must be a boolean/],
       [[{ step: 'auth', ok: true }], /runPreflightSteps\[0\]\.message must be a string/],
+      [[{ step: 'auth', ok: false, message: 'x', errorClass: 401 }], /runPreflightSteps\[0\]\.errorClass must be a string when present/],
     ];
     for (const [result, expected] of cases) {
       await expect(withPreflight(async () => result).runPreflightSteps()).rejects.toThrow(expected);

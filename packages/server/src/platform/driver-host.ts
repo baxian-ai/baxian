@@ -11,6 +11,7 @@ import {
   type PlatformDriver,
   type PlatformPromptContext,
   type PlatformProvider,
+  type PreflightStep,
 } from './types.js';
 
 const builtinProviders: readonly PlatformProvider[] = [githubProvider];
@@ -158,7 +159,7 @@ function assertCommentSources(sources: unknown): void {
   }
 }
 
-function assertPreflightSteps(value: unknown): Array<{ step: string; ok: boolean; message: string }> {
+function assertPreflightSteps(value: unknown): PreflightStep[] {
   if (!Array.isArray(value)) {
     throw new Error(`runPreflightSteps must return an array (got ${value === null ? 'null' : typeof value})`);
   }
@@ -168,8 +169,11 @@ function assertPreflightSteps(value: unknown): Array<{ step: string; ok: boolean
     // A truthy non-boolean (e.g. 'false') would silently pass the gate; consumers branch on !ok.
     if (typeof item.ok !== 'boolean') throw new Error(`runPreflightSteps[${i}].ok must be a boolean`);
     if (typeof item.message !== 'string') throw new Error(`runPreflightSteps[${i}].message must be a string`);
+    if (item.errorClass !== undefined && typeof item.errorClass !== 'string') {
+      throw new Error(`runPreflightSteps[${i}].errorClass must be a string when present`);
+    }
   }
-  return value as Array<{ step: string; ok: boolean; message: string }>;
+  return value as PreflightStep[];
 }
 
 function withRowValidation(driver: PlatformDriver): PlatformDriver {

@@ -14,6 +14,7 @@ import {
   type PlatformAgentPrompts,
   type PlatformDriver,
   type PlatformProvider,
+  type PreflightStep,
 } from './types.js';
 
 const DRIVER_MAX_BUFFER = 64 * 1024 * 1024;
@@ -57,6 +58,11 @@ const ERROR_MATCHERS: Array<{ class: string; regexes: RegExp[] }> = [
   { class: 'MERGE_BLOCKED', regexes: [/Pull Request is not mergeable/, /Head branch was modified/, /Base branch was modified/] },
   { class: 'NOT_FOUND', regexes: [/HTTP 404/, /Not Found/] },
 ];
+
+export const GITHUB_AUTH_FIX =
+  'GitHub CLI has no valid credentials for the user running baxian on this host. '
+  + 'If GH_TOKEN or GITHUB_TOKEN is set in that environment (GH_TOKEN wins; both override stored logins), '
+  + 'replace or unset it there; otherwise run "gh auth login --hostname github.com" as that user.';
 
 const GITHUB_REPO_URL_RE =
   /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+?)(?:\.git)?\/?$/;
@@ -220,15 +226,16 @@ export class GitHubDriver implements PlatformDriver {
     return undefined;
   }
 
-  async runPreflightSteps(): Promise<Array<{ step: string; ok: boolean; message: string }>> {
+  async runPreflightSteps(): Promise<PreflightStep[]> {
     const auth = await this.preflightStep('github-auth', ['gh', 'api', 'user']);
-    return [auth.ok
-      ? { step: auth.step, ok: true, message: 'GitHub CLI authenticated' }
-      : {
-          step: auth.step,
-          ok: false,
-          message: 'Run "gh auth login --hostname github.com" or set GITHUB_TOKEN',
-        }];
+    if (auth.ok) return [{ step: auth.step, ok: true, message: 'GitHub CLI authenticated' }];
+    const errorClass = this.classify(auth.output);
+    return [{
+      step: auth.step,
+      ok: false,
+      message: GITHUB_AUTH_FIX,
+      ...(errorClass === undefined ? {} : { errorClass }),
+    }];
   }
 
   async prView(prNumber: number): Promise<NormalizedRow> {

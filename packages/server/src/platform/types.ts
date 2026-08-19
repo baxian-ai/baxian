@@ -47,7 +47,7 @@ export type DriverExec = (
 export interface PlatformDriver {
   readonly visibilityLagMs: number;
   readonly commentSources: readonly CommentSource[];
-  runPreflightSteps(): Promise<Array<{ step: string; ok: boolean; message: string }>>;
+  runPreflightSteps(): Promise<PreflightStep[]>;
   projectView(): Promise<NormalizedRow>;
   prView(prNumber: number): Promise<NormalizedRow>;
   branchView(remoteProjectId: string, branch: string): Promise<NormalizedRow>;
@@ -85,6 +85,13 @@ export interface PlatformPluginHost {
 export interface PlatformPlugin {
   readonly apiVersion: typeof PLATFORM_PLUGIN_API_VERSION;
   readonly provider: PlatformProvider;
+}
+
+export interface PreflightStep {
+  step: string;
+  ok: boolean;
+  message: string;
+  errorClass?: string;
 }
 
 export class DriverOpError extends Error {

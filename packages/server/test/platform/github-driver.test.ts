@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   GITHUB_AGENT_PROMPTS,
+  GITHUB_AUTH_FIX,
   GitHubDriver,
   githubProvider,
 } from '../../src/platform/github-driver.js';
@@ -209,7 +210,14 @@ describe('GitHubDriver', () => {
 
     const unauthenticated = harness([result('', 1, 'not logged in')]);
     await expect(unauthenticated.driver.runPreflightSteps()).resolves.toEqual([
-      expect.objectContaining({ step: 'github-auth', ok: false }),
+      { step: 'github-auth', ok: false, message: GITHUB_AUTH_FIX },
+    ]);
+    // GH_TOKEN/GITHUB_TOKEN override stored logins, so the fix must start there before suggesting gh auth login.
+    expect(GITHUB_AUTH_FIX).toMatch(/GH_TOKEN or GITHUB_TOKEN[\s\S]*replace or unset[\s\S]*otherwise run "gh auth login --hostname github.com"/);
+
+    const badCredentials = harness([result('', 1, 'gh: Bad credentials (HTTP 401)')]);
+    await expect(badCredentials.driver.runPreflightSteps()).resolves.toEqual([
+      expect.objectContaining({ step: 'github-auth', ok: false, errorClass: 'ACCESS_DENIED' }),
     ]);
 
     const limited = harness([result('', 1, 'secondary rate limit')]);
