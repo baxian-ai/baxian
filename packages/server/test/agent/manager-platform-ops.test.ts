@@ -152,7 +152,6 @@ function gitTask(over: Partial<TaskState> = {}): TaskState {
     prNumber: 42, branch: 'bx/task-1', branchCreatedByBaxian: true,
     platformBinding: { repoKey: 'github.com/owner/repo' },
     baseBranch: 'main', latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
-    replyActorId: '77', replyActorStatus: 'verified',
     passToken: 'abcdef123456', failToken: '123456abcdef',
     passProvenance: {
       sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64), token: 'abcdef123456',
@@ -2562,47 +2561,6 @@ describe('confirm merge recovery routing', () => {
   });
 });
 
-describe('git reconciliation watcher rearm on lease dispatch', () => {
-  it('arms the dev reconciliation entry only while the actor remains provisional', async () => {
-    await seed({
-      status: 'review', prNumber: 42, qaAgentId: 'qa-1', signalToken: 'ffff00001111',
-      pendingPrSignalToken: 'aaaa11112222', replyActorId: '99', replyActorStatus: 'provisional',
-    });
-    const armCalls: Array<{ agentId: string; kinds: unknown; token: string }> = [];
-    const managerAny = manager as unknown as {
-      setupPhaseSignalWatcher: (
-        taskId: string, agentId: string, kinds: unknown, token: string, opts?: unknown,
-      ) => Promise<boolean>;
-    };
-    vi.spyOn(managerAny, 'setupPhaseSignalWatcher').mockImplementation(
-      async (_taskId, agentId, kinds, token) => {
-        armCalls.push({ agentId, kinds, token });
-        return true;
-      },
-    );
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const first = await manager.beginGitReviewPass('task-1', {
-      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
-    });
-    await manager.dispatchGitReviewLease('task-1', {
-      expectedGeneration: first!.task.reviewDispatch!.generation,
-    });
-    expect(armCalls).toHaveLength(2);
-    expect(armCalls[1]).toMatchObject({ agentId: 'dev-1', token: 'aaaa11112222' });
-
-    armCalls.length = 0;
-    await taskStore.set({ ...(await taskStore.get('task-1'))!, replyActorStatus: 'verified', updatedAt: new Date().toISOString() });
-    const second = await manager.beginGitReviewPass('task-1', {
-      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
-    });
-    await manager.dispatchGitReviewLease('task-1', {
-      expectedGeneration: second!.task.reviewDispatch!.generation,
-    });
-    expect(armCalls).toHaveLength(1);
-  });
-});
-
 describe('manual dispatch binding recheck', () => {
   it('requires an explicit stage before manually recovering an unconfirmed git delivery', async () => {
     await seed({
@@ -2611,15 +2569,10 @@ describe('manual dispatch binding recheck', () => {
       deliveryConfirmation: undefined,
       reviewRound: 0,
       signalToken: 'initial-delivery',
-      pendingPrSignalToken: 'initial-delivery',
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
     });
     const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
 
-    await expect(manager.dispatchReviewToQa('task-1', {
-      actorId: '77',
-    })).rejects.toMatchObject({
+    await expect(manager.dispatchReviewToQa('task-1', {})).rejects.toMatchObject({
       status: 400,
       message: expect.stringContaining('stage is required'),
     });
@@ -2635,9 +2588,6 @@ describe('manual dispatch binding recheck', () => {
       deliveryConfirmation: undefined,
       reviewRound: 0,
       signalToken: 'initial-delivery',
-      pendingPrSignalToken: 'initial-delivery',
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
     });
     const verify = vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true,
@@ -2650,15 +2600,12 @@ describe('manual dispatch binding recheck', () => {
 
     const result = await manager.dispatchReviewToQa('task-1', {
       stage: 'spec',
-      actorId: '77',
     });
 
     expect(result).toMatchObject({
       status: 'review',
       phase: 'spec',
       deliveryConfirmation: { phase: 'spec', source: 'human' },
-      replyActorId: '77',
-      replyActorStatus: 'verified',
       reviewRound: 0,
       reviewDispatch: {
         phase: 'pending',
@@ -2666,7 +2613,6 @@ describe('manual dispatch binding recheck', () => {
       },
     });
     expect(result.specReviewRound ?? 0).toBe(0);
-    expect(result.pendingPrSignalToken).toBeUndefined();
     expect(verify).toHaveBeenCalledTimes(2);
   });
 
@@ -2677,8 +2623,6 @@ describe('manual dispatch binding recheck', () => {
       deliveryConfirmation: undefined,
       reviewRound: 1,
       signalToken: 'ffff00001111',
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
     });
     const verify = vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true,
@@ -2691,15 +2635,12 @@ describe('manual dispatch binding recheck', () => {
 
     const result = await manager.dispatchReviewToQa('task-1', {
       stage: 'code',
-      actorId: '77',
     });
 
     expect(result).toMatchObject({
       status: 'review',
       phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'human' },
-      replyActorId: '77',
-      replyActorStatus: 'verified',
       reviewDispatch: { phase: 'pending', effectiveRound: 2 },
     });
     expect(verify).toHaveBeenCalledTimes(2);
@@ -2712,8 +2653,6 @@ describe('manual dispatch binding recheck', () => {
       deliveryConfirmation: undefined,
       reviewRound: 1,
       signalToken: 'ffff00001111',
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
     });
     vi.spyOn(manager, 'platformVerifyPrBinding').mockImplementationOnce(async () => {
       await manager.updateTask('task-1', { signalToken: 'eeee99990000' });
@@ -2727,17 +2666,12 @@ describe('manual dispatch binding recheck', () => {
 
     await expect(manager.dispatchReviewToQa('task-1', {
       stage: 'code',
-      actorId: '77',
     })).rejects.toMatchObject({
       status: 409,
       code: 'dispatch-superseded',
     });
 
-    expect(await taskStore.get('task-1')).toMatchObject({
-      signalToken: 'eeee99990000',
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
-    });
+    expect(await taskStore.get('task-1')).toMatchObject({ signalToken: 'eeee99990000' });
     expect((await taskStore.get('task-1'))?.deliveryConfirmation).toBeUndefined();
   });
 
@@ -2752,9 +2686,6 @@ describe('manual dispatch binding recheck', () => {
       branchCreatedByBaxian: false,
       reviewRound: 0,
       signalToken: 'initial-delivery',
-      pendingPrSignalToken: 'initial-delivery',
-      replyActorId: undefined,
-      replyActorStatus: undefined,
       reviewDispatch: undefined,
     });
     driver.prViewResult = prRow({
@@ -2768,7 +2699,6 @@ describe('manual dispatch binding recheck', () => {
     const result = await manager.dispatchReviewToQa('task-1', {
       prNumber: 73,
       stage: 'code',
-      actorId: '77',
     });
 
     expect(result).toMatchObject({
@@ -2778,8 +2708,6 @@ describe('manual dispatch binding recheck', () => {
       branch: 'feature/manual-review',
       phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'human' },
-      replyActorId: '77',
-      replyActorStatus: 'verified',
       reviewDispatch: { phase: 'pending', effectiveRound: 1 },
     });
     expect(driver.ops.filter(op => op.op === 'prView').map(op => op.vars))
@@ -2795,9 +2723,6 @@ describe('manual dispatch binding recheck', () => {
       branch: 'feature/manual-review',
       branchCreatedByBaxian: false,
       signalToken: 'initial-delivery',
-      pendingPrSignalToken: 'initial-delivery',
-      replyActorId: undefined,
-      replyActorStatus: undefined,
       reviewDispatch: undefined,
     });
     driver.prViewResult = prRow({ prNumber: 73, branch: 'feature/unrelated' });
@@ -2805,7 +2730,6 @@ describe('manual dispatch binding recheck', () => {
     await expect(manager.dispatchReviewToQa('task-1', {
       prNumber: 73,
       stage: 'code',
-      actorId: '77',
     })).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('binding branch'),
@@ -2826,15 +2750,12 @@ describe('manual dispatch binding recheck', () => {
       phase: undefined,
       deliveryConfirmation: undefined,
       signalToken: 'initial-delivery',
-      pendingPrSignalToken: 'initial-delivery',
-      replyActorStatus: 'provisional',
     });
     const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
 
     await expect(manager.dispatchReviewToQa('task-1', {
       prNumber: 73,
       stage: 'code',
-      actorId: '77',
     })).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already bound to PR #42'),

@@ -66,7 +66,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const [advancing, setAdvancing] = useState(false);
   const [reviewRecoveryOpen, setReviewRecoveryOpen] = useState(false);
   const [reviewRecoveryStage, setReviewRecoveryStage] = useState<TaskPhase>('spec');
-  const [reviewRecoveryActorId, setReviewRecoveryActorId] = useState('');
   const [reviewRecoveryPrNumber, setReviewRecoveryPrNumber] = useState('');
   const [completing, setCompleting] = useState(false);
   const [continuing, setContinuing] = useState(false);
@@ -152,7 +151,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const dispatchAdvance = async (
     currentTask: TaskState,
     executor: 'dev' | 'qa',
-    body?: { stage?: TaskPhase; actorId?: string; prNumber?: number; confirmRevoked?: boolean },
+    body?: { stage?: TaskPhase; prNumber?: number; confirmRevoked?: boolean },
   ) => {
     setAdvancing(true);
     try {
@@ -183,7 +182,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const actionLabel = advanceActionLabel(task, selected);
     if (selected === 'qa' && needsGitReviewRecovery(task)) {
       setReviewRecoveryStage(task.phase ?? 'spec');
-      setReviewRecoveryActorId(task.replyActorId ?? '');
       setReviewRecoveryPrNumber(task.prNumber?.toString() ?? '');
       setReviewRecoveryOpen(true);
       return;
@@ -438,7 +436,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 type="submit"
                 form="review-recovery-form"
                 disabled={advancing
-                  || reviewRecoveryActorId.trim() === ''
                   || (task.prNumber === undefined
                     && positivePrNumber(reviewRecoveryPrNumber) === undefined)}
                 className="btn-primary"
@@ -453,12 +450,10 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             className="space-y-4"
             onSubmit={(event) => {
               event.preventDefault();
-              const actorId = reviewRecoveryActorId.trim();
               const prNumber = task.prNumber ?? positivePrNumber(reviewRecoveryPrNumber);
-              if (!actorId || prNumber === undefined || advancing) return;
+              if (prNumber === undefined || advancing) return;
               void dispatchAdvance(task, 'qa', {
                 stage: reviewRecoveryStage,
-                actorId,
                 ...(task.prNumber === undefined ? { prNumber } : {}),
               });
             }}
@@ -498,22 +493,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 <option value="spec">{t.taskDetail.reviewRecoveryStageSpec}</option>
                 <option value="code">{t.taskDetail.reviewRecoveryStageCode}</option>
               </select>
-            </div>
-            <div>
-              <label htmlFor="review-recovery-actor" className="mb-1 block text-sm text-og-700">
-                {t.taskDetail.reviewRecoveryActorLabel}
-              </label>
-              <input
-                id="review-recovery-actor"
-                value={reviewRecoveryActorId}
-                required
-                disabled={advancing || (
-                  task.replyActorStatus === 'verified' && task.replyActorId !== undefined
-                )}
-                onChange={(event) => setReviewRecoveryActorId(event.target.value)}
-                placeholder={t.taskDetail.reviewRecoveryActorPlaceholder}
-                className={inputCls}
-              />
             </div>
           </form>
         </Modal>

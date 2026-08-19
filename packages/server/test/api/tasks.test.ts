@@ -444,7 +444,6 @@ describe('POST /api/tasks/:id/advance', () => {
       executor: 'qa',
       prNumber: 73,
       stage: 'spec',
-      actorId: '  77  ',
       note: '  verified delivery  ',
     });
 
@@ -453,7 +452,6 @@ describe('POST /api/tasks/:id/advance', () => {
       executor: 'qa',
       prNumber: 73,
       stage: 'spec',
-      actorId: '77',
       note: 'verified delivery',
     });
     expect(resetTask).toHaveBeenCalledWith('task-001');
@@ -478,8 +476,6 @@ describe('POST /api/tasks/:id/advance', () => {
   it.each([
     [{ executor: 'ops' }, 'executor must be'],
     [{ stage: 'design' }, 'stage must be'],
-    [{ actorId: '' }, 'actorId must be'],
-    [{ actorId: 77 }, 'actorId must be'],
     [{ prNumber: 0 }, 'prNumber must be'],
     [{ confirmRevoked: 'yes' }, 'confirmRevoked must be'],
     [{ note: 7 }, 'note must be'],

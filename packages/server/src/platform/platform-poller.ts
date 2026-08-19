@@ -31,8 +31,6 @@ export interface PlatformTaskView {
   signalToken?: string;
   expectedBase?: string;
   latestHeadSha?: string;
-  replyActorId?: string;
-  replyActorStatus?: 'verified' | 'provisional';
   closedUnmergedAnchor?: boolean;
   inReview?: boolean;
 }
@@ -55,8 +53,6 @@ export function platformTaskView(task: TaskState): PlatformTaskView {
     ...(task.signalToken !== undefined ? { signalToken: task.signalToken } : {}),
     ...(task.baseBranch !== undefined ? { expectedBase: task.baseBranch } : {}),
     ...(task.latestHeadSha !== undefined ? { latestHeadSha: task.latestHeadSha } : {}),
-    ...(task.replyActorId !== undefined ? { replyActorId: task.replyActorId } : {}),
-    ...(task.replyActorStatus !== undefined ? { replyActorStatus: task.replyActorStatus } : {}),
   };
 }
 
@@ -706,7 +702,6 @@ export class PlatformPoller {
         entry.adoptionDeferrals.delete(prNumber);
         await this.emit(entry, 'pr.created', {
           ...base, headSha: String(row.headSha), targetBranch: target,
-          ...(typeof row.prAuthorId === 'string' ? { prAuthorId: row.prAuthorId } : {}),
         }, task.taskId);
         const adoptedTask = await this.opts.task(task.taskId);
         if (adoptedTask?.prNumber !== prNumber) {
@@ -917,10 +912,7 @@ export class PlatformPoller {
     const scans = await scanCommentSourcesOnce(entry.driver, base.prNumber, this.now,
       (key, error) => fail(`listComments[${key}] pr#${base.prNumber}`, error), collector);
 
-    const ackCollection = collectValidAcks(buildAckCarrierRows(scans), {
-      replyActorId: task.replyActorId,
-      replyActorStatus: task.replyActorStatus,
-    });
+    const ackCollection = collectValidAcks(buildAckCarrierRows(scans));
 
     for (const scan of scans) {
       if (!scan.ok) continue;

@@ -1,4 +1,4 @@
-import { decodeSignalActorId, type PhaseSignalKind } from '../agent/phase-signal.js';
+import type { PhaseSignalKind } from '../agent/phase-signal.js';
 import { BODY_DIGEST_SOURCE } from '../platform/body-digest.js';
 import { ackRevisionKey } from '../platform/markers.js';
 import { LINE_SAFE_ID_RE } from '../platform/row-schema.js';
@@ -1057,32 +1057,6 @@ export function registerEventHandlers(
     if (event.data.source === 'pane-signal'
       && taskAtEntry.prNumber !== undefined && taskAtEntry.prNumber === event.data.prNumber
       && taskAtEntry.status !== 'in_progress') {
-      if (taskAtEntry.phase !== deliveryPhase) return;
-      if (taskAtEntry.pendingPrSignalToken === undefined
-        || event.data.token !== taskAtEntry.pendingPrSignalToken) {
-        return;
-      }
-      if (taskAtEntry.replyActorStatus !== 'verified') {
-        const actorId = typeof event.data.actorB64 === 'string'
-          ? decodeSignalActorId(event.data.actorB64)
-          : undefined;
-        if (actorId === undefined) {
-          await manager.rearmGitReconciliationWatcher(taskAtEntry.id, { skipSnapshot: true });
-          await emitIntervention(bus, taskAtEntry.projectId, event.agentId, taskAtEntry.id, {
-            phase: 'git-pr-created-actor-missing',
-            claimedPrNumber: event.data.prNumber as number,
-          });
-          return;
-        }
-        await manager.updateTask(taskAtEntry.id, {
-          replyActorId: actorId,
-          replyActorStatus: 'verified',
-          pendingPrSignalToken: undefined,
-        });
-      }
-      if (taskAtEntry.status === 'review') {
-        manager.stopPhaseSignalWatcherAgent(taskAtEntry.id, event.agentId);
-      }
       return;
     }
 
@@ -1181,23 +1155,11 @@ export function registerEventHandlers(
         ...(typeof event.data.prUrl === 'string' ? { prUrl: event.data.prUrl } : {}),
         headSha: reviewHead,
         ...(target !== undefined ? { targetBranch: target } : {}),
-        ...(typeof event.data.prAuthorId === 'string' ? { prAuthorId: event.data.prAuthorId } : {}),
       });
       return;
     }
 
-    const actorId = typeof event.data.actorB64 === 'string'
-      ? decodeSignalActorId(event.data.actorB64)
-      : undefined;
-    if (actorId === undefined || typeof event.data.prNumber !== 'number') {
-      await reArmDevelopWatcher(manager, task, event.agentId);
-      await emitIntervention(bus, task.projectId, event.agentId, event.taskId, {
-        phase: 'git-pr-delivery-actor-missing',
-        deliveryPhase,
-        claimedPrNumber: event.data.prNumber,
-      });
-      return;
-    }
+    if (typeof event.data.prNumber !== 'number') return;
     const confirmed = await manager.confirmGitDelivery(event.taskId, {
       phase: deliveryPhase,
       source: 'signal',
@@ -1206,7 +1168,6 @@ export function registerEventHandlers(
       headSha: reviewHead,
       ...(target !== undefined ? { targetBranch: target } : {}),
       ...(reconciledBranch !== undefined ? { branch: reconciledBranch } : {}),
-      actorId,
       expectedSignalToken: typeof event.data.token === 'string' ? event.data.token : undefined,
     });
     if (!confirmed) {

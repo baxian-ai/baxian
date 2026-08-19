@@ -942,7 +942,6 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
     const t = await harness.seedTask({
       status: 'review', phase: 'code', qaAgentId: 'qa-1', prNumber: 12,
       deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-      replyActorId: '77', replyActorStatus: 'verified',
       reviewRound: 1, signalToken: '111111111111', reviewHeadAnchorSha: headSha,
       passToken: '222222222222', failToken: '333333333333',
       reviewDispatch: {

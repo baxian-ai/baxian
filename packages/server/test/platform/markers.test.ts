@@ -3,7 +3,7 @@ import {
   buildReviewTokenLine, extractReviewTokens, buildAckMarker, extractAckMarkers,
   stripBaxianMarkerLines, collectValidAcks,
   projectCommentRow, rowAcks, rowBodyDigest, rowHasBody, rowTokens,
-  type AckCarrierRow, type AckActorContext,
+  type AckCarrierRow,
 } from '../../src/platform/markers.js';
 
 const SHA = 'abc123abc123abc123abc123abc123abc123abc1';
@@ -94,47 +94,39 @@ describe('row projection', () => {
 });
 
 describe('collectValidAcks: carrier matrix', () => {
-  const verified: AckActorContext = { replyActorId: '77', replyActorStatus: 'verified' };
   const ackTo = (sourceKey: string, commentId: string) => ({ sourceKey, commentId, bodyDigest: DIGEST });
   const row = (over: Partial<AckCarrierRow>): AckCarrierRow => ({
-    sourceKey: 'issue-comments', sourceClass: 'top-level', id: '1', authorId: '77',
+    sourceKey: 'issue-comments', sourceClass: 'top-level', id: '1',
     discussionId: null, acks: [ackTo('inline-comments', '55')], carriesToken: false, ...over,
   });
   const key = (sourceKey: string, commentId: string) => `${sourceKey}:${commentId}:${DIGEST}`;
 
-  it('accepts top-level rows from the verified actor for any source and reports the carrier', () => {
-    const r = collectValidAcks([row({})], verified);
+  it('accepts top-level rows for any source regardless of author and reports the carrier', () => {
+    const r = collectValidAcks([row({})]);
     expect(r.acks).toEqual(new Set([key('inline-comments', '55')]));
     expect(r.carrierRowKeys).toEqual(new Set(['issue-comments:1']));
   });
 
-  it('is fail-closed for provisional actors and mismatched author ids', () => {
-    expect(collectValidAcks([row({})], { replyActorId: '77', replyActorStatus: 'provisional' }).acks.size).toBe(0);
-    expect(collectValidAcks([row({ authorId: '78' })], verified).acks.size).toBe(0);
-    expect(collectValidAcks([row({ authorId: undefined })], verified).acks.size).toBe(0);
-    expect(collectValidAcks([row({})], {}).acks.size).toBe(0);
-  });
-
   it('never accepts reviews-class rows as carriers', () => {
-    const r = collectValidAcks([row({ sourceClass: 'reviews', sourceKey: 'reviews' })], verified);
+    const r = collectValidAcks([row({ sourceClass: 'reviews', sourceKey: 'reviews' })]);
     expect(r.acks.size).toBe(0);
     expect(r.carrierRowKeys.size).toBe(0);
   });
 
   it('never accepts rows carrying a verdict token', () => {
-    expect(collectValidAcks([row({ carriesToken: true })], verified).acks.size).toBe(0);
+    expect(collectValidAcks([row({ carriesToken: true })]).acks.size).toBe(0);
   });
 
   it('threaded rows ack any revision of their own thread, root and replies alike', () => {
     const thread = (over: Partial<AckCarrierRow>): AckCarrierRow => ({
-      sourceKey: 'inline-comments', sourceClass: 'threaded', id: 'x', authorId: undefined,
+      sourceKey: 'inline-comments', sourceClass: 'threaded', id: 'x',
       discussionId: null, acks: [], carriesToken: false, ...over,
     });
     const root = thread({ id: '55' });
     const reply = thread({ id: '56', discussionId: '55' });
     const otherThreadRoot = thread({ id: '90' });
     const devAck = thread({
-      id: '57', discussionId: '55', authorId: '77',
+      id: '57', discussionId: '55',
       acks: [
         ackTo('inline-comments', '55'),
         ackTo('inline-comments', '56'),
@@ -143,12 +135,12 @@ describe('collectValidAcks: carrier matrix', () => {
         ackTo('issue-comments', '55'),
       ],
     });
-    const r = collectValidAcks([root, reply, otherThreadRoot, devAck], verified);
+    const r = collectValidAcks([root, reply, otherThreadRoot, devAck]);
     expect(r.acks).toEqual(new Set([key('inline-comments', '55'), key('inline-comments', '56')]));
     expect(r.carrierRowKeys).toEqual(new Set(['inline-comments:57']));
   });
 
   it('threaded top-level rows (no discussionId) are not carriers', () => {
-    expect(collectValidAcks([row({ sourceClass: 'threaded', discussionId: null })], verified).acks.size).toBe(0);
+    expect(collectValidAcks([row({ sourceClass: 'threaded', discussionId: null })]).acks.size).toBe(0);
   });
 });

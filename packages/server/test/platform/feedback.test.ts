@@ -9,7 +9,6 @@ import type { FeedbackSourceScan } from '../../src/platform/feedback.js';
 
 const SHA = 'a'.repeat(40);
 const TS = '2026-07-17T01:02:03Z';
-const verified = { replyActorId: '77', replyActorStatus: 'verified' } as const;
 
 function row(id: string, body: string | null, extra: Record<string, unknown> = {}): NormalizedRow {
   const r: NormalizedRow = { id, body, createdAt: TS, updatedAt: TS, ...extra };
@@ -29,9 +28,9 @@ describe('collectPendingFeedback', () => {
     const failBody = `blocking findings\n${failLine}`;
     const humanBody = 'please also fix the tests';
     const result = collectPendingFeedback([
-      scan('reviews', 'reviews', [row('r1', failBody, { authorId: '99' })]),
-      scan('issue-comments', 'top-level', [row('c1', humanBody, { authorId: '5' })]),
-    ], verified);
+      scan('reviews', 'reviews', [row('r1', failBody)]),
+      scan('issue-comments', 'top-level', [row('c1', humanBody)]),
+    ]);
     expect(result.allSourcesOk).toBe(true);
     expect([...result.pending.keys()].sort()).toEqual([
       `issue-comments:c1:${sha256Hex(humanBody)}`,
@@ -44,8 +43,8 @@ describe('collectPendingFeedback', () => {
     const ack = `done\n${buildAckMarker({ sourceKey: 'reviews', commentId: 'r1', bodyDigest: sha256Hex(failBody) })}`;
     const result = collectPendingFeedback([
       scan('reviews', 'reviews', [row('r1', failBody), row('r2', `lgtm\n${passLine}`)]),
-      scan('issue-comments', 'top-level', [row('c9', ack, { authorId: '77' })]),
-    ], verified);
+      scan('issue-comments', 'top-level', [row('c9', ack)]),
+    ]);
     expect(result.pending.size).toBe(0);
   });
 
@@ -54,17 +53,17 @@ describe('collectPendingFeedback', () => {
     const result = collectPendingFeedback([
       scan('reviews', 'reviews', [row('r1', failBody)]),
       scan('issue-comments', 'top-level', []),
-    ], verified);
+    ]);
     expect(result.pending.size).toBe(1);
   });
 
-  it('does not let the verified actor own replies count as feedback', () => {
+  it('does not let ack-carrying replies count as feedback', () => {
     const result = collectPendingFeedback([
       scan('issue-comments', 'top-level', [
-        row('c1', 'third-party feedback', { authorId: '5' }),
-        row('c2', `on it\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('third-party feedback') })}`, { authorId: '77' }),
+        row('c1', 'third-party feedback'),
+        row('c2', `on it\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('third-party feedback') })}`),
       ]),
-    ], verified);
+    ]);
     expect(result.pending.size).toBe(0);
   });
 
@@ -73,15 +72,15 @@ describe('collectPendingFeedback', () => {
     projectCommentRow(pendingReview);
     const result = collectPendingFeedback([
       scan('reviews', 'reviews', [pendingReview]),
-    ], verified);
+    ]);
     expect(result.pending.size).toBe(0);
   });
 
   it('reports a failed source so callers stay fail closed', () => {
     const result = collectPendingFeedback([
       scan('reviews', 'reviews', [], false),
-      scan('issue-comments', 'top-level', [row('c1', 'feedback', { authorId: '5' })]),
-    ], verified);
+      scan('issue-comments', 'top-level', [row('c1', 'feedback')]),
+    ]);
     expect(result.allSourcesOk).toBe(false);
     expect(result.pending.size).toBe(1);
   });
@@ -91,28 +90,28 @@ describe('collectPendingFeedback', () => {
     const staleAck = buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('original requirement') });
     const result = collectPendingFeedback([
       scan('issue-comments', 'top-level', [
-        row('c1', edited, { authorId: '5' }),
-        row('c2', `handled\n${staleAck}`, { authorId: '77' }),
+        row('c1', edited),
+        row('c2', `handled\n${staleAck}`),
       ]),
-    ], verified);
+    ]);
     expect([...result.pending.keys()]).toEqual([`issue-comments:c1:${sha256Hex(edited)}`]);
   });
 });
 
 describe('feedbackEventTarget', () => {
   it('mirrors the poller synthesis matrix: token rows and carrier rows never become feedback events', () => {
-    const humanRow = row('c1', 'feedback', { authorId: '5' });
-    const ackRow = row('c2', `ok\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('feedback') })}`, { authorId: '77' });
+    const humanRow = row('c1', 'feedback');
+    const ackRow = row('c2', `ok\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('feedback') })}`);
     const failRow = row('r1', `no\n${failLine}`);
     const scans = [
       scan('issue-comments', 'top-level', [humanRow, ackRow]),
       scan('reviews', 'reviews', [failRow]),
     ];
-    const acks = collectValidAcks(buildAckCarrierRows(scans), verified);
+    const acks = collectValidAcks(buildAckCarrierRows(scans));
     expect(feedbackEventTarget(failRow, 'reviews', acks)).toBeUndefined();
     expect(feedbackEventTarget(ackRow, 'issue-comments', acks)).toBeUndefined();
     expect(feedbackEventTarget(humanRow, 'issue-comments', acks)).toBeUndefined();
-    const fresh = row('c3', 'new feedback', { authorId: '5' });
+    const fresh = row('c3', 'new feedback');
     expect(feedbackEventTarget(fresh, 'issue-comments', acks))
       .toEqual({ id: 'c3', digest: sha256Hex('new feedback') });
   });
@@ -204,8 +203,8 @@ describe('dismissed fail tokens', () => {
     const failBody = `findings\n${failLine}`;
     const result = collectPendingFeedback([
       scan('reviews', 'reviews', [row('r1', failBody, { reviewState: 'DISMISSED' })]),
-      scan('issue-comments', 'top-level', [row('c1', `quoted\n${failLine}`, { authorId: '5' })]),
-    ], verified);
+      scan('issue-comments', 'top-level', [row('c1', `quoted\n${failLine}`)]),
+    ]);
     expect(result.pending.size).toBe(0);
   });
 });

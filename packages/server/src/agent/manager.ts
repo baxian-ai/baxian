@@ -32,6 +32,7 @@ import {
   TASK_TERMINAL_STATUSES as TERMINAL_STATUSES,
   TASK_ACTIVE_STATUS_SET as ACTIVE_TASK_STATUSES,
   TASK_OWNER_ROLES,
+  TERMINAL_INTERVENTION_PHASES,
   effectiveTaskReviewRound,
   isSpecStagePhase,
   isTaskOpen,
@@ -215,14 +216,12 @@ interface GitPrObservation {
   prUrl?: string;
   headSha: string;
   targetBranch?: string;
-  prAuthorId?: string;
 }
 
 interface GitDeliveryConfirmation extends GitPrObservation {
   phase: TaskPhase;
   source: 'signal' | 'human';
   branch?: string;
-  actorId: string;
   expectedSignalToken?: string;
 }
 
@@ -443,7 +442,6 @@ export interface AdvanceTaskOptions {
   executor?: 'dev' | 'qa';
   agentId?: string;
   stage?: TaskPhase;
-  actorId?: string;
   prNumber?: number;
   confirmRevoked?: boolean;
   note?: string;
@@ -4322,12 +4320,9 @@ export class AgentManager {
             || fresh.phase !== task.phase
             || fresh.signalToken !== signalToken
           ) return false;
-          const rotatePendingPr = mapped.expectedKinds.includes('pr-created')
-            && fresh.pendingPrSignalToken === signalToken;
           await this.taskStore.set({
             ...fresh,
             signalToken: newToken,
-            ...(rotatePendingPr ? { pendingPrSignalToken: newToken } : {}),
             updatedAt: new Date().toISOString(),
           });
           return true;
@@ -4739,6 +4734,8 @@ export class AgentManager {
           ? event.data.reason
           : 'human-intervention';
       const reason = reasonValue.trim() || 'human-intervention';
+      // terminal attach/detach/input/close are audit trail, not a task blocked on a human
+      if ((TERMINAL_INTERVENTION_PHASES as readonly string[]).includes(reason)) return;
       if (reason === 'recovery-failed' && TERMINAL_STATUSES.includes(task.status)) return;
       const previousPhase = typeof event.data.previousPhase === 'string'
         ? event.data.previousPhase.trim()
@@ -5329,8 +5326,7 @@ export class AgentManager {
       expectedTask?: TaskGenerationGuard;
       allowDuringComplete?: boolean;
       patch?: Partial<Pick<TaskState,
-        | 'prNumber' | 'prUrl' | 'latestHeadSha' | 'branch' | 'baseBranch'
-        | 'replyActorId' | 'replyActorStatus' | 'pendingPrSignalToken'>>;
+        | 'prNumber' | 'prUrl' | 'latestHeadSha' | 'branch' | 'baseBranch'>>;
     },
   ): Promise<TransitionResult | null> {
     if (!PLATFORM_HEAD_SHA_RE.test(opts.headSha)) {
@@ -5984,19 +5980,16 @@ export class AgentManager {
     for (const task of tasks) {
       if (!this.phaseSignalWatcher) continue;
       if (!task.signalToken) continue;
-      const mappings = this.mapTaskStateToExpectedWatchers(task);
-      if (mappings.length === 0) continue;
-      for (const mapped of mappings) {
-        await this.setupRecoveredWatcherForMapping(task, mapped.token ?? task.signalToken, mapped, mappings.length > 1);
-      }
+      const mapped = this.mapTaskStateToExpectedWatcher(task);
+      if (!mapped) continue;
+      await this.setupRecoveredWatcherForMapping(task, task.signalToken, mapped);
     }
   }
 
   private async setupRecoveredWatcherForMapping(
     task: TaskState,
     signalToken: string,
-    mapped: { expectedKinds: readonly PhaseSignalKind[]; agentId: string; token?: string },
-    hasSiblings: boolean,
+    mapped: { expectedKinds: readonly PhaseSignalKind[]; agentId: string },
   ): Promise<void> {
     {
       const { expectedKinds, agentId } = mapped;
@@ -6014,7 +6007,6 @@ export class AgentManager {
           token: signalToken,
           skipSnapshot: false,
           recovered: true,
-          ...(hasSiblings ? { replaceScope: 'agent' as const } : {}),
         });
         if (interventionKindLabel && armed && this.phaseSignalWatcher?.isSettling(task.id)) {
           await this.phaseSignalWatcher.awaitSettled(task.id);
@@ -6208,10 +6200,6 @@ export class AgentManager {
       branch: String(row.branch),
       targetBranch: String(row.targetBranch),
     };
-  }
-
-  stopPhaseSignalWatcherAgent(taskId: string, agentId: string): void {
-    this.phaseSignalWatcher?.stopAgent(taskId, agentId);
   }
 
   private async mutateRemoteCleanup(
@@ -6519,10 +6507,7 @@ export class AgentManager {
         ? { kind: 'retryable', reason: recheck.reason }
         : { kind: 'provenance-invalid', reason: `provenance ${recheck.reason}` };
     }
-    const pending = collectPendingFeedback(scans, {
-      replyActorId: task.replyActorId,
-      replyActorStatus: task.replyActorStatus,
-    });
+    const pending = collectPendingFeedback(scans);
     if (!pending.allSourcesOk) return { kind: 'retryable', reason: 'source scan incomplete' };
     return { kind: 'valid', pendingCount: pending.pending.size };
   }
@@ -6535,10 +6520,7 @@ export class AgentManager {
     if (failed.length > 0) {
       throw new Error(`pending-feedback scan incomplete; failed sources: ${failed.join(', ')}`);
     }
-    return collectPendingFeedback(scans, {
-      replyActorId: task.replyActorId,
-      replyActorStatus: task.replyActorStatus,
-    });
+    return collectPendingFeedback(scans);
   }
 
   async platformConfirmMerge(
@@ -6578,10 +6560,7 @@ export class AgentManager {
         }
         throw new PlatformMergeRecheckError('provenance-invalid', `provenance ${recheck.reason}`);
       }
-      const pending = collectPendingFeedback(scans, {
-        replyActorId: task.replyActorId,
-        replyActorStatus: task.replyActorStatus,
-      });
+      const pending = collectPendingFeedback(scans);
       if (!pending.allSourcesOk) throw new Error('merge blocked: pending-feedback scan incomplete');
       if (pending.pending.size > 0) {
         throw new PlatformMergeRecheckError(
@@ -6755,13 +6734,8 @@ export class AgentManager {
                 ? { phase: confirmation.phase, source: confirmation.source, at: now }
                 : task.deliveryConfirmation,
               ...(confirmation.branch !== undefined ? { branch: confirmation.branch } : {}),
-              replyActorId: confirmation.actorId,
-              replyActorStatus: 'verified' as const,
-              pendingPrSignalToken: undefined,
             }
-          : task.replyActorStatus !== 'verified' && observation.prAuthorId !== undefined
-            ? { replyActorId: observation.prAuthorId, replyActorStatus: 'provisional' as const }
-            : {}),
+          : {}),
         updatedAt: now,
       };
       await this.taskStore.set(next);
@@ -7229,7 +7203,7 @@ export class AgentManager {
   ): Promise<TaskState> {
     if (task.status === 'in_progress' && task.agentId) {
       const signalToken = createSignalToken();
-      await this.updateTask(task.id, this.dispatchTokenFields(signalToken));
+      await this.updateTask(task.id, { signalToken });
       const dispatchLockToken = (await this.agentStore.get(task.agentId))?.lockToken;
       const start = this.startCreatedTaskSession(
         task.id,
@@ -7785,7 +7759,7 @@ export class AgentManager {
     const claimed = claim.task;
 
     const signalToken = createSignalToken();
-    await this.updateTask(claimed.id, this.dispatchTokenFields(signalToken));
+    await this.updateTask(claimed.id, { signalToken });
 
     let started = false;
     let dispatchErr: unknown = null;
@@ -9697,7 +9671,6 @@ export class AgentManager {
       await releaseOwnAcquire();
       throw new ApiError(500, `Failed to arm git review verdict watcher for ${taskId}`);
     }
-    await this.rearmGitReconciliationWatcher(taskId);
 
     let started: boolean;
     try {
@@ -9756,7 +9729,6 @@ export class AgentManager {
       onSideEffect?: () => void;
       confirmUncertainNotDelivered?: boolean;
       stage?: TaskPhase;
-      actorId?: string;
       prNumber?: number;
     } = {},
   ): Promise<TaskState> {
@@ -9788,19 +9760,7 @@ export class AgentManager {
       if (opts.stage !== undefined && routeTask.phase !== undefined && routeTask.phase !== opts.stage) {
         throw new ApiError(409, `Task ${taskId} is in ${routeTask.phase}, not ${opts.stage}`);
       }
-      if (deliveryUnconfirmed
-        || routeTask.replyActorStatus !== 'verified'
-        || routeTask.prNumber === undefined) {
-        const actorId = routeTask.replyActorStatus === 'verified'
-          ? routeTask.replyActorId
-          : opts.actorId?.trim();
-        if (!actorId) {
-          throw new ApiError(
-            400,
-            `Task ${taskId} has no verified PR actor; actorId is required for manual recovery`,
-            'dispatch-unsupported',
-          );
-        }
+      if (deliveryUnconfirmed || routeTask.prNumber === undefined) {
         const prNumber = routeTask.prNumber ?? opts.prNumber;
         if (prNumber === undefined) {
           throw new ApiError(
@@ -9825,7 +9785,6 @@ export class AgentManager {
           branch: verified.branch,
           headSha: verified.headSha,
           targetBranch: verified.targetBranch,
-          actorId,
           expectedSignalToken: routeTask.signalToken,
         });
         if (!confirmed) {
@@ -9987,7 +9946,6 @@ export class AgentManager {
         fromStatus: [task.status],
         confirmUncertainNotDelivered: true,
         ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
-        ...(opts.actorId !== undefined ? { actorId: opts.actorId } : {}),
         ...(opts.prNumber !== undefined ? { prNumber: opts.prNumber } : {}),
       });
     } else if (task.status === 'review') {
@@ -10303,26 +10261,6 @@ export class AgentManager {
     kinds: readonly PhaseSignalKind[];
   } {
     return { phase: 'develop', kinds: this.devInitialSignalKinds() };
-  }
-
-  private mapTaskStateToExpectedWatchers(task: TaskState): Array<{
-    expectedKinds: readonly PhaseSignalKind[];
-    agentId: string;
-    token?: string;
-  }> {
-    const single = this.mapTaskStateToExpectedWatcher(task);
-    const mappings: Array<{ expectedKinds: readonly PhaseSignalKind[]; agentId: string; token?: string }> =
-      single ? [single] : [];
-    if (task.status === 'review'
-      && task.replyActorStatus !== 'verified' && task.pendingPrSignalToken !== undefined
-      && task.devAgentId && task.prNumber !== undefined) {
-      mappings.push({
-        expectedKinds: ['pr-created'],
-        agentId: task.devAgentId,
-        token: task.pendingPrSignalToken,
-      });
-    }
-    return mappings;
   }
 
   private mapTaskStateToExpectedWatcher(task: TaskState): {
@@ -10788,21 +10726,6 @@ export class AgentManager {
       'Pane-signal watcher failed to arm after dispatch; the prompt expects a signal with no consumer. Cancel the task or delete the agent to retry.',
       { expectedTaskId: taskId },
     );
-  }
-
-  dispatchTokenFields(signalToken: string): Partial<TaskState> {
-    return { signalToken, pendingPrSignalToken: signalToken };
-  }
-
-  async rearmGitReconciliationWatcher(taskId: string, opts: { skipSnapshot?: boolean } = {}): Promise<void> {
-    const task = await this.taskStore.get(taskId);
-    if (!task || task.status !== 'review') return;
-    if (task.replyActorStatus === 'verified' || task.pendingPrSignalToken === undefined) return;
-    if (!task.devAgentId || task.prNumber === undefined) return;
-    await this.setupPhaseSignalWatcher(taskId, task.devAgentId, ['pr-created'], task.pendingPrSignalToken, {
-      replaceScope: 'agent',
-      ...(opts.skipSnapshot ? { skipSnapshot: true } : {}),
-    }).catch(() => false);
   }
 
   async rotateAndSetupPhaseSignal(
@@ -11643,7 +11566,7 @@ export class AgentManager {
           ...(approval.prNumber !== undefined ? { prNumber: approval.prNumber } : {}),
           ...(approval.prUrl !== undefined ? { prUrl: approval.prUrl } : {}),
         } : {}),
-        ...this.dispatchTokenFields(newToken),
+        signalToken: newToken,
       },
     );
     if (!transition) {

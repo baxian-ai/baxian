@@ -99,6 +99,26 @@ describe('TaskStore', () => {
     expect((await readRawTask(task.id)).attention).toBeUndefined();
   });
 
+  it('drops terminal audit attention persisted by older versions even when the generation still matches', async () => {
+    for (const reason of ['attach', 'detach', 'input', 'close']) {
+      const id = `task-legacy-${reason}`;
+      await writeUnsanitizedTask(id, {
+        status: 'in_progress',
+        signalToken: 'abcdef123456',
+        attention: {
+          reason,
+          runbook: `Task ${id} requires human intervention for ${reason}.`,
+          occurredAt: NOW,
+          recommendedActions: ['advance', 'cancel'],
+          generation: { status: 'in_progress', signalToken: 'abcdef123456', agentId: 'dev-1', reviewRound: 0 },
+        },
+      });
+
+      expect((await store.get(id))?.attention, reason).toBeUndefined();
+      expect((await store.list()).find(t => t.id === id)?.attention, reason).toBeUndefined();
+    }
+  });
+
   it('keeps cleanup attention for its generation and drops it when cleanup completes', async () => {
     const task = makeTask({
       id: 'task-cleanup-attention',
@@ -528,8 +548,6 @@ describe('TaskStore git review fields', () => {
     passToken: 'abcdef123456',
     failToken: '123456abcdef',
     baseBranch: 'main',
-    replyActorId: '77',
-    replyActorStatus: 'verified',
     closedUnmergedAnchor: { prNumber: 42, generation: 1 },
     passProvenance: {
       sourceKey: 'reviews', id: '900', bodyDigest: 'a'.repeat(64),
@@ -544,6 +562,20 @@ describe('TaskStore git review fields', () => {
     await store.set(makeTask({ id: 'task-400', status: 'pending', ...gitFields }));
     const loaded = await store.get('task-400');
     expect(loaded).toMatchObject(gitFields);
+  });
+
+  it('drops the retired reply-actor fields persisted by older versions on load', async () => {
+    await writeUnsanitizedTask('task-legacy-actor', {
+      status: 'in_progress',
+      signalToken: 'abcdef123456',
+      replyActorId: '77',
+      replyActorStatus: 'provisional',
+      pendingPrSignalToken: 'abcdef123456',
+    });
+    const loaded = await store.get('task-legacy-actor');
+    expect(loaded).not.toHaveProperty('replyActorId');
+    expect(loaded).not.toHaveProperty('replyActorStatus');
+    expect(loaded).not.toHaveProperty('pendingPrSignalToken');
   });
 
   it('round-trips a task with its immutable platform binding', async () => {
@@ -757,7 +789,6 @@ describe('TaskStore git review fields', () => {
     const bad: Array<[string, Record<string, unknown>]> = [
       ['reviewConversationUpdatedAt', { reviewConversationUpdatedAt: 123 }],
       ['reviewConversationUpdatedAt', { reviewConversationUpdatedAt: '' }],
-      ['replyActorStatus', { replyActorStatus: 'trusted' }],
       ['passToken', { passToken: 'short' }],
       ['failToken', { failToken: 42 }],
       ['closedUnmergedAnchor', { closedUnmergedAnchor: { prNumber: 0, generation: 1 } }],

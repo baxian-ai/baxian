@@ -100,8 +100,6 @@ async function seedTask(over: Partial<TaskState> = {}): Promise<TaskState> {
     phase: 'code',
     reviewRound: 2,
     deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-    replyActorId: '77',
-    replyActorStatus: 'verified',
     signalToken: 'tok-current1',
     reviewHeadAnchorSha: SHA,
     latestHeadSha: SHA,

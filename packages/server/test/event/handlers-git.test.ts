@@ -95,7 +95,6 @@ function panePrCreated(data: Record<string, unknown> = {}): BaxianEvent {
   return prCreated({
     source: 'pane-signal',
     token: 'aaaa11112222',
-    actorB64: Buffer.from('77', 'utf8').toString('base64url'),
     ...data,
   });
 }
@@ -109,7 +108,6 @@ function paneSpecDone(data: Record<string, unknown> = {}): BaxianEvent {
       kind: 'spec-done',
       token: 'aaaa11112222',
       prNumber: 42,
-      actorB64: Buffer.from('77', 'utf8').toString('base64url'),
       ...data,
     },
   };
@@ -366,7 +364,7 @@ describe('pr.created (git, poller source)', () => {
     const begin = vi.spyOn(manager, 'beginGitReviewPass');
     const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
 
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
 
     const task = await taskStore.get('task-1');
     expect(task).toMatchObject({
@@ -378,31 +376,20 @@ describe('pr.created (git, poller source)', () => {
     expect(dispatchSpy).not.toHaveBeenCalled();
   });
 
-  it('records a base snapshot and provisional actor, then no-ops on replay without starting review', async () => {
+  it('records a base snapshot, then no-ops on replay without starting review', async () => {
     await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
     const begin = vi.spyOn(manager, 'beginGitReviewPass');
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
     let task = await taskStore.get('task-1');
     expect(task).toMatchObject({
-      status: 'in_progress', prNumber: 42, baseBranch: 'main',
-      replyActorId: '99', replyActorStatus: 'provisional',
-      latestHeadSha: SHA1,
+      status: 'in_progress', prNumber: 42, baseBranch: 'main', latestHeadSha: SHA1,
     });
     expect(task?.reviewHeadAnchorSha).toBeUndefined();
     expect(task?.reviewDispatch).toBeUndefined();
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
     task = await taskStore.get('task-1');
     expect(task?.status).toBe('in_progress');
     expect(begin).not.toHaveBeenCalled();
-  });
-
-  it('adopts without actor fields when the row carried no author id', async () => {
-    await taskStore.set(gitTask());
-    await eventBus.emit(prCreated({ targetBranch: 'main' }));
-    const task = await taskStore.get('task-1');
-    expect(task?.status).toBe('in_progress');
-    expect(task?.replyActorId).toBeUndefined();
-    expect(task?.replyActorStatus).toBeUndefined();
   });
 
   it('records a fixing-task observation without creating or dispatching a review lease', async () => {
@@ -410,7 +397,7 @@ describe('pr.created (git, poller source)', () => {
     const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
       (await taskStore.get('task-1'))!);
 
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
 
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('fixing');
@@ -783,34 +770,14 @@ describe('pr.merged (git)', () => {
 });
 
 describe('pr.created (git, pane signal)', () => {
-  it('verifies via the platform predicate and records a verified self-reported actor', async () => {
-    await taskStore.set(gitTask({ pendingPrSignalToken: 'aaaa11112222' }));
-    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
-      ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
-    });
-    await eventBus.emit(prCreated({
-      source: 'pane-signal', token: 'aaaa11112222',
-      actorB64: Buffer.from('77', 'utf8').toString('base64url'),
-    }));
-    const task = await taskStore.get('task-1');
-    expect(task).toMatchObject({
-      status: 'review', baseBranch: 'main', replyActorId: '77', replyActorStatus: 'verified',
-    });
-    expect(task?.pendingPrSignalToken).toBeUndefined();
-  });
-
-  it('keeps actor fields unset when the signal has no valid actor segment (fail closed)', async () => {
+  it('verifies via the platform predicate and starts the review from the bare signal', async () => {
     await taskStore.set(gitTask());
     vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
     });
     await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
     const task = await taskStore.get('task-1');
-    expect(task?.status).toBe('in_progress');
-    expect(task?.replyActorStatus).toBeUndefined();
-    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
-      phase: 'git-pr-delivery-actor-missing',
-    });
+    expect(task).toMatchObject({ status: 'review', baseBranch: 'main', deliveryConfirmation: { phase: 'code', source: 'signal' } });
   });
 
   it('rejects a predicate mismatch to intervention instead of adopting', async () => {
@@ -894,21 +861,13 @@ describe('pr.created (git, pane signal)', () => {
 
 describe('spec.ready (git delivery)', () => {
   it('lets poller discovery enrich the task without starting review, then confirms spec delivery from the signal', async () => {
-    await taskStore.set(gitTask({
-      phase: undefined,
-      pendingPrSignalToken: 'aaaa11112222',
-    }));
+    await taskStore.set(gitTask({ phase: undefined }));
     const begin = vi.spyOn(manager, 'beginGitReviewPass');
     const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
       (await taskStore.get('task-1'))!);
 
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
-    expect(await taskStore.get('task-1')).toMatchObject({
-      status: 'in_progress',
-      prNumber: 42,
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
-    });
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
+    expect(await taskStore.get('task-1')).toMatchObject({ status: 'in_progress', prNumber: 42 });
     expect(begin).not.toHaveBeenCalled();
 
     await eventBus.emit(paneSpecDone());
@@ -918,8 +877,6 @@ describe('spec.ready (git delivery)', () => {
       status: 'review',
       phase: 'spec',
       prNumber: 42,
-      replyActorId: '77',
-      replyActorStatus: 'verified',
       deliveryConfirmation: { phase: 'spec', source: 'signal' },
       reviewRound: 0,
       reviewDispatch: {
@@ -940,10 +897,7 @@ describe('spec.ready (git delivery)', () => {
   });
 
   it('does not duplicate the spec review pass when the pane signal arrives before poller discovery', async () => {
-    await taskStore.set(gitTask({
-      phase: undefined,
-      pendingPrSignalToken: 'aaaa11112222',
-    }));
+    await taskStore.set(gitTask({ phase: undefined }));
     const begin = vi.spyOn(manager, 'beginGitReviewPass');
     const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
       (await taskStore.get('task-1'))!);
@@ -953,23 +907,18 @@ describe('spec.ready (git delivery)', () => {
     expect(first).toMatchObject({ status: 'review', phase: 'spec', prNumber: 42 });
     const generation = first?.reviewDispatch?.generation;
 
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
 
     const replayed = await taskStore.get('task-1');
     expect(replayed?.reviewDispatch?.generation).toBe(generation);
-    expect(replayed?.replyActorId).toBe('77');
-    expect(replayed?.replyActorStatus).toBe('verified');
     expect(begin).toHaveBeenCalledTimes(1);
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
   it('blocks a merge observed before spec delivery and never starts a review pass', async () => {
-    await taskStore.set(gitTask({
-      phase: undefined,
-      pendingPrSignalToken: 'aaaa11112222',
-    }));
+    await taskStore.set(gitTask({ phase: undefined }));
     const begin = vi.spyOn(manager, 'beginGitReviewPass');
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
 
     await eventBus.emit({
       id: '', type: 'pr.merged', timestamp: new Date().toISOString(),
@@ -989,76 +938,29 @@ describe('spec.ready (git delivery)', () => {
   });
 });
 
-describe('actor reconciliation on a late publish signal', () => {
-  it('verifies the provisional actor after poller adoption rotated the review token', async () => {
+describe('late duplicate publish signal for an already-bound PR', () => {
+  it('ignores a pane pr-created once the task left in_progress', async () => {
     await taskStore.set(gitTask({
-      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
-      signalToken: 'ffff00001111',
-      pendingPrSignalToken: 'aaaa11112222',
-      replyActorId: '99', replyActorStatus: 'provisional',
-      baseBranch: 'main',
+      status: 'review', phase: 'code', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', baseBranch: 'main',
     }));
-    const stopAgent = vi.spyOn(manager, 'stopPhaseSignalWatcherAgent');
-    await eventBus.emit(prCreated({
-      source: 'pane-signal', token: 'aaaa11112222',
-      actorB64: Buffer.from('77', 'utf8').toString('base64url'),
-    }));
-    const task = await taskStore.get('task-1');
-    expect(task).toMatchObject({ replyActorId: '77', replyActorStatus: 'verified' });
-    expect(task?.pendingPrSignalToken).toBeUndefined();
-    expect(stopAgent).toHaveBeenCalledWith('task-1', 'dev-1');
+    const begin = vi.spyOn(manager, 'beginGitReviewPass');
+    const update = vi.spyOn(manager, 'updateTask');
+    await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
+    expect(begin).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(emitted.find(e => e.type === 'human.intervention')).toBeUndefined();
+    expect((await taskStore.get('task-1'))?.status).toBe('review');
   });
 
-  it('ignores a reconciliation attempt whose token does not match the persisted expectation', async () => {
+  it('ignores a wrong-stage pane signal for the bound PR as well', async () => {
     await taskStore.set(gitTask({
-      status: 'review', prNumber: 42, signalToken: 'ffff00001111',
-      pendingPrSignalToken: 'aaaa11112222',
-      replyActorId: '99', replyActorStatus: 'provisional',
-    }));
-    await eventBus.emit(prCreated({
-      source: 'pane-signal', token: 'ffff00001111',
-      actorB64: Buffer.from('66', 'utf8').toString('base64url'),
-    }));
-    const task = await taskStore.get('task-1');
-    expect(task).toMatchObject({ replyActorId: '99', replyActorStatus: 'provisional' });
-  });
-
-  it('is a no-op when the actor is already verified', async () => {
-    await taskStore.set(gitTask({
-      status: 'review', prNumber: 42, signalToken: 'ffff00001111',
-      pendingPrSignalToken: 'aaaa11112222',
-      replyActorId: '77', replyActorStatus: 'verified',
-    }));
-    const updateSpy = vi.spyOn(manager, 'updateTask');
-    await eventBus.emit(prCreated({
-      source: 'pane-signal', token: 'aaaa11112222',
-      actorB64: Buffer.from('55', 'utf8').toString('base64url'),
-    }));
-    expect(updateSpy).not.toHaveBeenCalled();
-    expect((await taskStore.get('task-1'))?.replyActorId).toBe('77');
-  });
-
-  it('does not let a wrong-stage pane signal consume the code-stage actor reconciliation token', async () => {
-    await taskStore.set(gitTask({
-      status: 'review',
-      phase: 'code',
-      prNumber: 42,
-      signalToken: 'ffff00001111',
-      pendingPrSignalToken: 'aaaa11112222',
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
+      status: 'review', phase: 'code', prNumber: 42, signalToken: 'ffff00001111',
     }));
     const update = vi.spyOn(manager, 'updateTask');
-
     await eventBus.emit(paneSpecDone());
-
     expect(update).not.toHaveBeenCalled();
-    expect(await taskStore.get('task-1')).toMatchObject({
-      phase: 'code',
-      pendingPrSignalToken: 'aaaa11112222',
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
-    });
+    expect(await taskStore.get('task-1')).toMatchObject({ status: 'review', phase: 'code' });
   });
 });
 
@@ -1142,7 +1044,6 @@ describe('review.submitted (git)', () => {
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
       signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
-      replyActorId: '77', replyActorStatus: 'verified',
     }));
     await eventBus.emit(reviewSubmitted(gitVerdict({})));
     const task = await taskStore.get('task-1');
@@ -1158,7 +1059,6 @@ describe('review.submitted (git)', () => {
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
       signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
-      replyActorId: '77', replyActorStatus: 'verified',
       outbox: [
         {
           key: 'abcdef123456',
@@ -1611,11 +1511,6 @@ describe('git review dispatch token minting', () => {
     expect((await taskStore.get('task-1'))?.signalToken).toBe('aaaa11112222');
   });
 
-  it('initial git dispatch persists the pr-created expectation token alongside the signal token', async () => {
-    expect(manager.dispatchTokenFields('cccc33334444')).toEqual({
-      signalToken: 'cccc33334444', pendingPrSignalToken: 'cccc33334444',
-    });
-  });
 });
 
 describe('push replay idempotency (git)', () => {
@@ -1825,7 +1720,7 @@ describe('post-approve feedback consumption (git)', () => {
   const approvedTask = () => gitTask({
     status: 'approved', prNumber: 42, qaAgentId: 'qa-1',
     latestHeadSha: SHA1, signalToken: 'ffff00001111',
-    replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+    reviewRound: 1,
     ...postApproveEpisode(),
   });
 
@@ -1929,7 +1824,7 @@ describe('post-approve feedback consumption (git)', () => {
   it('survives a crash between the merge-ready return and the dispatch via the recovery sweep', async () => {
     await taskStore.set(gitTask({
       status: 'merge-ready', prNumber: 42, latestHeadSha: SHA1,
-      signalToken: 'ffff00001111', replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+      signalToken: 'ffff00001111', reviewRound: 1,
     }));
     const returned = asReturned(await manager.consumeGitFeedbackRevision('task-1', {
       key: 'issue-comments:c7:crash', versionTime: 1900,
@@ -2090,7 +1985,7 @@ describe('post-approve feedback consumption (git)', () => {
   it('returns a merge-ready task to approved and redispatches on fresh feedback', async () => {
     await taskStore.set(gitTask({
       status: 'merge-ready', prNumber: 42, latestHeadSha: SHA1,
-      signalToken: 'ffff00001111', replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+      signalToken: 'ffff00001111', reviewRound: 1,
     }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
@@ -2151,7 +2046,7 @@ describe('merge-ready receipt recheck (git)', () => {
 
   const approvedWithCompletion = () => gitTask({
     status: 'approved', prNumber: 42, latestHeadSha: SHA1, signalToken: 'ffff00001111',
-    replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+    reviewRound: 1,
     ...postApproveEpisode(),
   });
 
@@ -2297,7 +2192,7 @@ describe('merge-ready receipt recheck (git)', () => {
   it('does not let a provenance recheck replace a successor approved tuple', async () => {
     await taskStore.set(gitTask({
       status: 'approved', phase: undefined, signalToken: undefined, prNumber: 42,
-      latestHeadSha: SHA1, replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+      latestHeadSha: SHA1, reviewRound: 1,
       ...postApproveEpisode(),
     }));
     vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({
@@ -2349,7 +2244,7 @@ describe('merge-ready receipt recheck (git)', () => {
   it('clears a stale pending flag when the authoritative scan comes back empty', async () => {
     await taskStore.set(gitTask({
       status: 'approved', prNumber: 42, latestHeadSha: SHA1, signalToken: 'ffff00001111',
-      replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+      reviewRound: 1,
       ...postApproveEpisode({ pendingRedispatch: true }),
     }));
     vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 0 });
@@ -2389,7 +2284,6 @@ describe('pr-fixed no-op gate (git)', () => {
   const fixingTask = () => gitTask({
     status: 'fixing', prNumber: 42, latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
     signalToken: 'ffff00001111', qaAgentId: 'qa-1', reviewRound: 1,
-    replyActorId: '77', replyActorStatus: 'verified',
   });
 
   it('rejects a stale completion token before reading the PR', async () => {
@@ -2530,11 +2424,10 @@ describe('pr-fixed no-op gate (git)', () => {
 });
 
 describe('manual git review dispatch (dispatchReviewToQa)', () => {
-  it('anchors via the driver, re-mints the pair, and keeps the dev reconciliation entry', async () => {
+  it('anchors via the driver and re-mints the pair', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1', signalToken: 'ffff00001111',
       passToken: 'abcdef123456', failToken: '123456abcdef',
-      pendingPrSignalToken: 'aaaa11112222', replyActorStatus: 'provisional', replyActorId: '99',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
     }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
@@ -2544,7 +2437,7 @@ describe('manual git review dispatch (dispatchReviewToQa)', () => {
     });
     await taskStore.set({ ...(await taskStore.get('task-1'))!, latestHeadSha: SHA2, updatedAt: new Date().toISOString() });
 
-    await manager.dispatchReviewToQa('task-1', { actorId: '99' });
+    await manager.dispatchReviewToQa('task-1', {});
 
     const task = await taskStore.get('task-1');
     expect(task?.reviewHeadAnchorSha).toBe(SHA2);
@@ -2743,11 +2636,6 @@ describe('git review state transition guards', () => {
     });
   });
 
-  it('transitionToCodePhase refreshes the pr-created reconciliation token for git tasks', async () => {
-    const fields = manager.dispatchTokenFields('dddd55556666');
-    expect(fields.pendingPrSignalToken).toBe('dddd55556666');
-  });
-
   it('recovery redispatches a durable pending pass even while the waiting dev keeps its binding', async () => {
     await taskStore.set(gitTask({
       status: 'approved', prNumber: 42, latestHeadSha: SHA1,
@@ -2767,7 +2655,6 @@ describe('git review state transition guards', () => {
     await taskStore.set(gitTask({
       status: 'approved', prNumber: 42, latestHeadSha: SHA1,
       signalToken: 'ffff00001111', reviewRound: 1,
-      replyActorId: '77', replyActorStatus: 'verified',
       ...postApproveEpisode({ pendingRedispatch: true }),
     }));
     vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
@@ -2813,7 +2700,7 @@ describe('git review state transition guards', () => {
   });
 });
 
-describe('git feedback return and reconciliation re-arm', () => {
+describe('git feedback return', () => {
   it('returns merge-ready feedback on platforms whose head shas are not 40 hex chars', async () => {
     const shortSha = 'abc123def456';
     await taskStore.set(gitTask({
@@ -2827,22 +2714,6 @@ describe('git feedback return and reconciliation re-arm', () => {
     expect(returned?.postApproveHeadSha).toBe(shortSha);
   });
 
-  it('re-arms the reconciliation entry when a matching late signal carries no actor segment', async () => {
-    await taskStore.set(gitTask({
-      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
-      signalToken: 'ffff00001111', pendingPrSignalToken: 'aaaa11112222',
-      replyActorId: '99', replyActorStatus: 'provisional',
-    }));
-    const rearm = vi.spyOn(manager, 'rearmGitReconciliationWatcher').mockResolvedValue(undefined);
-    await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
-    const task = await taskStore.get('task-1');
-    expect(task).toMatchObject({ replyActorId: '99', replyActorStatus: 'provisional' });
-    expect(task?.pendingPrSignalToken).toBe('aaaa11112222');
-    expect(rearm).toHaveBeenCalledWith('task-1', { skipSnapshot: true });
-    expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
-      phase: 'git-pr-created-actor-missing',
-    });
-  });
 });
 
 describe('generation-fenced review dispatch', () => {

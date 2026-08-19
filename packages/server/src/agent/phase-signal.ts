@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { PLATFORM_ACTOR_ID_MAX_BYTES } from '../platform/types.js';
 
 export type PhaseSignalKind =
   | 'pr-created'
@@ -19,18 +18,17 @@ export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
 ] as const;
 
 export type PhaseSignal =
-  | { kind: 'pr-created'; token: string; prNumber: number; actorB64: string }
+  | { kind: 'pr-created'; token: string; prNumber: number }
   | { kind: 'pr-fixed'; token: string }
   | { kind: 'pr-merge-ready'; token: string }
-  | { kind: 'spec-done'; token: string; prNumber: number; actorB64: string }
+  | { kind: 'spec-done'; token: string; prNumber: number }
   | { kind: 'greeting'; token: string };
 
 const VALID_KINDS = new Set<PhaseSignalKind>(PHASE_SIGNAL_KINDS);
 
 const TOKEN_RANGE = '[A-Za-z0-9_-]{6,64}';
-const ACTOR_B64_RANGE = '[A-Za-z0-9_-]{1,256}';
 const COMPACT_SIGNAL_RE_PR_DELIVERY = new RegExp(
-  `\\[bx:(pr-created|spec-done):(\\d+):(${ACTOR_B64_RANGE}):(${TOKEN_RANGE})\\]`,
+  `\\[bx:(pr-created|spec-done):(\\d+):(${TOKEN_RANGE})\\]`,
   'g',
 );
 const COMPACT_SIGNAL_RE_PLAIN = new RegExp(
@@ -46,38 +44,23 @@ export function buildPhaseSignal(
   kind: 'pr-created' | 'spec-done',
   token: string,
   prNumber: number,
-  actorB64: string,
 ): string;
 export function buildPhaseSignal(
   kind: PhaseSignalKind,
   token: string,
   prNumber?: number,
-  actorB64?: string,
 ): string {
   if (kind === 'pr-created' || kind === 'spec-done') {
-    if (prNumber === undefined || actorB64 === undefined) {
-      throw new Error(`buildPhaseSignal(${kind}) requires prNumber and actorB64`);
+    if (prNumber === undefined) {
+      throw new Error(`buildPhaseSignal(${kind}) requires prNumber`);
     }
-    return `[bx:${kind}:${prNumber}:${actorB64}:${token}]`;
+    return `[bx:${kind}:${prNumber}:${token}]`;
   }
   return `[bx:${kind}:${token}]`;
 }
 
 export function createSignalToken(): string {
   return randomUUID().replace(/-/g, '').slice(0, 12);
-}
-
-export function decodeSignalActorId(actorB64: string): string | undefined {
-  if (!/^[A-Za-z0-9_-]+$/.test(actorB64) || actorB64.length % 4 === 1) return undefined;
-  const bytes = Buffer.from(actorB64, 'base64url');
-  if (bytes.length === 0 || bytes.length > PLATFORM_ACTOR_ID_MAX_BYTES) return undefined;
-  const text = bytes.toString('utf8');
-  if (!Buffer.from(text, 'utf8').equals(bytes)) return undefined;
-  for (const ch of text) {
-    const code = ch.codePointAt(0)!;
-    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return undefined;
-  }
-  return text;
 }
 
 export interface PhaseSignalMatch {
@@ -98,8 +81,7 @@ export function scanPhaseSignalMatches(visible: string): PhaseSignalMatch[] {
       signal: {
         kind: m[1] as 'pr-created' | 'spec-done',
         prNumber,
-        actorB64: m[3],
-        token: m[4],
+        token: m[3],
       },
     });
   }

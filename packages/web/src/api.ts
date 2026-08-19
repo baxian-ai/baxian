@@ -288,7 +288,6 @@ export const api = {
         executor?: 'dev' | 'qa';
         agentId?: string;
         stage?: 'spec' | 'code';
-        actorId?: string;
         prNumber?: number;
         confirmRevoked?: boolean;
         note?: string;

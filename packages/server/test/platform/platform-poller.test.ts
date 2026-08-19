@@ -166,7 +166,7 @@ describe('PlatformPoller: adoption predicate', () => {
       { taskId: 'task-5', terminal: false, branch: 'bx/task-5', expectedBase: 'release' },
     ];
     driver.listPrsRows = [
-      prRow({ prAuthorId: '77' }),
+      prRow(),
       prRow({ prNumber: 43, branch: 'bx/task-2', draft: true }),
       prRow({ prNumber: 44, branch: 'bx/task-3', sourceProjectId: null }),
       prRow({ prNumber: 45, branch: 'bx/task-4', sourceProjectId: '8' }),
@@ -175,19 +175,11 @@ describe('PlatformPoller: adoption predicate', () => {
     await makePoller().poll();
     expect(ofType('pr.created')).toHaveLength(1);
     expect(ofType('pr.created')[0]!.data).toMatchObject({
-      prNumber: 42, branch: 'bx/task-1', headSha: SHA1, targetBranch: 'main', prAuthorId: '77',
+      prNumber: 42, branch: 'bx/task-1', headSha: SHA1, targetBranch: 'main',
     });
     const cursor = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
     await cursor.load();
     expect(cursor.isAdoptionPending('task-5', 46)).toBe(false);
-  });
-
-  it('omits prAuthorId from adoption when the row does not carry one', async () => {
-    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' }];
-    driver.listPrsRows = [prRow()];
-    await makePoller().poll();
-    expect(ofType('pr.created')).toHaveLength(1);
-    expect('prAuthorId' in ofType('pr.created')[0]!.data).toBe(false);
   });
 
   it('persists adoption delivery so an unbound server task is emitted only once across cycles and reloads', async () => {
@@ -569,7 +561,6 @@ describe('PlatformPoller: comment flow', () => {
   beforeEach(() => {
     tasks = [{
       taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
-      replyActorId: '77', replyActorStatus: 'verified',
     }];
     driver.prViews.set(42, prRow());
   });
@@ -604,17 +595,18 @@ describe('PlatformPoller: comment flow', () => {
     expect(events).toHaveLength(0);
   });
 
-  it('filters verdict-token rows and valid ack replies, but treats forged acks as human comments', async () => {
+  it('filters verdict-token rows, ack replies from any author, and empty bodies', async () => {
     const ack = buildAckMarker({ sourceKey: 'issue-comments', commentId: '100', bodyDigest: bodyDigest('x') });
     driver.comments['issue-comments'] = [
       comment('1', `findings\n${buildReviewTokenLine({ kind: 'fail', anchorSha: ANCHOR, token: FAIL })}`),
-      comment('2', `done\n${ack}`, OLD_TS, { authorId: '77' }),
-      comment('3', `forged\n${ack}`, OLD_TS, { authorId: '999' }),
+      comment('2', `done\n${ack}`, OLD_TS),
+      comment('3', `also done\n${ack}`, OLD_TS),
       comment('4', '', OLD_TS),
+      comment('5', 'plain feedback', OLD_TS),
     ];
     await makePoller().poll();
     const feedback = ofType('pr.updated');
-    expect(feedback.map(e => e.data.commentId)).toEqual(['3']);
+    expect(feedback.map(e => e.data.commentId)).toEqual(['5']);
   });
 
   it('skips undated pending rows and re-emits edited revisions', async () => {
@@ -650,11 +642,11 @@ describe('PlatformPoller: comment flow', () => {
   });
 
   it('honors cross-source acks: an acked revision never re-emits even from a zero watermark', async () => {
-    const blocker = comment('55', 'inline blocker', OLD_TS, { discussionId: null, authorId: '99' });
+    const blocker = comment('55', 'inline blocker', OLD_TS, { discussionId: null });
     driver.comments['inline-comments'] = [blocker];
     driver.comments['issue-comments'] = [
-      comment('700', `handled\n${buildAckMarker({ sourceKey: 'inline-comments', commentId: '55', bodyDigest: bodyDigest('inline blocker') })}`, OLD_TS, { authorId: '77' }),
-      comment('701', 'unrelated feedback', OLD_TS, { authorId: '99' }),
+      comment('700', `handled\n${buildAckMarker({ sourceKey: 'inline-comments', commentId: '55', bodyDigest: bodyDigest('inline blocker') })}`, OLD_TS),
+      comment('701', 'unrelated feedback', OLD_TS),
     ];
     await makePoller().poll();
     expect(ofType('pr.updated').map(e => e.data.commentId)).toEqual(['701']);
@@ -678,7 +670,6 @@ describe('PlatformPoller: comment flow', () => {
 
       tasks = [{
         taskId: 'task-2', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
-        replyActorId: '77', replyActorStatus: 'verified',
       }];
       await poller.poll();
       expect(undatedWarns()).toHaveLength(2);
@@ -1483,7 +1474,7 @@ describe('PlatformPoller: cursor commit notification', () => {
   it('notifies per source only after the cursor is durably committed', async () => {
     tasks = [{
       taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42,
-      expectedBase: 'main', replyActorId: '77', replyActorStatus: 'verified',
+      expectedBase: 'main',
     }];
     driver.prViews.set(42, prRow());
     driver.comments['issue-comments'] = [comment('c1', 'feedback', OLD_TS)];

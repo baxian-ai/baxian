@@ -8,6 +8,7 @@ import {
   FS_READ_CONCURRENCY,
   TASK_PHASE_SET,
   TASK_TERMINAL_STATUS_SET,
+  TERMINAL_INTERVENTION_PHASES,
   taskMatchesAttentionGeneration,
 } from '../shared/index.js';
 
@@ -30,7 +31,7 @@ const TASK_FIELDS = [
   'status', 'createdAt', 'updatedAt', 'images',
   'maxRoundsContinues',
   'postApproveRevoked', 'postApproveHeadSha', 'attention',
-  'passToken', 'failToken', 'pendingPrSignalToken', 'postApproveToken', 'postApproveGeneration', 'postApprovePhase', 'reviewDispatch', 'platformBinding', 'baseBranch', 'replyActorId', 'replyActorStatus',
+  'passToken', 'failToken', 'postApproveToken', 'postApproveGeneration', 'postApprovePhase', 'reviewDispatch', 'platformBinding', 'baseBranch',
   'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'replacementTaskId', 'pendingRedispatch', 'redispatchCount',
 ] as const;
 
@@ -266,7 +267,6 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
       throw taskSchemaError(field, 'a 12-hex review token when present');
     }
   }
-  optionalString(raw, 'pendingPrSignalToken');
   optionalString(raw, 'postApproveToken');
   if (raw.postApproveGeneration !== undefined
     && (typeof raw.postApproveGeneration !== 'string' || !REVIEW_TOKEN_RE.test(raw.postApproveGeneration))) {
@@ -361,11 +361,6 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
     }
   }
   optionalString(raw, 'baseBranch');
-  optionalString(raw, 'replyActorId');
-  if (raw.replyActorStatus !== undefined
-    && raw.replyActorStatus !== 'verified' && raw.replyActorStatus !== 'provisional') {
-    throw taskSchemaError('replyActorStatus', 'verified or provisional when present');
-  }
   if (raw.closedUnmergedAnchor !== undefined) {
     const anchor = raw.closedUnmergedAnchor;
     if (!isRecord(anchor)
@@ -460,11 +455,13 @@ function sanitizeTask(state: unknown): TaskState {
     }
   }
   validateTask(out as Record<string, unknown>);
+  // older versions persisted terminal audit phases as attention
   if (out.attention
-    && !taskMatchesAttentionGeneration(
-      out as TaskState,
-      out.attention.generation as TaskAttentionGeneration,
-    )) {
+    && ((TERMINAL_INTERVENTION_PHASES as readonly string[]).includes(out.attention.reason)
+      || !taskMatchesAttentionGeneration(
+        out as TaskState,
+        out.attention.generation as TaskAttentionGeneration,
+      ))) {
     delete out.attention;
   }
   return out as TaskState;

@@ -441,8 +441,6 @@ export const enUS = {
     reviewRecoveryStageLabel: 'PR contains (required)',
     reviewRecoveryStageSpec: 'Plan',
     reviewRecoveryStageCode: 'Code',
-    reviewRecoveryActorLabel: 'PR author’s platform user ID (required)',
-    reviewRecoveryActorPlaceholder: 'Stable user ID on your code platform',
     reviewRecoverySubmit: 'Save and start review',
     continueButtonTitle: 'Starts another revision and sends the result back for review',
     completeButtonTitle: 'Accepts the current version and merges the PR without another revision',

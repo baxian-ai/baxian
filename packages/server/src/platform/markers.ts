@@ -85,16 +85,10 @@ export function rowHasBody(row: NormalizedRow): boolean {
   return isProjected(row) ? row.hasBody === true : rawBody(row) !== '';
 }
 
-export interface AckActorContext {
-  replyActorId?: string;
-  replyActorStatus?: 'verified' | 'provisional';
-}
-
 export interface AckCarrierRow {
   sourceKey: string;
   sourceClass: CommentSourceClass;
   id: string;
-  authorId?: string;
   discussionId?: string | null;
   acks: AckMarker[];
   carriesToken: boolean;
@@ -108,16 +102,14 @@ export interface AckCollection {
 export const ackRevisionKey = (sourceKey: string, id: string, digest: string) => `${sourceKey}:${id}:${digest}`;
 export const ackCarrierKey = (sourceKey: string, id: string) => `${sourceKey}:${id}`;
 
-export function collectValidAcks(rows: AckCarrierRow[], ctx: AckActorContext): AckCollection {
+export function collectValidAcks(rows: AckCarrierRow[]): AckCollection {
   const acks = new Set<string>();
   const carrierRowKeys = new Set<string>();
-  if (ctx.replyActorStatus !== 'verified' || ctx.replyActorId === undefined) return { acks, carrierRowKeys };
   const threadRootById = new Map<string, string>();
   for (const row of rows) {
     threadRootById.set(ackCarrierKey(row.sourceKey, row.id), row.discussionId ?? row.id);
   }
   for (const row of rows) {
-    if (row.authorId === undefined || row.authorId !== ctx.replyActorId) continue;
     if (row.sourceClass === 'reviews') continue;
     if (row.carriesToken) continue;
     if (row.sourceClass === 'threaded' && (row.discussionId === null || row.discussionId === undefined)) continue;

@@ -355,8 +355,6 @@ describe('TaskPanel', () => {
         title: 'stuck',
         prNumber: 42,
         deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-        replyActorId: '77',
-        replyActorStatus: 'verified',
         attention: {
           reason: 'review-verdict-overdue',
           runbook: 'Inspect the current QA review.',

@@ -1,7 +1,7 @@
 import {
   ackCarrierKey, ackRevisionKey, collectValidAcks, projectCommentRow,
   rowAcks, rowBodyDigest, rowHasBody, rowTokens,
-  type AckActorContext, type AckCarrierRow, type AckCollection,
+  type AckCarrierRow, type AckCollection,
 } from './markers.js';
 import { versionTimeOf, type NormalizedRow } from './row-schema.js';
 import type { CommentSource, CommentSourceClass } from './types.js';
@@ -71,7 +71,6 @@ export function buildAckCarrierRows(scans: readonly FeedbackSourceScan[]): AckCa
     sourceKey: scan.key,
     sourceClass: scan.sourceClass,
     id: String(row.id),
-    authorId: typeof row.authorId === 'string' ? row.authorId : undefined,
     discussionId: row.discussionId === null || row.discussionId === undefined ? null : String(row.discussionId),
     acks: rowAcks(row),
     carriesToken: rowTokens(row).length > 0,
@@ -101,11 +100,8 @@ export function feedbackEventTarget(
   return unackedRevision(row, sourceKey, acks);
 }
 
-export function collectPendingFeedback(
-  scans: readonly FeedbackSourceScan[],
-  ctx: AckActorContext,
-): PendingFeedbackResult {
-  const acks = collectValidAcks(buildAckCarrierRows(scans), ctx);
+export function collectPendingFeedback(scans: readonly FeedbackSourceScan[]): PendingFeedbackResult {
+  const acks = collectValidAcks(buildAckCarrierRows(scans));
   const dead = deadTokens(scans.map(s => ({ ...s, scanStartedAt: 0 })));
   const pending: PendingFeedbackResult['pending'] = new Map();
   for (const scan of scans) {

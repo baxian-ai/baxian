@@ -42,7 +42,6 @@ describe('GitHubDriver', () => {
       headSha: SHA,
       targetBranch: 'main',
       targetProjectId: '10',
-      prAuthorId: '7',
     }));
     expect(calls[0]!.command).toContain("GH_HOST='github.com'");
     expect(calls[0]!.command).toContain('repos/owner/repo/pulls/42');
@@ -159,7 +158,7 @@ describe('GitHubDriver', () => {
       created_at: '2026-07-31T00:00:00Z', updated_at: '2026-07-31T00:00:00Z',
     }])), result('[]')]);
     const issueRows = await issue.driver.listComments(issue.driver.commentSources[0]!, 42);
-    expect(issueRows).toEqual([expect.objectContaining({ id: '11', body: 'hello', authorId: '7' })]);
+    expect(issueRows).toEqual([expect.objectContaining({ id: '11', body: 'hello', author: 'alice' })]);
 
     const inline = harness([result(JSON.stringify([{
       id: 12, body: 'inline', user: { login: 'bob', id: 8 }, in_reply_to_id: 10,
@@ -193,13 +192,12 @@ describe('GitHubDriver', () => {
     expect(GITHUB_AGENT_PROMPTS.feedback).toContain('@base64');
   });
 
-  it('states the adopt-or-create publish semantics and the signal actor encoding chain', () => {
+  it('states the adopt-or-create publish semantics without any signal actor encoding', () => {
     expect(GITHUB_AGENT_PROMPTS.publish).toContain('reuse or create one open non-draft PR');
     expect(GITHUB_AGENT_PROMPTS.publish).toContain('exact head');
     expect(GITHUB_AGENT_PROMPTS.publish).toContain('requested/default base');
     expect(GITHUB_AGENT_PROMPTS.publish).toContain('stop on ambiguity');
-    expect(GITHUB_AGENT_PROMPTS.publish).toContain('numeric gh api user .id');
-    expect(GITHUB_AGENT_PROMPTS.publish).toContain('unpadded base64url');
+    expect(GITHUB_AGENT_PROMPTS.publish).not.toMatch(/base64|actor|gh api user/);
   });
 
   it('checks the authenticated GitHub identity and classifies rate limits', async () => {

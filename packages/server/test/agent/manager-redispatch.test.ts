@@ -69,13 +69,11 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       id: 'task-dev-restart',
       status: 'in_progress',
       signalToken: 'dev-token-1',
-      pendingPrSignalToken: 'dev-token-1',
     });
     const { continueSpy, armedWith } = spyDispatch(m);
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-restart')).toBe(true);
     const newToken = await rotatedTaskToken('task-dev-restart', 'dev-token-1');
-    expect((await harness.taskStore.get('task-dev-restart'))?.pendingPrSignalToken).toBe(newToken);
     expect(continueSpy).toHaveBeenCalledWith(
       'task-dev-restart',
       'dev-1',
@@ -187,13 +185,11 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       phase: 'code',
       reviewRound: 1,
       signalToken: 'dev-fix-token',
-      pendingPrSignalToken: 'initial-pr-token',
     });
     const { continueSpy, armedWith } = spyDispatch(m);
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-fix-restart')).toBe(true);
     const newToken = await rotatedTaskToken('task-dev-fix-restart', 'dev-fix-token');
-    expect((await harness.taskStore.get('task-dev-fix-restart'))?.pendingPrSignalToken).toBe('initial-pr-token');
     expect(continueSpy).toHaveBeenCalledWith(
       'task-dev-fix-restart',
       'dev-1',
@@ -933,7 +929,6 @@ describe('AgentManager.advanceTask', () => {
     await m.advanceTask(task.id, {
       executor: 'qa',
       stage: 'code',
-      actorId: '77',
       prNumber: 42,
     });
 
@@ -941,7 +936,6 @@ describe('AgentManager.advanceTask', () => {
       fromStatus: ['fixing'],
       confirmUncertainNotDelivered: true,
       stage: 'code',
-      actorId: '77',
       prNumber: 42,
     });
     expect(harness.events.at(-1)).toMatchObject({

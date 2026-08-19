@@ -89,7 +89,14 @@ jobs:
 
       - run: npm install -g node-gyp@12.3.0
 
-      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Ensure tmux is available
+        shell: bash
+        run: |
+          if ! command -v tmux >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y tmux
+          fi
+          tmux -V
 
       - run: pnpm install --frozen-lockfile
 

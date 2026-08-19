@@ -150,10 +150,10 @@ describe('request contract per endpoint', () => {
     { name: 'tasks.advance', run: () => api.tasks.advance('t-1'), url: '/api/tasks/t-1/advance', method: 'POST' },
     {
       name: 'tasks.advance recovery',
-      run: () => api.tasks.advance('t-1', { executor: 'qa', stage: 'spec', actorId: '77', prNumber: 73 }),
+      run: () => api.tasks.advance('t-1', { executor: 'qa', stage: 'spec', prNumber: 73 }),
       url: '/api/tasks/t-1/advance',
       method: 'POST',
-      body: { executor: 'qa', stage: 'spec', actorId: '77', prNumber: 73 },
+      body: { executor: 'qa', stage: 'spec', prNumber: 73 },
     },
     {
       name: 'tasks.verdict',

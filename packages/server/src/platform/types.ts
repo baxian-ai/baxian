@@ -3,8 +3,6 @@ import type { NormalizedRow } from './row-schema.js';
 
 const SAFE_ERROR_SUMMARY_CHARS = 200;
 export const COMMENT_BODY_MAX_BYTES = 64 * 1024;
-// Shared with the completion-signal decoder: an actor id that rows accept must survive the signal round-trip.
-export const PLATFORM_ACTOR_ID_MAX_BYTES = 128;
 
 export interface PlatformEvent {
   type: EventType;

@@ -600,7 +600,7 @@ export class PhaseSignalWatcher {
         verdictAgentId: entry.agentId,
         source: 'pane-signal',
         ...(signal.kind === 'pr-created' || signal.kind === 'spec-done'
-          ? { prNumber: signal.prNumber, actorB64: signal.actorB64 }
+          ? { prNumber: signal.prNumber }
           : {}),
       },
     };

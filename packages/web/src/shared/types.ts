@@ -199,8 +199,6 @@ export interface TaskState {
   deliveryConfirmation?: { phase: TaskPhase; source: 'signal' | 'human'; at: string };
   signalToken?: string;
   maxRoundsContinues?: number;
-  replyActorId?: string;
-  replyActorStatus?: 'verified' | 'provisional';
   postApproveRevoked?: { generation: string; reason: 'request-changes' | 'redispatch-cap'; at: string };
   attention?: TaskAttention;
   replacementTaskId?: string;
@@ -210,12 +208,11 @@ export interface TaskState {
 }
 
 export function needsGitReviewRecovery(
-  task: Pick<TaskState, 'phase' | 'deliveryConfirmation' | 'replyActorStatus' | 'prNumber'>,
+  task: Pick<TaskState, 'phase' | 'deliveryConfirmation' | 'prNumber'>,
 ): boolean {
   return task.prNumber === undefined
     || task.phase === undefined
-    || task.deliveryConfirmation?.phase !== task.phase
-    || task.replyActorStatus !== 'verified';
+    || task.deliveryConfirmation?.phase !== task.phase;
 }
 
 type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment';

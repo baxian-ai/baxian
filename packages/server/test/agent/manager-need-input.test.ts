@@ -862,7 +862,7 @@ describe('AgentManager need-input cross-layer (real watcher)', () => {
     const wm = (await harness.agentStore.get('dev-1'))?.needInput;
     expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 0 });
     expect(wm?.at).toBeDefined();
-    streamer.triggerLive('[bx:pr-created:7:Nzc:tokNEW1234567]\n');
+    streamer.triggerLive('[bx:pr-created:7:tokNEW1234567]\n');
     await flush();
     expect(captured.some(e => e.type === 'pr.created')).toBe(true);
   });
@@ -935,7 +935,7 @@ describe('AgentManager need-input cross-layer (real watcher)', () => {
 
     expect(await armVia(m, 'tokNEW1234567', { needInputMode: 'fresh', skipSnapshot: true })).toBe(true);
     expect((await harness.agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
-    streamer.triggerLive('[bx:pr-created:7:Nzc:tokNEW1234567]\n');
+    streamer.triggerLive('[bx:pr-created:7:tokNEW1234567]\n');
     await flush();
     expect(m['phaseSignalWatcher']!.has('t-xl', 'dev-1')).toBe(false);
 

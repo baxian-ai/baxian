@@ -108,13 +108,13 @@ describe('AgentManager transitionTaskStatus', () => {
       signalToken: 'token-1',
       agentId: 'dev-1',
       reviewRound: 2,
-      pendingPrSignalToken: 'pending-token-1',
+      prUrl: 'https://github.com/owner/repo/pull/1',
     });
 
     await expect(harness.manager.updateTaskIfStatus(
       'task-update-guard',
       'review',
-      { pendingPrSignalToken: undefined },
+      { prUrl: undefined },
       {
         phase: 'code',
         signalToken: 'token-1',
@@ -124,13 +124,13 @@ describe('AgentManager transitionTaskStatus', () => {
     )).resolves.toBe(false);
     expect(await harness.taskStore.get('task-update-guard')).toMatchObject({
       agentId: 'dev-1',
-      pendingPrSignalToken: 'pending-token-1',
+      prUrl: 'https://github.com/owner/repo/pull/1',
     });
 
     await expect(harness.manager.updateTaskIfStatus(
       'task-update-guard',
       'review',
-      { pendingPrSignalToken: undefined },
+      { prUrl: undefined },
       {
         phase: 'code',
         signalToken: 'token-1',
@@ -139,7 +139,7 @@ describe('AgentManager transitionTaskStatus', () => {
       },
     )).resolves.toBe(true);
     const updated = await harness.taskStore.get('task-update-guard');
-    expect(updated?.pendingPrSignalToken).toBeUndefined();
+    expect(updated?.prUrl).toBeUndefined();
   });
 });
 
@@ -309,8 +309,6 @@ describe('AgentManager max_rounds manual actions', () => {
       branch: 'bx/task-mr',
       phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-      replyActorId: '77',
-      replyActorStatus: 'verified',
       ...overrides,
     });
     if (value.phase === undefined) delete value.deliveryConfirmation;
@@ -912,5 +910,39 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
     expect(holdSpy).toHaveBeenCalled();
     expect(harness.events.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'code-resume-failed')).toBe(true);
+  });
+});
+
+describe('AgentManager.recordTaskAttention', () => {
+  const intervention = (taskId: string, phase: string) => ({
+    id: '',
+    type: 'human.intervention' as const,
+    timestamp: NOW,
+    projectId: 'proj',
+    agentId: 'dev-1',
+    taskId,
+    data: { phase },
+  });
+
+  it('ignores terminal audit phases so opening or closing the agent terminal never flags the task', async () => {
+    for (const phase of ['attach', 'detach', 'input', 'close']) {
+      const id = `task-terminal-${phase}`;
+      await harness.seedTask({ id, status: 'in_progress', agentId: 'dev-1' });
+
+      await harness.manager.recordTaskAttention(intervention(id, phase));
+
+      expect((await harness.taskStore.get(id))?.attention, phase).toBeUndefined();
+    }
+  });
+
+  it('still records attention for non-terminal intervention phases', async () => {
+    await harness.seedTask({ id: 'task-stalled', status: 'in_progress', agentId: 'dev-1' });
+
+    await harness.manager.recordTaskAttention(intervention('task-stalled', 'initial-dispatch-stalled'));
+
+    expect((await harness.taskStore.get('task-stalled'))?.attention).toMatchObject({
+      reason: 'initial-dispatch-stalled',
+      recommendedActions: ['advance', 'cancel'],
+    });
   });
 });

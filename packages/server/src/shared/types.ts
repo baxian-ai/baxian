@@ -290,15 +290,12 @@ export interface TaskState {
   postApproveHeadSha?: string;
   passToken?: string;
   failToken?: string;
-  pendingPrSignalToken?: string;
   postApproveToken?: string;
   postApproveGeneration?: string;
   postApprovePhase?: 'installed' | 'delivered' | 'signaled';
   reviewDispatch?: ReviewDispatchLease;
   platformBinding?: { repoKey: string };
   baseBranch?: string;
-  replyActorId?: string;
-  replyActorStatus?: 'verified' | 'provisional';
   closedUnmergedAnchor?: { prNumber: number; generation: number; cleared?: boolean };
   passProvenance?: { sourceKey: string; id: string; bodyDigest: string; token: string; failToken: string; anchorSha: string };
   consumedFeedback?: Record<string, number>;

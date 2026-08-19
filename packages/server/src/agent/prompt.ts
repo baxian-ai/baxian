@@ -169,16 +169,16 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
     fields: [],
     contract:
       `Choose one route: implement, test, commit, push, publish the PR, then emit ` +
-      `\`[bx:pr-created:<pr>:<actor>:<token>]\`; or write a complete implementable spec to spec-path without ` +
+      `\`[bx:pr-created:<pr>:<token>]\`; or write a complete implementable spec to spec-path without ` +
       `overwriting an unrelated file, commit, push, publish the PR, then emit ` +
-      `\`[bx:spec-done:<pr>:<actor>:<token>]\`. Never merge or leave workdir/branch ` +
+      `\`[bx:spec-done:<pr>:<token>]\`. Never merge or leave workdir/branch ` +
       `${JSON.stringify(task.branch ?? '<branch>')}.`,
   }),
   code: () => ({
     fields: [],
     contract:
       `Read the approved spec-path, implement it completely, test, commit, push, and update the bound PR via ` +
-      `platform publish. Then emit \`[bx:pr-created:<pr>:<actor>:<token>]\` exactly once. ` +
+      `platform publish. Then emit \`[bx:pr-created:<pr>:<token>]\` exactly once. ` +
       `Never merge or change branch/workdir.`,
   }),
   fix: ({ task }) => ({

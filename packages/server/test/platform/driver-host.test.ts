@@ -12,7 +12,6 @@ import {
 import type { DriverExecResult, PlatformDriver } from '../../src/platform/types.js';
 import type { CommandRunner, ExecOptions, ExecResult } from '../../src/agent/runner.js';
 import type { ProjectConfig } from '../../src/shared/index.js';
-import { decodeSignalActorId } from '../../src/agent/phase-signal.js';
 import { scanCommentSourcesOnce } from '../../src/platform/feedback.js';
 import {
   buildAckMarker, buildReviewTokenLine, rowAcks, rowBodyDigest, rowHasBody, rowTokens,
@@ -141,7 +140,7 @@ describe('driver row validation boundary', () => {
       branchView: async (remoteProjectId: string) => ({ remoteProjectId }),
       listPrs: async () => [],
       listComments: singlePageComments([{
-        id: 101, authorId: 8231, body: commentBody,
+        id: 101, body: commentBody,
         createdAt: '2026-08-05T00:00:00Z', updatedAt: '2026-08-05T00:00:00Z',
       }]),
       postComment: async () => undefined,
@@ -171,8 +170,8 @@ describe('driver row validation boundary', () => {
       pages.push(pageRows[0]);
       return pageRows;
     });
-    expect(pages[0]).toMatchObject({ id: '101', authorId: '8231' });
-    expect(rows[0]).toMatchObject({ id: '101', authorId: '8231' });
+    expect(pages[0]).toMatchObject({ id: '101' });
+    expect(rows[0]).toMatchObject({ id: '101' });
     await expect(driver.prView(1)).resolves.toMatchObject({
       sourceProjectId: '7',
       targetProjectId: '7',
@@ -294,14 +293,14 @@ describe('driver row validation boundary', () => {
         _prNumber: number,
         projectPage?: (rows: Record<string, unknown>[]) => Record<string, unknown>[],
       ) => {
-        const raw = [{ id: 101, authorId: 8231, body: 'x', updatedAt: '2026-08-05T00:00:00Z', versionTime: 9e15 }];
+        const raw = [{ id: 101, body: 'x', updatedAt: '2026-08-05T00:00:00Z', versionTime: 9e15 }];
         projectPage?.(raw.map(r => ({ ...r })));
         return raw;
       },
     } as PlatformDriver);
     const rows = await driver.listComments({ key: 'notes', category: 'top-level' }, 1);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ id: '101', authorId: '8231' });
+    expect(rows[0]).toMatchObject({ id: '101' });
     expect(rows[0]!.versionTime).toBeUndefined();
   });
 
@@ -348,16 +347,6 @@ describe('driver row validation boundary', () => {
       .resolves.toMatchObject({ sourceProjectId: null });
   });
 
-  it('caps actor ids at the completion-signal limit so accepted rows always round-trip', async () => {
-    const okId = 'a'.repeat(128);
-    const driver = driverFor({ ...GOOD_PR, prAuthorId: okId });
-    await expect(driver.prView(1)).resolves.toMatchObject({ prAuthorId: okId });
-    expect(decodeSignalActorId(Buffer.from(okId, 'utf8').toString('base64url'))).toBe(okId);
-
-    await expect(driverFor({ ...GOOD_PR, prAuthorId: 'a'.repeat(129) }).prView(1))
-      .rejects.toThrow(/prAuthorId.*at most 128 characters/);
-  });
-
   it('rejects threaded comment rows missing discussionId but accepts explicit null roots', async () => {
     const threadedDriver = (row: Record<string, unknown>): PlatformDriver => ({
       ...numericIdDriver(GOOD_PR),
@@ -365,7 +354,7 @@ describe('driver row validation boundary', () => {
       listComments: singlePageComments([row]),
     } as unknown as PlatformDriver);
     const baseRow = {
-      id: 7, body: 'x', authorId: 8231,
+      id: 7, body: 'x',
       createdAt: '2026-08-05T00:00:00Z', updatedAt: '2026-08-05T00:00:00Z',
     };
     const source = { key: 'inline-notes', category: 'threaded' as const };
@@ -405,7 +394,7 @@ describe('driver row validation boundary', () => {
     const scans = await scanCommentSourcesOnce(driver, 1, () => 0);
     expect(scans).toHaveLength(1);
     const row = scans[0]!.rows[0]!;
-    expect(row).toMatchObject({ id: '101', authorId: '8231' });
+    expect(row).toMatchObject({ id: '101' });
     expect(rowHasBody(row)).toBe(true);
     expect(rowBodyDigest(row)).toBe(bodyDigest(body));
     expect(rowTokens(row)).toEqual([{ kind: 'pass', anchorSha: SHA, token: 'tok-123456' }]);

@@ -440,8 +440,6 @@ export const zhCN: Messages = {
     reviewRecoveryStageLabel: 'PR 内容（必填）',
     reviewRecoveryStageSpec: '方案',
     reviewRecoveryStageCode: '代码',
-    reviewRecoveryActorLabel: 'PR 提交者的平台用户 ID（必填）',
-    reviewRecoveryActorPlaceholder: '代码平台的稳定用户 ID',
     reviewRecoverySubmit: '保存并开始评审',
     continueButtonTitle: '开始新一轮修改，完成后重新评审',
     completeButtonTitle: '不再修改，接受当前版本并合并 PR',

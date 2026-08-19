@@ -156,13 +156,12 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'tok123abc456';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42)}\n`);
     expect(captured).toHaveLength(1);
     expect(captured[0].type).toBe('spec.ready');
     expect(captured[0].data).toMatchObject({
       kind: 'spec-done',
       prNumber: 42,
-      actorB64: 'Nzc',
       token,
       source: 'pane-signal',
     });
@@ -213,7 +212,7 @@ describe('PhaseSignalWatcher', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'correctTok01' });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'wrongTok123x', 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'wrongTok123x', 42)}\n`);
     expect(captured).toHaveLength(0);
     expect(warn.mock.calls.some(c => String(c[0]).includes('foreign token'))).toBe(true);
     warn.mockRestore();
@@ -267,8 +266,8 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'oncetok123ab';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42)}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -330,9 +329,9 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'old1tok234ab' });
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'new1tok234ab' });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'old1tok234ab', 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'old1tok234ab', 42)}\n`);
     expect(captured).toHaveLength(0);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'new1tok234ab', 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'new1tok234ab', 42)}\n`);
     expect(captured).toHaveLength(1);
     warn.mockRestore();
   });
@@ -342,7 +341,7 @@ describe('PhaseSignalWatcher', () => {
     const token = 'stoptok1234a';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
     watcher.stop('t1');
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42)}\n`);
     expect(captured).toHaveLength(0);
   });
 
@@ -358,7 +357,7 @@ describe('PhaseSignalWatcher', () => {
     streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42, 'Nzc')}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
     await flushMicrotasks();
     expect(captured).toHaveLength(2);
     expect(captured.map(e => e.agentId).sort()).toEqual([DEV_AGENT.id, QA_AGENT.id]);
@@ -371,7 +370,7 @@ describe('PhaseSignalWatcher', () => {
       agentId: QA_AGENT.id, expectedKinds: 'pr-fixed', token: 'qatok1234567',
     });
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42, 'Nzc')}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
     expect(captured).toHaveLength(0);
     streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
@@ -402,7 +401,7 @@ describe('PhaseSignalWatcher', () => {
       replaceScope: 'agent', onlyReplaceOwnToken: true,
     });
     expect(armed).toBe(true);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 7, 'Nzc')}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 7)}\n`);
     expect(captured).toHaveLength(1);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
   });
@@ -461,10 +460,10 @@ describe('PhaseSignalWatcher', () => {
     expect(await handoff).toBe(true);
     watcher.releaseArm(claim);
 
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', oldToken, 1, 'Nzc')}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', oldToken, 1)}\n`);
     expect(captured).toHaveLength(0);
     streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', newToken, 2, 'Nzc')}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', newToken, 2)}\n`);
     await flushMicrotasks();
     expect(captured.map(event => event.agentId).sort()).toEqual([DEV_AGENT.id, QA_AGENT.id]);
     warn.mockRestore();
@@ -500,7 +499,7 @@ describe('PhaseSignalWatcher', () => {
 
     watcher.stopIfToken('t1', token);
     expect(watcher.has('t1')).toBe(false);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42)}\n`);
     expect(captured).toHaveLength(0);
   });
 
@@ -512,7 +511,7 @@ describe('PhaseSignalWatcher', () => {
     watcher.stopIfToken('t1', 'staletok1234');
 
     expect(watcher.has('t1')).toBe(true);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'freshtok1234', 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'freshtok1234', 42)}\n`);
     expect(captured.length).toBeGreaterThan(0);
     expect(captured[0].type).toBe('spec.ready');
   });
@@ -620,7 +619,7 @@ describe('PhaseSignalWatcher', () => {
     });
     const token = 'emitFail1234';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42)}\n`);
     await flushMicrotasks();
     expect(captured.length).toBe(1);
     expect((captured[0].data as { phase: string }).phase).toMatch(/^signal-emit-failed:/);
@@ -1111,7 +1110,7 @@ describe('need-input ask/answer watermark', () => {
     await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
     streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     streamer.triggerLive('y'.repeat(2000));
-    streamer.triggerLive(`[bx:pr-created:7:Nzc:${token}]\n`);
+    streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
     expect(captured).toHaveLength(1);
     expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
   });
@@ -1119,7 +1118,7 @@ describe('need-input ask/answer watermark', () => {
   it('a phase signal with nothing open commits no clear', async () => {
     const { watcher, streamer, commits } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
-    streamer.triggerLive(`[bx:pr-created:7:Nzc:${token}]\n`);
+    streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
     expect(commits).toEqual([]);
   });
 
@@ -1221,7 +1220,7 @@ describe('need-input ask/answer watermark', () => {
       expectedKinds: 'pr-created', token: 'tokDEV1234567',
       needInput: { epoch: 3, askSeq: 0, answeredSeq: 0 },
     });
-    streamers[DEV_AGENT.id].triggerLive('[bx:pr-created:7:Nzc:tokDEV1234567]\n');
+    streamers[DEV_AGENT.id].triggerLive('[bx:pr-created:7:tokDEV1234567]\n');
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     await watcher.start({
       taskId: 't1', projectId: 'p1', agentId: QA_AGENT.id,
@@ -1446,7 +1445,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   ])('fires on a marker the terminal displays after %s', async (_name, wrap) => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`${wrap(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'))}\n`);
+    streamer.triggerLive(`${wrap(buildPhaseSignal('spec-done', TOKEN, 42))}\n`);
     expect(captured).toHaveLength(1);
     expect(captured[0].type).toBe('spec.ready');
   });
@@ -1460,7 +1459,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   ])('stays armed when the marker is hidden inside %s', async (_name, wrap) => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`${wrap(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'))}\n`);
+    streamer.triggerLive(`${wrap(buildPhaseSignal('spec-done', TOKEN, 42))}\n`);
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
@@ -1469,7 +1468,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
     streamer.triggerLive(`${ESC}]0;`);
-    streamer.triggerLive(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'));
+    streamer.triggerLive(buildPhaseSignal('spec-done', TOKEN, 42));
     streamer.triggerLive(BEL);
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
@@ -1479,11 +1478,11 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     const { watcher, streamer, captured } = makeWatcher();
     streamer.triggerLive(`${ESC}]0;title-start`);
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}${BEL}`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42)}${BEL}`);
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
 
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -1508,15 +1507,15 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
 
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
   it.each([
     ['G1 = DEC graphics with SO/SI', (t: string) => `[bx:spec-\x1b)0\x0edone\x0f:${t}]`],
-    ['G0 = DEC graphics', (t: string) => `\x1b(0[bx:spec-done:42:Nzc:${t}]`],
-    ['G2 = DEC graphics locked in with LS2', (t: string) => `\x1b*0\x1bn[bx:spec-done:42:Nzc:${t}]`],
-    ['G3 = DEC graphics locked in with LS3', (t: string) => `\x1b+0\x1bo[bx:spec-done:42:Nzc:${t}]`],
+    ['G0 = DEC graphics', (t: string) => `\x1b(0[bx:spec-done:42:${t}]`],
+    ['G2 = DEC graphics locked in with LS2', (t: string) => `\x1b*0\x1bn[bx:spec-done:42:${t}]`],
+    ['G3 = DEC graphics locked in with LS3', (t: string) => `\x1b+0\x1bo[bx:spec-done:42:${t}]`],
   ])('stays armed when %s rewrote the marker', async (_name, wrap) => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
@@ -1524,7 +1523,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
 
-    streamer.triggerLive(`\x0f\x1b(B${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x0f\x1b(B${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -1547,7 +1546,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     ['a CR inside a 7-bit CSI', (t: string) => `[bx:spec-\x1b[\r31mdone:${t}]`],
     ['RI moving the tail above the prefix', (t: string) => `\n[bx:spec-\x1bMdone:${t}]`],
     ['conceal hiding the tail', (t: string) => `[bx:spec-\x1b[8mdone:${t}]`],
-    ['conceal surviving an extended-colour payload', (t: string) => `\x1b[8m\x1b[38;5;28m[bx:spec-done:42:Nzc:${t}]`],
+    ['conceal surviving an extended-colour payload', (t: string) => `\x1b[8m\x1b[38;5;28m[bx:spec-done:42:${t}]`],
   ])('stays armed when the pane only looks complete because of %s', async (_name, wrap) => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
@@ -1559,7 +1558,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   it('still completes once the tail is revealed again', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b[8m\x1b[28m${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b[8m\x1b[28m${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -1569,7 +1568,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   ])('completes again once %s puts the terminal back on US-ASCII', async (_name, reset) => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b(0${reset}${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b(0${reset}${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -1584,14 +1583,14 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   it('completes when RIS clears the saved charset a later DECRC would have restored', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b(0\x1b7\x1bc\x1b8${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b(0\x1b7\x1bc\x1b8${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
   it('stays armed when a GR designation arms a later shift', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b-0\x0e${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b-0\x0e${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
@@ -1600,7 +1599,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
     streamer.triggerLive(
-      `\x1b(0\x1b[?1048h\x1b(B\x1b[?01048h\x1b[?1048l${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`,
+      `\x1b(0\x1b[?1048h\x1b(B\x1b[?01048h\x1b[?1048l${buildPhaseSignal('spec-done', TOKEN, 42)}\n`,
     );
     expect(captured).toHaveLength(1);
   });
@@ -1612,7 +1611,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   ])('stays armed when %s', async (_name, enter, leave) => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b(0${enter}\x1b(B${leave}${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b(0${enter}\x1b(B${leave}${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
@@ -1633,7 +1632,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
     streamer.triggerLive(
-      `\x1b(0\x1b[${prefix}1049h\x1b(B\x1b[${prefix}1049l${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`,
+      `\x1b(0\x1b[${prefix}1049h\x1b(B\x1b[${prefix}1049l${buildPhaseSignal('spec-done', TOKEN, 42)}\n`,
     );
     expect(captured).toHaveLength(1);
   });
@@ -1642,7 +1641,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
     streamer.triggerLive(
-      `\x1b(0\x1b[?47h\x1b7\x1b(B\x1b[?47l\x1b8${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`,
+      `\x1b(0\x1b[?47h\x1b7\x1b(B\x1b[?47l\x1b8${buildPhaseSignal('spec-done', TOKEN, 42)}\n`,
     );
     expect(captured).toHaveLength(1);
   });
@@ -1650,7 +1649,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   it('stays armed when leaving the alternate screen restores the graphics set', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b(0\x1b[?1049h\x1b(B\x1b[?1049l${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b(0\x1b[?1049h\x1b(B\x1b[?1049l${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
@@ -1658,7 +1657,7 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
   it('completes when a shift after DECRC reloads the ASCII slot', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b(0\x1b7\x1b(B\x1b8\x0f${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b(0\x1b7\x1b(B\x1b8\x0f${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -1677,21 +1676,21 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
 
-    streamer.triggerLive(`\x1b%G${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b%G${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
   it('completes when ESC %G selects the default without disturbing G1', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b(0\x1b%G${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b(0\x1b%G${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 
   it('completes on a marker a partially-remapping charset leaves intact', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
-    streamer.triggerLive(`\x1b(A${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`\x1b(A${buildPhaseSignal('spec-done', TOKEN, 42)}\n`);
     expect(captured).toHaveLength(1);
   });
 

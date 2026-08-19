@@ -96,8 +96,6 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
         at: '2026-05-10T12:30:00.000Z',
       };
     }
-    if (!Object.hasOwn(overrides, 'replyActorId')) task.replyActorId = '77';
-    if (!Object.hasOwn(overrides, 'replyActorStatus')) task.replyActorStatus = 'verified';
   }
   return task;
 }
@@ -708,18 +706,14 @@ describe('TaskDetail page — advance', () => {
       status: 'in_progress',
       phase: undefined,
       deliveryConfirmation: undefined,
-      replyActorId: '99',
-      replyActorStatus: 'provisional',
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
     const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
     const stage = within(dialog).getByLabelText('PR contains (required)') as HTMLSelectElement;
-    const actor = within(dialog).getByLabelText('PR author’s platform user ID (required)') as HTMLInputElement;
     expect(stage.value).toBe('spec');
-    expect(actor.value).toBe('99');
+    expect(within(dialog).queryByLabelText(/platform user ID/i)).toBeNull();
     fireEvent.change(stage, { target: { value: 'code' } });
-    fireEvent.change(actor, { target: { value: ' 77 ' } });
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Save and start review' }));
     });
@@ -727,32 +721,18 @@ describe('TaskDetail page — advance', () => {
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
       executor: 'qa',
       stage: 'code',
-      actorId: '77',
     });
   });
 
-  it('does not restore review without the PR author’s platform user ID', async () => {
-    open({
-      status: 'in_progress',
-      phase: undefined,
-      deliveryConfirmation: undefined,
-      replyActorId: undefined,
-      replyActorStatus: undefined,
-    });
+  it('starts review directly when the delivery is already confirmed', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', phase: 'code' }));
+    open({ status: 'in_progress', phase: 'code' });
 
     fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
-    const submit = within(dialog).getByRole('button', {
-      name: 'Save and start review',
-    }) as HTMLButtonElement;
-    expect(submit.disabled).toBe(true);
-    fireEvent.change(within(dialog).getByLabelText('PR author’s platform user ID (required)'), {
-      target: { value: '   ' },
-    });
-    expect(submit.disabled).toBe(true);
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await settleConfirmDialog('Start review');
 
-    expect(tasksAdvanceMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog', { name: 'Restore PR review' })).toBeNull();
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', { executor: 'qa' });
   });
 
   it('collects a PR number when a custom-branch task lost its initial signal', async () => {
@@ -764,8 +744,6 @@ describe('TaskDetail page — advance', () => {
       branch: 'feature/manual-review',
       phase: undefined,
       deliveryConfirmation: undefined,
-      replyActorId: undefined,
-      replyActorStatus: undefined,
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
@@ -775,7 +753,6 @@ describe('TaskDetail page — advance', () => {
     }) as HTMLButtonElement;
     fireEvent.change(within(dialog).getByLabelText('PR number (required)'), { target: { value: '73' } });
     fireEvent.change(within(dialog).getByLabelText('PR contains (required)'), { target: { value: 'code' } });
-    fireEvent.change(within(dialog).getByLabelText('PR author’s platform user ID (required)'), { target: { value: '77' } });
     await act(async () => {
       fireEvent.click(submit);
     });
@@ -784,7 +761,6 @@ describe('TaskDetail page — advance', () => {
       executor: 'qa',
       prNumber: 73,
       stage: 'code',
-      actorId: '77',
     });
   });
 

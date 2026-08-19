@@ -886,7 +886,7 @@ describe('git review dispatch recovery', () => {
     await seedRecoveryTask({
       id: 'task-unbound-claim', status: 'in_progress', phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-      replyActorId: '77', replyActorStatus: 'verified', prNumber: 42,
+      prNumber: 42,
       signalToken: 'delivery-pass-1', qaAgentId: 'qa-1',
     });
     const begun = await manager.beginGitReviewPass('task-unbound-claim', {
@@ -903,7 +903,7 @@ describe('git review dispatch recovery', () => {
     await seedRecoveryTask({
       id: 'task-bound-claim', status: 'in_progress', phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-      replyActorId: '77', replyActorStatus: 'verified', prNumber: 42,
+      prNumber: 42,
       signalToken: 'delivery-pass-2', qaAgentId: 'qa-1',
     });
     const begun = await manager.beginGitReviewPass('task-bound-claim', {
@@ -1080,35 +1080,26 @@ describe('setupRecoveredSpecSignals()', () => {
       && event.data.phase === 'phase-signal-setup-during-recovery')).toBe(false);
   });
 
-  it('restores both the passive review watcher and an unverified PR delivery watcher', async () => {
+  it('restores only the passive review watcher for a task under review', async () => {
     await seedRecoveryTask({
-      id: 'task-pending-pr',
+      id: 'task-under-review',
       phase: 'code',
       status: 'review',
       signalToken: 'tok-review',
-      pendingPrSignalToken: 'tok-pending-pr',
-      replyActorStatus: 'provisional',
       prNumber: 42,
     });
     const { watcher } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
 
-    expect(watcher.start).toHaveBeenCalledTimes(2);
+    expect(watcher.start).toHaveBeenCalledTimes(1);
     expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: 'task-pending-pr',
+      taskId: 'task-under-review',
       agentId: 'qa-1',
       expectedKinds: [],
       token: 'tok-review',
-      replaceScope: 'agent',
     }));
-    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: 'task-pending-pr',
-      agentId: 'dev-1',
-      expectedKinds: ['pr-created'],
-      token: 'tok-pending-pr',
-      replaceScope: 'agent',
-    }));
+    expect(watcher.start).not.toHaveBeenCalledWith(expect.objectContaining({ agentId: 'dev-1' }));
   });
 });
 

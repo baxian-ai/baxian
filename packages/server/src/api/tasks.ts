@@ -96,7 +96,6 @@ interface AdvanceTaskBody {
   executor?: string;
   agentId?: string;
   stage?: string;
-  actorId?: string;
   prNumber?: number;
   confirmRevoked?: boolean;
   note?: string;
@@ -253,9 +252,6 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       if (body.stage !== undefined && body.stage !== 'spec' && body.stage !== 'code') {
         return reply.status(400).send({ error: 'stage must be "spec" or "code" when provided' });
       }
-      if (body.actorId !== undefined && (typeof body.actorId !== 'string' || body.actorId.trim() === '')) {
-        return reply.status(400).send({ error: 'actorId must be a non-empty string when provided' });
-      }
       if (body.prNumber !== undefined && (!Number.isSafeInteger(body.prNumber) || body.prNumber < 1)) {
         return reply.status(400).send({ error: 'prNumber must be a positive safe integer when provided' });
       }
@@ -272,7 +268,6 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
         ...(body.executor !== undefined ? { executor: body.executor } : {}),
         ...(requestedAgentId !== undefined ? { agentId: requestedAgentId } : {}),
         ...(body.stage !== undefined ? { stage: body.stage } : {}),
-        ...(body.actorId !== undefined ? { actorId: body.actorId.trim() } : {}),
         ...(body.prNumber !== undefined ? { prNumber: body.prNumber } : {}),
         ...(body.confirmRevoked !== undefined ? { confirmRevoked: body.confirmRevoked } : {}),
         ...(body.note?.trim() ? { note: body.note.trim() } : {}),

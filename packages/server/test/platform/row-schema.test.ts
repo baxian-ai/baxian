@@ -96,9 +96,9 @@ describe('row-schema: listComments', () => {
   it('validates integer line fields and string display fields', () => {
     expect(() => validateRows('listComments', [{ ...COMMENT, line: 'five' }])).toThrow(RowSchemaError);
     expect(() => validateRows('listComments', [{ ...COMMENT, reviewState: 42 }])).toThrow(RowSchemaError);
-    const [row] = validateRows('listComments', [{ ...COMMENT, line: 5, reviewState: 'APPROVED', authorId: 9 }]);
+    const [row] = validateRows('listComments', [{ ...COMMENT, line: 5, reviewState: 'APPROVED', parentId: 9 }]);
     expect(row!.line).toBe(5);
-    expect(row!.authorId).toBe('9');
+    expect(row!.parentId).toBe('9');
   });
 
   it('reports the source key and row index in the error', () => {

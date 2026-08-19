@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   buildPhaseSignal,
   createSignalToken,
-  decodeSignalActorId,
   PHASE_SIGNAL_KINDS,
   scanInputReceivedSignals,
   scanNeedInputSignals,
@@ -15,19 +14,19 @@ describe('phase signal protocol', () => {
     expect(buildPhaseSignal('pr-merge-ready', 'tok345abc')).toBe('[bx:pr-merge-ready:tok345abc]');
     expect(buildPhaseSignal('pr-fixed', 'tok456abc')).toBe('[bx:pr-fixed:tok456abc]');
     expect(buildPhaseSignal('greeting', 'tok456abc')).toBe('[bx:greeting:tok456abc]');
-    expect(buildPhaseSignal('spec-done', 'abc123def456', 42, 'Nzc'))
-      .toBe('[bx:spec-done:42:Nzc:abc123def456]');
-    expect(buildPhaseSignal('pr-created', 'tok123def456', 999, 'Nzc'))
-      .toBe('[bx:pr-created:999:Nzc:tok123def456]');
+    expect(buildPhaseSignal('spec-done', 'abc123def456', 42))
+      .toBe('[bx:spec-done:42:abc123def456]');
+    expect(buildPhaseSignal('pr-created', 'tok123def456', 999))
+      .toBe('[bx:pr-created:999:tok123def456]');
   });
 
-  it('requires both PR number and actor for delivery signals', () => {
+  it('requires a PR number for delivery signals', () => {
     expect(() => (buildPhaseSignal as (...args: unknown[]) => string)(
       'pr-created', 'abc123def456',
-    )).toThrow(/requires prNumber and actorB64/);
+    )).toThrow(/requires prNumber/);
     expect(() => (buildPhaseSignal as (...args: unknown[]) => string)(
-      'spec-done', 'abc123def456', 42,
-    )).toThrow(/requires prNumber and actorB64/);
+      'spec-done', 'abc123def456',
+    )).toThrow(/requires prNumber/);
   });
 
   it('scans only the retained grammar', () => {
@@ -36,23 +35,23 @@ describe('phase signal protocol', () => {
     ]);
     const text = [
       '[bx:pr-fixed:xyz789def]',
-      '[bx:pr-created:7:Nzc:fff111222333]',
-      '[bx:spec-done:42:Nzc:abc123def456]',
+      '[bx:pr-created:7:fff111222333]',
+      '[bx:spec-done:42:abc123def456]',
       '[bx:pr-merge-ready:tok111222333]',
     ].join('\n');
     expect(scanPhaseSignals(text)).toEqual([
       { kind: 'pr-fixed', token: 'xyz789def' },
-      { kind: 'pr-created', prNumber: 7, actorB64: 'Nzc', token: 'fff111222333' },
-      { kind: 'spec-done', prNumber: 42, actorB64: 'Nzc', token: 'abc123def456' },
+      { kind: 'pr-created', prNumber: 7, token: 'fff111222333' },
+      { kind: 'spec-done', prNumber: 42, token: 'abc123def456' },
       { kind: 'pr-merge-ready', token: 'tok111222333' },
     ]);
   });
 
-  it('rejects placeholders, incomplete delivery signals, and retired kinds', () => {
+  it('rejects placeholders, incomplete delivery signals, the retired actor segment, and retired kinds', () => {
     expect(scanPhaseSignals('[bx:spec-done:<token>]')).toEqual([]);
-    expect(scanPhaseSignals('[bx:pr-created:<pr_number>:<actor_b64>:<token>]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:pr-created:<pr_number>:<token>]')).toEqual([]);
     expect(scanPhaseSignals('[bx:spec-done:abcdef123456]')).toEqual([]);
-    expect(scanPhaseSignals('[bx:pr-created:42:abcdef123456]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:pr-created:42:Nzc:abcdef123456]')).toEqual([]);
     for (const kind of [
       'code-done', 'code-reviewed', 'code-fixed', 'code-ready', 'spec-reviewed', 'spec-fixed',
     ]) {
@@ -61,43 +60,16 @@ describe('phase signal protocol', () => {
   });
 
   it('fuzzy-matches a delivery signal split across lines', () => {
-    const wrapped = '[bx:spec-done:4\n  2:Nz\n  c:abc12\n  3def456]';
+    const wrapped = '[bx:spec-done:4\n  2:abc12\n  3def456]';
     expect(scanPhaseSignals(wrapped)).toEqual([
-      { kind: 'spec-done', prNumber: 42, actorB64: 'Nzc', token: 'abc123def456' },
+      { kind: 'spec-done', prNumber: 42, token: 'abc123def456' },
     ]);
-  });
-
-  it('keeps the last segment as token when actor and token share the charset', () => {
-    expect(scanPhaseSignals('[bx:pr-created:42:abcdef123456:bbbbbb123456]')).toEqual([
-      { kind: 'pr-created', prNumber: 42, actorB64: 'abcdef123456', token: 'bbbbbb123456' },
-    ]);
-  });
-
-  it('drops a pr-created whose actor segment carries out-of-charset bytes', () => {
-    expect(scanPhaseSignals('[bx:pr-created:42:has.dot:abcdef123456]')).toEqual([]);
-  });
-
-  it('decodes base64url actor ids back to the exact byte string', () => {
-    expect(decodeSignalActorId('Nzc')).toBe('77');
-    expect(decodeSignalActorId('MDExMDU1NTQ4')).toBe('011055548');
-    expect(decodeSignalActorId(Buffer.from('bot[7]:x', 'utf8').toString('base64url'))).toBe('bot[7]:x');
-    expect(decodeSignalActorId(Buffer.from('机器人-77', 'utf8').toString('base64url'))).toBe('机器人-77');
-  });
-
-  it('rejects malformed, oversized, and control-character actor payloads', () => {
-    expect(decodeSignalActorId('')).toBeUndefined();
-    expect(decodeSignalActorId('abcde')).toBeUndefined();
-    expect(decodeSignalActorId('Nzc=')).toBeUndefined();
-    expect(decodeSignalActorId(Buffer.from('x'.repeat(129), 'utf8').toString('base64url'))).toBeUndefined();
-    expect(decodeSignalActorId(Buffer.from('x'.repeat(128), 'utf8').toString('base64url'))).toBe('x'.repeat(128));
-    expect(decodeSignalActorId(Buffer.from('a\tb', 'utf8').toString('base64url'))).toBeUndefined();
-    expect(decodeSignalActorId(Buffer.from([0x61, 0xff, 0x62]).toString('base64url'))).toBeUndefined();
   });
 
   it('matches a marker the terminal shows through SGR colouring', () => {
-    const colored = `\x1b[32m[bx:spec-done:42:Nzc:tokABCDEF]\x1b[0m`;
+    const colored = `\x1b[32m[bx:spec-done:42:tokABCDEF]\x1b[0m`;
     expect(scanPhaseSignals(visibleText(colored))).toEqual([
-      { kind: 'spec-done', prNumber: 42, actorB64: 'Nzc', token: 'tokABCDEF' },
+      { kind: 'spec-done', prNumber: 42, token: 'tokABCDEF' },
     ]);
   });
 
@@ -110,9 +82,9 @@ describe('phase signal protocol', () => {
 
   it('ignores unknown kinds and malformed tokens', () => {
     expect(scanPhaseSignals('[bx:unknown-kind:abc123]')).toEqual([]);
-    expect(scanPhaseSignals('[bx:spec-done:42:Nzc:abc]')).toEqual([]);
-    expect(scanPhaseSignals('[bx:spec-done:42:Nzc:tok]extra]')).toEqual([]);
-    expect(scanPhaseSignals('[bx:pr-created:abc:Nzc:tok123abc]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:spec-done:42:abc]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:spec-done:42:tok]extra]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:pr-created:abc:tok123abc]')).toEqual([]);
   });
 
   it('createSignalToken produces 12 hex chars (48 bits)', () => {
@@ -126,10 +98,10 @@ describe('phase signal protocol', () => {
   });
 
   it('returns signals in text order', () => {
-    const text = '[bx:spec-done:7:Nzc:tokSpec01234]\nlater\n[bx:pr-created:42:Nzc:tokPR0123456]';
+    const text = '[bx:spec-done:7:tokSpec01234]\nlater\n[bx:pr-created:42:tokPR0123456]';
     expect(scanPhaseSignals(text)).toEqual([
-      { kind: 'spec-done', prNumber: 7, actorB64: 'Nzc', token: 'tokSpec01234' },
-      { kind: 'pr-created', prNumber: 42, actorB64: 'Nzc', token: 'tokPR0123456' },
+      { kind: 'spec-done', prNumber: 7, token: 'tokSpec01234' },
+      { kind: 'pr-created', prNumber: 42, token: 'tokPR0123456' },
     ]);
   });
 });

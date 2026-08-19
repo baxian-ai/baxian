@@ -100,8 +100,7 @@ describe('PlatformPoller over the GitHub driver (fake gh)', () => {
   it('turns a fail-token native review into REQUEST_CHANGES and human feedback into comment events', async () => {
     Object.assign(tasks[0]!, {
       prNumber: 42, latestHeadSha: SHA, anchorSha: ANCHOR,
-      passToken: PASS, failToken: FAIL, signalToken: 'abababababab',
-      replyActorId: '77', replyActorStatus: 'verified', inReview: true,
+      passToken: PASS, failToken: FAIL, signalToken: 'abababababab', inReview: true,
     });
     world.reviews = [ghReview(900, `findings body\n${buildReviewTokenLine({ kind: 'fail', anchorSha: ANCHOR, token: FAIL })}`, 'CHANGES_REQUESTED')];
     world.issueComments = [ghIssueComment(300, 'please also fix naming')];
@@ -411,32 +410,22 @@ describe('GitHub driver lifecycle integration', () => {
       title: 'Lifecycle', description: 'exercise the complete platform path', preferredAgentId: 'dev-1',
     });
     const publishToken = '111111111111';
-    await h.manager.updateTask(created.id, {
-      signalToken: publishToken,
-      pendingPrSignalToken: publishToken,
-    });
+    await h.manager.updateTask(created.id, { signalToken: publishToken });
     h.publish(created.branch!);
 
     await h.poller.poll();
     let task = (await h.taskStore.get(created.id))!;
-    expect(task).toMatchObject({
-      status: 'in_progress', prNumber: 42, latestHeadSha: SHA,
-      replyActorId: '77', replyActorStatus: 'provisional',
-    });
+    expect(task).toMatchObject({ status: 'in_progress', prNumber: 42, latestHeadSha: SHA });
     expect(task.reviewHeadAnchorSha).toBeUndefined();
 
     await h.eventBus.emit({
       id: '', type: 'pr.created', timestamp: new Date().toISOString(),
       projectId: 'proj', agentId: 'dev-1', taskId: created.id,
-      data: {
-        source: 'pane-signal', prNumber: 42, token: publishToken,
-        actorB64: Buffer.from('77', 'utf8').toString('base64url'),
-      },
+      data: { source: 'pane-signal', prNumber: 42, token: publishToken },
     });
     task = (await h.taskStore.get(created.id))!;
     expect(task).toMatchObject({
-      status: 'review', phase: 'code', prNumber: 42, latestHeadSha: SHA,
-      reviewHeadAnchorSha: SHA, replyActorId: '77', replyActorStatus: 'verified',
+      status: 'review', phase: 'code', prNumber: 42, latestHeadSha: SHA, reviewHeadAnchorSha: SHA,
     });
 
     const humanBody = 'please handle the edge case';
