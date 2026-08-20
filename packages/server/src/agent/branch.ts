@@ -7,6 +7,7 @@ export interface AutoDeleteIdentity {
   taskId?: string;
   taskBranch?: string;
   branchCreatedByBaxian?: boolean;
+  resolveMergedHeadSha?: () => Promise<string>;
 }
 
 export function isAutoDeletableTaskBranch(identity: AutoDeleteIdentity): boolean {
@@ -36,7 +37,7 @@ export class ReviewHeadMismatchError extends Error {
 export type BranchCleanupResult =
   | { status: 'deleted'; remoteTipSha?: string }
   | { status: 'skipped'; reason: string }
-  | { status: 'pending'; reason: string };
+  | { status: 'pending'; reason: string; remoteTipSha?: string };
 
 export class BranchManager {
   constructor(private runner: CommandRunner) {}
@@ -121,17 +122,14 @@ export class BranchManager {
       throw new Error(`Failed to fetch ${branch} for checkout restore: ${fetched.stderr.trim()}`);
     }
     const remoteTip = await this.resolveCommit(workdir, remoteRef);
-    const contained = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} merge-base --is-ancestor ` +
-        `${shellQuote(cleanedRemoteTipSha)} ${shellQuote(remoteTip)}`,
-    );
-    if (contained.exitCode === 1) {
+    const contained = await this.isAncestor(workdir, cleanedRemoteTipSha, remoteTip);
+    if (contained === false) {
       throw new Error(
         `Remote ${branch} no longer contains the cleaned-up local tip ${cleanedRemoteTipSha}; refusing to restore`,
       );
     }
-    if (contained.exitCode !== 0) {
-      throw new Error(`Remote ancestry probe failed for ${branch}: ${contained.stderr.trim()}`);
+    if (contained !== true) {
+      throw new Error(`Remote ancestry probe failed for ${branch}: ${contained.error}`);
     }
     await this.switch(workdir, `--no-guess -c ${shellQuote(branch)} --track ${shellQuote(remoteRef)}`);
     await this.markTaskBranch(workdir, branch, taskId);
@@ -188,7 +186,7 @@ export class BranchManager {
     const exists = await this.runner.exec(
       `git -C ${shellQuote(workdir)} show-ref --verify --quiet ${shellQuote(actualRef)}`,
     );
-    if (exists.exitCode === 1) return { status: 'deleted' };
+    if (exists.exitCode === 1) return this.sweepBranchConfig(workdir, identity.taskBranch!, identity.taskId!);
     if (exists.exitCode !== 0) {
       return { status: 'pending', reason: `local ref probe failed: ${exists.stderr.trim()}` };
     }
@@ -213,10 +211,10 @@ export class BranchManager {
     const remoteRef = `refs/remotes/origin/${identity.taskBranch}`;
     try {
       if (!await this.remoteBranchExists(workdir, identity.taskBranch)) {
-        return {
-          status: 'skipped',
-          reason: 'remote branch is absent; preserving the local branch without retry',
-        };
+        return this.deleteViaMergedHead(
+          workdir, identity, localTip, assertOwner,
+          'remote branch is absent; preserving the local branch without retry',
+        );
       }
     } catch (err) {
       return {
@@ -240,10 +238,10 @@ export class BranchManager {
     if (fetched.exitCode !== 0) {
       try {
         if (!await this.remoteBranchExists(workdir, identity.taskBranch)) {
-          return {
-            status: 'skipped',
-            reason: 'remote branch disappeared during cleanup; preserving the local branch without retry',
-          };
+          return this.deleteViaMergedHead(
+            workdir, identity, localTip, assertOwner,
+            'remote branch disappeared during cleanup; preserving the local branch without retry',
+          );
         }
       } catch (err) {
         return {
@@ -261,31 +259,21 @@ export class BranchManager {
       return { status: 'pending', reason: `upstream is not exact ${remoteRef}` };
     }
     const remoteTip = await this.resolveCommit(workdir, remoteRef);
-    const contained = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} merge-base --is-ancestor ` +
-        `${shellQuote(localTip)} ${shellQuote(remoteTip)}`,
-    );
-    if (contained.exitCode === 1) {
+    const contained = await this.isAncestor(workdir, localTip, remoteTip);
+    if (contained === false) {
       return { status: 'pending', reason: 'remote branch does not contain the local tip' };
     }
-    if (contained.exitCode !== 0) {
-      return {
-        status: 'pending',
-        reason: `remote ancestry probe failed: ${contained.stderr.trim()}`,
-      };
+    if (contained !== true) {
+      return { status: 'pending', reason: `remote ancestry probe failed: ${contained.error}` };
     }
     await assertOwner();
-    await this.assertClean(workdir);
-    await this.switchDetached(workdir, await this.resolveCommit(workdir, 'origin/HEAD'));
+    await this.parkOnDefaultDetached(workdir);
     await assertOwner();
     const deleted = await this.runner.exec(
       `git -C ${shellQuote(workdir)} branch -d -- ${shellQuote(identity.taskBranch)}`,
     );
     if (deleted.exitCode !== 0) {
-      return {
-        status: 'pending',
-        reason: `git branch -d refused: ${deleted.stderr.trim()}`,
-      };
+      return { status: 'pending', reason: `git branch -d refused: ${deleted.stderr.trim()}` };
     }
     const remaining = await this.runner.exec(
       `git -C ${shellQuote(workdir)} show-ref --verify --quiet ${shellQuote(actualRef)}`,
@@ -293,11 +281,141 @@ export class BranchManager {
     if (remaining.exitCode === 0) {
       return { status: 'pending', reason: 'local ref still exists after deletion' };
     }
-    if (remaining.exitCode === 1) return { status: 'deleted', remoteTipSha: remoteTip };
+    if (remaining.exitCode === 1) return this.sweepBranchConfig(workdir, identity.taskBranch!, identity.taskId!, remoteTip);
     return {
       status: 'pending',
       reason: `local ref deletion verification failed: ${remaining.stderr.trim()}`,
     };
+  }
+
+  private async deleteViaMergedHead(
+    workdir: string,
+    identity: AutoDeleteIdentity,
+    localTip: string,
+    assertOwner: () => Promise<void>,
+    noCredentialReason: string,
+  ): Promise<BranchCleanupResult> {
+    if (identity.resolveMergedHeadSha === undefined) {
+      return { status: 'skipped', reason: noCredentialReason };
+    }
+    let mergedHeadSha: string;
+    try {
+      mergedHeadSha = await identity.resolveMergedHeadSha();
+    } catch (err) {
+      return {
+        status: 'pending',
+        reason: `merged-head lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    // a platform-contract short sha would be prefix-expanded against the local object store,
+    // which cannot prove identity with the platform head; never delete on a partial id
+    if (!/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(mergedHeadSha)) {
+      return {
+        status: 'skipped',
+        reason: `platform head sha ${mergedHeadSha} is not a full object id; ` +
+          'preserving the local branch without retry',
+      };
+    }
+    const taskBranch = identity.taskBranch!;
+    const ref = `refs/heads/${taskBranch}`;
+    const known = await this.runner.exec(
+      `git -C ${shellQuote(workdir)} cat-file -e ${shellQuote(mergedHeadSha)}`,
+    );
+    if (known.exitCode === 1) {
+      return {
+        status: 'skipped',
+        reason: `merged head ${mergedHeadSha} is unknown to the local repository; ` +
+          'preserving the local branch without retry',
+      };
+    }
+    if (known.exitCode !== 0) {
+      return {
+        status: 'pending',
+        reason: `merged-head object probe failed: ${known.stderr.trim() || `exit ${known.exitCode}`}`,
+      };
+    }
+    const contained = await this.isAncestor(workdir, localTip, mergedHeadSha);
+    if (contained === false) {
+      return {
+        status: 'skipped',
+        reason: `merged head ${mergedHeadSha} does not contain the local tip; ` +
+          'preserving the local branch without retry',
+      };
+    }
+    if (contained !== true) {
+      return { status: 'pending', reason: `merged-head containment probe failed: ${contained.error}` };
+    }
+    await assertOwner();
+    await this.parkOnDefaultDetached(workdir);
+    await assertOwner();
+    const worktrees = await this.runner.exec(
+      `git -C ${shellQuote(workdir)} worktree list --porcelain`,
+    );
+    if (worktrees.exitCode !== 0) {
+      return { status: 'pending', reason: `worktree probe failed: ${worktrees.stderr.trim()}` };
+    }
+    if (worktrees.stdout.split('\n').some(line => line.trim() === `branch ${ref}`)) {
+      return { status: 'pending', reason: 'task branch is checked out in a linked worktree; refusing deletion' };
+    }
+    // old-value binding: only exactly the verified tip may vanish; --no-deref keeps a symref target intact
+    const deleted = await this.runner.exec(
+      `git -C ${shellQuote(workdir)} update-ref --no-deref -d ${shellQuote(ref)} ${shellQuote(localTip)}`,
+    );
+    if (deleted.exitCode !== 0) {
+      return { status: 'pending', reason: `atomic branch ref delete refused: ${deleted.stderr.trim()}` };
+    }
+    return this.sweepBranchConfig(workdir, taskBranch, identity.taskId!);
+  }
+
+  // branch config removal is a resumable postcondition: every deleted verdict, including the
+  // ref-already-missing path, re-runs it so a config lock failure converges on a later pass
+  private async sweepBranchConfig(
+    workdir: string,
+    taskBranch: string,
+    taskId: string,
+    remoteTipSha?: string,
+  ): Promise<BranchCleanupResult> {
+    const done: BranchCleanupResult = remoteTipSha !== undefined
+      ? { status: 'deleted', remoteTipSha }
+      : { status: 'deleted' };
+    // a pending here still proves the ref deletion happened at the verified remote tip,
+    // so the restore credential must survive the config retry loop
+    const credential = remoteTipSha !== undefined ? { remoteTipSha } : {};
+    const marker = await this.runner.exec(
+      `git -C ${shellQuote(workdir)} config --local --get ` +
+        `${shellQuote(`branch.${taskBranch}.baxian-task-id`)}`,
+    );
+    if (marker.exitCode === 1) return done;
+    if (marker.exitCode !== 0) {
+      return { status: 'pending', reason: `branch config probe failed: ${marker.stderr.trim()}`, ...credential };
+    }
+    // same ownership proof as the live-branch path: never remove a section baxian cannot claim
+    if (marker.stdout.trim() !== taskId) return done;
+    const removed = await this.runner.exec(
+      `git -C ${shellQuote(workdir)} config --local --remove-section ${shellQuote(`branch.${taskBranch}`)}`,
+    );
+    if (removed.exitCode !== 0) {
+      return {
+        status: 'pending',
+        reason: `branch config cleanup failed: ${removed.stderr.trim() || `exit ${removed.exitCode}`}`,
+        ...credential,
+      };
+    }
+    return done;
+  }
+
+  private async isAncestor(
+    workdir: string,
+    ancestor: string,
+    descendant: string,
+  ): Promise<boolean | { error: string }> {
+    const probe = await this.runner.exec(
+      `git -C ${shellQuote(workdir)} merge-base --is-ancestor ` +
+        `${shellQuote(ancestor)} ${shellQuote(descendant)}`,
+    );
+    if (probe.exitCode === 0) return true;
+    if (probe.exitCode === 1) return false;
+    return { error: probe.stderr.trim() || `exit ${probe.exitCode}` };
   }
 
   async currentRef(workdir: string): Promise<string | null> {

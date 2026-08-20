@@ -99,7 +99,14 @@ import {
   type TmuxSessionRef,
   type PaneRef,
 } from './tmux.js';
-import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError, isAutoDeletableTaskBranch } from './branch.js';
+import {
+  type AutoDeleteIdentity,
+  type BranchCleanupResult,
+  BranchManager,
+  DirtyWorkdirError,
+  ReviewHeadMismatchError,
+  isAutoDeletableTaskBranch,
+} from './branch.js';
 import { RepoStore, createRepoStoreCache, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import {
@@ -350,6 +357,14 @@ const DEFAULT_NEED_INPUT_RETRY_INTERVAL_MS = 5_000;
 const DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS = 3_000;
 const DELETE_CLEANUP_TIMEOUT_MS = 15_000;
 const PLATFORM_HEAD_SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
+
+function branchCleanupIdentity(task: TaskState): AutoDeleteIdentity {
+  return {
+    taskId: task.id,
+    taskBranch: task.branch,
+    branchCreatedByBaxian: task.branchCreatedByBaxian,
+  };
+}
 
 function createSignalTokenExcluding(...excluded: string[]): string {
   let token = createSignalToken();
@@ -2291,9 +2306,7 @@ export class AgentManager {
           }
           const pendingAt = new Date().toISOString();
           if (boundTask && cfg.role === 'dev') {
-            boundTask.branchCleanupPending = { agentId, reason, updatedAt: pendingAt };
-            boundTask.updatedAt = pendingAt;
-            await this.taskStore.set(boundTask);
+            await this.persistBranchCleanupOutcome(boundTask, agentId, { status: 'pending', reason });
           }
           let wrote = false;
           await this.agentStore.update(agentId, (latest2) => {
@@ -2372,66 +2385,13 @@ export class AgentManager {
           }
           if (cfg.role === 'dev' && boundTask) {
             const branches = new BranchManager(runner);
-            const cleanup = await branches.cleanupTaskBranch(releaseWorkdir, {
-              taskId: boundTask.id,
-              taskBranch: boundTask.branch,
-              branchCreatedByBaxian: boundTask.branchCreatedByBaxian,
-            }, () => this.assertTaskGeneration(
+            const cleanup = await branches.cleanupTaskBranch(releaseWorkdir, this.cleanupIdentityFor(boundTask), () => this.assertTaskGeneration(
               agentId,
               expectedTaskId,
               lockToken,
               releaseWorkdir,
             ).then(() => undefined));
-            let cleanupStateChanged = false;
-            if (cleanup.status === 'pending') {
-              if (
-                boundTask.branchCleanupPending?.agentId !== agentId
-                || boundTask.branchCleanupPending.reason !== cleanup.reason
-                || boundTask.branchCleanupSkipped !== undefined
-              ) {
-                boundTask.branchCleanupPending = {
-                  agentId,
-                  reason: cleanup.reason,
-                  updatedAt: new Date().toISOString(),
-                };
-                delete boundTask.branchCleanupSkipped;
-                cleanupStateChanged = true;
-              }
-            } else if (cleanup.status === 'skipped') {
-              if (
-                boundTask.branchCleanupSkipped?.agentId !== agentId
-                || boundTask.branchCleanupSkipped.reason !== cleanup.reason
-                || boundTask.branchCleanupPending !== undefined
-              ) {
-                boundTask.branchCleanupSkipped = {
-                  agentId,
-                  reason: cleanup.reason,
-                  updatedAt: new Date().toISOString(),
-                };
-                delete boundTask.branchCleanupPending;
-                cleanupStateChanged = true;
-              }
-            } else {
-              if (boundTask.branchCleanupPending?.agentId === agentId) {
-                delete boundTask.branchCleanupPending;
-                cleanupStateChanged = true;
-              }
-              if (boundTask.branchCleanupSkipped?.agentId === agentId) {
-                delete boundTask.branchCleanupSkipped;
-                cleanupStateChanged = true;
-              }
-              if (cleanup.remoteTipSha) {
-                boundTask.branchLocalCleaned = {
-                  remoteTipSha: cleanup.remoteTipSha,
-                  updatedAt: new Date().toISOString(),
-                };
-                cleanupStateChanged = true;
-              }
-            }
-            if (cleanupStateChanged) {
-              boundTask.updatedAt = new Date().toISOString();
-              await this.taskStore.set(boundTask);
-            }
+            await this.persistBranchCleanupOutcome(boundTask, agentId, cleanup);
             if (cleanup.status !== 'deleted') await branches.parkOnDefaultDetached(releaseWorkdir);
           } else {
             await new BranchManager(runner).parkOnDefaultDetached(releaseWorkdir);
@@ -2503,6 +2463,71 @@ export class AgentManager {
     });
   }
 
+  private cleanupIdentityFor(task: TaskState): AutoDeleteIdentity {
+    const identity = branchCleanupIdentity(task);
+    if (task.status === 'merged' && task.prNumber !== undefined) {
+      identity.resolveMergedHeadSha = () => this.platformFetchPrHeadSha(task.id);
+    }
+    return identity;
+  }
+
+  private async persistBranchCleanupOutcome(
+    task: TaskState,
+    agentId: string,
+    cleanup: BranchCleanupResult,
+    guard?: (latest: TaskState) => boolean,
+  ): Promise<void> {
+    await this.withTaskLock(async () => {
+      const latest = await this.taskStore.get(task.id);
+      if (!latest || latest.branch !== task.branch || (guard !== undefined && !guard(latest))) return;
+      const effective = cleanup;
+      const now = new Date().toISOString();
+      let changed = false;
+      if (effective.status === 'pending') {
+        if (
+          latest.branchCleanupPending?.agentId !== agentId
+          || latest.branchCleanupPending.reason !== effective.reason
+          || latest.branchCleanupSkipped !== undefined
+        ) {
+          latest.branchCleanupPending = { agentId, reason: effective.reason, updatedAt: now };
+          delete latest.branchCleanupSkipped;
+          changed = true;
+        }
+        if (effective.remoteTipSha !== undefined
+          && latest.branchLocalCleaned?.remoteTipSha !== effective.remoteTipSha) {
+          latest.branchLocalCleaned = { remoteTipSha: effective.remoteTipSha, updatedAt: now };
+          changed = true;
+        }
+      } else if (effective.status === 'skipped') {
+        if (
+          latest.branchCleanupSkipped?.agentId !== agentId
+          || latest.branchCleanupSkipped.reason !== effective.reason
+          || latest.branchCleanupPending !== undefined
+        ) {
+          latest.branchCleanupSkipped = { agentId, reason: effective.reason, updatedAt: now };
+          delete latest.branchCleanupPending;
+          changed = true;
+        }
+      } else {
+        if (latest.branchCleanupPending !== undefined) {
+          delete latest.branchCleanupPending;
+          changed = true;
+        }
+        if (latest.branchCleanupSkipped !== undefined) {
+          delete latest.branchCleanupSkipped;
+          changed = true;
+        }
+        if (effective.remoteTipSha) {
+          latest.branchLocalCleaned = { remoteTipSha: effective.remoteTipSha, updatedAt: now };
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      latest.updatedAt = now;
+      await this.taskStore.set(latest);
+    });
+  }
+
   private async releaseAgentIfBound(
     agentId: string,
     expectedTaskId: string,
@@ -2534,56 +2559,16 @@ export class AgentManager {
         .map(task => [task.branch, task]),
     );
     const owner = 'maintenance:branch-reconcile';
-    const persistCleanup = async (
+    const persistCleanup = (
       task: TaskState,
       agentId: string,
       cleanup: Awaited<ReturnType<BranchManager['cleanupTaskBranch']>>,
-    ): Promise<void> => {
-      await this.withTaskLock(async () => {
-        const latest = await this.taskStore.get(task.id);
-        if (
-          !latest
-          || latest.branch !== task.branch
-          || latest.branchCreatedByBaxian !== true
-          || !TERMINAL_STATUSES.includes(latest.status)
-        ) return;
-        const now = new Date().toISOString();
-        let changed = false;
-        if (cleanup.status === 'pending') {
-          if (
-            latest.branchCleanupPending?.agentId !== agentId
-            || latest.branchCleanupPending.reason !== cleanup.reason
-            || latest.branchCleanupSkipped !== undefined
-          ) {
-            latest.branchCleanupPending = { agentId, reason: cleanup.reason, updatedAt: now };
-            delete latest.branchCleanupSkipped;
-            changed = true;
-          }
-        } else if (cleanup.status === 'skipped') {
-          if (
-            latest.branchCleanupSkipped?.agentId !== agentId
-            || latest.branchCleanupSkipped.reason !== cleanup.reason
-            || latest.branchCleanupPending !== undefined
-          ) {
-            latest.branchCleanupSkipped = { agentId, reason: cleanup.reason, updatedAt: now };
-            delete latest.branchCleanupPending;
-            changed = true;
-          }
-        } else {
-          if (latest.branchCleanupPending !== undefined) {
-            delete latest.branchCleanupPending;
-            changed = true;
-          }
-          if (latest.branchCleanupSkipped !== undefined) {
-            delete latest.branchCleanupSkipped;
-            changed = true;
-          }
-        }
-        if (!changed) return;
-        latest.updatedAt = now;
-        await this.taskStore.set(latest);
-      });
-    };
+    ): Promise<void> => this.persistBranchCleanupOutcome(
+      task,
+      agentId,
+      cleanup,
+      latest => latest.branchCreatedByBaxian === true && TERMINAL_STATUSES.includes(latest.status),
+    );
 
     for (const cfg of this.agentIndex.values()) {
       if (cfg.role !== 'dev') continue;
@@ -2609,7 +2594,10 @@ export class AgentManager {
         );
         continue;
       }
-      if (!refs.some(ref => candidateByBranch.has(ref.slice('refs/heads/'.length)))) continue;
+      const isTarget = (task: TaskState, present: Set<string>): boolean =>
+        present.has(task.branch!) || task.branchCleanupPending !== undefined;
+      let present = new Set(refs.map(ref => ref.slice('refs/heads/'.length)));
+      if (!candidateTasks.some(task => isTarget(task, present))) continue;
       if (this.isDeletionInFlight(cfg.id)) continue;
       const token = await this.lockManager.acquire(cfg.id, owner);
       if (!token) continue;
@@ -2617,14 +2605,16 @@ export class AgentManager {
         task: TaskState;
         cleanup: Awaited<ReturnType<BranchManager['cleanupTaskBranch']>>;
       }> = [];
+      let targets: TaskState[] = [];
       try {
         if (!this.deletionGateOpen(cfg.id, genAtEntry)) continue;
         const lockedState = await this.agentStore.get(cfg.id);
         if (!lockedState || !canDispatchWithBinding(lockedState)) continue;
         if (!(await this.lockManager.isOwner(cfg.id, owner, token))) continue;
         refs = await branches.listLocalTaskRefs(workdir);
-        refs = refs.filter(ref => candidateByBranch.has(ref.slice('refs/heads/'.length)));
-        if (refs.length === 0) continue;
+        present = new Set(refs.map(ref => ref.slice('refs/heads/'.length)));
+        targets = [...candidateByBranch.values()].filter(task => isTarget(task, present));
+        if (targets.length === 0) continue;
         const tmux = new TmuxManager(runner);
         if (await tmux.hasSession(cfg.id)) {
           const pane = await this.resolveClaimedPane(tmux, cfg.id, lockedState.paneId ?? undefined);
@@ -2636,15 +2626,8 @@ export class AgentManager {
           );
         }
         if (!(await this.lockManager.isOwner(cfg.id, owner, token))) continue;
-        for (const actualRef of refs) {
-          const branch = actualRef.slice('refs/heads/'.length);
-          const task = candidateByBranch.get(branch);
-          if (!task) continue;
-          const cleanup = await branches.cleanupTaskBranch(workdir, {
-            taskId: task.id,
-            taskBranch: task.branch,
-            branchCreatedByBaxian: task.branchCreatedByBaxian,
-          }, () => this.assertTaskLockOwner(cfg.id, owner, token));
+        for (const task of targets) {
+          const cleanup = await branches.cleanupTaskBranch(workdir, this.cleanupIdentityFor(task), () => this.assertTaskLockOwner(cfg.id, owner, token));
           cleanupResults.push({ task, cleanup });
         }
       } catch (err) {
@@ -2652,9 +2635,7 @@ export class AgentManager {
         if (err instanceof DirtyWorkdirError) {
           await this.markAwaitingHuman(cfg.id, 'dirty-workdir', message, { expectedTaskId: null });
         } else if (err instanceof ReplNotReadyError || message.includes('stayed busy past')) {
-          for (const actualRef of refs) {
-            const task = candidateByBranch.get(actualRef.slice('refs/heads/'.length));
-            if (!task) continue;
+          for (const task of targets) {
             cleanupResults.push({
               task,
               cleanup: {

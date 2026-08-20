@@ -555,6 +555,90 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
+  async function releaseWithCleanupSpy(seed: Partial<TaskState>) {
+    const t = await harness.seedTask(seed);
+    await harness.seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
+      workdir: '/tmp/repo',
+    });
+    await harness.acquireAgentLock('dev-1');
+    const cleanupSpy = vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch')
+      .mockResolvedValue({ status: 'deleted' });
+    expect(await harness.manager.resumeAgent('dev-1')).toEqual({ resumed: true, releasedBinding: true });
+    return cleanupSpy;
+  }
+
+  it('attaches a lazy platform merged-head resolver when releasing a merged task', async () => {
+    const fetchSpy = vi.spyOn(harness.manager, 'platformFetchPrHeadSha').mockResolvedValue('b'.repeat(40));
+    const cleanupSpy = await releaseWithCleanupSpy({
+      status: 'merged', prNumber: 12, latestHeadSha: 'a'.repeat(40),
+    });
+    const identity = cleanupSpy.mock.calls[0]?.[1] as { resolveMergedHeadSha?: () => Promise<string> };
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(typeof identity.resolveMergedHeadSha).toBe('function');
+    await expect(identity.resolveMergedHeadSha!()).resolves.toBe('b'.repeat(40));
+    expect(fetchSpy).toHaveBeenCalledWith('task-1');
+  });
+
+  it('skips the platform credential resolver for a cancelled task', async () => {
+    const fetchSpy = vi.spyOn(harness.manager, 'platformFetchPrHeadSha');
+    const cleanupSpy = await releaseWithCleanupSpy({
+      status: 'cancelled', prNumber: 12, latestHeadSha: 'a'.repeat(40),
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const identity = cleanupSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(identity.resolveMergedHeadSha).toBeUndefined();
+  });
+
+  it('passes no credential resolver for a merged task without a bound PR', async () => {
+    const fetchSpy = vi.spyOn(harness.manager, 'platformFetchPrHeadSha');
+    const cleanupSpy = await releaseWithCleanupSpy({ status: 'merged', latestHeadSha: 'a'.repeat(40) });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const identity = cleanupSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(identity.resolveMergedHeadSha).toBeUndefined();
+  });
+
+  it('persists the remote tip credential carried by a pending config cleanup', async () => {
+    const t = await harness.seedTask({ status: 'cancelled' });
+    await harness.seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
+      workdir: '/tmp/repo',
+    });
+    await harness.acquireAgentLock('dev-1');
+    vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockResolvedValue({
+      status: 'pending', reason: 'branch config cleanup failed: lock', remoteTipSha: 'c'.repeat(40),
+    });
+
+    expect(await harness.manager.resumeAgent('dev-1')).toEqual({ resumed: true, releasedBinding: true });
+
+    const after = await harness.taskStore.get(t.id);
+    expect(after?.branchLocalCleaned?.remoteTipSha).toBe('c'.repeat(40));
+    expect(after?.branchCleanupPending?.reason).toContain('config cleanup failed');
+  });
+
+  it('keeps the persisted cleanup credential when the post-cleanup park fails', async () => {
+    const t = await harness.seedTask({ status: 'cancelled' });
+    await harness.seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
+      workdir: '/tmp/repo',
+    });
+    await harness.acquireAgentLock('dev-1');
+    vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockResolvedValue({
+      status: 'pending', reason: 'branch config cleanup failed: lock', remoteTipSha: 'c'.repeat(40),
+    });
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockRejectedValue(new Error('ssh reset'));
+
+    const result = await harness.manager.resumeAgent('dev-1');
+
+    expect(result).toMatchObject({ resumed: false, releasedBinding: false });
+    const after = await harness.taskStore.get(t.id);
+    expect(after?.branchLocalCleaned?.remoteTipSha).toBe('c'.repeat(40));
+    expect(after?.branchCleanupPending?.reason).toContain('checkout cleanup failed');
+  });
+
   it('records the branchLocalCleaned credential when release deletes a pushed local branch', async () => {
     const t = await harness.seedTask({ status: 'cancelled' });
     await harness.seedAgent({

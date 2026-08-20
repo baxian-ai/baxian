@@ -102,7 +102,7 @@ describe('BranchManager', () => {
     expect(await new BranchManager(local).currentRef(workdir)).toBe('refs/heads/main');
   });
 
-  async function pushTaskCommitAndCleanLocalRef(manager: BranchManager): Promise<string> {
+  async function pushTaskCommit(manager: BranchManager): Promise<string> {
     await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
     await run(
       `printf task > ${shellQuote(join(workdir, 'task.txt'))} && ` +
@@ -110,7 +110,11 @@ describe('BranchManager', () => {
       `git -C ${shellQuote(workdir)} commit -q -m task && ` +
       `git -C ${shellQuote(workdir)} push -q origin bx/task-1`,
     );
-    const pushedTip = await run(`git -C ${shellQuote(workdir)} rev-parse HEAD`);
+    return run(`git -C ${shellQuote(workdir)} rev-parse HEAD`);
+  }
+
+  async function pushTaskCommitAndCleanLocalRef(manager: BranchManager): Promise<string> {
+    const pushedTip = await pushTaskCommit(manager);
     const cleanup = await manager.cleanupTaskBranch(workdir, {
       taskId: 'task-1', taskBranch: 'bx/task-1', branchCreatedByBaxian: true,
     }, async () => {});
@@ -460,6 +464,326 @@ describe('BranchManager', () => {
     expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('0');
   });
 
+  async function pushTaskCommitAndDropRemoteRef(manager: BranchManager): Promise<string> {
+    const mergedHead = await pushTaskCommit(manager);
+    await run(`git -C ${shellQuote(origin)} update-ref -d refs/heads/bx/task-1`);
+    return mergedHead;
+  }
+
+  it('deletes the local branch via the merged-head credential when the remote branch is already gone', async () => {
+    const manager = new BranchManager(local);
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(manager);
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead,
+    }, async () => undefined);
+
+    expect(result).toEqual({ status: 'deleted' });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('1');
+    expect(await run(
+      `git -C ${shellQuote(workdir)} config --local --get branch.bx/task-1.baxian-task-id; echo $?`,
+    )).toBe('1');
+    expect(await manager.currentRef(workdir)).toBeNull();
+  });
+
+  it('keeps the local branch when the merged-head credential does not contain the local tip', async () => {
+    const manager = new BranchManager(local);
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(manager);
+    await run(
+      `printf local > ${shellQuote(join(workdir, 'local-only.txt'))} && ` +
+      `git -C ${shellQuote(workdir)} add local-only.txt && ` +
+      `git -C ${shellQuote(workdir)} commit -q -m local-only`,
+    );
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead,
+    }, async () => undefined);
+
+    expect(result).toMatchObject({
+      status: 'skipped',
+      reason: expect.stringContaining('does not contain the local tip'),
+    });
+    expect(await manager.currentRef(workdir)).toBe('refs/heads/bx/task-1');
+  });
+
+  it('keeps the local branch when the merged-head credential is unknown to the local repository', async () => {
+    const manager = new BranchManager(local);
+    await pushTaskCommitAndDropRemoteRef(manager);
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => 'f'.repeat(40),
+    }, async () => undefined);
+
+    expect(result).toMatchObject({
+      status: 'skipped',
+      reason: expect.stringContaining('unknown to the local repository'),
+    });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('0');
+  });
+
+  it('refuses the credential deletion while the branch is checked out in a linked worktree', async () => {
+    const manager = new BranchManager(local);
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(manager);
+    const wt = join(tempDir, 'wt');
+    await run(
+      `git -C ${shellQuote(workdir)} switch -q --detach && ` +
+      `git -C ${shellQuote(workdir)} worktree add -q ${shellQuote(wt)} bx/task-1`,
+    );
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead,
+    }, async () => undefined);
+
+    expect(result).toMatchObject({ status: 'pending', reason: expect.stringContaining('worktree') });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('0');
+    expect(await run(`git -C ${shellQuote(wt)} rev-parse HEAD`)).toBe(mergedHead);
+  });
+
+  it('keeps cleanup pending when the merged-head lookup rejects', async () => {
+    const manager = new BranchManager(local);
+    await pushTaskCommitAndDropRemoteRef(manager);
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => { throw new Error('gh api down'); },
+    }, async () => undefined);
+
+    expect(result).toMatchObject({
+      status: 'pending',
+      reason: expect.stringContaining('merged-head lookup failed'),
+    });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('0');
+  });
+
+  it('keeps the local branch when the platform head sha is not a full object id', async () => {
+    const manager = new BranchManager(local);
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(manager);
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead.slice(0, 12),
+    }, async () => undefined);
+
+    expect(result).toMatchObject({
+      status: 'skipped',
+      reason: expect.stringContaining('not a full object id'),
+    });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('0');
+  });
+
+  it('refuses the credential deletion when the branch advances after the containment check', async () => {
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(new BranchManager(local));
+    let advanced = false;
+    const runner: CommandRunner = {
+      exec: async (command, options) => {
+        const result = await local.exec(command, options);
+        if (!advanced && command.includes('merge-base --is-ancestor')) {
+          advanced = true;
+          await local.exec(
+            `git -C ${shellQuote(workdir)} commit -q --allow-empty -m sneak && ` +
+            `git -C ${shellQuote(workdir)} update-ref refs/heads/bx/task-1 HEAD`,
+          );
+        }
+        return result;
+      },
+      writeFile: (path, content) => local.writeFile(path, content),
+      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
+    };
+
+    const result = await new BranchManager(runner).cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead,
+    }, async () => undefined);
+
+    expect(result).toMatchObject({
+      status: 'pending',
+      reason: expect.stringContaining('refused'),
+    });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('0');
+  });
+
+  it('converges a config cleanup failure through the next ref-missing pass', async () => {
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(new BranchManager(local));
+    const runner: CommandRunner = {
+      exec: async (command, options) => command.includes('--remove-section')
+        ? { stdout: '', stderr: 'error: could not lock config file .git/config', exitCode: 255 }
+        : local.exec(command, options),
+      writeFile: (path, content) => local.writeFile(path, content),
+      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
+    };
+    const identity = {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead,
+    };
+
+    const first = await new BranchManager(runner).cleanupTaskBranch(workdir, identity, async () => undefined);
+    expect(first).toMatchObject({
+      status: 'pending',
+      reason: expect.stringContaining('config cleanup failed'),
+    });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('1');
+    expect(await run(
+      `git -C ${shellQuote(workdir)} config --local --get branch.bx/task-1.baxian-task-id; echo $?`,
+    )).toBe('task-1\n0');
+
+    const second = await new BranchManager(local).cleanupTaskBranch(workdir, identity, async () => undefined);
+    expect(second).toEqual({ status: 'deleted' });
+    expect(await run(
+      `git -C ${shellQuote(workdir)} config --local --get branch.bx/task-1.baxian-task-id; echo $?`,
+    )).toBe('1');
+  });
+
+  it('sweeps leftover branch config when the local ref is already gone', async () => {
+    const manager = new BranchManager(local);
+    await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+    await run(
+      `git -C ${shellQuote(workdir)} switch -q --detach && ` +
+      `git -C ${shellQuote(workdir)} update-ref --no-deref -d refs/heads/bx/task-1`,
+    );
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+    }, async () => undefined);
+
+    expect(result).toEqual({ status: 'deleted' });
+    expect(await run(
+      `git -C ${shellQuote(workdir)} config --local --get branch.bx/task-1.baxian-task-id; echo $?`,
+    )).toBe('1');
+  });
+
+  it('leaves a foreign branch config section alone when sweeping a missing ref', async () => {
+    const manager = new BranchManager(local);
+    await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+    await run(
+      `git -C ${shellQuote(workdir)} switch -q --detach && ` +
+      `git -C ${shellQuote(workdir)} update-ref --no-deref -d refs/heads/bx/task-1 && ` +
+      `git -C ${shellQuote(workdir)} config --local branch.bx/task-1.baxian-task-id task-2`,
+    );
+
+    const result = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+    }, async () => undefined);
+
+    expect(result).toEqual({ status: 'deleted' });
+    expect(await run(
+      `git -C ${shellQuote(workdir)} config --local --get branch.bx/task-1.baxian-task-id`,
+    )).toBe('task-2');
+  });
+
+  it('keeps the remote tip credential on a pending config cleanup after the ref deletion', async () => {
+    const manager = new BranchManager(local);
+    const remoteTip = await pushTaskCommit(manager);
+    let markerReads = 0;
+    const runner: CommandRunner = {
+      exec: async (command, options) => {
+        if (command.includes('--remove-section')) {
+          return { stdout: '', stderr: 'error: could not lock config file .git/config', exitCode: 255 };
+        }
+        if (command.includes('baxian-task-id') && command.includes('--get')) {
+          markerReads += 1;
+          if (markerReads > 1) return { stdout: 'task-1\n', stderr: '', exitCode: 0 };
+        }
+        return local.exec(command, options);
+      },
+      writeFile: (path, content) => local.writeFile(path, content),
+      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
+    };
+
+    const result = await new BranchManager(runner).cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+    }, async () => undefined);
+
+    expect(result).toEqual({
+      status: 'pending',
+      reason: expect.stringContaining('config cleanup failed'),
+      remoteTipSha: remoteTip,
+    });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('1');
+  });
+
+  it('keeps the cleanup retryable when the containment probe transport fails', async () => {
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(new BranchManager(local));
+    const runner: CommandRunner = {
+      exec: async (command, options) => command.includes('merge-base --is-ancestor')
+        ? { stdout: '', stderr: 'ssh: connection to host lost', exitCode: 255 }
+        : local.exec(command, options),
+      writeFile: (path, content) => local.writeFile(path, content),
+      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
+    };
+
+    const result = await new BranchManager(runner).cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead,
+    }, async () => undefined);
+
+    expect(result).toMatchObject({
+      status: 'pending',
+      reason: expect.stringContaining('containment probe failed'),
+    });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('0');
+  });
+
+  it('deletes via the merged-head credential when the remote branch disappears during cleanup', async () => {
+    const mergedHead = await pushTaskCommit(new BranchManager(local));
+    let probes = 0;
+    const runner: CommandRunner = {
+      exec: async (command, options) => {
+        if (command.includes('ls-remote --heads origin')) {
+          probes += 1;
+          return {
+            stdout: probes === 1 ? `${mergedHead}\trefs/heads/bx/task-1\n` : '',
+            stderr: '',
+            exitCode: 0,
+          };
+        }
+        if (command.includes(' fetch origin')) {
+          return { stdout: '', stderr: 'remote hung up unexpectedly', exitCode: 128 };
+        }
+        return local.exec(command, options);
+      },
+      writeFile: (path, content) => local.writeFile(path, content),
+      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
+    };
+
+    const result = await new BranchManager(runner).cleanupTaskBranch(workdir, {
+      taskId: 'task-1',
+      taskBranch: 'bx/task-1',
+      branchCreatedByBaxian: true,
+      resolveMergedHeadSha: async () => mergedHead,
+    }, async () => undefined);
+
+    expect(result).toEqual({ status: 'deleted' });
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('1');
+  });
+
   it('never deletes an exact bx task branch without the Git ownership marker', async () => {
     await run(
       `git -C ${shellQuote(workdir)} switch -q -c bx/task-1 && ` +
@@ -652,6 +976,135 @@ describe('BranchManager', () => {
     expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('1');
     expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-2; echo $?`)).toBe('0');
     expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('periodic reconciliation deletes a merged task branch via the merged-head credential after the remote is gone', async () => {
+    const now = new Date().toISOString();
+    const mergedHead = await pushTaskCommitAndDropRemoteRef(new BranchManager(local));
+    const task = makeTask({
+      id: 'task-1',
+      title: 'auto',
+      description: '',
+      phase: 'code',
+      platformBinding: undefined,
+      status: 'merged',
+      prNumber: 7,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const stateRoot = join(tempDir, 'credential-manager-state');
+    const config = makeConfig({
+      project: [{
+        id: 'proj', repo: 'https://github.com/owner/repo.git', merge: null,
+        agent: [[
+          makeAgent({ runtime: 'codex', workdir }),
+          makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
+        ]],
+      }],
+    });
+    const maintenanceRunner = fakeRunner({
+      rules: [
+        {
+          match: 'tmux has-session',
+          reply: { stderr: "can't find session: dev-1", exitCode: 1 },
+        },
+        {
+          match: 'repos/owner/repo/pulls/7',
+          reply: {
+            stdout: JSON.stringify({
+              number: 7, html_url: 'https://github.com/owner/repo/pull/7', title: 'auto',
+              state: 'closed', draft: false, merged_at: now, updated_at: now,
+              head: { sha: mergedHead, ref: 'bx/task-1', repo: { id: 11 } },
+              base: { ref: 'main', repo: { id: 11 } },
+              user: { login: 'u' },
+            }),
+            exitCode: 0,
+          },
+        },
+        {
+          match: command => !command.includes('tmux '),
+          reply: (command, options) => local.exec(command, options),
+        },
+      ],
+    });
+    const harness = await createManagerHarness(stateRoot, {
+      config,
+      deps: {
+        runnerFactory: () => maintenanceRunner,
+        platformRunner: maintenanceRunner,
+      },
+    });
+    const { manager, agentStore, taskStore } = harness;
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
+    await taskStore.set(task);
+
+    await manager.reconcileTaskBranches();
+
+    expect(await run(`git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`)).toBe('1');
+    const after = await taskStore.get('task-1');
+    expect(after?.branchCleanupSkipped).toBeUndefined();
+    expect(after?.branchCleanupPending).toBeUndefined();
+  });
+
+  it('periodic reconciliation converges a pending task whose local ref is already gone', async () => {
+    const now = new Date().toISOString();
+    await new BranchManager(local).switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+    await run(
+      `git -C ${shellQuote(workdir)} switch -q --detach && ` +
+      `git -C ${shellQuote(workdir)} update-ref --no-deref -d refs/heads/bx/task-1`,
+    );
+    const task = makeTask({
+      id: 'task-1',
+      title: 'auto',
+      description: '',
+      phase: 'code',
+      platformBinding: undefined,
+      status: 'merged',
+      branchCleanupPending: { agentId: 'dev-1', reason: 'branch config cleanup failed: lock', updatedAt: now },
+      createdAt: now,
+      updatedAt: now,
+    });
+    const stateRoot = join(tempDir, 'orphan-manager-state');
+    const config = makeConfig({
+      project: [{
+        id: 'proj', repo: 'https://github.com/owner/repo.git', merge: null,
+        agent: [[
+          makeAgent({ runtime: 'codex', workdir }),
+          makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
+        ]],
+      }],
+    });
+    const maintenanceRunner = fakeRunner({
+      rules: [
+        {
+          match: 'tmux has-session',
+          reply: { stderr: "can't find session: dev-1", exitCode: 1 },
+        },
+        {
+          match: command => !command.includes('tmux '),
+          reply: (command, options) => local.exec(command, options),
+        },
+      ],
+    });
+    const harness = await createManagerHarness(stateRoot, {
+      config,
+      deps: {
+        runnerFactory: () => maintenanceRunner,
+        platformRunner: maintenanceRunner,
+      },
+    });
+    const { manager, agentStore, taskStore } = harness;
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
+    await taskStore.set(task);
+
+    await manager.reconcileTaskBranches();
+
+    const after = await taskStore.get('task-1');
+    expect(after?.branchCleanupPending).toBeUndefined();
+    expect(after?.branchCleanupSkipped).toBeUndefined();
+    expect(await run(
+      `git -C ${shellQuote(workdir)} config --local --get branch.bx/task-1.baxian-task-id; echo $?`,
+    )).toBe('1');
   });
 
   it('periodic reconciliation leaves branches untouched while the runtime is not idle', async () => {
