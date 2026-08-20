@@ -108,23 +108,47 @@ describe('buildPromptInline', () => {
     expect(result).toContain('Original task body');
   });
 
-  it('slices platform instructions by operation', () => {
-    const publish = prompt('code', { prNumber: 42 });
-    const feedback = prompt('post-approve', { prNumber: 42 });
-    const review = prompt('review');
+  it('slices platform instructions by agent role', () => {
+    const dev = prompt('code', { prNumber: 42 });
+    const qa = prompt('review');
 
-    expect(publish).toContain('COMMON PLATFORM RULE');
-    expect(publish).toContain('PUBLISH PLATFORM RULE');
-    expect(publish).not.toContain('FEEDBACK PLATFORM RULE');
-    expect(publish).not.toContain('REVIEW PLATFORM RULE');
+    expect(dev).toContain('COMMON PLATFORM RULE');
+    expect(dev).toContain('PUBLISH PLATFORM RULE');
+    expect(dev).toContain('FEEDBACK PLATFORM RULE');
+    expect(dev).not.toContain('REVIEW PLATFORM RULE');
 
-    expect(feedback).toContain('COMMON PLATFORM RULE');
-    expect(feedback).toContain('FEEDBACK PLATFORM RULE');
-    expect(feedback).not.toContain('PUBLISH PLATFORM RULE');
+    expect(qa).toContain('COMMON PLATFORM RULE');
+    expect(qa).toContain('REVIEW PLATFORM RULE');
+    expect(qa).not.toContain('PUBLISH PLATFORM RULE');
+    expect(qa).not.toContain('FEEDBACK PLATFORM RULE');
+  });
 
-    expect(review).toContain('COMMON PLATFORM RULE');
-    expect(review).toContain('REVIEW PLATFORM RULE');
-    expect(review).not.toContain('PUBLISH PLATFORM RULE');
+  it('delivers the whole dev lifecycle contract on the first injection regardless of entry phase', () => {
+    for (const phase of ['develop', 'code', 'fix', 'post-approve']) {
+      const result = prompt(phase, { prNumber: 42 });
+      expect(result, phase).toContain('`[bx:pr-created:<pr>:<token>]`');
+      expect(result, phase).toContain('`[bx:spec-done:<pr>:<token>]`');
+      expect(result, phase).toContain('`[bx:pr-fixed:<token>]`');
+      expect(result, phase).toContain('`[bx:pr-merge-ready:<token>]`');
+    }
+  });
+
+  it('restates branch, base and spec-path on every dev first injection', () => {
+    for (const phase of ['develop', 'code', 'fix', 'post-approve']) {
+      expect(prompt(phase, { prNumber: 42, branch: 'feature/x', baseBranch: 'main' }), phase)
+        .toContain(`branch: feature/x\nbase: main\nspec-path: ${specPathForBranch('feature/x')}`);
+    }
+  });
+
+  it('delivers the whole qa lifecycle contract on the first injection regardless of entry phase', () => {
+    for (const phase of ['review', 'recheck']) {
+      const result = prompt(phase);
+      expect(result, phase).toContain('\nreview: Independently review the complete PR at anchor-sha');
+      expect(result, phase).toContain(
+        '\nrecheck: Everything under review applies again on this round\'s anchor-sha; additionally verify every ' +
+        'prior finding against the replies and current code',
+      );
+    }
   });
 
   it('server-fills the exact review verdict markers and provides no pane completion signal', () => {
@@ -142,13 +166,13 @@ describe('buildPromptInline', () => {
   });
 
   it('marks review, recheck, and fix prompts with stage: spec only while the task is in the spec phase', () => {
-    expect(prompt('review', { phase: 'spec' })).toContain('stage: spec');
-    expect(prompt('recheck', { phase: 'spec' })).toContain('stage: spec');
-    expect(prompt('fix', { phase: 'spec', prNumber: 42 })).toContain('stage: spec');
+    expect(prompt('review', { phase: 'spec' })).toContain('\nstage: spec\n');
+    expect(prompt('recheck', { phase: 'spec' })).toContain('\nstage: spec\n');
+    expect(prompt('fix', { phase: 'spec', prNumber: 42 })).toContain('\nstage: spec\n');
 
-    expect(prompt('review')).not.toContain('stage: spec');
-    expect(prompt('recheck')).not.toContain('stage: spec');
-    expect(prompt('fix', { phase: 'code', prNumber: 42 })).not.toContain('stage: spec');
+    expect(prompt('review')).not.toContain('\nstage: spec\n');
+    expect(prompt('recheck')).not.toContain('\nstage: spec\n');
+    expect(prompt('fix', { phase: 'code', prNumber: 42 })).not.toContain('\nstage: spec\n');
   });
 
   it('keeps task images in every full-context dispatch so a cleared runtime can recover', () => {
@@ -188,19 +212,25 @@ describe('buildPromptInline', () => {
     expect(result).toContain('repo: owner/repo');
   });
 
-  it('sends only phase-specific context when the runtime already owns this task', () => {
-    const result = prompt('fix', {
+  it('sends only the per-round variables once the runtime already owns this task', () => {
+    expect(prompt('fix', {
       title: 'Already known title',
       description: 'Already known description',
       prNumber: 42,
-    }, { includeTaskContext: false });
-
-    expect(result).toContain('task: task-1\nphase: fix');
-    expect(result).toContain('FEEDBACK PLATFORM RULE');
-    expect(result).not.toContain('Already known title');
-    expect(result).not.toContain('Already known description');
-    expect(result).not.toContain('COMMON PLATFORM RULE');
-    expect(result).not.toContain('Protocol:');
+      phase: 'code',
+    }, { includeTaskContext: false })).toBe(
+      'task: task-1\nphase: fix\npr: 42\ntoken: signal123456\n',
+    );
+    expect(prompt('develop', {}, { includeTaskContext: false })).toBe(
+      'task: task-1\nphase: develop\ntoken: signal123456\n',
+    );
+    expect(prompt('recheck', { phase: 'spec' }, { includeTaskContext: false })).toBe(
+      'task: task-1\nphase: recheck\npr: 42\nstage: spec\n' +
+      `anchor-sha: ${ANCHOR}\n` +
+      `pass: <!-- baxian:review:pass:${ANCHOR}:${PASS_TOKEN} -->\n` +
+      `fail: <!-- baxian:review:fail:${ANCHOR}:${FAIL_TOKEN} -->\n` +
+      'token: signal123456\n',
+    );
   });
 
   it('accepts exactly MAX_PROMPT_BYTES and rejects one byte more', () => {
@@ -234,6 +264,16 @@ describe('buildPromptInline', () => {
       workdir: '/tmp/repo',
       signalToken: SIGNAL_TOKEN,
     })).toThrow(/requires a qa agent/);
+  });
+
+  it('rejects a phase that has no agent contract', () => {
+    expect(() => buildPromptInline({
+      task: makeTask({ signalToken: SIGNAL_TOKEN }),
+      phase: 'merge',
+      agent: makeAgent(),
+      workdir: '/tmp/repo',
+      signalToken: SIGNAL_TOKEN,
+    })).toThrow(/merge/);
   });
 });
 

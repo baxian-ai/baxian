@@ -62,7 +62,6 @@ export type DispatchPhase =
   | 'code'
   | 'fix'
   | 'post-approve'
-  | 'merge'
   | 'review'
   | 'recheck';
 
@@ -72,7 +71,6 @@ export const PHASE_EXPECTED_STATUS: Record<string, TaskStatus[]> = {
   recheck: ['review'],
   fix: ['fixing'],
   'post-approve': ['approved'],
-  merge: ['approved', 'merge-ready', 'review'],
   code: ['in_progress'],
 };
 
@@ -82,7 +80,6 @@ export const PHASE_REQUIRES_AGENT_BOUND_TO_TASK: Record<string, boolean> = {
   'post-approve': true,
   review: false,
   recheck: false,
-  merge: false,
   code: true,
 };
 

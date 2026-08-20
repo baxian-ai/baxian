@@ -246,6 +246,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     expect(prompt).toContain('phase: develop');
     expect(prompt).not.toContain('Already delivered title');
     expect(prompt).not.toContain('Already delivered description');
+    expect(prompt).not.toContain('Task contract');
     expect(prompt).not.toContain('Protocol:');
   });
 
@@ -536,6 +537,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     expect(prompt).toContain('token: tok123456789');
     expect(prompt).not.toContain('Preserved context title');
     expect(prompt).not.toContain('Preserved context description');
+    expect(prompt).not.toContain('Task contract');
     expect(prompt).not.toContain('Protocol:');
   });
 
