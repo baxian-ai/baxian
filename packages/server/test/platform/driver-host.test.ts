@@ -227,18 +227,13 @@ describe('driver row validation boundary', () => {
     }
   });
 
-  it('requires at least one ack-capable source since reviews sources never carry acks', () => {
+  it('requires at least one source but accepts a reviews-only platform', () => {
     const withSources = (commentSources: unknown): PlatformDriver =>
       ({ ...numericIdDriver(GOOD_PR), commentSources } as PlatformDriver);
-    for (const sources of [[], [{ key: 'reviews', category: 'reviews' }]]) {
-      expect(() => buildOn('badsrc.example', withSources(sources)))
-        .toThrow(/must include at least one top-level or threaded source/);
-    }
-    const ok = buildOn('oksrc.example', withSources([
-      { key: 'reviews', category: 'reviews' },
-      { key: 'notes', category: 'top-level' },
-    ]));
-    expect(ok.commentSources).toHaveLength(2);
+    expect(() => buildOn('badsrc.example', withSources([])))
+      .toThrow(/must declare at least one source/);
+    const ok = buildOn('oksrc.example', withSources([{ key: 'reviews', category: 'reviews' }]));
+    expect(ok.commentSources).toHaveLength(1);
   });
 
   it('vets the preflight result shape so a plugin violation names the field instead of a consumer TypeError', async () => {
@@ -365,6 +360,40 @@ describe('driver row validation boundary', () => {
       .resolves.toMatchObject([{ id: '7', discussionId: null }]);
   });
 
+  it('applies the threaded contract to plugin rows, not to the caller projection a stop predicate sees', async () => {
+    const rawPage = [{
+      id: 7, body: 'x', discussionId: null,
+      createdAt: '2026-08-05T00:00:00Z', updatedAt: '2026-08-05T00:00:00Z',
+    }];
+    const stopPages: unknown[] = [];
+    const threaded = {
+      ...numericIdDriver(GOOD_PR),
+      commentSources: [{ key: 'inline-notes', category: 'threaded' }],
+      listComments: async (
+        _source: unknown,
+        _prNumber: number,
+        projectPage?: (rows: Record<string, unknown>[]) => Record<string, unknown>[],
+        shouldStop?: (rows: Record<string, unknown>[], page: number) => boolean,
+      ) => {
+        const projected = projectPage === undefined ? rawPage : projectPage(rawPage);
+        shouldStop?.(projected, 1);
+        return projected;
+      },
+    } as unknown as PlatformDriver;
+    const driver = buildOn('threadedstop.example', threaded);
+    const rows = await driver.listComments(
+      { key: 'inline-notes', category: 'threaded' },
+      1,
+      pageRows => pageRows.map(r => ({ id: r.id })),
+      pageRows => {
+        stopPages.push(pageRows);
+        return false;
+      },
+    );
+    expect(rows).toMatchObject([{ id: '7' }]);
+    expect(stopPages).toHaveLength(1);
+  });
+
   it('treats an undefined claim as unclaimed but rejects malformed slugs with a typed error', () => {
     registerPlatformProvider(makePlatformProvider({
       platform: 'sloppy.example',
@@ -387,7 +416,7 @@ describe('driver row validation boundary', () => {
     const body = [
       'real feedback body',
       buildReviewTokenLine({ kind: 'pass', anchorSha: SHA, token: 'tok-123456' }),
-      buildAckMarker({ sourceKey: 'notes', commentId: '9', bodyDigest: 'f'.repeat(64) }),
+      buildAckMarker({ sourceKey: 'notes', commentId: '9' }),
     ].join('\n');
     const driver = driverFor(GOOD_PR, body);
 
@@ -398,7 +427,7 @@ describe('driver row validation boundary', () => {
     expect(rowHasBody(row)).toBe(true);
     expect(rowBodyDigest(row)).toBe(bodyDigest(body));
     expect(rowTokens(row)).toEqual([{ kind: 'pass', anchorSha: SHA, token: 'tok-123456' }]);
-    expect(rowAcks(row)).toEqual([{ sourceKey: 'notes', commentId: '9', bodyDigest: 'f'.repeat(64) }]);
+    expect(rowAcks(row)).toEqual([{ sourceKey: 'notes', commentId: '9' }]);
   });
 });
 

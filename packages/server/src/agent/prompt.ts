@@ -80,6 +80,7 @@ export interface BuildPromptOpts {
   imagePaths?: string[];
   platform?: PlatformPromptContext;
   includeTaskContext?: boolean;
+  pendingFeedback?: string[];
 }
 
 export function buildPromptInline(opts: BuildPromptOpts): string {
@@ -91,20 +92,44 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
   const { task, signalToken } = opts;
   const includeTaskContext = opts.includeTaskContext ?? true;
 
-  const descriptor = [
-    `task: ${task.id}`,
-    `phase: ${phase}`,
-    ...(includeTaskContext ? [`workdir: ${opts.workdir}`, ...taskScopedFields(task, role, opts.platform)] : []),
-    ...roundFields(task, phase),
-    `token: ${signalToken}`,
-  ].join('\n');
-  const body = includeTaskContext
-    ? `${descriptor}${taskContextBlocks(task, opts.imagePaths)}\n\n${roleContext(role, opts.platform)}\n`
-    : `${descriptor}\n`;
+  const compose = (pendingItems: string[]): string => {
+    const descriptor = [
+      `task: ${task.id}`,
+      `phase: ${phase}`,
+      ...(includeTaskContext ? [`workdir: ${opts.workdir}`, ...taskScopedFields(task, role, opts.platform)] : []),
+      ...roundFields(task, phase),
+      ...(pendingItems.length ? [`pending: ${pendingItems.join(' ')}`] : []),
+      `token: ${signalToken}`,
+    ].join('\n');
+    return includeTaskContext
+      ? `${descriptor}${taskContextBlocks(task, opts.imagePaths)}\n\n${roleContext(role, opts.platform)}\n`
+      : `${descriptor}\n`;
+  };
+  const base = compose([]);
+  const wanted = opts.pendingFeedback ?? [];
+  const kept = wanted.length
+    ? fitPendingItems(wanted, MAX_PROMPT_BYTES - Buffer.byteLength(base, 'utf8'))
+    : [];
+  const body = kept.length ? compose(kept) : base;
   assertNoFilledSignal(body, phase, signalToken);
   const bytes = Buffer.byteLength(body, 'utf8');
   if (bytes > MAX_PROMPT_BYTES) throw new PromptSizeError(bytes);
   return body;
+}
+
+const PENDING_LINE_ITEM_CAP = 20;
+
+// The pending line is an aid — capped for noise, and never what tips a deliverable prompt over
+// the byte limit. Items are ASCII by schema (source keys and line-safe ids), so length = bytes.
+function fitPendingItems(items: string[], spareBytes: number): string[] {
+  let used = 'pending: \n'.length;
+  const kept: string[] = [];
+  for (const item of items.slice(0, PENDING_LINE_ITEM_CAP)) {
+    used += item.length + (kept.length > 0 ? 1 : 0);
+    if (used > spareBytes) break;
+    kept.push(item);
+  }
+  return kept;
 }
 
 export function buildGreetingPrompt(token: string): string {
@@ -127,9 +152,11 @@ const ROLE_CONTRACTS: Record<AgentRole, string> = {
     `no file change.\n` +
     `code: Read the approved spec-path, implement it completely, test, commit, push, and update the bound PR via ` +
     `platform publish. Then emit \`[bx:pr-created:<pr>:<token>]\` exactly once.\n` +
-    `post-approve: Re-read every fully paginated feedback source and handle all current items. If any file ` +
-    `changes, commit and push, then stop without a completion signal so Baxian can recheck. If no file change is ` +
-    `needed, re-fetch once more; only when clean emit \`[bx:pr-merge-ready:<token>]\` exactly once.\n` +
+    `post-approve: Re-read every fully paginated feedback source and handle all current items. A \`pending:\` ` +
+    `header line lists \`<source-key>:<comment-id>\` items still lacking an ack reply; answer each with an ack ` +
+    `before anything else. If any file changes, commit and push, then stop without a completion signal so Baxian ` +
+    `can recheck. If no file change is needed, re-fetch once more; only when clean emit ` +
+    `\`[bx:pr-merge-ready:<token>]\` exactly once.\n` +
     `Never merge or leave workdir/branch.`,
   qa:
     `Task contract (qa; later prompts for this task carry only the header lines):\n` +

@@ -26,7 +26,6 @@ import {
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 import { buildAckMarker, buildReviewTokenLine } from '../../src/platform/markers.js';
 import { PrConversationCache, prReviewCacheRevision } from '../../src/platform/pr-conversation-cache.js';
-import { sha256Hex } from '../../src/platform/body-digest.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
 import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
@@ -154,7 +153,7 @@ function gitTask(over: Partial<TaskState> = {}): TaskState {
     baseBranch: 'main', latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
     passToken: 'abcdef123456', failToken: '123456abcdef',
     passProvenance: {
-      sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64), token: 'abcdef123456',
+      sourceKey: 'reviews', id: 'r1', token: 'abcdef123456',
       failToken: '123456abcdef', anchorSha: SHA1,
     },
     ...over,
@@ -378,9 +377,9 @@ function seedAcceptedPass(): void {
   driver.comments.reviews = [comment('r1', body)];
 }
 
-function provenanceFor(body: string) {
+function provenanceFor() {
   return {
-    sourceKey: 'reviews', id: 'r1', bodyDigest: sha256Hex(body), token: 'abcdef123456',
+    sourceKey: 'reviews', id: 'r1', token: 'abcdef123456',
     failToken: '123456abcdef', anchorSha: SHA1,
   };
 }
@@ -1474,7 +1473,7 @@ describe('platformPendingFeedback', () => {
     const feedback = 'please fix';
     driver.comments['issue-comments'] = [
       comment('c1', feedback, { authorId: '5' }),
-      comment('c2', `done\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex(feedback) })}`, { authorId: '77' }),
+      comment('c2', `done\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1' })}`, { authorId: '77' }),
     ];
     const result = await manager.platformPendingFeedback('task-1');
     expect(result.pending.size).toBe(0);
@@ -1489,8 +1488,7 @@ describe('platformPendingFeedback', () => {
 
 describe('platformConfirmMerge', () => {
   it('merges with the expected head after provenance and ack recheck pass', async () => {
-    const body = passBody();
-    await seed({ passProvenance: provenanceFor(body) });
+    await seed({ passProvenance: provenanceFor() });
     seedAcceptedPass();
     await manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 });
     const merge = driver.ops.find(o => o.op === 'merge');
@@ -1498,8 +1496,7 @@ describe('platformConfirmMerge', () => {
   });
 
   it('fails early when the live head moved past the expected sha', async () => {
-    const body = passBody();
-    await seed({ passProvenance: provenanceFor(body) });
+    await seed({ passProvenance: provenanceFor() });
     seedAcceptedPass();
     driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
     await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
@@ -1507,18 +1504,8 @@ describe('platformConfirmMerge', () => {
     expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
   });
 
-  it('blocks the merge when the accepted pass body was edited afterwards', async () => {
-    const body = passBody();
-    await seed({ passProvenance: provenanceFor(body) });
-    driver.comments.reviews = [comment('r1', `${body}\nedited`)];
-    await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
-      .rejects.toThrow(/carrier-body-edited/);
-    expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
-  });
-
   it('blocks the merge while feedback revisions remain unacked', async () => {
-    const body = passBody();
-    await seed({ passProvenance: provenanceFor(body) });
+    await seed({ passProvenance: provenanceFor() });
     seedAcceptedPass();
     driver.comments['issue-comments'] = [comment('c1', 'wait, one more thing', { authorId: '5' })];
     await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
@@ -1526,9 +1513,30 @@ describe('platformConfirmMerge', () => {
     expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
   });
 
+  it('blocks the merge when a live same-round fail landed after approval, even if acked', async () => {
+    await seed({ passProvenance: provenanceFor() });
+    driver.comments.reviews = [
+      comment('r1', passBody()),
+      comment('r2', `regression found\n${failLine}`),
+    ];
+    driver.comments['issue-comments'] = [
+      comment('c1', `noted\n${buildAckMarker({ sourceKey: 'reviews', commentId: 'r2' })}`, { authorId: '77' }),
+    ];
+    await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
+      .rejects.toThrow(/fail-token-present/);
+    expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
+  });
+
+  it('blocks the merge when the accepted pass review was dismissed', async () => {
+    await seed({ passProvenance: provenanceFor() });
+    driver.comments.reviews = [comment('r1', passBody(), { reviewState: 'DISMISSED' })];
+    await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
+      .rejects.toThrow(/token-dismissed/);
+    expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
+  });
+
   it('surfaces MERGE_BLOCKED with the authoritative mergeable state for diagnosis', async () => {
-    const body = passBody();
-    await seed({ passProvenance: provenanceFor(body) });
+    await seed({ passProvenance: provenanceFor() });
     seedAcceptedPass();
     driver.mergeError = new DriverOpError('merge failed', {
       opName: 'merge', errorClass: 'MERGE_BLOCKED', exitCode: 1, stderrTail: 'Pull Request is not mergeable',
@@ -1536,6 +1544,30 @@ describe('platformConfirmMerge', () => {
     driver.prViewResult = prRow({ detailedMergeStatus: 'blocked' });
     await expect(manager.platformConfirmMerge('task-1', { expectedHeadSha: SHA1 }))
       .rejects.toThrow(/blocked/);
+  });
+});
+
+describe('platformVerifyAcceptedPass', () => {
+  it('returns provenance-invalid for a late same-round fail even after the fail comment is acked', async () => {
+    await seed({ passProvenance: provenanceFor() });
+    driver.comments.reviews = [
+      comment('r1', passBody()),
+      comment('r2', `regression found\n${failLine}`),
+    ];
+    driver.comments['issue-comments'] = [
+      comment('c1', `noted\n${buildAckMarker({ sourceKey: 'reviews', commentId: 'r2' })}`, { authorId: '77' }),
+    ];
+    expect(await manager.platformVerifyAcceptedPass('task-1'))
+      .toEqual({ kind: 'provenance-invalid', reason: 'provenance fail-token-present' });
+  });
+
+  it('reports valid with the unacked comments as pending when no live veto exists', async () => {
+    await seed({ passProvenance: provenanceFor() });
+    seedAcceptedPass();
+    driver.comments['issue-comments'] = [comment('c1', 'one more thing', { authorId: '5' })];
+    const result = await manager.platformVerifyAcceptedPass('task-1');
+    expect(result.kind).toBe('valid');
+    expect(result.kind === 'valid' && [...result.pending]).toEqual(['issue-comments:c1']);
   });
 });
 
@@ -1691,9 +1723,8 @@ describe('platform binding fingerprint', () => {
 
 describe('confirm-merge provenance anchoring', () => {
   it('refuses to merge a head the accepted pass never anchored', async () => {
-    const body = passBody();
     await seed({
-      passProvenance: { ...provenanceFor(body), anchorSha: 'b'.repeat(40) },
+      passProvenance: { ...provenanceFor(), anchorSha: 'b'.repeat(40) },
       latestHeadSha: SHA1,
     });
     seedAcceptedPass();
@@ -2433,7 +2464,7 @@ describe('git review lease outcomes', () => {
       headSha: SHA1,
       reviewRound: claimed!.lease.effectiveRound,
       provenance: {
-        sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64),
+        sourceKey: 'reviews', id: 'r1',
         token: claimed!.lease.passToken, failToken: claimed!.lease.failToken, anchorSha: SHA1,
       },
     });
@@ -2967,9 +2998,8 @@ describe('merge gate and post-review recovery integrity', () => {
   });
 
   it('refuses the confirm once the task has durably left its merge gate', async () => {
-    const body = passBody();
     await seed({
-      passProvenance: provenanceFor(body), status: 'approved',
+      passProvenance: provenanceFor(), status: 'approved',
       ...postApproveEpisode({ pendingRedispatch: true }),
     });
     seedAcceptedPass();

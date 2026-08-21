@@ -234,7 +234,11 @@ async function dispatchGitDevPostApproveCheck(
   manager: AgentManager,
   snapshot: TaskState,
   approvedHeadSha: string,
-  opts: { redispatchCount?: number; expectedEpisode?: PostApproveEpisodeKey } = {},
+  opts: {
+    redispatchCount?: number;
+    expectedEpisode?: PostApproveEpisodeKey;
+    pendingFeedback?: string[];
+  } = {},
 ): Promise<void> {
   if (!approvedHeadSha) {
     await emitIntervention(bus, snapshot.projectId, snapshot.agentId, snapshot.id, {
@@ -293,6 +297,7 @@ async function dispatchGitDevPostApproveCheck(
     resumed = await manager.continueSession(live.id, live.agentId, 'post-approve', {
       signalToken: key.token,
       postApproveEpisode: key,
+      ...(opts.pendingFeedback?.length ? { pendingFeedback: opts.pendingFeedback } : {}),
     });
   } catch (err) {
     dispatchErr = err;
@@ -447,7 +452,7 @@ async function handlePrMergeReady(
     }
     return;
   }
-  if (verified.pendingCount > 0 && !freshCompletion.pendingRedispatch) {
+  if (verified.pending.size > 0 && !freshCompletion.pendingRedispatch) {
     if (await manager.updatePostApproveCompletionIfToken(
       freshTask.id,
       signalToken,
@@ -456,7 +461,7 @@ async function handlePrMergeReady(
     )) {
       freshCompletion = { ...freshCompletion, pendingRedispatch: true };
     }
-  } else if (verified.pendingCount === 0 && freshCompletion.pendingRedispatch) {
+  } else if (verified.pending.size === 0 && freshCompletion.pendingRedispatch) {
     if (await manager.updatePostApproveCompletionIfToken(
       freshTask.id,
       signalToken,
@@ -493,7 +498,10 @@ async function handlePrMergeReady(
         manager,
         freshTask,
         freshCompletion.approvedHeadSha,
-        { redispatchCount: nextCount },
+        {
+          redispatchCount: nextCount,
+          pendingFeedback: [...verified.pending],
+        },
       );
       return;
     }
@@ -836,7 +844,6 @@ async function handleReviewApproval(
   const provenance = {
     sourceKey: gitVerdict.carrier.sourceKey,
     id: gitVerdict.carrier.id,
-    bodyDigest: gitVerdict.carrier.bodyDigest,
     token: gitVerdict.verdictToken,
     failToken: task.failToken,
     anchorSha: reviewedHeadSha,

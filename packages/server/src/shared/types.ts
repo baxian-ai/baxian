@@ -297,7 +297,8 @@ export interface TaskState {
   platformBinding?: { repoKey: string };
   baseBranch?: string;
   closedUnmergedAnchor?: { prNumber: number; generation: number; cleared?: boolean };
-  passProvenance?: { sourceKey: string; id: string; bodyDigest: string; token: string; failToken: string; anchorSha: string };
+  // sourceKey/id point humans at the verdict comment when debugging a stuck merge gate; no code path reads them.
+  passProvenance?: { sourceKey: string; id: string; token: string; failToken: string; anchorSha: string };
   consumedFeedback?: Record<string, number>;
   outbox?: TaskOutboxEntry[];
   attention?: TaskAttention;

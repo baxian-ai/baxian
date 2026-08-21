@@ -183,13 +183,12 @@ describe('GitHubDriver', () => {
       .toThrow(/unknown GitHub comment source/);
   });
 
-  it('states every server-matched ACK source key and digest encoding in the feedback contract', () => {
+  it('states every server-matched ACK source key in the feedback contract', () => {
     const { driver } = harness([]);
     for (const source of driver.commentSources) {
       expect(GITHUB_AGENT_PROMPTS.feedback).toContain(source.key);
     }
-    expect(GITHUB_AGENT_PROMPTS.feedback).toContain('lowercase hex SHA-256');
-    expect(GITHUB_AGENT_PROMPTS.feedback).toContain('@base64');
+    expect(GITHUB_AGENT_PROMPTS.feedback).toContain('baxian:reply:ack:<source-key>:<comment-id>');
   });
 
   it('states the adopt-or-create publish semantics without any signal actor encoding', () => {

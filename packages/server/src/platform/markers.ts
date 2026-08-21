@@ -1,5 +1,5 @@
-import { BODY_DIGEST_SOURCE, bodyDigest } from './body-digest.js';
-import { SHA_HEX_SOURCE, SOURCE_KEY_PATTERN, type CommentSourceClass } from './types.js';
+import { bodyDigest } from './body-digest.js';
+import { SHA_HEX_SOURCE, SOURCE_KEY_PATTERN } from './types.js';
 import { LINE_SAFE_ID_RE, versionTimeOf, type NormalizedRow } from './row-schema.js';
 
 export interface ReviewTokenMarker {
@@ -11,7 +11,6 @@ export interface ReviewTokenMarker {
 export interface AckMarker {
   sourceKey: string;
   commentId: string;
-  bodyDigest: string;
 }
 
 const unanchored = (re: RegExp) => re.source.replace(/^\^/, '').replace(/\$$/, '');
@@ -19,7 +18,7 @@ const REVIEW_TOKEN_RE = new RegExp(
   `<!--\\s*baxian:review:(pass|fail):(${SHA_HEX_SOURCE}):([A-Za-z0-9_-]{6,64})\\s*-->`, 'g',
 );
 const ACK_RE = new RegExp(
-  `<!--\\s*baxian:reply:ack:(${unanchored(SOURCE_KEY_PATTERN)}):(${unanchored(LINE_SAFE_ID_RE)}):(${BODY_DIGEST_SOURCE})\\s*-->`, 'g',
+  `<!--\\s*baxian:reply:ack:(${unanchored(SOURCE_KEY_PATTERN)}):(${unanchored(LINE_SAFE_ID_RE)})\\s*-->`, 'g',
 );
 const MARKER_ONLY_LINE_RE = /^<!--\s*baxian:(?:(?!-->).)*-->$/;
 
@@ -36,11 +35,11 @@ export function extractReviewTokens(body: string): ReviewTokenMarker[] {
 }
 
 export function buildAckMarker(m: AckMarker): string {
-  return `<!-- baxian:reply:ack:${m.sourceKey}:${m.commentId}:${m.bodyDigest} -->`;
+  return `<!-- baxian:reply:ack:${m.sourceKey}:${m.commentId} -->`;
 }
 
 export function extractAckMarkers(body: string): AckMarker[] {
-  return [...body.matchAll(ACK_RE)].map(m => ({ sourceKey: m[1], commentId: m[2], bodyDigest: m[3] }));
+  return [...body.matchAll(ACK_RE)].map(m => ({ sourceKey: m[1], commentId: m[2] }));
 }
 
 export function stripBaxianMarkerLines(body: string): string {
@@ -87,43 +86,20 @@ export function rowHasBody(row: NormalizedRow): boolean {
 
 export interface AckCarrierRow {
   sourceKey: string;
-  sourceClass: CommentSourceClass;
   id: string;
-  discussionId?: string | null;
   acks: AckMarker[];
-  carriesToken: boolean;
-}
-
-export interface AckCollection {
-  acks: Set<string>;
-  carrierRowKeys: Set<string>;
 }
 
 export const ackRevisionKey = (sourceKey: string, id: string, digest: string) => `${sourceKey}:${id}:${digest}`;
 export const ackCarrierKey = (sourceKey: string, id: string) => `${sourceKey}:${id}`;
 
-export function collectValidAcks(rows: AckCarrierRow[]): AckCollection {
-  const acks = new Set<string>();
-  const carrierRowKeys = new Set<string>();
-  const threadRootById = new Map<string, string>();
+// Settled keys: comments that were acked, plus the ack-carrying replies themselves.
+export function collectValidAcks(rows: AckCarrierRow[]): Set<string> {
+  const settled = new Set<string>();
   for (const row of rows) {
-    threadRootById.set(ackCarrierKey(row.sourceKey, row.id), row.discussionId ?? row.id);
+    if (row.acks.length === 0) continue;
+    for (const m of row.acks) settled.add(ackCarrierKey(m.sourceKey, m.commentId));
+    settled.add(ackCarrierKey(row.sourceKey, row.id));
   }
-  for (const row of rows) {
-    if (row.sourceClass === 'reviews') continue;
-    if (row.carriesToken) continue;
-    if (row.sourceClass === 'threaded' && (row.discussionId === null || row.discussionId === undefined)) continue;
-    let carried = false;
-    for (const m of row.acks) {
-      if (row.sourceClass === 'threaded') {
-        if (m.sourceKey !== row.sourceKey) continue;
-        const targetRoot = threadRootById.get(ackCarrierKey(m.sourceKey, m.commentId));
-        if (targetRoot === undefined || targetRoot !== row.discussionId) continue;
-      }
-      acks.add(ackRevisionKey(m.sourceKey, m.commentId, m.bodyDigest));
-      carried = true;
-    }
-    if (carried) carrierRowKeys.add(ackCarrierKey(row.sourceKey, row.id));
-  }
-  return { acks, carrierRowKeys };
+  return settled;
 }

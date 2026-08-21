@@ -372,7 +372,7 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
   }
   if (raw.passProvenance !== undefined) {
     const prov = raw.passProvenance;
-    const keys = ['sourceKey', 'id', 'bodyDigest', 'token', 'failToken', 'anchorSha'];
+    const keys = ['sourceKey', 'id', 'token', 'failToken', 'anchorSha'];
     if (!isRecord(prov) || keys.some(key => typeof prov[key] !== 'string' || (prov[key] as string).trim() === '')) {
       throw taskSchemaError('passProvenance', 'a carrier provenance record when present');
     }

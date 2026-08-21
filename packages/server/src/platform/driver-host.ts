@@ -128,10 +128,14 @@ function singleRow(opName: string, rows: NormalizedRow[]): NormalizedRow {
 
 const SOURCE_CATEGORIES: ReadonlySet<string> = new Set(COMMENT_SOURCE_CLASSES);
 
-// Cursors, ack markers, and the timeline bucket by source key, and ack trust rules switch on category — bad values corrupt them silently.
+// Cursors, ack markers, and the timeline bucket by source key, and dismissal/timeline semantics switch on category — bad values corrupt them silently.
 function assertCommentSources(sources: unknown): void {
   if (!Array.isArray(sources)) {
     throw new Error('commentSources must be an array');
+  }
+  // Verdict markers and acks are found by scanning these sources; zero sources means no review loop at all.
+  if (sources.length === 0) {
+    throw new Error('commentSources must declare at least one source');
   }
   const seen = new Set<string>();
   for (const [i, source] of (sources as unknown[]).entries()) {
@@ -152,10 +156,6 @@ function assertCommentSources(sources: unknown): void {
         + `(expected top-level, threaded, or reviews)`,
       );
     }
-  }
-  // collectValidAcks never accepts acks from 'reviews' sources, so without one of the others feedback deadlocks.
-  if (!(sources as { category?: unknown }[]).some(s => s.category === 'top-level' || s.category === 'threaded')) {
-    throw new Error('commentSources must include at least one top-level or threaded source (acks in reviews sources are ignored)');
   }
 }
 
@@ -217,6 +217,8 @@ function withRowValidation(driver: PlatformDriver): PlatformDriver {
           : {}),
       };
       const validatePage = (pageRows: unknown) => rows('listComments', pageRows, opts);
+      // Stop predicates may see the caller's projected rows; the threaded contract binds plugin rows only.
+      const stopOpts = { sourceKey: source.key };
       const collected: NormalizedRow[] = [];
       let pageError: unknown;
       let pagedInline = false;
@@ -236,7 +238,7 @@ function withRowValidation(driver: PlatformDriver): PlatformDriver {
             throw err;
           }
         },
-        guardStop('listComments', shouldStop, opts),
+        guardStop('listComments', shouldStop, stopOpts),
       );
       if (pageError !== undefined) throw pageError;
       // A paging plugin's aggregate may ignore the vetted rows, and re-validating projected rows would blank every comment (Symbol and body are gone).

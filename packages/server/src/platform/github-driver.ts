@@ -43,9 +43,7 @@ export const GITHUB_AGENT_PROMPTS: PlatformAgentPrompts = {
   feedback:
     `Read every page of pulls/<pr>/reviews => reviews, pulls/<pr>/comments => inline-comments, and ` +
     `issues/<pr>/comments => issue-comments; judge and answer every current item. End each reply with ` +
-    `<!-- baxian:reply:ack:<source-key>:<comment-id>:<body-digest> --> using the exact source key and lowercase hex ` +
-    `SHA-256 of the exact raw API body; fetch the body via @base64 before hashing to avoid an output newline. Then ` +
-    `re-fetch all sources.`,
+    `<!-- baxian:reply:ack:<source-key>:<comment-id> --> using the exact source key. Then re-fetch all sources.`,
   review:
     `Publish one native review containing all findings and the verdict marker; use a comment only if GitHub rejects ` +
     `self-review, then verify the marker landed on anchor-sha.`,

@@ -4,7 +4,6 @@ import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
 const SHA1 = 'a'.repeat(40);
-const SHA2 = 'b'.repeat(40);
 
 const harness = useManagerSuiteHarness();
 
@@ -986,7 +985,7 @@ describe('AgentManager.advanceTask', () => {
     });
     vi.spyOn(m, 'platformVerifyAcceptedPass').mockResolvedValue({
       kind: 'valid',
-      pendingCount: 0,
+      pending: new Set(),
     });
     const replay = vi.spyOn(m, 'redispatchTaskPromptAfterReplRestart').mockResolvedValue(true);
 
@@ -1015,10 +1014,10 @@ describe('AgentManager.advanceTask', () => {
       const fresh = (await harness.taskStore.get('task-racing-revoked'))!;
       await harness.taskStore.set({
         ...fresh,
-        passProvenance: { ...fresh.passProvenance!, bodyDigest: `changed-${SHA2}` },
+        passProvenance: { ...fresh.passProvenance!, id: 'r-replaced' },
         updatedAt: new Date().toISOString(),
       });
-      return { kind: 'valid', pendingCount: 0 };
+      return { kind: 'valid', pending: new Set() };
     });
     const replay = vi.spyOn(m, 'redispatchTaskPromptAfterReplRestart');
 

@@ -59,7 +59,7 @@ import { versionTimeOf, type NormalizedRow } from '../platform/row-schema.js';
 import { checkOpenPrBinding, checkPrBinding, type PrRejection } from '../platform/pr-binding.js';
 import { collectPendingFeedback, scanCommentSourcesOnce, type PendingFeedbackResult } from '../platform/feedback.js';
 import { prReviewCacheRevision, type PrConversationCache, type PrConversationPayload } from '../platform/pr-conversation-cache.js';
-import { deadTokens, recheckPassProvenance, type VerdictSourceScan } from '../platform/verdict-engine.js';
+import { deadTokens, liveVerdictVeto, type VerdictSourceScan } from '../platform/verdict-engine.js';
 import {
   platformBindingMismatch,
   taskNeedsPlatformBindingAudit,
@@ -153,7 +153,6 @@ function samePassProvenance(
     && right !== undefined
     && left.sourceKey === right.sourceKey
     && left.id === right.id
-    && left.bodyDigest === right.bodyDigest
     && left.token === right.token
     && left.failToken === right.failToken
     && left.anchorSha === right.anchorSha;
@@ -407,6 +406,7 @@ export interface ContinueSessionOpts extends SessionDispatchOpts {
   allowDirtyWorkdir?: boolean;
   guardBeforeInject?: () => Promise<boolean>;
   expectedHold?: { phase?: string; since?: string; nonce?: string };
+  pendingFeedback?: string[];
 }
 
 export interface MergePrOpts {
@@ -6468,29 +6468,19 @@ export class AgentManager {
   }
 
   async platformVerifyAcceptedPass(taskId: string): Promise<
-    | { kind: 'valid'; pendingCount: number }
+    | { kind: 'valid'; pending: PendingFeedbackResult['pending'] }
     | { kind: 'retryable'; reason: string }
     | { kind: 'provenance-invalid'; reason: string }
   > {
     const { task, driver } = await this.platformTaskAndDriver(taskId);
     if (task.prNumber === undefined) return { kind: 'provenance-invalid', reason: 'no bound PR' };
-    const provenance = task.passProvenance;
-    if (!provenance) return { kind: 'provenance-invalid', reason: 'no accepted pass provenance' };
+    if (!task.passProvenance) return { kind: 'provenance-invalid', reason: 'no accepted pass provenance' };
     const scans = await this.platformScanComments(driver, task.prNumber);
-    const recheck = recheckPassProvenance({
-      token: provenance.token,
-      failToken: provenance.failToken,
-      anchorSha: provenance.anchorSha,
-      carrier: { sourceKey: provenance.sourceKey, id: provenance.id, bodyDigest: provenance.bodyDigest },
-    }, scans);
-    if (!recheck.ok) {
-      return recheck.reason === 'source-scan-incomplete'
-        ? { kind: 'retryable', reason: recheck.reason }
-        : { kind: 'provenance-invalid', reason: `provenance ${recheck.reason}` };
-    }
     const pending = collectPendingFeedback(scans);
     if (!pending.allSourcesOk) return { kind: 'retryable', reason: 'source scan incomplete' };
-    return { kind: 'valid', pendingCount: pending.pending.size };
+    const veto = liveVerdictVeto(task.passProvenance, scans);
+    if (veto) return { kind: 'provenance-invalid', reason: `provenance ${veto}` };
+    return { kind: 'valid', pending: pending.pending };
   }
 
   async platformPendingFeedback(taskId: string): Promise<PendingFeedbackResult> {
@@ -6528,25 +6518,15 @@ export class AgentManager {
           `pass provenance anchors ${provenance.anchorSha}, not the merge head ${opts.expectedHeadSha}`,
         );
       }
-      const scans = await this.platformScanComments(driver, prNumber);
-      const recheck = recheckPassProvenance({
-        token: provenance.token,
-        failToken: provenance.failToken,
-        anchorSha: provenance.anchorSha,
-        carrier: { sourceKey: provenance.sourceKey, id: provenance.id, bodyDigest: provenance.bodyDigest },
-      }, scans);
-      if (!recheck.ok) {
-        if (recheck.reason === 'source-scan-incomplete') {
-          throw new Error('merge blocked: provenance source-scan-incomplete');
-        }
-        throw new PlatformMergeRecheckError('provenance-invalid', `provenance ${recheck.reason}`);
+      const verified = await this.platformVerifyAcceptedPass(taskId);
+      if (verified.kind === 'retryable') throw new Error('merge blocked: pending-feedback scan incomplete');
+      if (verified.kind === 'provenance-invalid') {
+        throw new PlatformMergeRecheckError('provenance-invalid', verified.reason);
       }
-      const pending = collectPendingFeedback(scans);
-      if (!pending.allSourcesOk) throw new Error('merge blocked: pending-feedback scan incomplete');
-      if (pending.pending.size > 0) {
+      if (verified.pending.size > 0) {
         throw new PlatformMergeRecheckError(
           'pending-feedback',
-          `${pending.pending.size} pending feedback revision(s) without ack`,
+          `${verified.pending.size} pending feedback comment(s) without ack`,
         );
       }
     }
@@ -8684,6 +8664,7 @@ export class AgentManager {
         ...(platform ? { platform } : {}),
         ...(signalToken ? { signalToken } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
+        ...(opts.pendingFeedback?.length ? { pendingFeedback: opts.pendingFeedback } : {}),
       });
     } catch (err) {
       if (err instanceof PromptSizeError) {
@@ -9974,7 +9955,7 @@ export class AgentManager {
     if (accepted.kind !== 'valid') {
       throw new ApiError(409, `Cannot restore task ${task.id}: ${accepted.reason}`);
     }
-    if (accepted.pendingCount > 0) {
+    if (accepted.pending.size > 0) {
       throw new ApiError(409, `Cannot restore task ${task.id}: the accepted pass has pending feedback`);
     }
     const reviewedPass = task.passProvenance;

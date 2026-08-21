@@ -32,15 +32,15 @@ describe('collectPendingFeedback', () => {
       scan('issue-comments', 'top-level', [row('c1', humanBody)]),
     ]);
     expect(result.allSourcesOk).toBe(true);
-    expect([...result.pending.keys()].sort()).toEqual([
-      `issue-comments:c1:${sha256Hex(humanBody)}`,
-      `reviews:r1:${sha256Hex(failBody)}`,
+    expect([...result.pending].sort()).toEqual([
+      'issue-comments:c1',
+      'reviews:r1',
     ]);
   });
 
-  it('clears a revision only through a valid ack and ignores pass-only verdict rows', () => {
+  it('clears a comment only through an ack and ignores pass-only verdict rows', () => {
     const failBody = `findings\n${failLine}`;
-    const ack = `done\n${buildAckMarker({ sourceKey: 'reviews', commentId: 'r1', bodyDigest: sha256Hex(failBody) })}`;
+    const ack = `done\n${buildAckMarker({ sourceKey: 'reviews', commentId: 'r1' })}`;
     const result = collectPendingFeedback([
       scan('reviews', 'reviews', [row('r1', failBody), row('r2', `lgtm\n${passLine}`)]),
       scan('issue-comments', 'top-level', [row('c9', ack)]),
@@ -61,7 +61,7 @@ describe('collectPendingFeedback', () => {
     const result = collectPendingFeedback([
       scan('issue-comments', 'top-level', [
         row('c1', 'third-party feedback'),
-        row('c2', `on it\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('third-party feedback') })}`),
+        row('c2', `on it\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1' })}`),
       ]),
     ]);
     expect(result.pending.size).toBe(0);
@@ -85,23 +85,22 @@ describe('collectPendingFeedback', () => {
     expect(result.pending.size).toBe(1);
   });
 
-  it('keeps an edited revision pending after its stale ack digest mismatches', () => {
-    const edited = 'updated requirement';
-    const staleAck = buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('original requirement') });
+  it('keeps a comment acked across later edits since acks match by id', () => {
+    const ack = buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1' });
     const result = collectPendingFeedback([
       scan('issue-comments', 'top-level', [
-        row('c1', edited),
-        row('c2', `handled\n${staleAck}`),
+        row('c1', 'updated requirement'),
+        row('c2', `handled\n${ack}`),
       ]),
     ]);
-    expect([...result.pending.keys()]).toEqual([`issue-comments:c1:${sha256Hex(edited)}`]);
+    expect(result.pending.size).toBe(0);
   });
 });
 
 describe('feedbackEventTarget', () => {
   it('mirrors the poller synthesis matrix: token rows and carrier rows never become feedback events', () => {
     const humanRow = row('c1', 'feedback');
-    const ackRow = row('c2', `ok\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1', bodyDigest: sha256Hex('feedback') })}`);
+    const ackRow = row('c2', `ok\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: 'c1' })}`);
     const failRow = row('r1', `no\n${failLine}`);
     const scans = [
       scan('issue-comments', 'top-level', [humanRow, ackRow]),

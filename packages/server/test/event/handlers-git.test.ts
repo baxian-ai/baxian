@@ -1049,7 +1049,7 @@ describe('review.submitted (git)', () => {
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('approved');
     expect(task?.passProvenance).toEqual({
-      sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64),
+      sourceKey: 'reviews', id: 'r1',
       token: 'abcdef123456', failToken: '123456abcdef', anchorSha: SHA1,
     });
   });
@@ -1220,7 +1220,6 @@ describe('review.submitted (git)', () => {
       passProvenance: {
         sourceKey: 'reviews',
         id: 'r1',
-        bodyDigest: 'f'.repeat(64),
         token: 'abcdef123456',
         failToken: '123456abcdef',
         anchorSha: SHA1,
@@ -2103,7 +2102,7 @@ describe('merge-ready receipt recheck (git)', () => {
 
   it('re-runs the pending-feedback set server-side and redispatches instead of migrating', async () => {
     await taskStore.set(approvedWithCompletion());
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set(['issue-comments:c1']) });
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
     await eventBus.emit(mergeReadySignal('tok123456789'));
@@ -2112,18 +2111,14 @@ describe('merge-ready receipt recheck (git)', () => {
     expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.not.objectContaining({
       postApproveRedispatchCount: expect.anything(),
     }));
-    expect(manager.markAgentWaiting).toHaveBeenCalledWith('dev-1', 'task-1', {
-      expectedPostApproveEpisode: {
-        generation: POST_APPROVE_GENERATION,
-        token: 'tok123456789',
-        headSha: SHA1,
-      },
-    });
+    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.objectContaining({
+      pendingFeedback: ['issue-comments:c1'],
+    }));
   });
 
   it('revokes at the redispatch cap when merge-ready recheck finds pending feedback', async () => {
     await taskStore.set({ ...approvedWithCompletion(), redispatchCount: 10 });
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set(['issue-comments:c1']) });
     const continueSpy = vi.spyOn(manager, 'continueSession');
 
     await eventBus.emit(mergeReadySignal('tok123456789'));
@@ -2139,7 +2134,7 @@ describe('merge-ready receipt recheck (git)', () => {
 
   it('reports a stale cap decision when the episode rotates before revocation', async () => {
     await taskStore.set({ ...approvedWithCompletion(), pendingRedispatch: true, redispatchCount: 10 });
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set(['issue-comments:c1']) });
     vi.spyOn(manager, 'revokePostApproveCompletion').mockResolvedValue(false);
 
     await eventBus.emit(mergeReadySignal('tok123456789'));
@@ -2154,7 +2149,7 @@ describe('merge-ready receipt recheck (git)', () => {
     vi.spyOn(manager, 'getPostApproveCompletion').mockResolvedValue({
       token: 'tok123456789', approvedHeadSha: '', pendingRedispatch: true, redispatchCount: 0,
     } as never);
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set(['issue-comments:c1']) });
 
     await eventBus.emit(mergeReadySignal('tok123456789'));
 
@@ -2247,21 +2242,21 @@ describe('merge-ready receipt recheck (git)', () => {
       reviewRound: 1,
       ...postApproveEpisode({ pendingRedispatch: true }),
     }));
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 0 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set() });
     await eventBus.emit(mergeReadySignal('tok123456789'));
     expect((await taskStore.get('task-1'))?.status).toBe('merge-ready');
   });
 
   it('migrates to merge-ready when the pending set is empty', async () => {
     await taskStore.set(approvedWithCompletion());
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 0 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set() });
     await eventBus.emit(mergeReadySignal('tok123456789'));
     expect((await taskStore.get('task-1'))?.status).toBe('merge-ready');
   });
 
   it('reports a stale merge-ready completion refusal', async () => {
     await taskStore.set(approvedWithCompletion());
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 0 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set() });
     vi.spyOn(manager, 'completeApprovedPassToMergeReady').mockResolvedValue({ refused: 'stale' } as never);
 
     await eventBus.emit(mergeReadySignal('tok123456789'));
@@ -2383,7 +2378,7 @@ describe('pr-fixed no-op gate (git)', () => {
     vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
     });
-    vi.spyOn(manager, 'platformPendingFeedback').mockResolvedValue({ allSourcesOk: true, pending: new Map() });
+    vi.spyOn(manager, 'platformPendingFeedback').mockResolvedValue({ allSourcesOk: true, pending: new Set() });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);

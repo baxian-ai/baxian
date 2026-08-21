@@ -39,13 +39,6 @@ export interface VerdictDecision {
   submittedAt?: string;
 }
 
-export interface PassProvenanceRecord {
-  token: string;
-  failToken: string;
-  anchorSha: string;
-  carrier: VerdictCarrier;
-}
-
 interface PassCandidate {
   token: string;
   recordedScanAt: number;
@@ -72,32 +65,26 @@ export function deadTokens(sources: VerdictSourceScan[]): Set<string> {
   return dead;
 }
 
-export function recheckPassProvenance(
-  record: PassProvenanceRecord,
+// The poller stops evaluating verdicts once a task leaves review; a late same-round fail
+// or a dismissed pass surfaces only through this recheck on the post-approve/merge path.
+export function liveVerdictVeto(
+  record: { token: string; failToken: string; anchorSha: string },
   sources: VerdictSourceScan[],
-): { ok: true } | { ok: false; reason: string } {
-  if (sources.some(s => !s.ok)) return { ok: false, reason: 'source-scan-incomplete' };
-  const row = sources.find(s => s.key === record.carrier.sourceKey)?.rows.find(r => String(r.id) === record.carrier.id);
-  if (row === undefined) return { ok: false, reason: 'carrier-row-missing' };
-  if (rowBodyDigest(row) !== record.carrier.bodyDigest) return { ok: false, reason: 'carrier-body-edited' };
-  if (!rowTokens(row).some(m => m.kind === 'pass' && m.token === record.token
-    && m.anchorSha === record.anchorSha.toLowerCase())) {
-    return { ok: false, reason: 'carrier-token-missing' };
-  }
+): 'token-dismissed' | 'fail-token-present' | undefined {
   const dead = deadTokens(sources);
-  if (dead.has(record.token)) return { ok: false, reason: 'token-dismissed' };
+  if (dead.has(record.token)) return 'token-dismissed';
   const anchor = record.anchorSha.toLowerCase();
   for (const s of sources) {
     for (const r of s.rows) {
       if (!isProtocolCarrier(r)) continue;
       for (const m of rowTokens(r)) {
         if (m.kind === 'fail' && m.token === record.failToken && m.anchorSha === anchor && !dead.has(m.token)) {
-          return { ok: false, reason: 'fail-token-present' };
+          return 'fail-token-present';
         }
       }
     }
   }
-  return { ok: true };
+  return undefined;
 }
 
 export class VerdictEngine {
@@ -145,13 +132,6 @@ export class VerdictEngine {
     }
     if (minScanStart <= candidate.recordedScanAt) return undefined;
     return this.decision('pass', input.pair.passToken, anchor, false, passMatch);
-  }
-
-  recheckPassProvenance(
-    record: PassProvenanceRecord,
-    sources: VerdictSourceScan[],
-  ): { ok: true } | { ok: false; reason: string } {
-    return recheckPassProvenance(record, sources);
   }
 
   dropCandidate(taskId: string, prNumber: number): void {

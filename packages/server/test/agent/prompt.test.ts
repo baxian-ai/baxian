@@ -33,6 +33,7 @@ function prompt(
     runtime?: 'claude-code' | 'codex' | 'opencode' | 'qodercli';
     platform?: PlatformPromptContext;
     includeTaskContext?: boolean;
+    pendingFeedback?: string[];
   } = {},
 ): string {
   const qa = phase === 'review' || phase === 'recheck';
@@ -60,6 +61,7 @@ function prompt(
     signalToken: SIGNAL_TOKEN,
     platform: opts.platform ?? PLATFORM,
     includeTaskContext: opts.includeTaskContext ?? true,
+    ...(opts.pendingFeedback ? { pendingFeedback: opts.pendingFeedback } : {}),
   });
 }
 
@@ -131,6 +133,18 @@ describe('buildPromptInline', () => {
       expect(result, phase).toContain('`[bx:pr-fixed:<token>]`');
       expect(result, phase).toContain('`[bx:pr-merge-ready:<token>]`');
     }
+  });
+
+  it('lists supplied unacked feedback in a pending header line, capped for noise', () => {
+    const items = ['issue-comments:c7', 'reviews:r2'];
+    expect(prompt('post-approve', { prNumber: 42 }, { pendingFeedback: items }))
+      .toContain('pending: issue-comments:c7 reviews:r2\ntoken: signal123456');
+    expect(prompt('post-approve', { prNumber: 42 })).not.toContain('\npending: ');
+
+    const many = Array.from({ length: 25 }, (_, i) => `issue-comments:c${i}`);
+    const capped = prompt('post-approve', { prNumber: 42 }, { pendingFeedback: many });
+    expect(capped).toContain('issue-comments:c19');
+    expect(capped).not.toContain('issue-comments:c20');
   });
 
   it('restates branch, base and spec-path on every dev first injection', () => {
@@ -254,6 +268,37 @@ describe('buildPromptInline', () => {
       ...baseOpts,
       task: { ...baseTask, description: `${exactDescription}x` },
     })).toThrow(PromptSizeError);
+  });
+
+  it('byte-fits the pending line near the prompt limit instead of failing the dispatch', () => {
+    const baseTask = makeTask({ description: '', signalToken: SIGNAL_TOKEN });
+    const baseOpts = {
+      task: baseTask,
+      phase: 'post-approve',
+      agent: makeAgent(),
+      workdir: '/tmp/repo',
+      signalToken: SIGNAL_TOKEN,
+    } as const;
+    const baseBytes = Buffer.byteLength(buildPromptInline(baseOpts), 'utf8');
+    const items = ['issue-comments:c0', 'issue-comments:c1', 'issue-comments:c2'];
+    const oneItemCost = 'pending: \n'.length + 'issue-comments:c0'.length;
+
+    const nearLimit = buildPromptInline({
+      ...baseOpts,
+      task: { ...baseTask, description: 'x'.repeat(MAX_PROMPT_BYTES - baseBytes - 2 - oneItemCost) },
+      pendingFeedback: items,
+    });
+    expect(Buffer.byteLength(nearLimit, 'utf8')).toBe(MAX_PROMPT_BYTES);
+    expect(nearLimit).toContain('\npending: issue-comments:c0\ntoken:');
+    expect(nearLimit).not.toContain('issue-comments:c1');
+
+    const noRoom = buildPromptInline({
+      ...baseOpts,
+      task: { ...baseTask, description: 'x'.repeat(MAX_PROMPT_BYTES - baseBytes - 2) },
+      pendingFeedback: items,
+    });
+    expect(noRoom).not.toContain('\npending: ');
+    expect(Buffer.byteLength(noRoom, 'utf8')).toBe(MAX_PROMPT_BYTES);
   });
 
   it('rejects a phase assigned to the wrong role', () => {

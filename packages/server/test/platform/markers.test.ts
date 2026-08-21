@@ -37,19 +37,18 @@ describe('review token markers', () => {
 
 describe('ack markers', () => {
   it('build and extract round-trip', () => {
-    const marker = buildAckMarker({ sourceKey: 'issue-comments', commentId: '100', bodyDigest: DIGEST });
-    expect(extractAckMarkers(`done\n${marker}\n${buildAckMarker({ sourceKey: 'reviews', commentId: 'r-1', bodyDigest: DIGEST })}`))
+    const marker = buildAckMarker({ sourceKey: 'issue-comments', commentId: '100' });
+    expect(extractAckMarkers(`done\n${marker}\n${buildAckMarker({ sourceKey: 'reviews', commentId: 'r-1' })}`))
       .toEqual([
-        { sourceKey: 'issue-comments', commentId: '100', bodyDigest: DIGEST },
-        { sourceKey: 'reviews', commentId: 'r-1', bodyDigest: DIGEST },
+        { sourceKey: 'issue-comments', commentId: '100' },
+        { sourceKey: 'reviews', commentId: 'r-1' },
       ]);
   });
 
-  it('rejects malformed source keys, ids, and digests', () => {
-    expect(extractAckMarkers(`<!-- baxian:reply:ack:Issue:100:${DIGEST} -->`)).toEqual([]);
-    expect(extractAckMarkers(`<!-- baxian:reply:ack:issue:a b:${DIGEST} -->`)).toEqual([]);
-    expect(extractAckMarkers('<!-- baxian:reply:ack:issue:100:abcd -->')).toEqual([]);
-    expect(extractAckMarkers(`<!-- baxian:reply:ack:issue:100:${'A'.repeat(64)} -->`)).toEqual([]);
+  it('rejects malformed source keys and ids', () => {
+    expect(extractAckMarkers('<!-- baxian:reply:ack:Issue:100 -->')).toEqual([]);
+    expect(extractAckMarkers('<!-- baxian:reply:ack:issue:a b -->')).toEqual([]);
+    expect(extractAckMarkers('<!-- baxian:reply:ack:issue -->')).toEqual([]);
   });
 });
 
@@ -77,7 +76,7 @@ describe('stripBaxianMarkerLines', () => {
 
 describe('row projection', () => {
   it('projects digest/tokens/acks once, releases the body, and helpers serve both forms', () => {
-    const body = `note\n${buildReviewTokenLine({ kind: 'pass', anchorSha: SHA, token: 'tokenaaaaaaa' })}\n${buildAckMarker({ sourceKey: 'reviews', commentId: '9', bodyDigest: DIGEST })}`;
+    const body = `note\n${buildReviewTokenLine({ kind: 'pass', anchorSha: SHA, token: 'tokenaaaaaaa' })}\n${buildAckMarker({ sourceKey: 'reviews', commentId: '9' })}`;
     const projected: Record<string, unknown> = { id: '1', body };
     const raw: Record<string, unknown> = { id: '1', body };
     projectCommentRow(projected);
@@ -93,54 +92,21 @@ describe('row projection', () => {
   });
 });
 
-describe('collectValidAcks: carrier matrix', () => {
-  const ackTo = (sourceKey: string, commentId: string) => ({ sourceKey, commentId, bodyDigest: DIGEST });
+describe('collectValidAcks', () => {
+  const ackTo = (sourceKey: string, commentId: string) => ({ sourceKey, commentId });
   const row = (over: Partial<AckCarrierRow>): AckCarrierRow => ({
-    sourceKey: 'issue-comments', sourceClass: 'top-level', id: '1',
-    discussionId: null, acks: [ackTo('inline-comments', '55')], carriesToken: false, ...over,
-  });
-  const key = (sourceKey: string, commentId: string) => `${sourceKey}:${commentId}:${DIGEST}`;
-
-  it('accepts top-level rows for any source regardless of author and reports the carrier', () => {
-    const r = collectValidAcks([row({})]);
-    expect(r.acks).toEqual(new Set([key('inline-comments', '55')]));
-    expect(r.carrierRowKeys).toEqual(new Set(['issue-comments:1']));
+    sourceKey: 'issue-comments', id: '1', acks: [ackTo('inline-comments', '55')], ...over,
   });
 
-  it('never accepts reviews-class rows as carriers', () => {
-    const r = collectValidAcks([row({ sourceClass: 'reviews', sourceKey: 'reviews' })]);
-    expect(r.acks.size).toBe(0);
-    expect(r.carrierRowKeys.size).toBe(0);
+  it('settles the acked comments and the carrying rows themselves', () => {
+    expect(collectValidAcks([row({})]))
+      .toEqual(new Set(['inline-comments:55', 'issue-comments:1']));
   });
 
-  it('never accepts rows carrying a verdict token', () => {
-    expect(collectValidAcks([row({ carriesToken: true })]).acks.size).toBe(0);
-  });
-
-  it('threaded rows ack any revision of their own thread, root and replies alike', () => {
-    const thread = (over: Partial<AckCarrierRow>): AckCarrierRow => ({
-      sourceKey: 'inline-comments', sourceClass: 'threaded', id: 'x',
-      discussionId: null, acks: [], carriesToken: false, ...over,
-    });
-    const root = thread({ id: '55' });
-    const reply = thread({ id: '56', discussionId: '55' });
-    const otherThreadRoot = thread({ id: '90' });
-    const devAck = thread({
-      id: '57', discussionId: '55',
-      acks: [
-        ackTo('inline-comments', '55'),
-        ackTo('inline-comments', '56'),
-        ackTo('inline-comments', '90'),
-        ackTo('inline-comments', '404'),
-        ackTo('issue-comments', '55'),
-      ],
-    });
-    const r = collectValidAcks([root, reply, otherThreadRoot, devAck]);
-    expect(r.acks).toEqual(new Set([key('inline-comments', '55'), key('inline-comments', '56')]));
-    expect(r.carrierRowKeys).toEqual(new Set(['inline-comments:57']));
-  });
-
-  it('threaded top-level rows (no discussionId) are not carriers', () => {
-    expect(collectValidAcks([row({ sourceClass: 'threaded', discussionId: null })]).acks.size).toBe(0);
+  it('collects acks from any row and skips rows carrying none', () => {
+    expect(collectValidAcks([
+      row({ sourceKey: 'reviews', id: 'r-1', acks: [ackTo('issue-comments', '9')] }),
+      row({ id: '2', acks: [] }),
+    ])).toEqual(new Set(['issue-comments:9', 'reviews:r-1']));
   });
 });

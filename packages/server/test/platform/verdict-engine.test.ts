@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { VerdictEngine, recheckPassProvenance, type VerdictSourceScan } from '../../src/platform/verdict-engine.js';
-import { buildReviewTokenLine , projectCommentRow } from '../../src/platform/markers.js';
+import { VerdictEngine, liveVerdictVeto, type VerdictSourceScan } from '../../src/platform/verdict-engine.js';
+import { buildReviewTokenLine } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 
@@ -163,37 +163,34 @@ describe('VerdictEngine: token hygiene', () => {
   });
 });
 
-describe('VerdictEngine: pass provenance recheck', () => {
-  const record = () => ({
-    token: PASS, failToken: FAIL, anchorSha: ANCHOR,
-    carrier: { sourceKey: 'reviews', id: '1', bodyDigest: bodyDigest(`LGTM\n${passLine}`) },
-  });
-  const engine = new VerdictEngine();
+describe('liveVerdictVeto', () => {
+  const record = { token: PASS, failToken: FAIL, anchorSha: ANCHOR };
 
-  it('passes when the carrier is intact, undismissed, and no fail exists', () => {
-    expect(engine.recheckPassProvenance(record(), [
-      scan('reviews', 'reviews', [row('1', `LGTM\n${passLine}`)]),
-      scan('issue-comments', 'top-level', []),
-    ])).toEqual({ ok: true });
+  it('vetoes when a live same-round fail token exists at the anchor', () => {
+    expect(liveVerdictVeto(record, [
+      scan('reviews', 'reviews', [row('1', `LGTM\n${passLine}`), row('2', `stop\n${failLine}`, FRESH)]),
+    ])).toBe('fail-token-present');
   });
 
-  it('fails on edited body, missing row, dismissal, cross-carrier dismissal, late fail, or failed scans', () => {
-    const cases: Array<[VerdictSourceScan[], string]> = [
-      [[scan('reviews', 'reviews', [row('1', `edited\n${passLine}`)])], 'carrier-body-edited'],
-      [[scan('reviews', 'reviews', [])], 'carrier-row-missing'],
-      [[scan('reviews', 'reviews', [row('1', `LGTM\n${passLine}`, OLD, { reviewState: 'DISMISSED' })])], 'token-dismissed'],
-      [[
-        scan('reviews', 'reviews', [
-          row('1', `LGTM\n${passLine}`),
-          row('3', `dup\n${passLine}`, OLD, { reviewState: 'DISMISSED' }),
-        ]),
-      ], 'token-dismissed'],
-      [[scan('reviews', 'reviews', [row('1', `LGTM\n${passLine}`), row('4', `stop\n${failLine}`, FRESH)])], 'fail-token-present'],
-      [[scan('reviews', 'reviews', [row('1', `LGTM\n${passLine}`)], { ok: false })], 'source-scan-incomplete'],
-    ];
-    for (const [sources, reason] of cases) {
-      expect(engine.recheckPassProvenance(record(), sources)).toEqual({ ok: false, reason });
-    }
+  it('vetoes when the pass token was dismissed on any carrier', () => {
+    expect(liveVerdictVeto(record, [
+      scan('reviews', 'reviews', [
+        row('1', `LGTM\n${passLine}`),
+        row('3', `dup\n${passLine}`, OLD, { reviewState: 'DISMISSED' }),
+      ]),
+    ])).toBe('token-dismissed');
+  });
+
+  it('ignores dismissed fails, foreign anchors, and undated rows', () => {
+    const otherAnchorFail = buildReviewTokenLine({ kind: 'fail', anchorSha: 'd'.repeat(40), token: FAIL });
+    expect(liveVerdictVeto(record, [
+      scan('reviews', 'reviews', [
+        row('1', `LGTM\n${passLine}`),
+        row('2', `retracted\n${failLine}`, OLD, { reviewState: 'DISMISSED' }),
+        row('3', `elsewhere\n${otherAnchorFail}`),
+      ]),
+      scan('issue-comments', 'top-level', [{ id: '9', body: `draft\n${failLine}` }]),
+    ])).toBeUndefined();
   });
 });
 
@@ -216,13 +213,6 @@ describe('VerdictEngine: unpublished rows are not protocol carriers', () => {
     expect(submitted).toMatchObject({ kind: 'fail' });
   });
 
-  it('rejects undated rows as provenance carriers', () => {
-    const engine = new VerdictEngine();
-    const record = { token: PASS, failToken: FAIL, anchorSha: ANCHOR, carrier: { sourceKey: 'reviews', id: '1', bodyDigest: bodyDigest(`LGTM\n${passLine}`) } };
-    const undatedFail = { id: '9', body: `late\n${failLine}` };
-    const sources = [scan('reviews', 'reviews', [row('1', `LGTM\n${passLine}`), undatedFail])];
-    expect(engine.recheckPassProvenance(record, sources)).toEqual({ ok: true });
-  });
 });
 
 describe('VerdictEngine: candidate stability', () => {
@@ -243,23 +233,5 @@ describe('VerdictEngine: candidate stability', () => {
     engine.dropCandidate('task-1', 42);
     expect(engine.evaluate(at(NOW + 30_000))).toBe(undefined);
     expect(engine.evaluate(at(NOW + 60_000))).toMatchObject({ kind: 'pass' });
-  });
-});
-
-describe('provenance carrier token integrity', () => {
-  it('rejects a carrier row that no longer parses the recorded pass pair', () => {
-    const record = {
-      token: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', anchorSha: 'a'.repeat(40),
-      carrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: bodyDigest('just words, no marker') },
-    };
-    const row: Record<string, unknown> = {
-      id: 'r1', body: 'just words, no marker',
-      createdAt: '2026-07-17T01:02:03Z', updatedAt: '2026-07-17T01:02:03Z',
-    };
-    projectCommentRow(row);
-    const result = recheckPassProvenance(record, [
-      { key: 'reviews', sourceClass: 'reviews', ok: true, scanStartedAt: 0, rows: [row] },
-    ]);
-    expect(result).toEqual({ ok: false, reason: 'carrier-token-missing' });
   });
 });

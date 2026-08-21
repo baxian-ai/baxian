@@ -871,7 +871,7 @@ describe('setupRecoveredPostApproveSignals()', () => {
       phaseSignalWatcher: watcher,
     });
     registerEventHandlers(localBus, manager);
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ ok: true, pendingCount: 0 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pending: new Set() });
 
     await manager.setupRecoveredPostApproveSignals();
     await waitForTaskStatus('task-approved-manual', 'merge-ready');

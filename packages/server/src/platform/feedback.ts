@@ -1,7 +1,7 @@
 import {
-  ackCarrierKey, ackRevisionKey, collectValidAcks, projectCommentRow,
+  ackCarrierKey, collectValidAcks, projectCommentRow,
   rowAcks, rowBodyDigest, rowHasBody, rowTokens,
-  type AckCarrierRow, type AckCollection,
+  type AckCarrierRow,
 } from './markers.js';
 import { versionTimeOf, type NormalizedRow } from './row-schema.js';
 import type { CommentSource, CommentSourceClass } from './types.js';
@@ -16,7 +16,7 @@ export interface FeedbackSourceScan {
 
 export interface PendingFeedbackResult {
   allSourcesOk: boolean;
-  pending: Map<string, { sourceKey: string; id: string; bodyDigest: string }>;
+  pending: Set<string>;
 }
 
 export interface CommentSourceReader {
@@ -69,51 +69,45 @@ export async function scanCommentSourcesOnce(
 export function buildAckCarrierRows(scans: readonly FeedbackSourceScan[]): AckCarrierRow[] {
   return scans.flatMap(scan => scan.rows.map(row => ({
     sourceKey: scan.key,
-    sourceClass: scan.sourceClass,
     id: String(row.id),
-    discussionId: row.discussionId === null || row.discussionId === undefined ? null : String(row.discussionId),
     acks: rowAcks(row),
-    carriesToken: rowTokens(row).length > 0,
   })));
 }
 
-function unackedRevision(
+// digest identifies the comment revision for fix-dispatch dedupe; acks themselves match by id alone.
+function unackedComment(
   row: NormalizedRow,
   sourceKey: string,
-  acks: AckCollection,
+  settled: Set<string>,
 ): { id: string; digest: string } | undefined {
   if (versionTimeOf(row) === undefined) return undefined;
   if (!rowHasBody(row)) return undefined;
   const id = String(row.id);
-  if (acks.carrierRowKeys.has(ackCarrierKey(sourceKey, id))) return undefined;
-  const digest = rowBodyDigest(row);
-  if (acks.acks.has(ackRevisionKey(sourceKey, id, digest))) return undefined;
-  return { id, digest };
+  if (settled.has(ackCarrierKey(sourceKey, id))) return undefined;
+  return { id, digest: rowBodyDigest(row) };
 }
 
 export function feedbackEventTarget(
   row: NormalizedRow,
   sourceKey: string,
-  acks: AckCollection,
+  settled: Set<string>,
 ): { id: string; digest: string } | undefined {
   if (rowTokens(row).length > 0) return undefined;
-  return unackedRevision(row, sourceKey, acks);
+  return unackedComment(row, sourceKey, settled);
 }
 
 export function collectPendingFeedback(scans: readonly FeedbackSourceScan[]): PendingFeedbackResult {
-  const acks = collectValidAcks(buildAckCarrierRows(scans));
+  const settled = collectValidAcks(buildAckCarrierRows(scans));
   const dead = deadTokens(scans.map(s => ({ ...s, scanStartedAt: 0 })));
-  const pending: PendingFeedbackResult['pending'] = new Map();
+  const pending = new Set<string>();
   for (const scan of scans) {
     if (!scan.ok) continue;
     for (const row of scan.rows) {
       const tokens = rowTokens(row);
       if (tokens.length > 0 && !tokens.some(t => t.kind === 'fail' && !dead.has(t.token))) continue;
-      const target = unackedRevision(row, scan.key, acks);
+      const target = unackedComment(row, scan.key, settled);
       if (target === undefined) continue;
-      pending.set(ackRevisionKey(scan.key, target.id, target.digest), {
-        sourceKey: scan.key, id: target.id, bodyDigest: target.digest,
-      });
+      pending.add(ackCarrierKey(scan.key, target.id));
     }
   }
   return { allSourcesOk: scans.every(s => s.ok), pending };
