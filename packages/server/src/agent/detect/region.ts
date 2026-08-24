@@ -1,121 +1,149 @@
 export interface DetectionInput {
   screen: string;
   oscTitle: string;
+  oscProgress?: string;
 }
 
-export function isHorizontalRule(line: string): boolean {
+function isHorizontalRule(line: string): boolean {
   const trimmed = line.trim();
-  if (trimmed.length === 0) return false;
-  let dashCount = 0;
-  let allDashes = true;
-  for (const ch of trimmed) {
-    if (ch === '─') {
-      dashCount++;
-    } else {
-      allDashes = false;
-      break;
-    }
-  }
-  return dashCount >= 3 || (allDashes && dashCount > 0);
+  let dashes = 0;
+  while (dashes < trimmed.length && trimmed[dashes] === '─') dashes++;
+  return dashes > 0 && (dashes === trimmed.length || dashes >= 3);
 }
 
-export function tailNonEmpty(screen: string, count: number): string {
+// 命中行的换行符属于该行:前缀切片要切到下一行行首,不能用 lines.join 重建
+function lineStartOffset(screen: string, lines: string[], index: number): number {
+  let offset = 0;
+  const stop = Math.min(index, lines.length);
+  for (let i = 0; i < stop; i++) offset += lines[i].length + 1;
+  return Math.min(offset, screen.length);
+}
+
+function sliceFromLine(screen: string, lines: string[], index: number): string {
+  return screen.slice(lineStartOffset(screen, lines, index));
+}
+
+function bottomNonEmptyLines(screen: string, lines: string[], count: number): string {
   if (count <= 0) return '';
-  const lines = screen.split('\n');
-  let lastNonEmptyIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trim() !== '') {
-      lastNonEmptyIdx = i;
-      break;
-    }
-  }
-  if (lastNonEmptyIdx < 0) return '';
-  let startIdx = lastNonEmptyIdx;
-  let found = 1;
-  for (let i = lastNonEmptyIdx - 1; i >= 0 && found < count; i--) {
+  let start = -1;
+  let found = 0;
+  for (let i = lines.length - 1; i >= 0 && found < count; i--) {
     if (lines[i].trim() !== '') {
       found++;
-      startIdx = i;
+      start = i;
     }
   }
-  return lines.slice(startIdx, lastNonEmptyIdx + 1).join('\n');
+  if (start < 0) return '';
+  return sliceFromLine(screen, lines, start);
 }
 
-export function extractRegion(input: DetectionInput, spec: string): string {
+function topNonEmptyLines(screen: string, lines: string[], count: number): string {
+  if (count <= 0) return '';
+  let end = -1;
+  let found = 0;
+  for (let i = 0; i < lines.length && found < count; i++) {
+    if (lines[i].trim() !== '') {
+      found++;
+      end = i;
+    }
+  }
+  if (end < 0) return '';
+  return screen.slice(0, lineStartOffset(screen, lines, end + 1));
+}
+
+function codexPromptLine(line: string): boolean {
+  return line === '›' || line.startsWith('› ');
+}
+
+function afterLastPromptMarker(screen: string, lines: string[]): string {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (codexPromptLine(lines[i])) return sliceFromLine(screen, lines, i + 1);
+  }
+  return screen;
+}
+
+function promptBoxTopBorderIndex(lines: string[]): number {
+  let borders = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (isHorizontalRule(lines[i])) {
+      borders++;
+      if (borders === 2) return i;
+    }
+  }
+  return -1;
+}
+
+function abovePromptBox(screen: string, lines: string[]): string {
+  const top = promptBoxTopBorderIndex(lines);
+  if (top < 0) return screen;
+  return screen.slice(0, lineStartOffset(screen, lines, top));
+}
+
+function lastNonEmptyLine(content: string): string {
+  const lines = content.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() !== '') return lines[i];
+  }
+  return '';
+}
+
+function promptBoxBody(screen: string, lines: string[]): string {
+  const top = promptBoxTopBorderIndex(lines);
+  if (top < 0) return '';
+  let end = lines.length;
+  for (let i = top + 1; i < lines.length; i++) {
+    if (isHorizontalRule(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  return screen.slice(lineStartOffset(screen, lines, top + 1), lineStartOffset(screen, lines, end));
+}
+
+function afterLastHorizontalRule(screen: string, lines: string[]): string {
+  let lastRuleIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (isHorizontalRule(lines[i])) lastRuleIdx = i;
+  }
+  if (lastRuleIdx < 0) return screen;
+  return sliceFromLine(screen, lines, lastRuleIdx + 1);
+}
+
+const BOTTOM_LINES_RE = /^bottom_non_empty_lines\((\d+)\)$/;
+const TOP_LINES_RE = /^top_non_empty_lines\((\d+)\)$/;
+
+function resolveRegion(input: DetectionInput, spec: string): string | undefined {
   const trimmed = spec.trim();
 
-  if (trimmed === 'oscTitle') return input.oscTitle;
-  if (trimmed === 'whole') return input.screen;
+  if (trimmed === 'osc_title') return input.oscTitle;
+  if (trimmed === 'osc_progress') return input.oscProgress ?? '';
+  if (trimmed === 'whole_recent') return input.screen;
 
   const lines = input.screen.split('\n');
 
-  if (trimmed === 'afterLastHorizontalRule') {
-    let lastRuleIdx = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (isHorizontalRule(lines[i])) lastRuleIdx = i;
-    }
-    if (lastRuleIdx < 0) return input.screen;
-    return lines.slice(lastRuleIdx + 1).join('\n');
+  if (trimmed === 'after_last_prompt_marker') return afterLastPromptMarker(input.screen, lines);
+  if (trimmed === 'above_prompt_box') return abovePromptBox(input.screen, lines);
+  if (trimmed === 'last_non_empty_above_prompt_box') {
+    return lastNonEmptyLine(abovePromptBox(input.screen, lines));
   }
+  if (trimmed === 'prompt_box_body') return promptBoxBody(input.screen, lines);
+  if (trimmed === 'after_last_horizontal_rule') return afterLastHorizontalRule(input.screen, lines);
 
-  if (trimmed === 'promptBoxBody') {
-    const ruleIndices: number[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (isHorizontalRule(lines[i])) ruleIndices.push(i);
-    }
-    if (ruleIndices.length < 2) return '';
-    const topIdx = ruleIndices[ruleIndices.length - 2];
-    const bottomIdx = ruleIndices[ruleIndices.length - 1];
-    return lines.slice(topIdx + 1, bottomIdx).join('\n');
-  }
+  const bottomMatch = BOTTOM_LINES_RE.exec(trimmed);
+  if (bottomMatch) return bottomNonEmptyLines(input.screen, lines, parseInt(bottomMatch[1], 10));
 
-  if (trimmed === 'afterLastPromptMarker') {
-    let lastPromptIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const trimmedLine = lines[i].trimStart();
-      if (/^›\s*$/.test(trimmedLine)) {
-        lastPromptIdx = i;
-        break;
-      }
-      if (/^→ [A-Za-z0-9][\w.-]*(?:\s+git:\([^\s)]+\))?\s*$/.test(trimmedLine)) {
-        let atTail = true;
-        for (let j = i + 1; j < lines.length; j++) {
-          if (lines[j].trim() !== '') { atTail = false; break; }
-        }
-        if (atTail) {
-          lastPromptIdx = i;
-          break;
-        }
-      }
-      if (trimmedLine.startsWith('› ') && !/^› \d+\./.test(trimmedLine)
-        && i + 2 < lines.length
-        && lines[i + 1].trim() === ''
-        && /^\s+[A-Za-z0-9]\S*(?:\s+\S+){0,2}\s+·/.test(lines[i + 2])
-      ) {
-        let atTail = true;
-        for (let j = i + 3; j < lines.length; j++) {
-          if (lines[j].trim() !== '') { atTail = false; break; }
-        }
-        if (atTail) {
-          lastPromptIdx = i;
-          break;
-        }
-      }
-    }
-    if (lastPromptIdx < 0) return input.screen;
-    return lines.slice(lastPromptIdx + 1).join('\n');
-  }
+  const topMatch = TOP_LINES_RE.exec(trimmed);
+  if (topMatch) return topNonEmptyLines(input.screen, lines, parseInt(topMatch[1], 10));
 
-  const tailMatch = trimmed.match(/^tail\((\d+)\)$/);
-  if (tailMatch) {
-    const count = parseInt(tailMatch[1], 10);
-    return lines.slice(Math.max(0, lines.length - count)).join('\n');
-  }
+  return undefined;
+}
 
-  const tailNonEmptyMatch = trimmed.match(/^tailNonEmpty\((\d+)\)$/);
-  if (tailNonEmptyMatch) {
-    return tailNonEmpty(input.screen, parseInt(tailNonEmptyMatch[1], 10));
-  }
+const EMPTY_INPUT: DetectionInput = { screen: '', oscTitle: '' };
 
-  return '';
+export function isKnownRegion(spec: string): boolean {
+  return resolveRegion(EMPTY_INPUT, spec) !== undefined;
+}
+
+export function extractRegion(input: DetectionInput, spec: string): string {
+  return resolveRegion(input, spec) ?? '';
 }

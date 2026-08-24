@@ -307,6 +307,20 @@ describe('compactAgent', () => {
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
+  it('refuses to inject when the pre-inject frame shows a pending blocker (herdr: Blocked 是唯一拒发条件)', async () => {
+    await seedAgent();
+    setPollMs(1);
+    const fakeTmux = fakeDispatchTmux();
+    fakeTmux.readPaneTitle = vi.fn().mockResolvedValue('✳ 上一任务');
+    fakeTmux.capturePaneById = vi.fn().mockResolvedValue(
+      'Bash command\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend · ctrl+e to explain',
+    );
+    await expect(injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'p', 'dev-1', 'claude-code'))
+      .rejects.toThrow(/pre-inject/);
+    expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
+    expect(fakeTmux.clearComposerDraft).not.toHaveBeenCalled();
+  });
+
   it('samples the OSC title BEFORE sendEnter and threads it into waitSubmitAck (a post-submit working title must not become the baseline)', async () => {
     await seedAgent();
     setPollMs(1);

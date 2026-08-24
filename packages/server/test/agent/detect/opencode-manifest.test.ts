@@ -55,14 +55,29 @@ const cases: Case[] = [
     expect: { state: 'pending', rule: 'permission_required', visibleBlocker: true },
   },
   {
-    name: 'progress bar + "esc interrupt" (no "to", post-rewrite) is working',
+    name: 'progress bar + "esc interrupt" (no "to", post-rewrite) is working via progress bar',
     lines: ['   ■■■■⬝⬝⬝⬝  esc interrupt                       tab agents  ctrl+p commands'],
-    expect: { state: 'working', rule: 'interrupt_hint_working', visibleWorking: true },
+    expect: { state: 'working', rule: 'progress_bar_working', visibleWorking: true },
   },
   {
     name: 'herdr-listed "esc to interrupt" wording is also working',
     lines: ['some tool output  esc to interrupt'],
     expect: { state: 'working', rule: 'interrupt_hint_working' },
+  },
+  {
+    name: 'uppercase "ESC to interrupt" is working (contains is case-insensitive)',
+    lines: ['some tool output  ESC to interrupt'],
+    expect: { state: 'working', rule: 'interrupt_hint_working', visibleWorking: true },
+  },
+  {
+    name: 'herdr-listed "press esc to interrupt" wording is working',
+    lines: ['  press esc to interrupt'],
+    expect: { state: 'working', rule: 'interrupt_hint_working', visibleWorking: true },
+  },
+  {
+    name: 'opencode-branded "esc again to interrupt" line is working (herdr (?i) regex)',
+    lines: ['OpenCode — press ESC again to interrupt'],
+    expect: { state: 'working', rule: 'interrupt_hint_working', visibleWorking: true },
   },
   {
     name: 'progress bar alone (no interrupt text) is working',
@@ -80,14 +95,14 @@ const cases: Case[] = [
     expect: { state: 'pending', rule: 'permission_required', visibleBlocker: true },
   },
   {
-    name: 'permission title with allow/reject options is pending',
+    name: 'plain "Permission required" without herdr signals falls back to idle (herdr boundary)',
     lines: ['Permission required', '  Allow once', '  Allow always', '  Reject'],
-    expect: { state: 'pending', rule: 'permission_required', visibleBlocker: true },
+    expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'idle composer footer is idle with visibleIdle',
+    name: 'idle composer footer falls back to default idle (herdr: no idle rules)',
     lines: ['┃  Build auto · Big Pickle OpenCode Zen', '                8.3K (4%)  ctrl+p commands'],
-    expect: { state: 'idle', rule: 'idle_composer', visibleIdle: true },
+    expect: { state: 'idle', rule: undefined },
   },
   {
     name: 'working progress bar wins over the idle composer footer on the same screen',

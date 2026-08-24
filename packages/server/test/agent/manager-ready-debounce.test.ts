@@ -8,7 +8,7 @@ import { createManagerHarness } from '../helpers/manager-harness.js';
 import { fakeRunner } from '../helpers/fake-runner.js';
 
 const CODEX_IDLE = '› \n\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
-const CODEX_BUSY = '• Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
+const CODEX_BUSY = '• Working (12s • esc to interrupt)\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
 
 type WaitOpts = { stableIdle?: boolean };
 type WaitFn = (tmux: TmuxManager, paneId: string, runtime: string, timeoutMs: number, opts?: WaitOpts) => Promise<void>;
@@ -54,6 +54,14 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
+});
+
+describe('waitForReplPromptReady 完整判定优先', () => {
+  it('screen-only ready 不得绕过 working 的 OSC 标题', async () => {
+    mockFrames([CODEX_IDLE], { cycle: true });
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('⠹ 分析');
+    await expect(waitReady(60)).rejects.toBeInstanceOf(ReplNotReadyError);
+  });
 });
 
 describe('waitForReplPromptReady stableIdle 去抖', () => {

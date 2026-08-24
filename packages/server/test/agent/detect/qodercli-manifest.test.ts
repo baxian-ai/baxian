@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { QODER_NONYOLO_SHELL_PERMISSION_LINES } from '../runtime-captures.js';
 import { evaluateManifest, type AgentManifest } from '../../../src/agent/detect/manifest.js';
 import type { DetectionInput } from '../../../src/agent/detect/region.js';
 import qodercliManifest from '../../../src/agent/detect/manifests/qodercli.json' with { type: 'json' };
@@ -18,30 +19,8 @@ interface Case {
 const cases: Case[] = [
   {
     name: '非 YOLO shell 权限 prompt（真实截屏 perm-qoder，issue #475）',
-    lines: [
-      "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
-      " > Run this exact bash command: echo bx475",
-      "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-      "",
-      " Thinking",
-      " │ The user wants me to run a specific bash command.",
-      " ? Bash(echo bx475)",
-      "",
-      " Permission Required",
-      "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      " Tool: Bash",
-      "",
-      " Print bx475",
-      " Command: echo bx475",
-      "",
-      " Allow this command to run?",
-      "",
-      "  ❯ 1. Allow once",
-      "    2. Always allow \"echo\" for future sessions [local]",
-      "    3. Reject and type something",
-      "    4. No",
-    ],
-    expect: { state: 'pending', rule: 'confirmation_blocker', visibleBlocker: true },
+    lines: QODER_NONYOLO_SHELL_PERMISSION_LINES,
+    expect: { state: 'pending', rule: 'confirmation_or_input_blocker', visibleBlocker: true },
   },
   {
     name: 'braille spinner with "(esc to cancel," is working',
@@ -54,24 +33,29 @@ const cases: Case[] = [
     expect: { state: 'working', rule: 'spinner_working', visibleWorking: true },
   },
   {
+    name: 'braille spinner with non-ASCII activity text is working (herdr \\p{Alphabetic})',
+    lines: ['⠼ 正在思考中...'],
+    expect: { state: 'working', rule: 'spinner_working', visibleWorking: true },
+  },
+  {
     name: 'measured "Permission Required" prompt is pending',
     lines: ['? Bash(echo hello > test.txt)', 'Permission Required', 'Allow this command to run?', '❯ 1. Allow once'],
-    expect: { state: 'pending', rule: 'confirmation_blocker', visibleBlocker: true },
+    expect: { state: 'pending', rule: 'confirmation_or_input_blocker', visibleBlocker: true },
   },
   {
     name: 'herdr-listed "waiting for user confirmation" wording is also pending',
     lines: ['waiting for user confirmation', '  1. yes', '  2. no'],
-    expect: { state: 'pending', rule: 'confirmation_blocker', visibleBlocker: true },
+    expect: { state: 'pending', rule: 'confirmation_or_input_blocker', visibleBlocker: true },
   },
   {
-    name: 'idle composer placeholder is idle with visibleIdle',
+    name: 'idle composer placeholder falls back to default idle (herdr: no idle rules)',
     lines: ['*   Type your message or @path/to/file'],
-    expect: { state: 'idle', rule: 'idle_composer', visibleIdle: true },
+    expect: { state: 'idle', rule: undefined },
   },
   {
     name: 'confirmation blocker wins over a stale spinner line on the same screen',
     lines: ['⠙ Thinking...', 'Permission Required', 'Allow this command to run?'],
-    expect: { state: 'pending', rule: 'confirmation_blocker' },
+    expect: { state: 'pending', rule: 'confirmation_or_input_blocker' },
   },
   {
     name: 'unrecognized screen falls back to idle',

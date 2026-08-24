@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, detectRuntimePendingPrompt, detectRuntimeOverlay, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, hasOscTitleIdle, runtimeBusyCheck } from '../../src/agent/tmux.js';
+import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog } from '../../src/agent/tmux.js';
 import type { PaneRef } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { blank, CC_NONYOLO_BASH_PERMISSION, CODEX_NONYOLO_ESCALATION } from './runtime-captures.js';
+import { classifyScreen } from '../../src/agent/detect/classify.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
 
@@ -957,7 +959,7 @@ describe('TmuxManager', () => {
     it('acks on an idle→busy transition (runtime starts working after submit)', async () => {
       const baseline = buildBaseline('idle composer\n', 0);
       primeSnapshot('idle composer\n', 0);
-      primeSnapshot('working\n  esc to interrupt\n', 0);
+      primeSnapshot('✻ Working… (3s · esc to interrupt)\n', 0);
       await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
@@ -970,12 +972,19 @@ describe('TmuxManager', () => {
         .resolves.toBeUndefined();
     });
 
-    it('rejects (busy baseline) when the pane is ALREADY working at entry — a spinner refresh is not a fresh ack', async () => {
+    // fire-and-forget 的判据在调用方(粘贴前那一帧),这里只负责观察提交跃迁
+    it('已判 working 的基线在这里不构成 ack —— 观察不到跃迁就超时,不谎报已提交', async () => {
       const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
       primeTitle('⠹ Reviewing');
-      primeTitle('⠸ Reviewing');
       await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 200, intervalMs: 50 }))
-        .rejects.toThrow(/pane already busy at baseline/);
+        .rejects.toThrow(/runtime ack timeout/);
+    });
+
+    it('基线上的陈旧 working 标题同样不构成 ack(herdr: 无仲裁,标题需相对基线变化)', async () => {
+      const baseline = buildBaseline('✻ Worked for 10s\n\n❯ \n', 0);
+      paneTitle = '⠹ 旧任务';
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
+        .rejects.toThrow(/runtime ack timeout/);
     });
 
     it('honors a caller-provided PRE-Enter baseline title: a title already working on the first post-submit read still acks', async () => {
@@ -984,6 +993,87 @@ describe('TmuxManager', () => {
       await expect(
         tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50, baselineTitle: '~/repo' }),
       ).resolves.toBeUndefined();
+    });
+
+    // opencode/qodercli 的 working 规则是 whole_recent 裸 contains:提示词带上关键字,基线就自匹配
+    it.each<[string, 'opencode' | 'qodercli', string]>([
+      ['opencode', 'opencode', '› 帮我看下 esc to interrupt 这个判定\n'],
+      ['qodercli', 'qodercli', '> 文案里写的是 (esc to cancel, 要不要改\n'],
+    ])('%s: 提示词自带 working 关键字的基线不可 ack —— 走重发/超时,不能当作已提交', async (_n, runtime, pasted) => {
+      const baseline = buildBaseline(pasted, 0);
+      runner.exec.mockImplementation(async () => ({ stdout: composeSnapStdout(pasted, 0), stderr: '', exitCode: 0 }));
+      const resend = vi.fn(async () => undefined);
+      await expect(tmux.waitSubmitAck(PANE, baseline, runtime, {
+        timeoutMs: 260, intervalMs: 50, baselineTitle: '', resend, resendIntervalMs: 50,
+      })).rejects.toThrow(/runtime ack timeout/);
+      expect(resend.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    // 自匹配基线之后,「提交成功的新 working 帧」与「Enter 被吞 + attach 重绘」在屏幕上完全同形:
+    // 两者都判 working、都与基线不同。只有 runtime 自己写的标题能分开,屏幕证据一律不采信。
+    it.each<[string, 'opencode' | 'qodercli', string, string, string]>([
+      [
+        'opencode',
+        'opencode',
+        '› 帮我看下 esc to interrupt 这个判定\n',
+        '⏳ opencode is working\n  esc to interrupt\n  ■■■■■■\n',
+        '› 帮我看下 esc to interrupt 这个判定\n[Image #1] frame 0\n',
+      ],
+      [
+        'qodercli',
+        'qodercli',
+        '> 文案里写的是 (esc to cancel, 要不要改\n',
+        '⠹ 正在执行 (esc to cancel, 请稍候)\n',
+        '> 文案里写的是 (esc to cancel, 要不要改\n[Image #1] frame 0\n',
+      ],
+    ])('%s: 自匹配基线后没有任何可观测的提交证据 —— 屏幕同形,标题也不构成 working 证据', async (_n, runtime, pasted, submitted, redrawn) => {
+      for (const frame of [pasted, submitted, redrawn]) {
+        expect(classifyScreen(runtime, frame).state, frame).toBe('working');
+      }
+      expect(new Set([pasted, submitted, redrawn]).size).toBe(3);
+      // 这两个 runtime 的 manifest 没有 osc_title 规则:标题单独看永远不是 working 证据
+      for (const title of [`${runtime} · working`, '⠹ Reviewing', '~/other/dir']) {
+        expect(classifyScreen(runtime, '', title).state, title).not.toBe('working');
+      }
+      const baseline = buildBaseline(pasted, 0);
+      const runAck = async (after: string, titleAfter: string): Promise<string> => {
+        let n = 0;
+        runner.exec.mockImplementation(async () => ({ stdout: composeSnapStdout(n++ === 0 ? pasted : after, 0), stderr: '', exitCode: 0 }));
+        let t = 0;
+        vi.spyOn(tmux, 'readPaneTitle').mockImplementation(async () => (t++ === 0 ? '' : titleAfter));
+        return tmux.waitSubmitAck(PANE, baseline, runtime, { timeoutMs: 300, intervalMs: 50, baselineTitle: '' })
+          .then(() => 'ack').catch(() => 'timeout');
+      };
+      for (const after of [submitted, redrawn]) {
+        for (const title of ['', `${runtime} · working`, '~/other/dir']) {
+          expect(await runAck(after, title), `${after} / ${title}`).toBe('timeout');
+        }
+      }
+    });
+
+    it('自匹配基线 + 无关标题变化不构成 ack —— 屏幕的 working 不能替标题作证', async () => {
+      const pasted = '› 帮我看下 esc to interrupt 这个判定\n';
+      const baseline = buildBaseline(pasted, 0);
+      runner.exec.mockImplementation(async () => ({ stdout: composeSnapStdout(pasted, 0), stderr: '', exitCode: 0 }));
+      let t = 0;
+      vi.spyOn(tmux, 'readPaneTitle').mockImplementation(async () => (t++ === 0 ? '~/repo' : '~/some/other/dir'));
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'opencode', { timeoutMs: 300, intervalMs: 50, baselineTitle: '~/repo' }))
+        .rejects.toThrow(/runtime ack timeout/);
+    });
+
+    it('claude/codex 的自匹配基线仍可由真正的 working 标题 ack(标题规则存在)', async () => {
+      const pasted = '✻ 复现一下… (3s · esc to interrupt) 这段文案\n';
+      const baseline = buildBaseline(pasted, 0);
+      expect(classifyScreen('claude-code', pasted).state).toBe('working');
+      runner.exec.mockImplementation(async () => ({ stdout: composeSnapStdout(pasted, 0), stderr: '', exitCode: 0 }));
+      let t = 0;
+      vi.spyOn(tmux, 'readPaneTitle').mockImplementation(async () => (t++ === 0 ? '✳ Claude Code' : '~/other/dir'));
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 300, intervalMs: 50, baselineTitle: '✳ Claude Code' }))
+        .rejects.toThrow(/runtime ack timeout/);
+      t = 0;
+      vi.spyOn(tmux, 'readPaneTitle').mockImplementation(async () => (t++ === 0 ? '✳ Claude Code' : '⠂ 正在处理'));
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 300, intervalMs: 50, baselineTitle: '✳ Claude Code' }))
+        .resolves.toBeUndefined();
     });
 
     it('does NOT ack on scrollback growth alone when the runtime never goes busy (uncommitted redraw)', async () => {
@@ -1004,21 +1094,21 @@ describe('TmuxManager', () => {
 
     it('codex: stale esc-to-interrupt above → prompt is NOT busy baseline (position-aware)', async () => {
       const baseline = buildBaseline('Working on it…\n  esc to interrupt\n→ baxian git:(main)\n', 0);
-      primeSnapshot('· Thinking… (2s)\n→ baxian git:(main)\n', 0);
+      primeSnapshot('› \n• Working (2s • esc to interrupt)\n', 0);
       await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
-    it('codex: pasted prompt containing "Working (8s)" is NOT busy baseline', async () => {
+    it('codex: a pasted line-start "Working (8s)" is NOT the herdr • Working shape → idle baseline, swallowed Enter surfaces as ack timeout', async () => {
       const baseline = buildBaseline('→ baxian git:(main)\nPlease explain this log:\nWorking (8s)\n', 0);
-      primeSnapshot('· Thinking… (2s)\n  esc to interrupt\n', 0);
-      await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
-        .resolves.toBeUndefined();
+      runner.exec.mockResolvedValue({ stdout: composeSnapStdout('→ baxian git:(main)\nPlease explain this log:\nWorking (8s)\n', 0), stderr: '', exitCode: 0 });
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 200, intervalMs: 50 }))
+        .rejects.toThrow(/runtime ack timeout/);
     });
 
-    it('codex: full-screen spinner high on viewport acks after Enter', async () => {
+    it('codex: spinner high on viewport is stale; the fresh Working footer under the cleared composer acks', async () => {
       const baseline = buildBaseline('→ baxian git:(main)\nidle prompt text\n', 0);
-      const lines = ['· Thinking… (2s)', ...Array(12).fill(''), '→ baxian git:(main)'].join('\n') + '\n';
+      const lines = ['· Thinking… (2s)', ...blank(12), '› ', '• Working (2s • esc to interrupt)'].join('\n') + '\n';
       primeSnapshot(lines, 0);
       await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
@@ -1035,7 +1125,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('idle composer\n', 0);
       let submitted = false;
       runner.exec.mockImplementation(async () => ({
-        stdout: composeSnapStdout(submitted ? 'working\n  esc to interrupt\n' : 'idle composer\n', 0),
+        stdout: composeSnapStdout(submitted ? '✻ Working… (3s · esc to interrupt)\n' : 'idle composer\n', 0),
         stderr: '',
         exitCode: 0,
       }));
@@ -1051,7 +1141,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline(longComposer, 0);
       let submitted = false;
       runner.exec.mockImplementation(async () => ({
-        stdout: composeSnapStdout(submitted ? 'working\n  esc to interrupt\n' : longComposer, 0),
+        stdout: composeSnapStdout(submitted ? '✻ Working… (3s · esc to interrupt)\n' : longComposer, 0),
         stderr: '',
         exitCode: 0,
       }));
@@ -1066,7 +1156,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('idle composer\n', 0);
       let submitted = false;
       runner.exec.mockImplementation(async () => ({
-        stdout: composeSnapStdout(submitted ? 'working\n  esc to interrupt\n' : 'idle composer\n\n', 0),
+        stdout: composeSnapStdout(submitted ? '✻ Working… (3s · esc to interrupt)\n' : 'idle composer\n\n', 0),
         stderr: '',
         exitCode: 0,
       }));
@@ -1096,7 +1186,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline(held, 0);
       let submitted = false;
       runner.exec.mockImplementation(async () => ({
-        stdout: composeSnapStdout(submitted ? '· Thinking… (2s)\n' : held, 0),
+        stdout: composeSnapStdout(submitted ? '› \n• Working (2s • esc to interrupt)\n' : held, 0),
         stderr: '',
         exitCode: 0,
       }));
@@ -1170,7 +1260,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline(held, 0);
       let submitted = false;
       runner.exec.mockImplementation(async () => ({
-        stdout: composeSnapStdout(submitted ? '· Thinking… (2s)\n' : held, 0),
+        stdout: composeSnapStdout(submitted ? '› \n• Working (2s • esc to interrupt)\n' : held, 0),
         stderr: '',
         exitCode: 0,
       }));
@@ -1198,7 +1288,7 @@ describe('TmuxManager', () => {
     it('does NOT re-send Enter once the pane leaves the composer for a menu — detect-only policy', async () => {
       const baseline = buildBaseline('idle composer\n', 0);
       runner.exec.mockResolvedValue({
-        stdout: composeSnapStdout('Pick one\nEnter to select · Esc to cancel\n', 0),
+        stdout: composeSnapStdout('Pick one\nEnter to confirm · Esc to cancel\n', 0),
         stderr: '',
         exitCode: 0,
       });
@@ -1442,8 +1532,8 @@ describe('TmuxManager', () => {
         ).rejects.toThrow(/repl not ready/);
       });
 
-      it('claude-code: "✳ " title does not shortcut an actively busy screen (esc to interrupt in tail)', async () => {
-        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '✳ 部署服务');
+      it('claude-code: "✳ " title does not shortcut an actively busy screen (live spinner in tail)', async () => {
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\n✻ 部署中… (3s · esc to interrupt)\n`, '✳ 部署服务');
         await expect(
           tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
@@ -1492,15 +1582,15 @@ describe('TmuxManager', () => {
         ).rejects.toThrow(/repl not ready/);
       });
 
-      it('claude-code: "✳ " title does not shortcut a narrow-wrapped select-option form (AskUserQuestion)', async () => {
+      it('herdr boundary: a narrow-wrapped select-option form is undetectable (contains 不跨行), the ✳ title fast path proceeds', async () => {
         mockPaneState(
           '2.1.199',
           '选择合并策略：\n❯ 1. squash\n  2. rebase\n\nEnter to select ·\nEsc to cancel · Tab/arrow\nkeys to navigate\n',
           '✳ 等待合并策略选择',
         );
         await expect(
-          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
-        ).rejects.toThrow(/repl not ready/);
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+        ).resolves.toBeUndefined();
       });
 
       it('claude-code: a pending-prompt phrase far above the tail does not veto an idle bottom screen', async () => {
@@ -1512,7 +1602,7 @@ describe('TmuxManager', () => {
       });
 
       it('does not read the pane title while the screen is visibly busy (sync short-circuit first)', async () => {
-        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '✳ 部署服务');
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\n✻ 部署中… (3s · esc to interrupt)\n`, '✳ 部署服务');
         await expect(
           tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
@@ -1520,8 +1610,22 @@ describe('TmuxManager', () => {
         expect(titleReads.length).toBe(1);
       });
 
+      it('claude-code: a screen-only ready view never shortcuts a working OSC title', async () => {
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\n⏵⏵ bypass permissions on (shift+tab to cycle)\n`, '⠹ 部署服务');
+        await expect(
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: the working-title veto applies even without titleIdleFastPath', async () => {
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\n⏵⏵ bypass permissions on (shift+tab to cycle)\n`, '⠹ 部署服务');
+        await expect(
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30 }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
       it('timeout on a busy screen still reports the pane title via the failure-path fallback read', async () => {
-        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '⠹ 部署服务');
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\n✻ 部署中… (3s · esc to interrupt)\n`, '⠹ 部署服务');
         await expect(
           tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/paneTitle="⠹ 部署服务"/);
@@ -1541,7 +1645,7 @@ describe('TmuxManager', () => {
       it('claude-code: "✳ " title does not shortcut the transcript viewer overlay', async () => {
         mockPaneState(
           '2.1.199',
-          'transcript content line\n\nctrl+o to toggle · esc to close\n',
+          'transcript content line\nShowing detailed transcript\nctrl+o to toggle · esc to close\n',
           '✳ 分析日志',
         );
         await expect(
@@ -1582,15 +1686,15 @@ describe('TmuxManager', () => {
         ).rejects.toThrow(/repl not ready/);
       });
 
-      it('claude-code: a leftover composer draft below a quoted offer phrase does not veto the fast path', async () => {
+      it('herdr flip: a quoted offer phrase plus a ❯ draft token satisfies the legacy blocker and vetoes the fast path', async () => {
         mockPaneState(
           '2.1.199',
           `表单文案 "would you like to" 已覆盖。\n${NARROW_IDLE_SCREEN}\n❯ run tests\n`,
           '✳ 跑测试收尾',
         );
         await expect(
-          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
-        ).resolves.toBeUndefined();
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
       });
 
       it('claude-code: "✳ " title does not shortcut a permission prompt with bare unnumbered Yes options', async () => {
@@ -1881,782 +1985,6 @@ describe('detectStartupDialog', () => {
     for (const [name, screen] of CODEX_NEGATIVE) {
       expect.soft(detectStartupDialog(screen, 'codex'), name).toBe(false);
     }
-  });
-});
-
-describe('detectRuntimeMenu', () => {
-  const POSITIVE: Array<[string, string]> = [
-    [
-      'superpowers picker: "Enter to select · ↑/↓ to navigate · Esc to cancel"',
-      '❯ 1. Subagent-Driven (Recommended)\n  2. Inline Execution\n  3. Type something.\n  4. Chat about this\nEnter to select · ↑/↓ to navigate · Esc to cancel\n',
-    ],
-    [
-      'single-choice confirm anchor "Enter to confirm · Esc to cancel"',
-      '> Apply this refactor?\nEnter to confirm · Esc to cancel\n',
-    ],
-    [
-      'overflow scroll-overlay mangles footer (real baxian-dev capture, task-064, 53-col pane): "Jump to bottom" hint overwrites the middle, width truncates "cancel"',
-      '❯ 1. post-approve-complete（推荐）\n  2. post-approve-fixed\n  3. 保持 pr-merge-ready 不变\n  4. Type something.\n  5. Chat about this\n─────────────────────────────────────────────────────\nEnter to sel Jump to bottom (ctrl+End) ↓ ate · Esc to\n',
-    ],
-    [
-      'narrow pane truncates the footer tail "cancel" but the Enter/Esc verbs survive',
-      '❯ 1. Yes\n  2. No\nEnter to select · ↑/↓ to navigate · Esc to\n',
-    ],
-    [
-      'indented footer (boxed menu) — line-start anchor tolerates leading whitespace',
-      '  ❯ 1. Yes\n    2. No\n    Enter to select · Esc to cancel\n',
-    ],
-  ];
-
-  const NEGATIVE: Array<[string, string]> = [
-    [
-      'healthy REPL with user-typed prefill bracketed by dividers (claude no-footer menu shape)',
-      '✻ Worked for 5m 38s\n────────────────────────────────────────────────────────────────────────────────\n❯ 按方案 A 开分支重构\n────────────────────────────────────────────────────────────────────────────────\n  Opus 4.7 [###############     ] 75%\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-    [
-      'real baxian-dev capture: idle claude REPL with prefilled draft "直接push" (regression)',
-      '  Read 1 file\n\n⏺ 全部 review 处理完。汇总：\n\n✻ Worked for 33m 3s\n\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ 直接push\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  Opus 4.7 [#################   ] 85%\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #101\n',
-    ],
-    [
-      'numbered picker structure when footer hints are hidden',
-      '❯ 1. Subagent-Driven (Recommended)\n  2. Inline Execution\n  3. Type something.\n',
-    ],
-    [
-      'healthy ready REPL screen',
-      '❯ Try "fix typecheck errors"\n⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-    [
-      'healthy ready REPL screen with non-English prompt',
-      '❯ 按方案 A 开分支重构\n⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-    [
-      'ready REPL prompt after a single divider',
-      '────────────────────────────────────────────────────────────────────────────────\n❯ 按方案 A 开分支重构\n⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-    [
-      'markdown quote text bracketed by ASCII separators',
-      '------------------------------------------------------------\n> quoted text from command output\n------------------------------------------------------------\n',
-    ],
-    [
-      'numbered list typed at a ready REPL prompt',
-      '❯ 1. Write a regression test\n  2. Run the relevant test\n  3. Push the branch\n⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-    [
-      'blank lines collapsed into a fake divider-bracketed picker',
-      '────────────────────────────────────────────────────────────────────────────────\n\n❯ 按方案 A 开分支重构\n\n────────────────────────────────────────────────────────────────────────────────\n',
-    ],
-    ['Auto-updating with Unicode ellipsis (startup-only signal)', 'status bar: Auto-updating…\n'],
-    ['Auto-updating with version target', 'Auto-updating to v2.1.87'],
-    [
-      'busy "Esc to interrupt" with an unrelated "Enter to" on a different line (same-line rule)',
-      '❯ press Enter to send a follow-up\n⏺ Thinking…\n  Esc to interrupt\n',
-    ],
-    [
-      'keyboard help in prose/tool output — line does not START with "Enter to"',
-      'Press Enter to continue, Esc to abort\n',
-    ],
-    [
-      'agent prose mentioning the keys mid-sentence',
-      'Then hit Enter to select an option or Esc to cancel the dialog.\n',
-    ],
-    [
-      'line-start keyboard hint without the "·" footer separator (tool/TUI output)',
-      'Enter to continue, Esc to abort\n',
-    ],
-    [
-      'line-start keyboard hint, comma-joined (tool/TUI output)',
-      'Enter to accept, Esc to skip\n',
-    ],
-  ];
-
-  it('matches every known runtime-menu anchor', () => {
-    for (const [name, screen] of POSITIVE) {
-      expect.soft(detectRuntimeMenu(screen), name).toBe(true);
-    }
-  });
-
-  it('does NOT match REPL chrome / unrelated text', () => {
-    for (const [name, screen] of NEGATIVE) {
-      expect.soft(detectRuntimeMenu(screen), name).toBe(false);
-    }
-  });
-});
-
-describe('hasRuntimeReadyView', () => {
-  it('accepts a claude-code idle composer without the footer anchor', () => {
-    expect(hasRuntimeReadyView('✻ Worked for 10s\n\n❯ \n', 'claude-code')).toBe(true);
-  });
-
-  it('rejects small-pane fallback when the visible pane is busy or waiting on a menu/dialog', () => {
-    for (const [name, screen] of [
-      ['busy spinner', '✽ Grooving… (5m 21s · thinking)\n\n❯ \n'],
-      ['runtime menu', '❯ \nEnter to select · ↑/↓ to navigate · Esc to cancel\n'],
-      ['startup dialog', '❯ \nPress enter to continue\n'],
-      ['trust dialog', 'Quick safety check\n❯ 1. Yes, I trust this folder\n'],
-    ] as Array<[string, string]>) {
-      expect.soft(hasRuntimeReadyView(screen, 'claude-code'), name).toBe(false);
-    }
-  });
-
-  it('rejects claude-code when spinner is high on tall pane (full-screen check)', () => {
-    const lines = [
-      '✽ Grooving… (5m 21s · thinking)',
-      ...Array(18).fill(''),
-      '❯ ',
-      '',
-    ];
-    expect(hasRuntimeReadyView(lines.join('\n'), 'claude-code')).toBe(false);
-  });
-
-  it('does not apply the claude small-pane fallback to codex', () => {
-    expect(hasRuntimeReadyView('❯ \n', 'codex')).toBe(false);
-  });
-
-  it('accepts codex idle prompt with → arrow', () => {
-    expect(hasRuntimeReadyView('→ baxian git:(main)\n', 'codex')).toBe(true);
-  });
-
-  it('accepts a bare › as codex idle (a cleared empty composer; busy/menu gating still applies)', () => {
-    expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
-  });
-
-  it('rejects codex → prompt when busy spinner is active', () => {
-    const screen = '· Thinking… (5s)\n→ baxian git:(main)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
-  });
-
-  it('accepts codex → prompt when stale esc-to-interrupt is ABOVE the prompt', () => {
-    const screen = 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
-  });
-
-  it('rejects codex → prompt when esc-to-interrupt is BELOW the prompt (active busy)', () => {
-    const screen = '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
-  });
-
-  it('rejects codex → prompt when Working(...) is active in tail', () => {
-    const screen = '→ baxian git:(main)\n• Working (8s)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
-  });
-
-  it('does not accept → output line (e.g. → run tests) as codex idle prompt', () => {
-    expect(hasRuntimeReadyView('→ run tests\n', 'codex')).toBe(false);
-  });
-
-  it('does not accept indented → line as codex idle prompt', () => {
-    expect(hasRuntimeReadyView('  → baxian git:(main)\n', 'codex')).toBe(false);
-  });
-
-  it('rejects codex → prompt when output follows it', () => {
-    expect(hasRuntimeReadyView('→ baxian git:(main)\nStill working on the request...\n', 'codex')).toBe(false);
-  });
-
-  it('accepts codex backtrack hint footer (Esc on empty composer) as idle/ready', () => {
-    const screen =
-      '─ Worked for 1m 14s ─────────────────\n\n' +
-      '› Use /skills to list available skills\n\n' +
-      '  esc again to edit previous message\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
-  });
-
-  it('only treats the backtrack hint as ready when it is the bottom footer (busy marker below → not ready)', () => {
-    const screen =
-      '› Use /skills to list available skills\n\n' +
-      '  esc again to edit previous message\n' +
-      '· Working (8s)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
-  });
-
-  it('does not treat the backtrack hint as ready for claude-code', () => {
-    expect(hasRuntimeReadyView('  esc again to edit previous message\n', 'claude-code')).toBe(false);
-  });
-
-  it('opencode: idle composer footer without busy signals is ready', () => {
-    expect(hasRuntimeReadyView('┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode')).toBe(true);
-  });
-
-  it('opencode: a working screen (progress bar + esc interrupt) is not ready', () => {
-    expect(hasRuntimeReadyView('   ■■■⬝⬝⬝  esc interrupt          ctrl+p commands\n', 'opencode')).toBe(false);
-  });
-
-  it('qodercli: idle composer placeholder is ready', () => {
-    expect(hasRuntimeReadyView('*   Type your message or @path/to/file\n', 'qodercli')).toBe(true);
-  });
-
-  it('qodercli: a thinking spinner screen is not ready', () => {
-    expect(hasRuntimeReadyView('⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli')).toBe(false);
-  });
-
-  it('opencode: a permission prompt that keeps the idle footer is not ready', () => {
-    expect(hasRuntimeReadyView('△ Permission required\n  Allow once   Reject\n  ctrl+p commands\n', 'opencode')).toBe(false);
-  });
-
-  it.each([
-    'Permission Required',
-    'Allow this command to run?',
-    'Do you want to allow this read?',
-    'waiting for user confirmation',
-    'awaiting approval',
-    'allow once or always?',
-    'asking user',
-    'enter your response',
-    'review your answers:',
-    'shell awaiting input',
-  ])('qodercli: pending prompt %j keeping the composer is not ready', (prompt) => {
-    expect(hasRuntimeReadyView(`${prompt}\n  Type your message or @path\n`, 'qodercli')).toBe(false);
-  });
-
-  it('qodercli: a shortcuts/help overlay is not ready (footer alone is not an idle cue)', () => {
-    expect(hasRuntimeReadyView('  keyboard shortcuts\n  ? for shortcuts\n', 'qodercli')).toBe(false);
-  });
-});
-
-describe('runtimeBusyCheck (opencode/qodercli screen-only busy)', () => {
-  it('opencode: esc interrupt hint is busy', () => {
-    expect(runtimeBusyCheck('   ■■■⬝⬝⬝  esc interrupt\n', 'opencode')).toBe(true);
-  });
-
-  it('opencode: idle composer is not busy', () => {
-    expect(runtimeBusyCheck('┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode')).toBe(false);
-  });
-
-  it('qodercli: "(esc to cancel," spinner is busy', () => {
-    expect(runtimeBusyCheck('⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli')).toBe(true);
-  });
-
-  it('qodercli: idle composer is not busy', () => {
-    expect(runtimeBusyCheck('*   Type your message or @path/to/file\n', 'qodercli')).toBe(false);
-  });
-
-  it('opencode: ctrl+c interrupt hint alone (progress bar wrapped out of tail) is busy', () => {
-    expect(runtimeBusyCheck('running a long tool call\n  ctrl+c to interrupt          ctrl+p commands\n', 'opencode')).toBe(true);
-  });
-});
-
-const blank = (n: number): string[] => Array(n).fill('');
-
-const CC_NONYOLO_IDLE = [
-  " ▎ Run /model and select Fable to use it. Learn more",
-  ...blank(27),
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  "❯\u00a0",
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  "  wd-cc Fable 5",
-  "  ⏸ manual mode on · ← for agents",
-].join('\n');
-
-const CODEX_NONYOLO_IDLE = [
-  "│                                                          │",
-  "│ model:     gpt-5.5 xhigh   /model to change              │",
-  "│ directory: /private/tmp/claude-501/…/yolo-probe/wd-codex │",
-  "╰──────────────────────────────────────────────────────────╯",
-  "",
-  "  Tip: New Use /fast to enable our fastest inference with increased plan usage.",
-  "",
-  "• You have 2 usage limit resets available. Run /usage to use one.",
-  "",
-  "",
-  "› Run /review on my current changes",
-  "",
-  "  gpt-5.5 xhigh · /private/tmp/claude-501/-Users-devuser--baxian-repos-example-baxian/f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/scratchpad/yolo-probe/wd-codex",
-  ...blank(35),
-].join('\n');
-
-const OC_NONYOLO_FRESH_IDLE = [
-  "                                                                                 ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
-  "",
-  "",
-  "                                                               ┃",
-  "                                                               ┃  Ask anything... \"What is the tech stack of this project?\"",
-  "                                                               ┃",
-  "                                                               ┃  Build · GLM-5.2 Alibaba (China) · max",
-  "                                                               ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-  "                                                                                                               tab agents  ctrl+p commands",
-  ...blank(18),
-  "  /private/tmp/claude-501/-Users-devuser--baxian-repos-example-baxian/f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/scratchpad/yolo-probe/wd-oc                                                         1.17.16",
-  "",
-].join('\n');
-
-const OC_YOLO_FRESH_IDLE = [
-  "                                                                                 ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
-  "",
-  "",
-  "                                                               ┃",
-  "                                                               ┃  Ask anything... \"What is the tech stack of this project?\"",
-  "                                                               ┃",
-  "                                                               ┃  Build auto · GLM-5.2 Alibaba (China) · max",
-  "                                                               ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-  "                                                                                                               tab agents  ctrl+p commands",
-  ...blank(18),
-  "  /private/tmp/claude-501/-Users-devuser--baxian-repos-example-baxian/f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/scratchpad/yolo-probe/wd-oc2                                                        1.17.17",
-  "",
-].join('\n');
-
-const QODER_NONYOLO_FRESH_IDLE = [
-  " ██      ██                            │ 1. Create AGENTS.md files to customize interactions          │",
-  " ██  ██  ██  Qoder CLI v1.0.41         │ 2. /help for more information                                │",
-  " ██    ██                              │ 3. Ask coding questions, edit code or run commands           │",
-  "   ████  ██  Signed in Browser Login   │ 4. Be specific for the best results                          │",
-  "                                       ╰──────────────────────────────────────────────────────────────╯",
-  "",
-  "",
-  "                                                                                                                                                                                        ? for shortcuts",
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  " Shift+Tab to Accept Edits                                                                                                                                                  Try /model to switch models",
-  "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
-  " >   Type your message or @path/to/file",
-  "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-  " GLM-5.2 (Alibaba Cloud Model Studio - China) Model · ctx ░░░░░░░░░░ 0%",
-  ...blank(34),
-].join('\n');
-
-const QODER_YOLO_FRESH_IDLE = [
-  " ██      ██                            │ 1. Create AGENTS.md files to customize interactions          │",
-  " ██  ██  ██  Qoder CLI v1.0.41         │ 2. /help for more information                                │",
-  " ██    ██                              │ 3. Ask coding questions, edit code or run commands           │",
-  "   ████  ██  Signed in Browser Login   │ 4. Be specific for the best results                          │",
-  "                                       ╰──────────────────────────────────────────────────────────────╯",
-  "",
-  "",
-  "                                                                                                                                                                                        ? for shortcuts",
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  " YOLO Shift+Tab to Auto Mode                                                                                                                                                Try /model to switch models",
-  "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
-  " *   Type your message or @path/to/file",
-  "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-  " GLM-5.2 (Alibaba Cloud Model Studio - China) Model · ctx ░░░░░░░░░░ 0%",
-  ...blank(34),
-].join('\n');
-
-const CC_NONYOLO_BASH_PERMISSION = [
-  "⏺ bx475",
-  "",
-  "✻ Churned for 10s",
-  "",
-  "❯ Run this exact bash command: touch /tmp/bx475-perm-probe",
-  "",
-  "⏺ Running 1 shell command…",
-  "  ⎿  $ touch /tmp/bx475-perm-probe",
-  "",
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  " Bash command",
-  "",
-  "   touch /tmp/bx475-perm-probe",
-  "   Create empty file /tmp/bx475-perm-probe",
-  "",
-  " Do you want to proceed?",
-  " ❯ 1. Yes",
-  "   2. Yes, and always allow access to tmp/ from this project",
-  "   3. No",
-  "",
-  " Esc to cancel · Tab to amend · ctrl+e to explain",
-  ...blank(6),
-].join('\n');
-
-const CODEX_NONYOLO_ESCALATION = [
-  "• Done.",
-  "",
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  "",
-  "",
-  "› Run this exact bash command: touch ~/bx475-perm-probe",
-  "",
-  "",
-  "• Running touch ~/bx475-perm-probe",
-  "",
-  "",
-  "  Would you like to run the following command?",
-  "",
-  "  Environment: local",
-  "",
-  "  Reason: Do you want to allow creating /Users/devuser/bx475-perm-probe in your home directory?",
-  "",
-  "  $ touch ~/bx475-perm-probe",
-  "",
-  "› 1. Yes, proceed (y)",
-  "  2. Yes, and don't ask again for commands that start with `touch '~/bx475-perm-probe'` (p)",
-  "  3. No, and tell Codex what to do differently (esc)",
-  "",
-  "  Press enter to confirm or esc to cancel",
-].join('\n');
-
-const OC_NONYOLO_EXTERNAL_DIR_PERMISSION = [
-  "  ┃",
-  "  ┃  Run this exact bash command: touch /tmp/bx475-perm-probe",
-  "  ┃",
-  "",
-  "     $ touch /tmp/bx475-perm-probe",
-  "",
-  "     ▣  Build · GLM-5.2",
-  ...blank(14),
-  "  ┃",
-  "  ┃  △ Permission required",
-  "  ┃    ← Access external directory /tmp",
-  "  ┃",
-  "  ┃  Patterns",
-  "  ┃                                                                                                                                                             /private/tmp/claude-501/-Users-",
-  "  ┃  - /tmp/*                                                                                                                                                   devuser--baxian-repos-example-baxian/",
-  "  ┃                                                                                                                                                             f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/",
-  "  ┃                                                                                                                                                             scratchpad/yolo-probe/wd-oc",
-  "  ┃   Allow once   Allow always   Reject                                                                       ctrl+f fullscreen  ⇆ select  enter confirm",
-  "  ┃                                                                                                                                                             • OpenCode 1.17.16",
-  "",
-].join('\n');
-
-const QODER_NONYOLO_SHELL_PERMISSION = [
-  "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
-  " > Run this exact bash command: echo bx475",
-  "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-  "",
-  " Thinking",
-  " │ The user wants me to run a specific bash command.",
-  " ? Bash(echo bx475)",
-  "",
-  " Permission Required",
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-  " Tool: Bash",
-  "",
-  " Print bx475",
-  " Command: echo bx475",
-  "",
-  " Allow this command to run?",
-  "",
-  "  ❯ 1. Allow once",
-  "    2. Always allow \"echo\" for future sessions [local]",
-  "    3. Reject and type something",
-  "    4. No",
-  ...blank(20),
-].join('\n');
-describe('non-yolo & fresh-screen geometry (real captures)', () => {
-  it.each([
-    ['claude-code non-yolo idle (❯ + NBSP composer)', CC_NONYOLO_IDLE, 'claude-code'],
-    ['codex non-yolo idle (generic footer anchor)', CODEX_NONYOLO_IDLE, 'codex'],
-    ['opencode non-yolo fresh idle (footer above blank sea)', OC_NONYOLO_FRESH_IDLE, 'opencode'],
-    ['opencode --auto fresh idle', OC_YOLO_FRESH_IDLE, 'opencode'],
-    ['qodercli non-yolo fresh idle (top-anchored, 34 trailing blanks)', QODER_NONYOLO_FRESH_IDLE, 'qodercli'],
-    ['qodercli --dangerously-skip-permissions fresh idle', QODER_YOLO_FRESH_IDLE, 'qodercli'],
-  ] as const)('%s is ready and not busy', (_name, screen, runtime) => {
-    expect(runtimeBusyCheck(screen, runtime)).toBe(false);
-    expect(hasRuntimeReadyView(screen, runtime)).toBe(true);
-  });
-
-  it.each([
-    ['claude-code bash permission prompt', CC_NONYOLO_BASH_PERMISSION, 'claude-code'],
-    ['codex escalation prompt', CODEX_NONYOLO_ESCALATION, 'codex'],
-    ['opencode external-directory permission prompt', OC_NONYOLO_EXTERNAL_DIR_PERMISSION, 'opencode'],
-    ['qodercli shell permission prompt', QODER_NONYOLO_SHELL_PERMISSION, 'qodercli'],
-  ] as const)('%s blocks the ready gate', (_name, screen, runtime) => {
-    expect(hasRuntimeReadyView(screen, runtime)).toBe(false);
-  });
-
-  it('opencode: busy bar above the blank sea is still busy', () => {
-    const screen = ['  ┃  ■■■■⬝⬝⬝⬝  esc interrupt', ...blank(12), '  /w  1.17.17'].join('\n');
-    expect(runtimeBusyCheck(screen, 'opencode')).toBe(true);
-  });
-
-  it('qodercli: spinner above 34 trailing blank rows is still busy', () => {
-    const screen = [' ⠼ Thinking... (esc to cancel, 3s)', ...blank(34)].join('\n');
-    expect(runtimeBusyCheck(screen, 'qodercli')).toBe(true);
-  });
-});
-
-describe('hasOscTitleIdle', () => {
-  it.each([
-    ['claude-code idle title with task summary', '✳ 分析 baxian 服务', 'claude-code' as const, true],
-    ['claude-code idle title without a task yet', '✳ Claude Code', 'claude-code' as const, true],
-    ['braille spinner prefix means working, not idle', '⠹ 分析 baxian 服务', 'claude-code' as const, false],
-    ['empty title (pane_title unavailable)', '', 'claude-code' as const, false],
-    ['✳ without the following space is not the idle contract', '✳分析', 'claude-code' as const, false],
-    ['codex cwd-shaped title has no idle contract', 'baxian', 'codex' as const, false],
-    ['codex: even a ✳-prefixed title is not an idle signal', '✳ x', 'codex' as const, false],
-    ['opencode title has no idle contract', 'OC | some session', 'opencode' as const, false],
-    ['qodercli Ready title is not an idle signal (shown while working too)', '◇  Ready (repo)', 'qodercli' as const, false],
-  ])('%s → %s', (_label, title, runtime, expected) => {
-    expect(hasOscTitleIdle(title, runtime)).toBe(expected);
-  });
-});
-
-describe('detectRuntimePendingPrompt', () => {
-  it.each([
-    ['bash permission prompt', 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n', true],
-    ['legacy waiting-for-permission', 'Waiting for permission…\n', true],
-    ['connection allow prompt', 'Do you want to allow this connection?\n1. Yes\n', true],
-    ['select-option footer, narrow-wrapped', 'Enter to select ·\nEsc to cancel\n', true],
-    ['dynamic workflow prompt', 'Run a dynamic workflow?\nEnter to run · Esc to cancel\n', true],
-    ['bash amend footer with option lines', 'Do you want to proceed?\n❯ 1. Yes\n  2. No\ntab to amend · esc to cancel\n', true],
-    ['explain footer with option lines', 'rm -rf build\n❯ 1. Yes\nctrl+e to explain this command\n', true],
-    ['offer with a numbered Yes option line', 'Would you like to create a plan?\n❯ 1. Yes\n  2. No\n', true],
-    ['offer with a selected non-yes option line', 'Do you want to continue?\n❯ 2. No, cancel\n', true],
-    ['offer with bare unnumbered Yes options (inverse-video selection, no ❯ after stripAnsi)', 'Do you want to proceed?\nYes\nNo\n', true],
-    ['offer with a bare Yes-and-dont-ask variant', "Do you want to proceed?\nYes, and don't ask again\nNo\n", true],
-    ['offer with only a numbered No option visible', 'Do you want to proceed?\n  2. No\n', true],
-    ['bare yes at line start in prose without an offer phrase', 'yes 分支的判定已经覆盖。\n', false],
-    ['plan-mode review prompt', 'Review your answers\n', true],
-    ['skip-interview prompt', 'Skip interview and plan immediately\n', true],
-    ['narrow-wrapped confirm footer (enter to confirm)', '确认删除分支？\nEnter to confirm ·\nEsc to cancel\n', true],
-    ['narrow-wrapped skip-interview blocker', 'Skip interview and plan\nimmediately\n', true],
-    ['narrow-wrapped offer phrase with a Yes option', 'Would you like\nto apply this plan?\n❯ 1. Yes\n  2. No\n', true],
-    ['composer draft after a quoted offer phrase is not a prompt option', '表单文案是 "Would you like to apply?"。\n❯ run tests\n', false],
-    ['offer phrase alone in prose (no option line)', 'Would you like me to proceed with the merge?\n', false],
-    ['proceed question quoted in prose (no option line)', '日志里出现 Do you want to proceed? 即为权限提示。\n', false],
-    ['amend hotkey explained in prose (no option line)', '权限表单支持 tab to amend 快捷键。\n', false],
-    ['dynamic workflow phrase in prose (no esc to cancel)', '我加了 run a dynamic workflow? 的检测。\n', false],
-    ['enter-to-select alone in prose (no esc to cancel)', '在 TUI 里 enter to select 表示确认当前项。\n', false],
-    ['plain idle composer tail', '✻ Worked for 31s\n\n❯ \n⏵⏵ bypass permissions on\n', false],
-    ['phrase outside the 15-line tail window (no rule on screen)', 'do you want to proceed?\n' + 'x\n'.repeat(16) + '❯ \n', false],
-    [
-      'tall permission form: offer above the 15-line tail but inside the active form region',
-      '正文历史\n' + '─'.repeat(40) + '\nWould you like to apply this plan?\n' + 'plan detail\n'.repeat(16) + '❯ 1. Yes\n  2. No\n',
-      true,
-    ],
-    [
-      'prose mention above the composer box rule is outside the active form region',
-      'Do you want to proceed? 的检测已补充。\n' + '─'.repeat(40) + '\n❯ \n' + '─'.repeat(40) + '\n  ⏵⏵ bypass permissions on\n',
-      false,
-    ],
-  ])('%s → %s', (_label, screen, expected) => {
-    expect(detectRuntimePendingPrompt(screen)).toBe(expected);
-  });
-});
-
-describe('detectRuntimeOverlay', () => {
-  it.each([
-    ['transcript viewer footer (ctrl+o)', '  transcript line\n\nctrl+o to toggle · esc to close\n', true],
-    ['narrow-wrapped transcript viewer footer (close on its own line)', 'transcript line\nctrl+o to toggle · esc to\nclose\n', true],
-    ['narrow-wrapped detailed-transcript header', 'Showing detailed\ntranscript\n', true],
-    ['transcript viewer detailed header as last line', 'Showing detailed transcript\n', true],
-    ['transcript viewer scroll hint', 'some output\n↑↓ scroll · q quit\n', true],
-    ['transcript viewer collapse hint', 'ctrl+e collapse view\n', true],
-    ['model picker menu', 'Select model\n❯ 1. Fable\n  2. Opus\nenter to set as default\n', true],
-    ['normal idle footer', '✻ Worked for 31s\n\n❯ \n⏵⏵ bypass permissions on (shift+tab to cycle)\n', false],
-    ['ctrl+o mentioned mid-text, above the 2-line footer window', 'ctrl+o to toggle 是转录视图快捷键。\n正文继续。\n结论：已覆盖。\n', false],
-    ['select model mentioned without the set-as-default footer', '我用 /model 打开 select model 菜单做了对比。\n', false],
-  ])('%s → %s', (_label, screen, expected) => {
-    expect(detectRuntimeOverlay(screen)).toBe(expected);
-  });
-});
-
-describe('runtimeBusyCheck', () => {
-  it('codex: stale esc-to-interrupt above → prompt is NOT busy (position-aware)', () => {
-    const screen = 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n';
-    expect(runtimeBusyCheck(screen, 'codex')).toBe(false);
-  });
-
-  it('codex: active esc-to-interrupt below → prompt IS busy', () => {
-    const screen = '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n';
-    expect(runtimeBusyCheck(screen, 'codex')).toBe(true);
-  });
-
-  it('claude-code: spinner high on tall pane IS busy (full-screen check)', () => {
-    const lines = [
-      '✽ Grooving… (5m 21s · thinking)',
-      ...Array(18).fill(''),
-      '❯ ',
-      '',
-    ];
-    expect(runtimeBusyCheck(lines.join('\n'), 'claude-code')).toBe(true);
-  });
-
-  it('codex: same tall-pane spinner is NOT busy (position-aware only checks tail)', () => {
-    const lines = [
-      '✽ Grooving… (5m 21s · thinking)',
-      ...Array(18).fill(''),
-      '→ baxian git:(main)',
-      '',
-    ];
-    expect(runtimeBusyCheck(lines.join('\n'), 'codex')).toBe(false);
-  });
-});
-
-describe('hasRuntimeReadyView accepts a cleared bare Codex › only when nothing runtime-owned is on screen', () => {
-  it('treats a bare › (only blank lines below) as a ready idle composer', () => {
-    expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
-    expect(hasRuntimeReadyView('output scrolled up\n›\n\n', 'codex')).toBe(true);
-  });
-  it('accepts an INDENTED bare › — Codex indents the empty prompt marker', () => {
-    expect(hasRuntimeReadyView('  › \n', 'codex')).toBe(true);
-    expect(hasRuntimeReadyView('prior output\n  ›\n', 'codex')).toBe(true);
-  });
-  it('does NOT treat a bare › as ready when a busy turn marker is still on screen', () => {
-    expect(hasRuntimeReadyView('· Working… (12s)\n  esc to interrupt\n› \n', 'codex')).toBe(false);
-  });
-  it('does NOT treat a bare › as ready under a permission/confirm blocker', () => {
-    expect(hasRuntimeReadyView('Allow command `rm`?\n  Press Enter to confirm or Esc to cancel\n› \n', 'codex')).toBe(false);
-  });
-  it('does NOT treat a node/shell > as a Codex composer', () => {
-    expect(hasRuntimeReadyView('> require("fs")\n> \n', 'codex')).toBe(false);
-  });
-
-  it('does NOT treat a bare › as ready when ordinary user text follows it (pasted/leftover transcript)', () => {
-    expect(hasRuntimeReadyView('›\nplease finish the refactor\n', 'codex')).toBe(false);
-    expect(hasRuntimeReadyView('some output\n›\nleftover line\n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
-  });
-  it('does NOT treat a bare › with a status footer DIRECTLY below it as empty (that shape is the with-text form)', () => {
-    expect(hasRuntimeReadyView('› \n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
-    expect(hasRuntimeReadyView('› \n  gpt-5.5 xhigh · /Users/x/repo\n', 'codex')).toBe(false);
-  });
-  it('does NOT treat a › followed by a dirty/non-blank line then a footer as ready', () => {
-    expect(hasRuntimeReadyView('›\nold output\n› new dirty prompt text\n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
-    expect(hasRuntimeReadyView('›\n  see logs · /tmp/out and fix it\n', 'codex')).toBe(false);
-    expect(hasRuntimeReadyView('›\n  - refactor auth · update tests · ship\n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
-  });
-});
-
-describe('hasOscTitleWorking', () => {
-  it('matches a braille-spinner OSC pane title (same pattern both runtime manifests use)', () => {
-    expect(hasOscTitleWorking('⠁ Reading file')).toBe(true);
-    expect(hasOscTitleWorking('⣿ Working')).toBe(true);
-  });
-  it('does NOT match an idle/non-spinner title or a bare proc name', () => {
-    expect(hasOscTitleWorking('baxian · main')).toBe(false);
-    expect(hasOscTitleWorking('✳ idle')).toBe(false);
-    expect(hasOscTitleWorking('node')).toBe(false);
-    expect(hasOscTitleWorking('')).toBe(false);
-    expect(hasOscTitleWorking('⠁no-space-after-spinner')).toBe(false);
-  });
-});
-
-describe('hasRuntimeIdleComposerPrompt', () => {
-  it('detects codex → prompt in tail', () => {
-    const screen = 'some output\n→ baxian git:(main)\n';
-    expect(hasRuntimeIdleComposerPrompt(screen, 'codex')).toBe(true);
-  });
-
-  it('detects codex → prompt without git info', () => {
-    expect(hasRuntimeIdleComposerPrompt('→ myproject\n', 'codex')).toBe(true);
-  });
-
-  it('matches a bare › empty composer — only blank lines may follow (col-0 OR indented marker)', () => {
-    expect(hasRuntimeIdleComposerPrompt('› \n', 'codex')).toBe(true);
-    expect(hasRuntimeIdleComposerPrompt('  ›\n', 'codex')).toBe(true);
-    expect(hasRuntimeIdleComposerPrompt('old output\n  ›\n\n', 'codex')).toBe(true);
-    expect(hasRuntimeIdleComposerPrompt('› with text\n', 'codex')).toBe(false);
-    expect(hasRuntimeIdleComposerPrompt('› \n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
-  });
-
-  it('a bare › is empty only when ONLY blank lines follow — any non-blank line below means dirty', () => {
-    expect(hasRuntimeIdleComposerPrompt('›\nleftover user text\n', 'codex')).toBe(false);
-    expect(hasRuntimeIdleComposerPrompt('›\nold output\n› still typing\n', 'codex')).toBe(false);
-    expect(hasRuntimeIdleComposerPrompt('› old typing\n  wrapped\n  ›\n', 'codex')).toBe(true);
-  });
-
-  it('does not match → followed by multi-word content (output, not prompt)', () => {
-    expect(hasRuntimeIdleComposerPrompt('→ run tests now\n', 'codex')).toBe(false);
-  });
-
-  it('does not match → prompt when output follows it', () => {
-    expect(hasRuntimeIdleComposerPrompt('→ baxian git:(main)\nStill working on the request...\n', 'codex')).toBe(false);
-  });
-
-  it('rejects codex when prompt is not in tail', () => {
-    const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`);
-    lines[0] = '→ baxian git:(main)';
-    expect(hasRuntimeIdleComposerPrompt(lines.join('\n'), 'codex')).toBe(false);
-  });
-
-  it('still works for claude-code', () => {
-    expect(hasRuntimeIdleComposerPrompt('❯ \n', 'claude-code')).toBe(true);
-  });
-});
-
-describe('detectReplActiveBusy', () => {
-  const STATUS_TAIL = [
-    '────────────────────────────────────────────────────────────────────────────────',
-    '❯ ',
-    '────────────────────────────────────────────────────────────────────────────────',
-    '  Opus 4.7 [#################   ] 87%',
-    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-  ].join('\n');
-
-  const POSITIVE: Array<[string, string]> = [
-    ['live spinner (claude-code)', '· Stewing… (24s)'],
-    ['live spinner in middle of viewport', '❯ user prompt\n\n· Wrangling… (2m 42s)\n\n' + STATUS_TAIL],
-    ['codex "esc to interrupt" in tail', 'Working on it…\n  esc to interrupt'],
-    ['claude-code early-thinking with Esc to interrupt in tail', '⏵ Thinking…\n\n  Esc to interrupt'],
-  ];
-
-  const NEGATIVE: Array<[string, string]> = [
-    ['idle REPL prompt', '⏵⏵ bypass permissions on ~/code\n\n>'],
-    [
-      'history mentions `esc to interrupt` phrase but runtime is idle (regression: was busy under detectBusy)',
-      [
-        '⏺ 之前讨论过：detectBusy 用字面 "esc to interrupt" 匹配，会被历史误报。',
-        '',
-        '所以现在改用 spatial-scoped detector，把这个 phrase 的判定限制到 viewport 底部状态区。',
-        '',
-        '✻ Worked for 5m 38s',
-        '',
-        STATUS_TAIL,
-      ].join('\n'),
-    ],
-    [
-      'user prompt quotes "Esc to interrupt" (case-insensitive) but pane is idle',
-      [
-        '❯ 请解释 Esc to interrupt 在 Claude Code 状态条下方什么时候显示',
-        '',
-        '✻ Worked for 12s',
-        '',
-        STATUS_TAIL,
-      ].join('\n'),
-    ],
-    ['spinner-shaped line in history with subsequent Worked for marker', '· Wrangling… (24s)\n\n✻ Worked for 24s\n\n' + STATUS_TAIL],
-    ['empty string', ''],
-  ];
-
-  it('matches every active-task signal (spinner anywhere, esc-to-interrupt in tail)', () => {
-    for (const [name, screen] of POSITIVE) {
-      expect.soft(detectReplActiveBusy(screen), name).toBe(true);
-    }
-  });
-
-  it('rejects idle / history-only / quoted-text false positives', () => {
-    for (const [name, screen] of NEGATIVE) {
-      expect.soft(detectReplActiveBusy(screen), name).toBe(false);
-    }
-  });
-});
-
-describe('hasActiveSpinner (the only signal that MUST tick during genuine work)', () => {
-  it('matches a live incomplete spinner', () => {
-    for (const [name, screen] of [
-      ['claude spinner with duration', '· Wrangling… (2m 42s · esc to interrupt)'],
-      ['spinner mid-viewport', '❯ prompt\n\n✻ Pondering… (24s)\n'],
-    ] as Array<[string, string]>) {
-      expect.soft(hasActiveSpinner(screen), name).toBe(true);
-    }
-  });
-
-  it('does NOT match a static busy anchor without a spinner, or a completed spinner', () => {
-    for (const [name, screen] of [
-      ['codex static busy (esc to interrupt only, no spinner)', 'Working on it…\n  esc to interrupt'],
-      ['esc to interrupt anchor alone', '  esc to interrupt'],
-      ['spinner-shaped line already completed (Worked for marker after)', '· Wrangling… (24s)\n\n✻ Worked for 24s\n'],
-      ['idle ready prompt', '❯ \n'],
-      ['empty', ''],
-    ] as Array<[string, string]>) {
-      expect.soft(hasActiveSpinner(screen), name).toBe(false);
-    }
-  });
-});
-
-describe('hasActiveSpinnerInTail (active-region-scoped, used for stuck-busy)', () => {
-  it('matches a spinner in the activity region just above the footer', () => {
-    const screen = [
-      '· Wrangling… (42s)',
-      '────────────────────────────────────────',
-      '❯ ',
-      '────────────────────────────────────────',
-      '  Opus 4.7 [#################   ] 87%',
-      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-    ].join('\n');
-    expect(hasActiveSpinnerInTail(screen)).toBe(true);
-  });
-
-  it('does NOT match a quoted/leftover spinner high in scrollback above an idle prompt', () => {
-    const screen = ['· Wrangling… (24s)', ...Array(12).fill(''), '❯ '].join('\n');
-    expect(hasActiveSpinner(screen)).toBe(true);
-    expect(hasActiveSpinnerInTail(screen)).toBe(false);
   });
 });
 

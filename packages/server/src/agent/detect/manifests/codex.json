@@ -5,110 +5,184 @@
       "id": "osc_title_blocked",
       "state": "pending",
       "priority": 1100,
-      "region": "oscTitle",
+      "region": "osc_title",
       "visibleBlocker": true,
-      "contains": ["Action Required"]
+      "contains": [
+        "Action Required"
+      ]
     },
     {
       "id": "osc_title_working",
       "state": "working",
       "priority": 1050,
-      "region": "oscTitle",
+      "region": "osc_title",
       "visibleWorking": true,
-      "regex": ["^[\\u2800-\\u28FF] "]
+      "regex": [
+        "(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)"
+      ]
     },
     {
       "id": "transcript_viewer",
       "state": "unknown",
-      "priority": 1200,
-      "region": "tailNonEmpty(1)",
+      "priority": 1000,
+      "region": "after_last_prompt_marker",
       "skipStateUpdate": true,
+      "contains": [
+        "↑/↓ to scroll",
+        "pgup/pgdn to",
+        "home/end to jump",
+        "q to quit"
+      ],
       "any": [
-        { "contains": ["↑/↓ to scroll", "q to quit"] },
-        { "contains": ["esc to edit prev"] },
-        { "contains": ["esc/← to edit prev"] }
+        {
+          "contains": [
+            "esc to edit prev"
+          ]
+        },
+        {
+          "contains": [
+            "esc/← to edit prev"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "trust_directory",
+      "state": "pending",
+      "priority": 950,
+      "region": "top_non_empty_lines(20)",
+      "visibleBlocker": true,
+      "all": [
+        {
+          "regex": [
+            "^> You are in [^\\r\\n]+(?:\\r?\\n|$)"
+          ]
+        },
+        {
+          "regex": [
+            "(?s)Do\\s+you\\s+trust\\s+the\\s+contents\\s+of\\s+this\\s+directory\\?"
+          ]
+        }
       ]
     },
     {
       "id": "live_strong_blocker",
       "state": "pending",
       "priority": 900,
-      "region": "afterLastPromptMarker",
+      "region": "after_last_prompt_marker",
       "visibleBlocker": true,
       "any": [
-        { "contains": ["press enter to confirm or esc to cancel"] },
-        { "contains": ["enter to submit answer"] },
-        { "contains": ["enter to submit all"] },
-        { "contains": ["allow command?"] }
-      ],
-      "notAfter": [
-        { "lineRegex": ["^[ \\t]*(?:[•·][ \\t]+)?Working[ \\t]*\\("] },
-        { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*›[ \\t]*$"] },
-        { "lineRegex": ["^→ [A-Za-z0-9][\\w.-]*(?:\\s+git:\\([^\\s)]+\\))?\\s*$"] },
-        { "regex": ["(?:^|\\n)› [^\\n]+\\n\\n\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\\s+·[^\\n]*(?:\\n\\s*)?$"] },
-        { "lineRegex": ["^\\s*permissions:\\s*YOLO mode\\s*$"] }
+        {
+          "contains": [
+            "press enter to confirm or esc to cancel"
+          ]
+        },
+        {
+          "contains": [
+            "enter to submit answer"
+          ]
+        },
+        {
+          "contains": [
+            "enter to submit all"
+          ]
+        },
+        {
+          "contains": [
+            "allow command?"
+          ]
+        }
       ]
     },
     {
       "id": "weak_blocker",
       "state": "pending",
       "priority": 600,
-      "region": "whole",
-      "visibleBlocker": true,
+      "region": "whole_recent",
       "any": [
-        { "contains": ["[y/n]"] },
-        { "contains": ["yes (y)"] },
-        { "contains": ["do you want to"], "any": [{ "contains": ["yes"] }, { "lineRegex": ["^\\s*❯\\s+\\S"] }] },
-        { "contains": ["would you like to"], "any": [{ "contains": ["yes"] }, { "lineRegex": ["^\\s*❯\\s+\\S"] }] }
-      ],
-      "notAfter": [
-        { "lineRegex": ["^[ \\t]*(?:[•·][ \\t]+)?Working[ \\t]*\\("] },
-        { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*›[ \\t]*$"] },
-        { "lineRegex": ["^→ [A-Za-z0-9][\\w.-]*(?:\\s+git:\\([^\\s)]+\\))?\\s*$"] },
-        { "regex": ["(?:^|\\n)› [^\\n]+\\n\\n\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\\s+·[^\\n]*(?:\\n\\s*)?$"] },
-        { "lineRegex": ["^\\s*permissions:\\s*YOLO mode\\s*$"] }
+        {
+          "contains": [
+            "[y/n]"
+          ]
+        },
+        {
+          "contains": [
+            "yes (y)"
+          ]
+        },
+        {
+          "contains": [
+            "do you want to"
+          ],
+          "any": [
+            {
+              "contains": [
+                "yes"
+              ]
+            },
+            {
+              "contains": [
+                "❯"
+              ]
+            }
+          ]
+        },
+        {
+          "contains": [
+            "would you like to"
+          ],
+          "any": [
+            {
+              "contains": [
+                "yes"
+              ]
+            },
+            {
+              "contains": [
+                "❯"
+              ]
+            }
+          ]
+        }
       ]
     },
     {
-      "id": "working_line",
+      "id": "screen_working_fallback",
       "state": "working",
-      "priority": 300,
-      "region": "afterLastPromptMarker",
+      "priority": 500,
+      "region": "bottom_non_empty_lines(3)",
       "visibleWorking": true,
-      "lineRegex": ["^[ \\t]*(?:[•·][ \\t]+)?Working[ \\t]*\\("]
-    },
-    {
-      "id": "esc_to_interrupt_working",
-      "state": "working",
-      "priority": 240,
-      "region": "afterLastPromptMarker",
-      "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"]
-    },
-    {
-      "id": "codex_idle_prompt",
-      "state": "idle",
-      "priority": 150,
-      "region": "tail(6)",
-      "visibleIdle": true,
-      "any": [
-        { "regex": ["(?:^|\\n)[ \\t]*›[ \\t]*(?:\\n[ \\t]*)*$"] },
-        { "regex": ["(?:^|\\n)→ [A-Za-z0-9][\\w.-]*(?:[ \\t]+git:\\([^\\s)]+\\))?[ \\t]*(?:\\n[ \\t]*)*$"] },
-        { "regex": ["(?:^|\\n)› [^\\n]+\\n\\n\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\\s+·[^\\n]*(?:\\n\\s*)?$"] },
-        { "regex": ["(?:^|\\n)[ \\t]*permissions:[ \\t]*YOLO mode[ \\t]*(?:\\n[ \\t]*)*$"] }
+      "lineRegex": [
+        "^[•◦]\\s+Working \\([^)]*esc to interrupt\\)(?: · .*)?$"
+      ],
+      "not": [
+        {
+          "contains": [
+            "■ Conversation interrupted"
+          ]
+        }
       ]
     },
     {
       "id": "osc_title_idle",
       "state": "idle",
       "priority": 100,
-      "region": "oscTitle",
+      "region": "osc_title",
       "visibleIdle": true,
-      "regex": ["\\S"],
+      "regex": [
+        "\\S"
+      ],
       "not": [
-        { "regex": ["^[\\u2800-\\u28FF]"] },
-        { "contains": ["Action Required"] }
+        {
+          "regex": [
+            "(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)"
+          ]
+        },
+        {
+          "contains": [
+            "Action Required"
+          ]
+        }
       ]
     }
   ]

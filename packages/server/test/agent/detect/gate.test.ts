@@ -67,43 +67,9 @@ describe('evaluateGate', () => {
     expect(evaluateGate(gate, 'Operation cancelled')).toBe(false);
   });
 
-  it('notAfter suppresses when negative appears after positive match', () => {
-    const gate: Gate = {
-      contains: ['allow command?'],
-      notAfter: [{ lineRegex: ['^Working \\('] }],
-    };
-    expect(evaluateGate(gate, 'Allow command?\nrm -rf test\nWorking (3s)')).toBe(false);
-  });
 
-  it('notAfter does NOT suppress when negative appears before positive match', () => {
-    const gate: Gate = {
-      contains: ['allow command?'],
-      notAfter: [{ lineRegex: ['^Working \\('] }],
-    };
-    expect(evaluateGate(gate, 'Working (3s)\nAllow command?\nrm -rf test')).toBe(true);
-  });
 
-  it('notAfter does not fire when positive match is on last line', () => {
-    const gate: Gate = {
-      contains: ['allow command?'],
-      notAfter: [{ contains: ['anything'] }],
-    };
-    expect(evaluateGate(gate, 'some output\nAllow command?')).toBe(true);
-  });
 
-  it('notAfter uses last positive match line as anchor', () => {
-    const gate: Gate = {
-      any: [
-        { contains: ['press enter to confirm'] },
-        { contains: ['allow command?'] },
-      ],
-      notAfter: [{ lineRegex: ['^Working \\('] }],
-    };
-    const text = 'Allow command?\nPress Enter to confirm\nWorking (3s)';
-    expect(evaluateGate(gate, text)).toBe(false);
-    const textReversed = 'Working (3s)\nAllow command?\nPress Enter to confirm';
-    expect(evaluateGate(gate, textReversed)).toBe(true);
-  });
 
   it('combines contains + regex + nested gates', () => {
     const gate: Gate = {
@@ -121,5 +87,18 @@ describe('evaluateGate', () => {
     };
     const screen = 'Do you want to proceed?\nbash command\n❯ yes\n2. no';
     expect(evaluateGate(gate, screen)).toBe(true);
+  });
+
+  it('compiles regexes in unicode mode so \\p{...} property escapes work (herdr parity)', () => {
+    const gate: Gate = { lineRegex: ['^\\s*[\\u2800-\\u28FF]\\s+.*\\p{Alphabetic}'] };
+    expect(evaluateGate(gate, '⠼ 正在思考中...')).toBe(true);
+    expect(evaluateGate(gate, '⠼ ...')).toBe(false);
+  });
+
+  it('honors a leading (?i) inline flag as case-insensitive (herdr regex dialect)', () => {
+    const gate: Gate = { lineRegex: ['(?i).*opencode.*esc (again to )?interrupt'] };
+    expect(evaluateGate(gate, 'OpenCode — press ESC again to interrupt')).toBe(true);
+    expect(evaluateGate(gate, 'opencode esc interrupt')).toBe(true);
+    expect(evaluateGate(gate, 'other tui esc interrupt')).toBe(false);
   });
 });

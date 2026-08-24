@@ -1,7 +1,4 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type {
   AgentConfig,
   AgentErrorSummary,
@@ -13,9 +10,9 @@ import type { AgentManager } from './manager.js';
 import type { CommandRunner } from './runner.js';
 import { createRunner, resolveAgentHost } from './runner.js';
 import { TmuxManager, type AdoptPaneState, type AgentRuntimeKind } from './tmux.js';
-import { evaluateManifest, type AgentManifest, type DetectedState } from './detect/manifest.js';
+import type { DetectedState } from './detect/manifest.js';
+import { classifyScreen } from './detect/classify.js';
 import { WorkingToIdleDebounce } from './detect/debounce.js';
-import type { DetectionInput } from './detect/region.js';
 import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
 import type { AgentStore } from '../state/agent-store.js';
 import type { ErrorRecordStore } from '../state/error-record-store.js';
@@ -108,18 +105,6 @@ export interface TmuxProbePollerOptions {
   now?: () => number;
 }
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-function loadManifests(): Map<AgentRuntimeKind, AgentManifest> {
-  const dir = join(__dirname, 'detect', 'manifests');
-  return new Map<AgentRuntimeKind, AgentManifest>([
-    ['claude-code', JSON.parse(readFileSync(join(dir, 'claude-code.json'), 'utf-8')) as AgentManifest],
-    ['codex', JSON.parse(readFileSync(join(dir, 'codex.json'), 'utf-8')) as AgentManifest],
-    ['opencode', JSON.parse(readFileSync(join(dir, 'opencode.json'), 'utf-8')) as AgentManifest],
-    ['qodercli', JSON.parse(readFileSync(join(dir, 'qodercli.json'), 'utf-8')) as AgentManifest],
-  ]);
-}
-
 const DEFAULT_FAILURE_THRESHOLD = 2;
 const PENDING_IDLE_AFTER_MS = 5 * 60 * 1000;
 
@@ -139,7 +124,6 @@ export class TmuxProbePoller {
   private lastRecordedIssue = new Map<string, string>();
   private lastScreen = new Map<string, { hash: string; changedAt: number; taskId: string | null; idle: boolean; width: number }>();
   private validInstances = new Map<string, AgentConfig>();
-  private manifests = loadManifests();
   private debouncers = new Map<string, WorkingToIdleDebounce>();
   private lastPublishedState = new Map<string, DetectedState>();
   private now: () => number;
@@ -216,14 +200,8 @@ export class TmuxProbePoller {
     runtime: AgentRuntimeKind,
     runtimeScreen: string,
     oscTitle: string,
-  ): { runtimeStatusHint?: AgentRuntimeStatus; visibleBlocker: boolean; visibleWorking: boolean; visibleIdle: boolean } | 'skip' {
-    const manifest = this.manifests.get(runtime);
-    if (!manifest) {
-      return { runtimeStatusHint: undefined, visibleBlocker: false, visibleWorking: false, visibleIdle: false };
-    }
-
-    const input: DetectionInput = { screen: runtimeScreen, oscTitle };
-    const detection = evaluateManifest(manifest, input);
+  ): { published: DetectedState; visibleWorking: boolean } | 'skip' {
+    const detection = classifyScreen(runtime, runtimeScreen, oscTitle);
 
     if (detection.skipStateUpdate) return 'skip';
 
@@ -236,12 +214,7 @@ export class TmuxProbePoller {
     const published = debouncer.apply(detection.state, previousPublished, detection.visibleIdle);
     this.lastPublishedState.set(agentId, published);
 
-    return {
-      runtimeStatusHint: published === 'working' || published === 'pending' ? published : undefined,
-      visibleBlocker: detection.visibleBlocker,
-      visibleWorking: detection.visibleWorking,
-      visibleIdle: detection.visibleIdle,
-    };
+    return { published, visibleWorking: detection.visibleWorking };
   }
 
   start(): void {
@@ -363,18 +336,20 @@ export class TmuxProbePoller {
       const manifestResult = liveRuntime
         ? this.detectViaManifest(agent.id, agent.runtime, runtimeScreen, oscTitle)
         : undefined;
+      // 去抖后的发布态才是状态源:herdr 的 weak_blocker/legacy blocker 是 pending 但不带 visible 证据
+      const detected = manifestResult === 'skip' ? undefined : manifestResult;
 
       if (liveRuntime) {
         const hash = createHash('sha1').update(runtimeScreen).update(oscTitle).digest('hex');
-        const idleNow = manifestResult && manifestResult !== 'skip' ? manifestResult.visibleIdle : false;
+        const idleNow = detected?.published === 'idle';
         const prev = this.lastScreen.get(agent.id);
         if (!prev || prev.taskId !== currentTaskId) {
           this.lastScreen.set(agent.id, { hash, changedAt: this.now(), taskId: currentTaskId, idle: idleNow, width: paneWidth });
         } else if (prev.hash !== hash) {
           const cosmeticIdleReflow = idleNow && prev.idle && prev.width > 0 && paneWidth > 0 && prev.width !== paneWidth;
           this.lastScreen.set(agent.id, { hash, changedAt: cosmeticIdleReflow ? prev.changedAt : this.now(), taskId: currentTaskId, idle: idleNow, width: paneWidth });
-        } else if (prev.width !== paneWidth) {
-          this.lastScreen.set(agent.id, { ...prev, width: paneWidth });
+        } else if (prev.width !== paneWidth || prev.idle !== idleNow) {
+          this.lastScreen.set(agent.id, { ...prev, width: paneWidth, idle: idleNow });
         }
       } else {
         this.resetDetectionBaseline(agent.id);
@@ -391,11 +366,10 @@ export class TmuxProbePoller {
         };
       }
 
-      const pending = manifestResult ? manifestResult.visibleBlocker : false;
-      const busy = manifestResult ? manifestResult.runtimeStatusHint === 'working' : false;
+      const pending = detected?.published === 'pending';
+      const busy = detected?.published === 'working';
       const screenStatic = !pending && this.screenStaticForGrace(agent.id, paneState);
-      const visibleWorking = manifestResult ? manifestResult.visibleWorking : false;
-      const stuckBusy = busy && screenStatic && visibleWorking;
+      const stuckBusy = busy && screenStatic && (detected?.visibleWorking ?? false);
       const pendingIdle = !busy && screenStatic;
       const issue = this.issueForPaneState(paneState, pending, pendingIdle, stuckBusy);
       if (!issue) {

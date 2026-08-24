@@ -71,6 +71,48 @@ describe('AgentManager runtime menu marker', () => {
     expect(interventions[1].data.previousPhase).toBe('agent_runtime_menu_pending');
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBe('task-1');
   });
+
+  it('emits the pending/resolved pair for a model picker (skipStateUpdate rules bypass the poller, only this watcher notifies)', async () => {
+    let captures = 0;
+    const runner = fakeRunner({
+      rules: [{
+        match: 'capture-pane',
+        reply: () => {
+          captures += 1;
+          const frame = captures <= 2
+            ? 'Select model\n❯ 1. Fable\n  2. Opus\nEnter to set as default · Esc to cancel'
+            : '⏵⏵ bypass permissions on /tmp/repo\n\n>';
+          return { stdout: `BX_PANE_OK\n${frame}` };
+        },
+      }],
+    });
+    harness.manager = harness.createManager({ runnerFactory: () => runner });
+    harness.manager['runtimeMenuPollIntervalMs'] = 5;
+    await harness.seedTask();
+    await harness.seedAgent({
+      id: 'dev-1',
+      taskId: 'task-1',
+      paneId: '%0',
+    });
+
+    harness.manager.startRuntimeMenuWatch('dev-1');
+    try {
+      await vi.waitFor(() => {
+        expect(harness.events.some(event =>
+          event.type === 'human.intervention' &&
+          event.data.phase === 'agent_runtime_menu_resolved'
+        )).toBe(true);
+      }, { interval: 5 });
+    } finally {
+      harness.manager.stopRuntimeMenuWatch('dev-1');
+    }
+
+    const interventions = harness.events.filter(e => e.type === 'human.intervention');
+    expect(interventions.map(event => event.data.phase)).toEqual([
+      'agent_runtime_menu_pending',
+      'agent_runtime_menu_resolved',
+    ]);
+  });
 });
 
 describe('cancelTask interrupts (ESC) then releases dev and qa panes without clearing', () => {
@@ -562,6 +604,8 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
   const RUNNING_TURN_B = '• Working (13s)\n  esc to interrupt\n';
   const CLAUDE_RUN_A = '✶ Grooving… (12s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
   const CLAUDE_RUN_B = '✶ Grooving… (13s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
+  const CLAUDE_RUN_C = '✶ Grooving… (14s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
+  const CLAUDE_RUN_D = '✶ Grooving… (15s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
   const RUNTIME_MENU = 'Select a model\n  Enter to confirm · Esc to cancel\n';
   const GROWING_OUTPUT_A = 'building project…\n  compiled module 1\n';
   const GROWING_OUTPUT_B = 'building project…\n  compiled module 2\n';
@@ -626,13 +670,50 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     expect(keys).toEqual(['Escape']);
   });
 
+  it('a turn that settles to a stable ready frame during the probe is NOT live (working→idle between grabs)', async () => {
+    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
+      .mockResolvedValueOnce('• Working (8s • esc to interrupt)\n')
+      .mockResolvedValueOnce('› \n')
+      .mockResolvedValueOnce('› \n');
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('');
+    const tmux = new TmuxManager(fakeRunner({ rules: [] }));
+    const pane = { session: { sessionId: '$1', serverPid: '1', serverStart: '2' }, paneId: '%3', claim: 'dev-1' };
+    const live = await (harness.manager as unknown as {
+      paneHasLiveTurn: (t: TmuxManager, p: unknown, r: string) => Promise<boolean>;
+    }).paneHasLiveTurn(tmux, pane, 'codex');
+    expect(live).toBe(false);
+  });
+
+  it('the final settling confirmation re-reads the OSC title: a new turn announced only by the title is live', async () => {
+    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
+      .mockResolvedValueOnce('• Working (8s • esc to interrupt)\n')
+      .mockResolvedValueOnce('› \n')
+      .mockResolvedValueOnce('›  \n')
+      .mockResolvedValue('›  \n');
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle')
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('')
+      .mockResolvedValue('⠙ Working');
+    const tmux = new TmuxManager(fakeRunner({ rules: [] }));
+    const pane = { session: { sessionId: '$1', serverPid: '1', serverStart: '2' }, paneId: '%3', claim: 'dev-1' };
+    const live = await (harness.manager as unknown as {
+      paneHasLiveTurn: (t: TmuxManager, p: unknown, r: string) => Promise<boolean>;
+    }).paneHasLiveTurn(tmux, pane, 'codex');
+    expect(live).toBe(true);
+  });
+
   it('holds (no C-c) on a real running Claude turn whose high spinner advances between grabs (dev-1)', async () => {
     Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
     const keys = spyKeys('claude');
     vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
     vi.spyOn(TmuxManager.prototype, 'capturePaneById')
       .mockResolvedValueOnce(CLAUDE_RUN_A)
-      .mockResolvedValueOnce(CLAUDE_RUN_B);
+      .mockResolvedValueOnce(CLAUDE_RUN_B)
+      .mockResolvedValueOnce(CLAUDE_RUN_C)
+      .mockResolvedValueOnce(CLAUDE_RUN_D);
 
     await harness.seedAgent({ id: 'dev-1', paneId: '%3' });
     const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('dev-1'))!, cfgOf(harness.manager, 'dev-1'));

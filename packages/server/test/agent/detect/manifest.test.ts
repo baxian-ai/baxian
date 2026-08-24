@@ -1,18 +1,10 @@
-import { readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
-import { evaluateManifest, type AgentManifest } from '../../../src/agent/detect/manifest.js';
+import { compileManifest, evaluateManifest, type AgentManifest } from '../../../src/agent/detect/manifest.js';
+import { manifests } from '../../../src/agent/detect/classify.js';
 import type { DetectionInput } from '../../../src/agent/detect/region.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const manifestDir = join(__dirname, '../../../src/agent/detect/manifests');
-const claudeCodeManifest: AgentManifest = JSON.parse(
-  readFileSync(join(manifestDir, 'claude-code.json'), 'utf-8'),
-);
-const codexManifest: AgentManifest = JSON.parse(
-  readFileSync(join(manifestDir, 'codex.json'), 'utf-8'),
-);
+const claudeCodeManifest = manifests['claude-code'];
+const codexManifest = manifests.codex;
 
 function input(screen: string, oscTitle = ''): DetectionInput {
   return { screen, oscTitle };
@@ -25,7 +17,7 @@ const sampleManifest: AgentManifest = {
       id: 'osc_title_working',
       state: 'working',
       priority: 1100,
-      region: 'oscTitle',
+      region: 'osc_title',
       visibleWorking: true,
       regex: ['^[\\u2800-\\u28FF] '],
     },
@@ -33,7 +25,7 @@ const sampleManifest: AgentManifest = {
       id: 'permission_prompt',
       state: 'pending',
       priority: 850,
-      region: 'whole',
+      region: 'whole_recent',
       visibleBlocker: true,
       contains: ['do you want to proceed?'],
       any: [
@@ -45,14 +37,14 @@ const sampleManifest: AgentManifest = {
       id: 'idle_prompt',
       state: 'idle',
       priority: 200,
-      region: 'tail(6)',
+      region: 'bottom_non_empty_lines(6)',
       visibleIdle: true,
       lineRegex: ['^\\s*[❯>]\\s*$'],
     },
   ],
 };
 
-describe('evaluateManifest', () => {
+describe('evaluateManifest (herdr: pure highest-priority match)', () => {
   it('matches highest-priority rule', () => {
     const result = evaluateManifest(sampleManifest, input('', '⠁ Working on task'));
     expect(result.state).toBe('working');
@@ -87,22 +79,29 @@ describe('evaluateManifest', () => {
     expect(result.state).toBe('pending');
     expect(result.matchedRuleId).toBe('permission_prompt');
   });
+
+  it('has no screen-over-title arbitration: a working osc title beats a lower-priority idle screen', () => {
+    const screen = 'previous output\n❯ \n\n';
+    const result = evaluateManifest(sampleManifest, input(screen, '⠁ Working on task'));
+    expect(result.state).toBe('working');
+    expect(result.matchedRuleId).toBe('osc_title_working');
+  });
 });
 
-describe('claude-code manifest: transcript viewer skip outranks stale OSC working', () => {
-  it('transcript_viewer (p1200) beats osc_title_working (p1100) when OSC title is stale', () => {
+describe('claude-code manifest: osc_title_working outranks transcript_viewer (herdr priorities)', () => {
+  it('osc_title_working (p1100) beats transcript_viewer (p1000) while the title spins', () => {
     const screen = '\n\n\nShowing detailed transcript · ctrl+o to toggle · ↑↓ scroll · ? for shortcuts';
     const result = evaluateManifest(claudeCodeManifest, input(screen, '⠁ Reading file'));
-    expect(result.matchedRuleId).toBe('transcript_viewer');
-    expect(result.skipStateUpdate).toBe(true);
+    expect(result.matchedRuleId).toBe('osc_title_working');
+    expect(result.state).toBe('working');
   });
 
-  it('transcript_viewer matches when content spans many lines', () => {
+  it('transcript_viewer matches when the phrase and a footer share the bottom 3 non-empty lines', () => {
     const screen = [
-      'Showing detailed transcript',
+      'transcript body',
       'line a',
       'line b',
-      'line c',
+      'Showing detailed transcript',
       'ctrl+o to toggle',
     ].join('\n');
     const result = evaluateManifest(claudeCodeManifest, input(screen));
@@ -110,7 +109,7 @@ describe('claude-code manifest: transcript viewer skip outranks stale OSC workin
     expect(result.skipStateUpdate).toBe(true);
   });
 
-  it('stale transcript text does not suppress active blocker', () => {
+  it('transcript text scrolled out of the bottom window does not suppress an active blocker', () => {
     const screen = [
       'Showing detailed transcript',
       'line a',
@@ -128,45 +127,97 @@ describe('claude-code manifest: transcript viewer skip outranks stale OSC workin
   });
 });
 
-describe('claude-code manifest: spinner_working excludes completed spinner', () => {
-  it('matches active spinner with elapsed time', () => {
-    const screen = '✻ Editing file… (12s\n\n\n\n\n';
+describe('claude-code manifest: live_turn_working (herdr spinner shape)', () => {
+  it('matches an active spinner with elapsed time', () => {
+    const screen = '✻ Editing file… (12s · esc to interrupt)\n\n\n\n\n';
     const result = evaluateManifest(claudeCodeManifest, input(screen));
     expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('spinner_working');
+    expect(result.matchedRuleId).toBe('live_turn_working');
   });
 
-  it('does not match "Worked for" completion marker', () => {
+  it('does not match a "Worked for" completion marker (no ellipsis)', () => {
     const screen = '✻ Worked for 2m 15s\n\n❯ \n\n\n';
     const result = evaluateManifest(claudeCodeManifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('spinner_working');
+    expect(result.matchedRuleId).not.toBe('live_turn_working');
   });
-});
 
-describe('claude-code manifest: osc_title_idle vs spinner_working priority', () => {
-  it('spinner_working (p250) outranks osc_title_idle (p200)', () => {
-    const screen = '✻ Hatching… (5s\n\n\n\n\n';
+  it('live_turn_working (p970) outranks osc_title_idle (p250)', () => {
+    const screen = '✻ Hatching… (5s · esc to interrupt)\n\n\n\n\n';
     const result = evaluateManifest(claudeCodeManifest, input(screen, '✳ Claude'));
     expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('spinner_working');
+    expect(result.matchedRuleId).toBe('live_turn_working');
   });
 });
 
-describe('codex manifest: esc_to_interrupt_working', () => {
-  it('matches Esc to interrupt text after prompt marker', () => {
-    const screen = '› task\nProcessing...\nEsc to interrupt\n';
+describe('codex manifest: screen_working_fallback (herdr rule)', () => {
+  it('matches the • Working (…esc to interrupt) status line', () => {
+    const screen = '› task\n\n• Working (4s • esc to interrupt)\n';
     const result = evaluateManifest(codexManifest, input(screen));
     expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('esc_to_interrupt_working');
+    expect(result.matchedRuleId).toBe('screen_working_fallback');
+  });
+
+  it('does not match after ■ Conversation interrupted', () => {
+    const screen = '■ Conversation interrupted\n• Working (4s • esc to interrupt)\n';
+    const result = evaluateManifest(codexManifest, input(screen));
+    expect(result.matchedRuleId).not.toBe('screen_working_fallback');
   });
 });
 
-describe('codex manifest: codex_idle_prompt', () => {
-  it('matches bare › prompt with visibleIdle', () => {
+describe('codex manifest: no screen idle rule (herdr default idle fallback)', () => {
+  it('a bare › prompt falls back to default idle without a matched rule', () => {
     const screen = 'previous output\n\n› \n\n\n';
     const result = evaluateManifest(codexManifest, input(screen));
     expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
+    expect(result.matchedRuleId).toBeUndefined();
+  });
+
+  it('a non-spinner osc title is positive idle evidence (osc_title_idle)', () => {
+    const result = evaluateManifest(codexManifest, input('', '~/repo — codex'));
+    expect(result.state).toBe('idle');
+    expect(result.matchedRuleId).toBe('osc_title_idle');
     expect(result.visibleIdle).toBe(true);
+  });
+
+  it('a braille spinner osc title is working, not idle', () => {
+    const result = evaluateManifest(codexManifest, input('', '⠙ Fixing tests'));
+    expect(result.state).toBe('working');
+    expect(result.matchedRuleId).toBe('osc_title_working');
+  });
+
+  it('an Action Required osc title is pending (osc_title_blocked)', () => {
+    const result = evaluateManifest(codexManifest, input('', 'Action Required: approve command'));
+    expect(result.state).toBe('pending');
+    expect(result.matchedRuleId).toBe('osc_title_blocked');
+    expect(result.visibleBlocker).toBe(true);
+  });
+});
+
+describe('compileManifest (herdr: load 期校验,拒绝静默失效的规则)', () => {
+  const rule = (over: Partial<AgentManifest['rules'][number]>): AgentManifest => ({
+    id: 'probe',
+    rules: [{ id: 'r1', state: 'idle', priority: 1, region: 'whole_recent', contains: ['x'], ...over }],
+  });
+
+  it('未知 region 在 load 期报错并点名 rule id', () => {
+    expect(() => compileManifest(rule({ region: 'bottom_lines(3)' })))
+      .toThrow(/probe.*r1.*unknown region.*bottom_lines\(3\)/);
+  });
+
+  it('非法正则在 load 期报错并点名 rule id', () => {
+    expect(() => compileManifest(rule({ regex: ['a(?i)b'] }))).toThrow(/probe.*r1/);
+  });
+
+  it('嵌套 gate 里的非法正则同样在 load 期报错', () => {
+    expect(() => compileManifest(rule({ any: [{ lineRegex: ['('] }] }))).toThrow(/probe.*r1/);
+  });
+
+  it('合法 manifest 原样返回', () => {
+    const m = rule({});
+    expect(compileManifest(m)).toBe(m);
+  });
+
+  it('四份内置 manifest 全部通过校验', () => {
+    for (const m of Object.values(manifests)) expect(() => compileManifest(m)).not.toThrow();
   });
 });

@@ -10,7 +10,7 @@ import type {
 } from '../../src/shared/index.js';
 import { AgentManager, type AgentManagerDeps } from '../../src/agent/manager.js';
 import { BranchManager } from '../../src/agent/branch.js';
-import { TmuxManager, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
+import { TmuxManager, type AgentRuntimeKind, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -38,12 +38,12 @@ export function callInjectAndAwaitAck(
   paneId: string,
   prompt: string,
   agentId: string,
-  runtime: 'claude-code' | 'codex',
+  runtime: AgentRuntimeKind,
   guardBeforePaste?: () => Promise<boolean>,
 ): Promise<AckResult> {
   return (manager as unknown as {
     injectAndAwaitAck: (
-      tmux: TmuxManager, pane: PaneRef, prompt: string, agentId: string, runtime: 'claude-code' | 'codex',
+      tmux: TmuxManager, pane: PaneRef, prompt: string, agentId: string, runtime: AgentRuntimeKind,
       guardBeforePaste?: () => Promise<boolean>,
     ) => Promise<AckResult>;
   }).injectAndAwaitAck(tmux, paneRefOf(paneId, agentId), prompt, agentId, runtime, guardBeforePaste);
@@ -219,7 +219,7 @@ async function createManagerSuiteHarness(tempDir: string) {
       paneId: string,
       prompt: string,
       agentId: string,
-      runtime: 'claude-code' | 'codex',
+      runtime: AgentRuntimeKind,
     ) => Promise<{ acked: boolean; composerDelivered: boolean }>,
   ): void {
     vi.spyOn(

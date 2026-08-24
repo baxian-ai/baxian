@@ -5,40 +5,92 @@
       "id": "permission_required",
       "state": "pending",
       "priority": 300,
-      "region": "whole",
+      "region": "whole_recent",
       "visibleBlocker": true,
       "any": [
-        { "contains": ["△ Permission required"] },
-        { "contains": ["Permission required"] },
-        { "contains": ["Allow once"], "any": [{ "contains": ["Allow always"] }, { "contains": ["Reject"] }] }
+        {
+          "contains": [
+            "△ Permission required"
+          ]
+        },
+        {
+          "contains": [
+            "esc dismiss"
+          ],
+          "any": [
+            {
+              "contains": [
+                "enter confirm"
+              ]
+            },
+            {
+              "contains": [
+                "enter submit"
+              ]
+            },
+            {
+              "contains": [
+                "enter toggle"
+              ]
+            }
+          ],
+          "all": [
+            {
+              "any": [
+                {
+                  "contains": [
+                    "↑↓ select"
+                  ]
+                },
+                {
+                  "contains": [
+                    "⇆ tab"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
       ]
     },
     {
       "id": "interrupt_hint_working",
       "state": "working",
       "priority": 110,
-      "region": "whole",
+      "region": "whole_recent",
       "visibleWorking": true,
       "any": [
-        { "regex": ["esc\\s+(?:to\\s+)?interrupt"] },
-        { "contains": ["ctrl+c to interrupt"] }
+        {
+          "contains": [
+            "esc to interrupt"
+          ]
+        },
+        {
+          "contains": [
+            "ctrl+c to interrupt"
+          ]
+        },
+        {
+          "contains": [
+            "press esc to interrupt"
+          ]
+        },
+        {
+          "lineRegex": [
+            "(?i).*opencode.*esc (again to )?interrupt"
+          ]
+        }
       ]
     },
     {
       "id": "progress_bar_working",
       "state": "working",
       "priority": 100,
-      "region": "whole",
+      "region": "whole_recent",
       "visibleWorking": true,
-      "regex": ["(?:■|⬝){4,}"]
-    },
-    {
-      "id": "idle_composer",
-      "state": "idle",
-      "priority": 90,
-      "region": "tail(6)",
-      "visibleIdle": true,
-      "contains": ["ctrl+p commands"]
+      "regex": [
+        "(■|⬝){4,}"
+      ]
     }
   ]
 }

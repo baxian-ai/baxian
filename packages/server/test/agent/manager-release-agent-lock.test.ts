@@ -477,7 +477,7 @@ describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
     vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
     vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('');
     vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockResolvedValue(
-      '• Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/repo\n',
+      '• Working (12s • esc to interrupt)\n  gpt-5.5 xhigh · ~/repo\n',
     );
     const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
 

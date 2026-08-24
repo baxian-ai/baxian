@@ -1,10 +1,12 @@
 import type { Gate } from './gate.js';
-import { evaluateGate } from './gate.js';
-import { extractRegion, type DetectionInput } from './region.js';
+import { compileGate, evaluateGate } from './gate.js';
+import { extractRegion, isKnownRegion, type DetectionInput } from './region.js';
+
+export type AgentRuntimeKind = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
 
 export type DetectedState = 'idle' | 'working' | 'pending' | 'unknown';
 
-interface ManifestRule extends Gate {
+export interface ManifestRule extends Gate {
   id: string;
   state: DetectedState;
   priority: number;
@@ -29,76 +31,52 @@ export interface ManifestDetection {
   skipStateUpdate: boolean;
 }
 
+export function compileManifest(manifest: AgentManifest): AgentManifest {
+  for (const rule of manifest.rules) {
+    const where = `manifest ${manifest.id} rule ${rule.id}`;
+    if (!isKnownRegion(rule.region)) throw new Error(`${where} uses unknown region: ${rule.region}`);
+    try {
+      compileGate(rule);
+    } catch (err) {
+      throw new Error(`${where} has an uncompilable pattern: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return manifest;
+}
+
+const rulesByPriority = new WeakMap<AgentManifest, ManifestRule[]>();
+
+// 稳定降序 = 上游"取最高优先级、同分取先出现者",于是首个命中即最终结果
+function orderedRules(manifest: AgentManifest): ManifestRule[] {
+  let ordered = rulesByPriority.get(manifest);
+  if (!ordered) {
+    ordered = [...manifest.rules].sort((a, b) => b.priority - a.priority);
+    rulesByPriority.set(manifest, ordered);
+  }
+  return ordered;
+}
+
 export function evaluateManifest(
   manifest: AgentManifest,
   input: DetectionInput,
 ): ManifestDetection {
-  let matched: ManifestRule | undefined;
-  let bestScreenBlocker: ManifestRule | undefined;
-  let bestScreenEvidence: ManifestRule | undefined;
-  let bestScreenSkip: ManifestRule | undefined;
-
-  for (const rule of manifest.rules) {
-    const regionText = extractRegion(input, rule.region);
-    if (!evaluateGate(rule, regionText)) continue;
-
-    if (!matched || rule.priority > matched.priority) {
-      matched = rule;
-    }
-    if (rule.region !== 'oscTitle') {
-      if (rule.skipStateUpdate) {
-        if (!bestScreenSkip || rule.priority > bestScreenSkip.priority) {
-          bestScreenSkip = rule;
-        }
-      } else {
-        if (rule.visibleBlocker && rule.state === 'pending') {
-          if (!bestScreenBlocker || rule.priority > bestScreenBlocker.priority) {
-            bestScreenBlocker = rule;
-          }
-        }
-        if ((rule.visibleWorking && rule.state === 'working') || (rule.visibleIdle && rule.state === 'idle')) {
-          if (!bestScreenEvidence || rule.priority > bestScreenEvidence.priority) {
-            bestScreenEvidence = rule;
-          }
-        }
-      }
-    }
-  }
-
-  if (matched && matched.region === 'oscTitle') {
-    if (bestScreenBlocker && bestScreenSkip && bestScreenBlocker.priority >= bestScreenSkip.priority) {
-      matched = bestScreenBlocker;
-    } else if (bestScreenSkip) {
-      matched = bestScreenSkip;
-    } else if (matched.state === 'working' && bestScreenBlocker && bestScreenBlocker.priority >= 900) {
-      matched = bestScreenBlocker;
-    } else if (matched.state === 'working' && bestScreenEvidence && bestScreenEvidence.state === 'idle') {
-      matched = bestScreenEvidence;
-    } else if (matched.state === 'pending') {
-      if (bestScreenBlocker) {
-        matched = bestScreenBlocker;
-      } else if (bestScreenEvidence) {
-        matched = bestScreenEvidence;
-      }
-    }
-  }
-
-  if (!matched) {
+  for (const rule of orderedRules(manifest)) {
+    if (!evaluateGate(rule, extractRegion(input, rule.region))) continue;
     return {
-      state: 'idle',
-      visibleBlocker: false,
-      visibleIdle: false,
-      visibleWorking: false,
-      skipStateUpdate: false,
+      state: rule.state,
+      matchedRuleId: rule.id,
+      visibleBlocker: !!(rule.visibleBlocker && rule.state === 'pending'),
+      visibleIdle: !!(rule.visibleIdle && rule.state === 'idle'),
+      visibleWorking: !!(rule.visibleWorking && rule.state === 'working'),
+      skipStateUpdate: !!rule.skipStateUpdate,
     };
   }
 
   return {
-    state: matched.state,
-    matchedRuleId: matched.id,
-    visibleBlocker: !!(matched.visibleBlocker && matched.state === 'pending'),
-    visibleIdle: !!(matched.visibleIdle && matched.state === 'idle'),
-    visibleWorking: !!(matched.visibleWorking && matched.state === 'working'),
-    skipStateUpdate: !!matched.skipStateUpdate,
+    state: 'idle',
+    visibleBlocker: false,
+    visibleIdle: false,
+    visibleWorking: false,
+    skipStateUpdate: false,
   };
 }

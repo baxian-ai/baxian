@@ -10,13 +10,13 @@ import {
   type AckResult,
 } from '../helpers/manager-harness.js';
 
-function makeInjectManager(runner: CommandRunner, ackMs: number, settleMs: number): AgentManager {
+function makeInjectManager(runner: CommandRunner, ackMs: number, settleMs: number, resendMs?: number): AgentManager {
   const mgr = harness.createManager({
     runnerFactory: () => runner,
     dispatchAckTimeoutMs: ackMs,
     dispatchSettleTimeoutMs: settleMs,
   });
-  Object.assign(mgr, { runtimeLivenessProbeMs: 1 });
+  Object.assign(mgr, { runtimeLivenessProbeMs: 1, ...(resendMs === undefined ? {} : { dispatchAckResendIntervalMs: resendMs }) });
   return mgr;
 }
 
@@ -55,15 +55,24 @@ function snapRunner(
 
 async function runAck(
   runner: CommandRunner,
-  opts: { ackMs: number; settleMs: number; prompt?: string; lock?: boolean } = { ackMs: 150, settleMs: 150 },
+  opts: {
+    ackMs: number;
+    settleMs: number;
+    prompt?: string;
+    lock?: boolean;
+    resendMs?: number;
+    guard?: () => Promise<boolean>;
+  } = { ackMs: 150, settleMs: 150 },
 ): Promise<{ result?: AckResult; caught?: unknown; taskId: string }> {
-  const localManager = makeInjectManager(runner, opts.ackMs, opts.settleMs);
+  const localManager = makeInjectManager(runner, opts.ackMs, opts.settleMs, opts.resendMs);
   const t = await harness.seedTask();
   await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
   if (opts.lock !== false) await harness.acquireAgentLock('dev-1');
   const tmux = new TmuxManager(runner);
   try {
-    const result = await callInjectAndAwaitAck(localManager, tmux, '%0', opts.prompt ?? 'hello prompt', 'dev-1', 'claude-code');
+    const result = await callInjectAndAwaitAck(
+      localManager, tmux, '%0', opts.prompt ?? 'hello prompt', 'dev-1', 'claude-code', opts.guard,
+    );
     return { result, taskId: t.id };
   } catch (caught) {
     return { caught, taskId: t.id };
@@ -418,7 +427,7 @@ describe('injectAndAwaitAck ack timeout', () => {
           return { stdout: '', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
-          const visible = enterCount >= 2 ? 'working\n  esc to interrupt\n' : 'idle composer\n';
+          const visible = enterCount >= 2 ? '✻ Working… (3s · esc to interrupt)\n' : 'idle composer\n';
           const header = cmd.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
           return { stdout: `${header}\n${visible}`, stderr: '', exitCode: 0 };
         }
@@ -483,7 +492,7 @@ describe('injectAndAwaitAck settles the pane before Enter', () => {
         if (cmd.includes('history_size')) {
           order.push(enterSent ? 'snap-post' : 'snap-pre');
           const visible = enterSent
-            ? 'box: [Image #1]\nThinking\n  esc to interrupt\n'
+            ? 'box: [Image #1]\n✻ Thinking… (2s · esc to interrupt)\n'
             : preEnter[Math.min(snap++, preEnter.length - 1)];
           return { stdout: `BX_PANE_OK|0\n${visible}`, stderr: '', exitCode: 0 };
         }
@@ -539,7 +548,7 @@ describe('injectAndAwaitAck never-settle + swallowed Enter is non-ackable', () =
 
 describe('injectAndAwaitAck post-approve edge cases', () => {
   it('acks a quick task on its brief idle-to-busy flash after Enter', async () => {
-    const runner = snapRunner(enterSent => (enterSent ? 'working\n  esc to interrupt\n' : 'composer\n'), () => 5);
+    const runner = snapRunner(enterSent => (enterSent ? '✻ Working… (3s · esc to interrupt)\n' : 'composer\n'), () => 5);
     const { result } = await runAck(runner, { ackMs: 1000, settleMs: 1000 });
     expect(result).toEqual({ acked: true, composerDelivered: true });
     expect(runner.sawEnter()).toBe(true);
@@ -597,7 +606,7 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
       execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const { result } = await runAck(runner, { ackMs: 150, settleMs: 150, prompt: 'do X\n  esc to interrupt' });
-    expect(result).toEqual({ acked: false, composerDelivered: false });
+    expect(result).toEqual({ acked: false, composerDelivered: true });
     expect(ackInterventions()).toHaveLength(1);
   });
 
@@ -768,7 +777,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         return { stdout: '', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
-        const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
+        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : 'composer\n';
         return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
@@ -792,7 +801,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         return { stdout: '', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
-        const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
+        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : 'composer\n';
         return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
@@ -833,7 +842,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(0);
   });
 
-  it('a visible ready view overrides a stale working title: the draft is still cleared and the prompt pasted', async () => {
+  it('herdr: a working title beats a visible ready view (no arbitration) — paste proceeds without a composer clear', async () => {
     const sent: string[] = [];
     let pasted = false;
     let enterSent = false;
@@ -845,7 +854,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         return { stdout: 'BX_PANE_OK\n❯ \n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
-        const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
+        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : '❯ \n';
         return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
@@ -860,11 +869,11 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     });
     await runAck(runner);
     expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(1);
-    expect(ccCmds(sent)).toHaveLength(1);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
+    expect(ccCmds(sent)).toHaveLength(0);
   });
 
-  it('aborts without pasting when only the OSC title shows working and no ready view is visible (narrow pane wraps the busy line)', async () => {
+  it('herdr: a working OSC title no longer aborts dispatch — paste proceeds fire-and-forget without a composer clear', async () => {
     const sent: string[] = [];
     let pasted = false;
     let captures = 0;
@@ -872,7 +881,10 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       if (cmd.includes('pane_title')) {
         return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
       }
-      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+      if (cmd.includes('history_size')) {
+        return { stdout: 'BX_PANE_OK|0\nsoft-wrapped output without any anchor line\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
         captures++;
         return { stdout: `BX_PANE_OK\nsoft-wrapped output without any anchor line ${captures}\n`, stderr: '', exitCode: 0 };
       }
@@ -883,13 +895,13 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       return undefined;
     });
     const { caught } = await runAck(runner);
-    expect(caught).toBeInstanceOf(Error);
-    expect(String((caught as Error).message)).toMatch(/pre-inject busy check/);
-    expect(pasted).toBe(false);
+    expect(caught).toBeUndefined();
+    expect(pasted).toBe(true);
     expect(ccCmds(sent)).toHaveLength(0);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
   });
 
-  it('clears a busy-looking leftover draft even under a stale working title when the frame is static (no live turn)', async () => {
+  it('herdr: under a working title the draft is NOT cleared — the prompt is pasted directly (fire-and-forget)', async () => {
     const sent: string[] = [];
     let pasted = false;
     let enterSent = false;
@@ -902,7 +914,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         return { stdout: `BX_PANE_OK\n${DRAFT}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
-        const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
+        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : '❯ \n';
         return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
@@ -917,11 +929,11 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     });
     await runAck(runner);
     expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(1);
-    expect(ccCmds(sent)).toHaveLength(1);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
+    expect(ccCmds(sent)).toHaveLength(0);
   });
 
-  it('aborts without pasting when the pane is visibly busy (pasting would feed the running turn or submit onto a leftover draft)', async () => {
+  it('herdr: a visibly busy pane no longer aborts dispatch — paste proceeds without a composer clear', async () => {
     const sent: string[] = [];
     let pasted = false;
     let captures = 0;
@@ -929,9 +941,12 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       if (cmd.includes('pane_title')) {
         return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
       }
-      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+      if (cmd.includes('history_size')) {
+        return { stdout: 'BX_PANE_OK|0\n✶ Grooving… (30s · esc to interrupt)\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
         captures++;
-        return { stdout: `BX_PANE_OK\n✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n✶ Grooving… (${12 + captures}s · esc to interrupt)\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
@@ -940,9 +955,8 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       return undefined;
     });
     const { caught } = await runAck(runner);
-    expect(caught).toBeInstanceOf(Error);
-    expect(String((caught as Error).message)).toMatch(/pre-inject busy check/);
-    expect(pasted).toBe(false);
+    expect(caught).toBeUndefined();
+    expect(pasted).toBe(true);
     expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
     expect(ccCmds(sent)).toHaveLength(0);
   });
@@ -960,7 +974,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         return { stdout: `BX_PANE_OK\n${DRAFT}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
-        const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
+        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : '❯ \n';
         return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
@@ -979,7 +993,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     expect(ccCmds(sent)).toHaveLength(1);
   });
 
-  it('aborts when the text looks busy, the title is idle, but the frame is advancing (a real turn with a lost title)', async () => {
+  it('herdr: no liveness gate — an advancing frame with an idle title still dispatches', async () => {
     const sent: string[] = [];
     let pasted = false;
     let captures = 0;
@@ -987,7 +1001,10 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       if (cmd.includes('pane_title')) {
         return { stdout: 'BX_PANE_OKdev-1\n', stderr: '', exitCode: 0 };
       }
-      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+      if (cmd.includes('history_size')) {
+        return { stdout: 'BX_PANE_OK|0\n✶ Grooving… (30s)\n  esc to interrupt\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
         captures++;
         return { stdout: `BX_PANE_OK\n✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
       }
@@ -998,10 +1015,116 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       return undefined;
     });
     const { caught } = await runAck(runner);
-    expect(caught).toBeInstanceOf(Error);
-    expect(String((caught as Error).message)).toMatch(/pre-inject busy check/);
-    expect(pasted).toBe(false);
+    expect(caught).toBeUndefined();
+    expect(pasted).toBe(true);
+  });
+
+  const WORKING_FRAME = '✻ Working… (12s · esc to interrupt)\n';
+
+  it('working pane + 粘贴结果不确定 + buffer 删除失败:不发 C-c,转 ack_unknown 交人工核验', async () => {
+    const sent: string[] = [];
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+      if (cmd.includes('paste-buffer')) return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
+      if (cmd.includes('delete-buffer')) return { stdout: '', stderr: 'no buffer', exitCode: 1 };
+      return undefined;
+    });
+    const guard = vi.fn<[], Promise<boolean>>().mockResolvedValue(true);
+    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 150, guard });
+
+    expect(caught).toBeInstanceOf(DispatchTerminalError);
+    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
     expect(ccCmds(sent)).toHaveLength(0);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
+  });
+
+  it('working pane + fence 拒绝:不发 C-c,转 ack_unknown', async () => {
+    const sent: string[] = [];
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+      return undefined;
+    });
+    // guard 依次在:外层、steps 入口、paste 锁、submit 锁被调用,最后一次拒绝 = Enter 前 fence 拒绝
+    const guard = vi.fn<[], Promise<boolean>>()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(false);
+    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 150, guard });
+
+    expect(caught).toBeInstanceOf(DispatchTerminalError);
+    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
+    expect(ccCmds(sent)).toHaveLength(0);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
+  });
+
+  it.each<['opencode' | 'qodercli', string]>([
+    ['opencode', '帮我看下 esc to interrupt 这个判定'],
+    ['qodercli', '文案里写的是 (esc to cancel, 要不要改'],
+  ])('%s: idle pane 收到自带 working 关键字的提示词且 Enter 被吞 → 走超时并提人工介入,不得报已提交', async (runtime, prompt) => {
+    const sent: string[] = [];
+    // 粘贴后基线含提示词正文,自己命中 whole_recent 的 working 规则;Enter 被吞,屏幕此后不再变化
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${prompt}\n`, stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: 'BX_PANE_OK\nctrl+p commands\n', stderr: '', exitCode: 0 };
+      return undefined;
+    });
+    const localManager = makeInjectManager(runner, 250, 60, 50);
+    const t = await harness.seedTask();
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await harness.acquireAgentLock('dev-1');
+
+    const result = await callInjectAndAwaitAck(
+      localManager, new TmuxManager(runner), '%0', prompt, 'dev-1', runtime,
+    );
+
+    expect(result.acked).toBe(false);
+    expect(ackInterventions()).toHaveLength(1);
+  });
+
+  it('派发前就在 working 的 pane 仍然 fire-and-forget:不等 ack、不提人工介入', async () => {
+    const sent: string[] = [];
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+      return undefined;
+    });
+    const { result, caught } = await runAck(runner, { ackMs: 250, settleMs: 60, resendMs: 1 });
+
+    expect(caught).toBeUndefined();
+    expect(result).toEqual({ acked: true, composerDelivered: true });
+    expect(ackInterventions()).toHaveLength(0);
+    // 边界前置的结构性保证:working pane 完全不进入 ack/重发/清稿机制,Enter 只发一次,永不 C-c
+    expect(ccCmds(sent)).toHaveLength(0);
+    expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(1);
+  });
+
+  it('working pane + Enter 前异常:不走 clearComposerForReuse 的 C-c,转 ack_unknown', async () => {
+    const sent: string[] = [];
+    let snaps = 0;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('history_size')) {
+        snaps++;
+        if (snaps === 1) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
+      }
+      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
+      return undefined;
+    });
+
+    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 60 });
+
+    expect(caught).toBeInstanceOf(DispatchTerminalError);
+    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
+    expect(ccCmds(sent)).toHaveLength(0);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
   });
 
   it('re-validates the binding after the pre-inject clear: a task cancelled during the clear is never pasted', async () => {
@@ -1033,7 +1156,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
   });
 });
 
-describe('injectAndAwaitAck busy-baseline is non-ackable', () => {
+describe('injectAndAwaitAck: busy-looking baseline text is not busy under herdr — swallowed Enter surfaces as ack timeout', () => {
   it.each([
     {
       name: 'composer "clears" after submit but baseline was busy → still non-ackable',
@@ -1053,7 +1176,7 @@ describe('injectAndAwaitAck busy-baseline is non-ackable', () => {
   ])('$name', async ({ frames, settleMs }) => {
     const runner = snapRunner(frames());
     const { result } = await runAck(runner, { ackMs: 150, settleMs, prompt: 'review:\n  esc to interrupt' });
-    expect(result).toEqual({ acked: false, composerDelivered: false });
+    expect(result).toEqual({ acked: false, composerDelivered: true });
     expect(ackInterventions().length).toBeGreaterThanOrEqual(1);
   });
 });

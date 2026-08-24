@@ -6,6 +6,7 @@ import type { AgentConfig, BaxianConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from '../../src/agent/tmux-probe-poller.js';
+import { blank } from './runtime-captures.js';
 import { ErrorRecordStore } from '../../src/state/error-record-store.js';
 
 const noopAgentManager = {
@@ -286,7 +287,7 @@ describe('TmuxProbePoller', () => {
 
   it('marks busy live runtimes as working observations', async () => {
     await runProbeScenario({
-      exec: makeExec({ capturePane: text('Hatching...\nEsc to interrupt') }),
+      exec: makeExec({ capturePane: text('✻ Hatching… (3s · esc to interrupt)') }),
       steps: [{}],
       expectMatch: {
         tmuxSessionStatus: 'present',
@@ -296,7 +297,7 @@ describe('TmuxProbePoller', () => {
     });
   });
 
-  it('marks a codex small-pane Working line as a working observation', async () => {
+  it('marks a codex • Working line as a working observation (herdr shape; truncated tails no longer covered)', async () => {
     const codexAgent: AgentConfig = { ...makeAgent('qa-1'), runtime: 'codex', role: 'qa' };
     await runProbeScenario({
       agents: [codexAgent],
@@ -304,7 +305,7 @@ describe('TmuxProbePoller', () => {
       exec: makeExec({
         listPanes: codexPane,
         classify: codexRuntimePane,
-        capturePane: text('• Working (2m 30s • esc to interrup…'),
+        capturePane: text('• Working (2m 30s • esc to interrupt)'),
       }),
       steps: [{}],
       expectMatch: {
@@ -512,15 +513,12 @@ describe('TmuxProbePoller', () => {
       });
     });
 
-    it('does NOT flag STUCK_BUSY for static esc-to-interrupt without visibleWorking', async () => {
+    it('herdr flip: a plain esc-to-interrupt line is not a claude working shape → static screen ends as PENDING_IDLE', async () => {
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: makeExec({ capturePane: text('Working on it…\n  esc to interrupt') }),
         steps: [{}, { advance: SIX_MIN }],
-        expect: (store) => {
-          expect(store.get('dev-1').runtimeStatusHint).toBe('working');
-          expect(store.get('dev-1').reason).toBeUndefined();
-        },
+        expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
       });
     });
 
@@ -536,13 +534,13 @@ describe('TmuxProbePoller', () => {
       });
     });
 
-    it('a quoted/leftover spinner above an idle prompt is classified as PENDING_IDLE', async () => {
-      const quotedSpinnerIdle: ExecResult = text(['· Wrangling… (24s)', ...Array(12).fill(''), '❯ '].join('\n'));
+    it('a frozen spinner above an idle prompt flags STUCK_BUSY (non-empty spinner window, herdr-style: blanks cannot demote it to idle)', async () => {
+      const frozenSpinner: ExecResult = text(['· Wrangling… (24s · esc to interrupt)', ...blank(12), '❯ '].join('\n'));
       await runProbeScenario({
         binding: { taskId: 'task-001' },
-        exec: makeExec({ capturePane: quotedSpinnerIdle }),
+        exec: makeExec({ capturePane: frozenSpinner }),
         steps: [{}, { advance: SIX_MIN }],
-        expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
+        expectMatch: { runtimeStatusHint: 'error', reason: 'STUCK_BUSY' },
       });
     });
 
@@ -550,7 +548,7 @@ describe('TmuxProbePoller', () => {
       let secs = 10;
       await runProbeScenario({
         binding: { taskId: 'task-001' },
-        exec: makeExec({ capturePane: () => text(`· Working… (${secs} s · esc to interrupt)`) }),
+        exec: makeExec({ capturePane: () => text(`· Working… (${secs}s · esc to interrupt)`) }),
         steps: [
           {},
           ...Array.from({ length: 6 }, () => ({ set: () => { secs += 90; }, advance: 90 * 1000 })),
@@ -620,8 +618,23 @@ describe('TmuxProbePoller', () => {
       });
     });
 
+    it('working→连续三拍相同 idle 后的 resize/reflow 不重置静止计时', async () => {
+      const working: ExecResult = text('✻ Working… (12s · esc to interrupt)');
+      const idle: ExecResult = text('done\n❯ ');
+      const idleReflowed: ExecResult = text('done ❯ ');
+      await runProbeScenario({
+        binding: { taskId: 'task-001' },
+        exec: makeExec({
+          capturePane: scripted([working, idle, idle, idle, idleReflowed]),
+          paneWidth: scripted([text('80'), text('80'), text('80'), text('80'), text('120')]),
+        }),
+        steps: [{}, {}, {}, { advance: FIVE_MIN + 1 }, {}],
+        expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
+      });
+    });
+
     it('prefers PENDING_HUMAN (menu) over PENDING_IDLE when both could apply', async () => {
-      const menuCapture: ExecResult = text('Pick one\nEnter to select · Esc to cancel');
+      const menuCapture: ExecResult = text('Pick one\nEnter to confirm · Esc to cancel');
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: execScripted([menuCapture, menuCapture]),
@@ -631,10 +644,33 @@ describe('TmuxProbePoller', () => {
     });
   });
 
-  const transcriptCapture: ExecResult = text('Showing detailed transcript\nctrl+o to toggle\n↑↓ scroll\n? for shortcuts');
+  it('herdr 非 visible 的 pending 规则仍要发布 pending(claude legacy blocker)', async () => {
+    await runProbeScenario({
+      exec: makeExec({ capturePane: text('waiting for permission\n') }),
+      steps: [{}],
+      expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_HUMAN' },
+    });
+  });
+
+  it('herdr 非 visible 的 pending 规则仍要发布 pending(codex weak_blocker)', async () => {
+    const codexAgent: AgentConfig = { ...makeAgent('qa-1'), runtime: 'codex', role: 'qa' };
+    await runProbeScenario({
+      agents: [codexAgent],
+      agentId: 'qa-1',
+      exec: makeExec({
+        listPanes: codexPane,
+        classify: codexRuntimePane,
+        capturePane: text('do you want to continue? [y/n]\n'),
+      }),
+      steps: [{}],
+      expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_HUMAN' },
+    });
+  });
+
+  const transcriptCapture: ExecResult = text('transcript body\nShowing detailed transcript\nctrl+o to toggle\n↑↓ scroll');
 
   it('skipStateUpdate rule preserves previous observation (e.g. transcript viewer)', async () => {
-    let currentCapture = text('Hatching...\nEsc to interrupt');
+    let currentCapture = text('✻ Hatching… (3s · esc to interrupt)');
     await runProbeScenario({
       exec: makeExec({ capturePane: () => currentCapture }),
       steps: [

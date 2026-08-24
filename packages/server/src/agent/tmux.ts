@@ -2,13 +2,14 @@ import { randomUUID } from 'node:crypto';
 import type { CommandRunner, ExecOptions, ExecResult } from './runner.js';
 import { shellQuote } from './runner.js';
 import { execOutcomeUnknown, isTransientNetworkFailure } from './net-exec.js';
-import { isHorizontalRule, tailNonEmpty } from './detect/region.js';
+import { classifyScreen, isTrustedIdleRule } from './detect/classify.js';
+import type { AgentRuntimeKind, ManifestDetection } from './detect/manifest.js';
 import { MAX_PROMPT_BYTES } from './prompt.js';
 
 const run = (runner: CommandRunner, cmd: string, opts?: ExecOptions): Promise<ExecResult> =>
   runner['exec'](cmd, opts);
 
-export type AgentRuntimeKind = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
+export type { AgentRuntimeKind };
 
 export interface TmuxSessionRef {
   sessionId: string;
@@ -228,7 +229,6 @@ export interface WaitReplReadyOpts extends WaitOpts {
 export interface WaitSubmitAckOpts extends WaitOpts {
   resend?: () => Promise<void>;
   resendIntervalMs?: number;
-  acceptComposerChange?: boolean;
   baselineTitle?: string;
 }
 
@@ -277,14 +277,6 @@ export function detectStartupDialog(stripped: string, runtime?: AgentRuntimeKind
   return RUNTIME_STARTUP_DIALOG_SIGNALS[runtime]?.some(re => re.test(stripped)) ?? false;
 }
 
-const RUNTIME_MENU_SIGNALS: readonly RegExp[] = [
-  /^[ \t]*Enter to\b[^\n]{0,160}·[^\n]{0,40}\bEsc to\b/im,
-];
-
-export function detectRuntimeMenu(stripped: string): boolean {
-  return RUNTIME_MENU_SIGNALS.some(re => re.test(stripped));
-}
-
 const RUNTIME_COMPLETION_POPUP_RE = /\benter to insert\b[^\n]{0,40}\besc to close\b/i;
 const COMPLETION_POPUP_FOOTER_LINES = 3;
 function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRuntimeKind): boolean {
@@ -307,19 +299,6 @@ function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind): boolea
   return runtime === 'codex' && CODEX_BACKTRACK_HINT_RE.test(stripped);
 }
 
-const OSC_TITLE_WORKING_RE = /^[⠀-⣿] /;
-export function hasOscTitleWorking(paneTitle: string): boolean {
-  return OSC_TITLE_WORKING_RE.test(paneTitle);
-}
-
-const OSC_TITLE_IDLE_RES: Partial<Record<AgentRuntimeKind, RegExp>> = {
-  'claude-code': /^✳ /,
-};
-
-export function hasOscTitleIdle(paneTitle: string, runtime: AgentRuntimeKind): boolean {
-  return OSC_TITLE_IDLE_RES[runtime]?.test(paneTitle) ?? false;
-}
-
 export function hasReplProcTitle(current: string, runtime: AgentRuntimeKind): boolean {
   return REPL_PROC_TITLES[runtime].test(current);
 }
@@ -328,212 +307,31 @@ export function isShellProcTitle(current: string): boolean {
   return SHELL_PROC_TITLES.test(current);
 }
 
-const ESC_TO_INTERRUPT_TAIL_LINES = 8;
-const CLAUDE_IDLE_COMPOSER_TAIL_LINES = 6;
-const ESC_TO_INTERRUPT_RE = /esc to interru(?:pt|p(?:…|\.{3})?)/i;
-const CODEX_WORKING_LINE_RE = /^[ \t]*(?:[•·][ \t]+)?Working[ \t]*\(/im;
-const CODEX_IDLE_PROMPT_LINE_RE = /^[ \t]*[›→](?:[ \t].*)?$/im;
-const CODEX_IDLE_COMPOSER_LINE_RE = /(?:^|\n)→ [A-Za-z0-9][\w.-]*(?:\s+git:\([^\s)]+\))?\s*$/i;
-const CODEX_IDLE_PROMPT_TAIL_LINES = 6;
-const CODEX_WORKING_TAIL_LINES = 8;
-const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t\u00A0]*[❯>][ \t\u00A0]*$/m;
-const OPENCODE_BUSY_RE = /(?:esc|ctrl\+c)\s+(?:to\s+)?interrupt|(?:■|⬝){4,}/i;
-const OPENCODE_IDLE_COMPOSER_RE = /ctrl\+p\s+commands/;
-const QODER_BUSY_RE = /\(esc to cancel,|^[ \t]*[⠀-⣿][ \t]+.*\p{L}/mu;
-const QODER_IDLE_COMPOSER_RE = /Type your message or @/;
-const RUNTIME_PENDING_RES: Partial<Record<AgentRuntimeKind, RegExp>> = {
-  opencode: /△\s*Permission required|Permission required|Allow once|Allow always/i,
-  qodercli: /Permission Required|Allow this command to run|Do you want to allow|waiting for user confirmation|awaiting approval|allow once or always\?|asking user|enter your response|review your answers:|shell awaiting input/i,
+// 空白 boot 屏在 manifest 下默认 idle,启动就绪必须另有 composer 正证据
+const LAUNCH_COMPOSER_CUES: Record<AgentRuntimeKind, RegExp[]> = {
+  'claude-code': [/(?:^|\n)[ \t\u00a0]*[❯>][ \t\u00a0]*(?:\n[ \t]*)*$/],
+  codex: [
+    /(?:^|\n)[ \t]*›[ \t]*(?:\n[ \t]*)*$/,
+    /(?:^|\n)→ [A-Za-z0-9][\w.-]*(?:[ \t]+git:\([^\s)]+\))?[ \t]*(?:\n[ \t]*)*$/,
+  ],
+  opencode: [/ctrl\+p commands/],
+  qodercli: [/Type your message or @/],
 };
 
-export function hasActiveSpinner(stripped: string): boolean {
-  for (const m of stripped.matchAll(SPINNER_LINE_RE)) {
-    if (!COMPLETION_MARKER_RE.test(stripped.slice(m.index + m[0].length))) return true;
-  }
-  return false;
+function hasLaunchReadyCue(stripped: string, runtime: AgentRuntimeKind): boolean {
+  return hasReplReadyAnchor(stripped, runtime)
+    || LAUNCH_COMPOSER_CUES[runtime].some(re => re.test(stripped));
 }
 
-const ACTIVE_SPINNER_TAIL_LINES = 10;
-
-export function hasActiveSpinnerInTail(stripped: string): boolean {
-  const lines = stripped.split('\n');
-  const tail = lines.slice(Math.max(0, lines.length - ACTIVE_SPINNER_TAIL_LINES)).join('\n');
-  return hasActiveSpinner(tail);
+export function hasRuntimeReadyView(
+  stripped: string,
+  runtime: AgentRuntimeKind,
+  detection: ManifestDetection = classifyScreen(runtime, stripped),
+): boolean {
+  if (detection.state !== 'idle') return false;
+  if (!isTrustedIdleRule(runtime, detection.matchedRuleId) && !hasLaunchReadyCue(stripped, runtime)) return false;
+  return !detectStartupDialog(stripped, runtime) && !TRUST_DIALOGS[runtime].test(stripped);
 }
-
-function tail(stripped: string, count: number): string {
-  const paneLines = stripped.split('\n');
-  return paneLines.slice(Math.max(0, paneLines.length - count)).join('\n');
-}
-
-function bottomNonBlankLine(stripped: string): string {
-  const lines = stripped.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trim() !== '') return lines[i];
-  }
-  return '';
-}
-
-function escToInterruptInTail(stripped: string): boolean {
-  return ESC_TO_INTERRUPT_RE.test(tail(stripped, ESC_TO_INTERRUPT_TAIL_LINES));
-}
-
-export function detectReplActiveBusy(stripped: string): boolean {
-  return hasActiveSpinner(stripped) || escToInterruptInTail(stripped);
-}
-
-function lastMatchIndex(stripped: string, pattern: RegExp): number {
-  let last = -1;
-  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
-  for (const m of stripped.matchAll(new RegExp(pattern.source, flags))) {
-    if (m.index !== undefined) last = m.index;
-  }
-  return last;
-}
-
-function lastIdlePromptIndex(stripped: string, runtime?: AgentRuntimeKind): number {
-  if (runtime === 'codex') return lastMatchIndex(stripped, CODEX_IDLE_PROMPT_LINE_RE);
-  if (runtime === 'claude-code') return lastMatchIndex(stripped, CLAUDE_IDLE_COMPOSER_LINE_RE);
-  return -1;
-}
-
-function escToInterruptActiveInTail(stripped: string, runtime?: AgentRuntimeKind): boolean {
-  const activeTail = tail(stripped, ESC_TO_INTERRUPT_TAIL_LINES);
-  const lastEsc = lastMatchIndex(activeTail, ESC_TO_INTERRUPT_RE);
-  if (lastEsc < 0) return false;
-  return lastEsc > lastIdlePromptIndex(activeTail, runtime);
-}
-
-function codexWorkingInTail(stripped: string, runtime?: AgentRuntimeKind): boolean {
-  if (runtime !== 'codex') return false;
-  const activeTail = tail(stripped, CODEX_WORKING_TAIL_LINES);
-  const lastWorking = lastMatchIndex(activeTail, CODEX_WORKING_LINE_RE);
-  if (lastWorking < 0) return false;
-  return lastWorking > lastIdlePromptIndex(activeTail, runtime);
-}
-
-function detectActiveRegionBusy(stripped: string, runtime?: AgentRuntimeKind): boolean {
-  return hasActiveSpinnerInTail(stripped)
-    || escToInterruptActiveInTail(stripped, runtime)
-    || codexWorkingInTail(stripped, runtime);
-}
-
-const CODEX_EMPTY_COMPOSER_RE = /(?:^|\n)[ \t]*›[ \t]*(?:\n[ \t]*)*$/;
-
-export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRuntimeKind): boolean {
-  if (runtime === 'claude-code') {
-    return CLAUDE_IDLE_COMPOSER_LINE_RE.test(tail(stripped, CLAUDE_IDLE_COMPOSER_TAIL_LINES));
-  }
-  if (runtime === 'codex') {
-    const t = tail(stripped, CODEX_IDLE_PROMPT_TAIL_LINES);
-    return CODEX_IDLE_COMPOSER_LINE_RE.test(t) || CODEX_EMPTY_COMPOSER_RE.test(t);
-  }
-  if (runtime === 'opencode') {
-    return OPENCODE_IDLE_COMPOSER_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  }
-  if (runtime === 'qodercli') {
-    return QODER_IDLE_COMPOSER_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  }
-  return false;
-}
-
-function screenBlocksReadyView(stripped: string, runtime: AgentRuntimeKind): boolean {
-  return runtimeBusyCheck(stripped, runtime)
-    || detectRuntimeMenu(stripped)
-    || detectStartupDialog(stripped, runtime)
-    || TRUST_DIALOGS[runtime].test(stripped)
-    || (RUNTIME_PENDING_RES[runtime]?.test(stripped) ?? false)
-    || detectRuntimeOverlay(stripped);
-}
-
-const PENDING_PROMPT_SIGNALS: readonly RegExp[] = [
-  /waiting\s+for\s+permission/i,
-  /review\s+your\s+answers/i,
-  /skip\s+interview\s+and\s+plan\s+immediately/i,
-];
-const PENDING_OFFER_RE = /do\s+you\s+want\s+to|would\s+you\s+like\s+to|tab\s+to\s+amend|ctrl\+e\s+to\s+explain/i;
-const PENDING_OPTION_LINE_RE = /^\s*(?:❯\s*)?(?:\d+\.\s*)?yes\b|^\s*(?:❯\s*)?\d+\.\s*no\b/im;
-const SELECT_FORM_ENTER_RE = /enter\s+to\s+(?:select|confirm)/i;
-const DYNAMIC_WORKFLOW_RE = /run\s+a\s+dynamic\s+workflow\?/i;
-const FORM_ESC_CANCEL_RE = /esc\s+to\s+cancel/i;
-const PENDING_PROMPT_TAIL_LINES = 15;
-
-function pendingPromptRegion(stripped: string): string {
-  const lines = stripped.split('\n');
-  let lastRule = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (isHorizontalRule(lines[i])) lastRule = i;
-  }
-  if (lastRule >= 0) return lines.slice(lastRule + 1).join('\n');
-  return tail(stripped, PENDING_PROMPT_TAIL_LINES);
-}
-
-export function detectRuntimePendingPrompt(stripped: string): boolean {
-  const t = pendingPromptRegion(stripped);
-  if (PENDING_PROMPT_SIGNALS.some(re => re.test(t))) return true;
-  if (PENDING_OFFER_RE.test(t) && PENDING_OPTION_LINE_RE.test(t)) return true;
-  if (DYNAMIC_WORKFLOW_RE.test(t) && FORM_ESC_CANCEL_RE.test(t)) return true;
-  return SELECT_FORM_ENTER_RE.test(t) && FORM_ESC_CANCEL_RE.test(t);
-}
-
-const OVERLAY_FOOTER_SIGNALS: readonly RegExp[] = [
-  /ctrl\+o[^\n]{0,60}to\s+toggle/i,
-  /ctrl\+e[^\n]{0,60}show\s+all/i,
-  /ctrl\+e[^\n]{0,60}collapse/i,
-  /showing\s+detailed\s+transcript/i,
-  /↑↓\s+scroll/,
-  /\?\s+for\s+shortcuts/,
-];
-const OVERLAY_FOOTER_NONBLANK_LINES = 2;
-const MODEL_PICKER_TITLE_RE = /select\s+model/i;
-const MODEL_PICKER_FOOTER_RE = /enter\s+to\s+set\s+as\s+default/i;
-
-function lastNonBlankLines(stripped: string, count: number): string {
-  const kept: string[] = [];
-  const lines = stripped.split('\n');
-  for (let i = lines.length - 1; i >= 0 && kept.length < count; i--) {
-    if (lines[i].trim() !== '') kept.unshift(lines[i]);
-  }
-  return kept.join('\n');
-}
-
-export function detectRuntimeOverlay(stripped: string): boolean {
-  const footer = lastNonBlankLines(stripped, OVERLAY_FOOTER_NONBLANK_LINES);
-  if (OVERLAY_FOOTER_SIGNALS.some(re => re.test(footer))) return true;
-  const t = tail(stripped, PENDING_PROMPT_TAIL_LINES);
-  return MODEL_PICKER_TITLE_RE.test(t) && MODEL_PICKER_FOOTER_RE.test(t);
-}
-
-export function screenAllowsTitleIdle(stripped: string, runtime: AgentRuntimeKind): boolean {
-  return !screenBlocksReadyView(stripped, runtime)
-    && !detectRuntimePendingPrompt(stripped)
-    && !detectRuntimeOverlay(stripped);
-}
-
-export function hasRuntimeReadyView(stripped: string, runtime: AgentRuntimeKind): boolean {
-  if (hasReplReadyAnchor(stripped, runtime)) return true;
-  if (!hasRuntimeIdleComposerPrompt(stripped, runtime)) return false;
-  return !screenBlocksReadyView(stripped, runtime);
-}
-
-export function runtimeBusyCheck(stripped: string, runtime: AgentRuntimeKind): boolean {
-  if (runtime === 'codex') return detectActiveRegionBusy(stripped, runtime);
-  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  return detectReplActiveBusy(stripped);
-}
-
-function submitAckBusy(stripped: string, runtime: AgentRuntimeKind): boolean {
-  if (runtime === 'codex') {
-    return hasActiveSpinner(stripped) || escToInterruptActiveInTail(stripped, runtime);
-  }
-  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  return detectReplActiveBusy(stripped);
-}
-
-const SPINNER_LINE_RE = /^[·✢✳✶✻✽][ \t]+[^\n…]{1,200}…[ \t]*\([ \t]*(?:\d+[ \t]*m[ \t]+)?\d+[ \t]*s/gm;
-const COMPLETION_MARKER_RE = /^✻[ \t]+Worked for/m;
 
 export type AdoptPaneState =
   | { kind: 'live-runtime' }
@@ -1251,29 +1049,24 @@ export class TmuxManager {
     const deadline = Date.now() + (opts.timeoutMs ?? 30_000);
     const interval = Math.max(opts.intervalMs ?? 100, MIN_POLL_INTERVAL_MS);
     const composerBaseline = stripHistorySuffix(baseline);
-    if (submitAckBusy(composerBaseline, runtime)) {
-      throw new Error(`runtime ack timeout (paneId=${pane.paneId}): pane already busy at baseline`);
-    }
     const baselineTitle = opts.baselineTitle ?? await this.readPaneTitle(pane);
-    if (hasOscTitleWorking(baselineTitle)) {
-      throw new Error(`runtime ack timeout (paneId=${pane.paneId}): pane already busy at baseline`);
-    }
+    // 基线是粘贴之后抓的,含用户提示词正文;它自己就判 working 时屏幕证据是用户可控的,只剩标题能作证
+    const baselineWorking = classifyScreen(runtime, composerBaseline, baselineTitle).state === 'working';
     const resendIntervalMs = Math.max(opts.resendIntervalMs ?? 3_000, interval);
     let lastResend = Date.now();
     while (Date.now() < deadline) {
       const visible = stripHistorySuffix(await this.capturePaneSnapshot(pane));
-      if (submitAckBusy(visible, runtime)) return;
+      if (!baselineWorking && classifyScreen(runtime, visible).state === 'working') return;
       const title = await this.readPaneTitle(pane);
-      if (hasOscTitleWorking(title) && title !== baselineTitle) return;
-      if (opts.acceptComposerChange && visible !== composerBaseline) return;
-      const bottomLine = bottomNonBlankLine(visible);
+      const detection = classifyScreen(runtime, visible, title);
+      // 提交确认要标题自己作证:传空屏幕即只跑标题规则,合并判定的 working 可能来自粘贴正文
+      if (title !== baselineTitle && classifyScreen(runtime, '', title).state === 'working') return;
       const enterWouldSubmit =
-        !detectRuntimeMenu(bottomLine)
-        && !detectStartupDialog(bottomLine, runtime)
+        detection.state !== 'pending'
+        && !detection.skipStateUpdate
+        && !detectStartupDialog(visible, runtime)
         && !TRUST_DIALOGS[runtime].test(visible)
-        && !detectRuntimeCompletionPopup(visible, runtime)
-        && !(RUNTIME_PENDING_RES[runtime]?.test(visible) ?? false)
-        && !detectRuntimePendingPrompt(visible);
+        && !detectRuntimeCompletionPopup(visible, runtime);
       if (
         opts.resend
         && enterWouldSubmit
@@ -1284,7 +1077,7 @@ export class TmuxManager {
       }
       await sleep(interval);
     }
-    throw new Error(`runtime ack timeout (paneId=${pane.paneId})`);
+    throw new Error(`runtime ack timeout (paneId=${pane.paneId})${baselineWorking ? ': baseline already matched a working rule; submit evidence unobservable on screen' : ''}`);
   }
 
   async handleTrustDialog(
@@ -1364,10 +1157,14 @@ export class TmuxManager {
       const stripped = stripAnsi(cap);
       lastStripped = stripped;
       if (procTitle.test(current)) {
-        if (hasRuntimeReadyView(stripped, runtime)) return;
-        if (opts.titleIdleFastPath && screenAllowsTitleIdle(stripped, runtime)) {
+        const screenOnly = classifyScreen(runtime, stripped);
+        // 标题规则优先级最高:屏幕单独判 ready 也必须带标题复核后才能返回
+        const worthTitleRead = opts.titleIdleFastPath
+          ? screenOnly.state === 'idle'
+          : hasRuntimeReadyView(stripped, runtime, screenOnly);
+        if (worthTitleRead) {
           lastTitle = await this.readPaneTitle(pane, cmdOpts);
-          if (hasOscTitleIdle(lastTitle, runtime)) return;
+          if (hasRuntimeReadyView(stripped, runtime, classifyScreen(runtime, stripped, lastTitle))) return;
         }
       }
       await sleep(interval);

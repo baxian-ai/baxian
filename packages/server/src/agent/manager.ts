@@ -80,19 +80,15 @@ import {
   workdirHostGroupKey,
 } from './runner.js';
 import { isTransientNetworkFailure } from './net-exec.js';
+import { classifyScreen, isMenuRule } from './detect/classify.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
 import {
   TmuxManager,
   ReplNotReadyError,
   detectStartupDialog,
-  detectRuntimeMenu,
-  runtimeBusyCheck,
   hasRuntimeReadyView,
   hasReplProcTitle,
   isShellProcTitle,
-  hasOscTitleWorking,
-  hasOscTitleIdle,
-  screenAllowsTitleIdle,
   PaneGoneError,
   type AdoptPaneState,
   type AgentRuntimeKind,
@@ -1772,7 +1768,7 @@ export class AgentManager {
         continue;
       }
 
-      const onMenu = detectRuntimeMenu(stripped);
+      const onMenu = isMenuRule(cfg.runtime, classifyScreen(cfg.runtime, stripped).matchedRuleId);
       if (onMenu && !pendingMenu) {
         pendingMenu = true;
         await this.emitIntervention(fresh.projectId, agentId, fresh.taskId, {
@@ -3723,31 +3719,44 @@ export class AgentManager {
 
   private async paneHasLiveTurn(tmux: TmuxManager, pane: PaneRef, runtime: AgentRuntimeKind): Promise<boolean> {
     const paneId = pane.paneId;
-    let first: string;
-    let firstTitle: string;
-    try {
-      first = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
-      firstTitle = await tmux.readPaneTitle(pane);
-    } catch (err) {
-      console.warn(`[AgentManager] interruptPaneAndWaitReady: liveness capture failed for pane ${paneId}:`, err);
-      return true;
-    }
+    const sample = async (phase: string): Promise<{ frame: string; title: string } | null> => {
+      try {
+        return {
+          frame: await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 }),
+          title: await tmux.readPaneTitle(pane),
+        };
+      } catch (err) {
+        console.warn(`[AgentManager] interruptPaneAndWaitReady: liveness ${phase} failed for pane ${paneId}:`, err);
+        return null;
+      }
+    };
+    const first = await sample('capture');
+    if (!first) return true;
+    // 空屏幕 = 只让标题规则说话:标题相对首帧变了且判 working,说明 turn 还活着
+    const titleTurnedWorking = (title: string): boolean =>
+      title !== first.title && classifyScreen(runtime, '', title).state === 'working';
+
+    let prev = first.frame;
+    let settledSinceChange = true;
     for (let i = 1; i < RUNTIME_LIVENESS_SAMPLES; i++) {
       await new Promise(r => setTimeout(r, this.runtimeLivenessProbeMs));
-      let frame: string;
-      let title: string;
-      try {
-        frame = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
-        title = await tmux.readPaneTitle(pane);
-      } catch (err) {
-        console.warn(`[AgentManager] interruptPaneAndWaitReady: liveness re-capture failed for pane ${paneId}:`, err);
-        return true;
+      const next = await sample('re-capture');
+      if (!next) return true;
+      if (titleTurnedWorking(next.title)) return true;
+      if (next.frame === prev) {
+        settledSinceChange = true;
+        continue;
       }
-      if (title !== firstTitle && hasOscTitleWorking(title)) return true;
-      if (hasRuntimeReadyView(frame, runtime)) return false;
-      if (frame !== first) return true;
+      if (!hasRuntimeReadyView(next.frame, runtime)) return true;
+      // working→idle 的最新帧已 ready:不能仅凭帧差判 live,需再观察一拍确认它稳定
+      prev = next.frame;
+      settledSinceChange = false;
     }
-    return false;
+    if (settledSinceChange) return false;
+    await new Promise(r => setTimeout(r, this.runtimeLivenessProbeMs));
+    const confirm = await sample('confirm capture');
+    if (!confirm) return true;
+    return titleTurnedWorking(confirm.title) || confirm.frame !== prev;
   }
 
   private async paneRunsRuntime(tmux: TmuxManager, pane: PaneRef, runtime: AgentRuntimeKind): Promise<boolean> {
@@ -8333,17 +8342,17 @@ export class AgentManager {
     const paneId = pane.paneId;
     const preTitle = await tmux.readPaneTitle(pane);
     const preFrame = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
-    const staticBusy = hasOscTitleWorking(preTitle)
-      ? (runtimeBusyCheck(preFrame, runtime) || !hasRuntimeReadyView(preFrame, runtime))
-      : runtimeBusyCheck(preFrame, runtime);
-    if (staticBusy && await this.paneHasLiveTurn(tmux, pane, runtime)) {
+    const preDetection = classifyScreen(runtime, preFrame, preTitle);
+    if (preDetection.state === 'pending') {
       throw new ReplNotReadyError(
         paneId,
         runtime,
         preFrame,
-        `pre-inject busy check: pane ${paneId} is still running a turn; dispatch aborted`,
+        `pre-inject check: pane ${paneId} shows a blocker; dispatch aborted`,
       );
     }
+    // working pane 上清稿的 C-c 会打断进行中的 turn
+    const paneWorking = preDetection.state === 'working';
     await revalidate?.();
     if (guardBeforePaste) {
       if (!(await guardBeforePaste())) {
@@ -8354,7 +8363,7 @@ export class AgentManager {
       try {
         pasted = await this.withTaskLock(async () => {
           if (!(await guardBeforePaste())) return false;
-          await tmux.clearComposerDraft(pane);
+          if (!paneWorking) await tmux.clearComposerDraft(pane);
           await tmux.pasteStagedBuffer(paneId, staged.buf);
           return true;
         });
@@ -8370,6 +8379,13 @@ export class AgentManager {
           );
         }
         if (bufferConsumed) {
+          const message = pasteErr instanceof Error ? pasteErr.message : String(pasteErr);
+          if (paneWorking) {
+            throw new DispatchTerminalError(
+              'ack_unknown',
+              `paste outcome unknown on working pane ${paneId}; composer left untouched to keep the live turn intact: ${message}`,
+            );
+          }
           try {
             await tmux.clearComposerDraft(pane);
           } catch (clearErr) {
@@ -8387,7 +8403,7 @@ export class AgentManager {
         return { acked: false, composerDelivered: false, aborted: true };
       }
     } else {
-      await tmux.clearComposerDraft(pane);
+      if (!paneWorking) await tmux.clearComposerDraft(pane);
       await revalidate?.();
       await tmux.injectPrompt(pane, prompt, agentId);
     }
@@ -8403,6 +8419,9 @@ export class AgentManager {
           return true;
         });
         if (!submitted) {
+          if (paneWorking) {
+            throw new Error(`fence-rejected prompt stays in the composer of working pane ${paneId}`);
+          }
           try {
             await tmux.clearComposerDraft(pane);
           } catch (err) {
@@ -8417,13 +8436,22 @@ export class AgentManager {
         await tmux.sendEnter(pane);
       }
     } catch (preAckErr) {
-      if (await this.clearComposerForReuse(tmux, pane, agentId)) throw preAckErr;
       const message = preAckErr instanceof Error ? preAckErr.message : String(preAckErr);
+      // working pane 上 scrub 的 C-c 会打断进行中的 turn:交人工核验,不动 composer
+      if (paneWorking) {
+        throw new DispatchTerminalError(
+          'ack_unknown',
+          `pre-ack failure left an unconfirmed composer on working pane ${paneId}: ${message}`,
+        );
+      }
+      if (await this.clearComposerForReuse(tmux, pane, agentId)) throw preAckErr;
       throw new DispatchTerminalError(
         'ack_unknown',
         `pre-ack failure left an unconfirmed composer on live pane ${paneId}: ${message}`,
       );
     }
+    // 判据必须取自粘贴之前:粘贴后的基线含提示词正文,会自匹配 working 规则
+    if (paneWorking) return { acked: true, composerDelivered: true };
     let staleDuringResend = false;
     try {
       await tmux.waitSubmitAck(pane, baseline, runtime, {
@@ -8471,8 +8499,7 @@ export class AgentManager {
           'baxian intentionally did NOT send C-c — the input may still be queued. ' +
           'Attach via web terminal to verify and resolve.',
       });
-      const composerDelivered = !/pane already busy at baseline/.test(message);
-      return { acked: false, composerDelivered };
+      return { acked: false, composerDelivered: true };
     }
   }
 
@@ -10537,17 +10564,8 @@ export class AgentManager {
     });
     await new Promise(r => setTimeout(r, this.compactIdlePollMs));
     while (true) {
-      const current = await tmux.displayMessage(pane, '#{pane_current_command}');
-      if (!hasReplProcTitle(current, runtime)) {
-        throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
-      }
-      const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
-      const ready = hasRuntimeReadyView(cap, runtime)
-        || (screenAllowsTitleIdle(cap, runtime) && hasOscTitleIdle(await tmux.readPaneTitle(pane), runtime));
-      if (detectRuntimeMenu(cap) || (!ready && detectStartupDialog(cap, runtime))) {
-        throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
-      }
-      if (!runtimeBusyCheck(cap, runtime)) {
+      const { cap, ready, working } = await this.probeReplPrompt(tmux, pane, runtime);
+      if (!working) {
         if (!ready) {
           throw new Error(`waitForReplPromptReady: pane ${paneId} observed idle but no ready anchor (stale frame?)`);
         }
@@ -10558,6 +10576,27 @@ export class AgentManager {
       }
       await new Promise(r => setTimeout(r, this.compactIdlePollMs));
     }
+  }
+
+  private async probeReplPrompt(
+    tmux: TmuxManager,
+    pane: PaneRef,
+    runtime: AgentRuntimeKind,
+  ): Promise<{ cap: string; ready: boolean; working: boolean }> {
+    const paneId = pane.paneId;
+    const current = await tmux.displayMessage(pane, '#{pane_current_command}');
+    if (!hasReplProcTitle(current, runtime)) {
+      throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
+    }
+    const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
+    let detection = classifyScreen(runtime, cap);
+    // 标题规则优先级最高:屏幕判 idle 不作数,必须带标题复核
+    if (detection.state === 'idle') detection = classifyScreen(runtime, cap, await tmux.readPaneTitle(pane));
+    const ready = hasRuntimeReadyView(cap, runtime, detection);
+    if (detection.state === 'pending' || detection.skipStateUpdate || detectStartupDialog(cap, runtime)) {
+      throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
+    }
+    return { cap, ready, working: detection.state === 'working' };
   }
 
   private async waitForReplPromptStableIdle(
@@ -10572,17 +10611,8 @@ export class AgentManager {
     const deadline = Date.now() + timeoutMs + (samples - 1) * spacing;
     let streak = 0;
     while (true) {
-      const current = await tmux.displayMessage(pane, '#{pane_current_command}');
-      if (!hasReplProcTitle(current, runtime)) {
-        throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
-      }
-      const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
-      const ready = hasRuntimeReadyView(cap, runtime)
-        || (screenAllowsTitleIdle(cap, runtime) && hasOscTitleIdle(await tmux.readPaneTitle(pane), runtime));
-      if (detectRuntimeMenu(cap) || (!ready && detectStartupDialog(cap, runtime))) {
-        throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
-      }
-      streak = ready && !runtimeBusyCheck(cap, runtime) ? streak + 1 : 0;
+      const { cap, ready } = await this.probeReplPrompt(tmux, pane, runtime);
+      streak = ready ? streak + 1 : 0;
       if (streak >= samples) return;
       if (Date.now() >= deadline) {
         throw new ReplNotReadyError(

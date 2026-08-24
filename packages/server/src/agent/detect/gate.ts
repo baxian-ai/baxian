@@ -5,75 +5,35 @@ export interface Gate {
   all?: Gate[];
   any?: Gate[];
   not?: Gate[];
-  notAfter?: Gate[];
 }
 
 const regexCache = new Map<string, RegExp>();
 
+const INLINE_FLAGS_RE = /^\(\?([ims]+)\)/;
+
 function getCachedRegExp(pattern: string): RegExp {
   let re = regexCache.get(pattern);
   if (!re) {
-    re = new RegExp(pattern);
+    // 规则用 Rust regex 方言:Unicode 默认开启,行首内联 flag 需转成 JS flags
+    const inline = INLINE_FLAGS_RE.exec(pattern);
+    const flags = inline ? inline[1] : '';
+    // Rust 走 DFA,前导 .* 不要钱;JS 回溯引擎下它让每行退化成 O(L²),而 test() 本就不锚定行首
+    const body = (inline ? pattern.slice(inline[0].length) : pattern).replace(/^\.\*(?![?*+])/, '');
+    re = new RegExp(body, `${flags}u`);
     regexCache.set(pattern, re);
   }
   return re;
 }
 
-function findLastPositiveMatchLine(gate: Gate, lines: string[]): number {
-  let last = -1;
-
-  if (gate.contains) {
-    for (const needle of gate.contains) {
-      const lower = needle.toLowerCase();
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (lines[i].toLowerCase().includes(lower)) {
-          last = Math.max(last, i);
-          break;
-        }
-      }
-    }
-  }
-
-  if (gate.lineRegex) {
-    for (const pattern of gate.lineRegex) {
-      const re = getCachedRegExp(pattern);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (re.test(lines[i])) {
-          last = Math.max(last, i);
-          break;
-        }
-      }
-    }
-  }
-
-  if (gate.regex) {
-    for (const pattern of gate.regex) {
-      const re = getCachedRegExp(pattern);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (re.test(lines[i])) {
-          last = Math.max(last, i);
-          break;
-        }
-      }
-    }
-  }
-
-  if (gate.any) {
-    for (const nested of gate.any) {
-      last = Math.max(last, findLastPositiveMatchLine(nested, lines));
-    }
-  }
-
-  if (gate.all) {
-    for (const nested of gate.all) {
-      last = Math.max(last, findLastPositiveMatchLine(nested, lines));
-    }
-  }
-
-  return last;
+export function compileGate(gate: Gate): void {
+  gate.regex?.forEach(getCachedRegExp);
+  gate.lineRegex?.forEach(getCachedRegExp);
+  gate.all?.forEach(compileGate);
+  gate.any?.forEach(compileGate);
+  gate.not?.forEach(compileGate);
 }
 
-export function evaluateGate(gate: Gate, text: string): boolean {
+export function evaluateGate(gate: Gate, text: string, lowerText = text.toLowerCase()): boolean {
   const hasMatcher =
     (gate.contains && gate.contains.length > 0)
     || (gate.regex && gate.regex.length > 0)
@@ -85,7 +45,6 @@ export function evaluateGate(gate: Gate, text: string): boolean {
   if (!hasMatcher) return false;
 
   if (gate.contains) {
-    const lowerText = text.toLowerCase();
     for (const needle of gate.contains) {
       if (!lowerText.includes(needle.toLowerCase())) return false;
     }
@@ -106,28 +65,17 @@ export function evaluateGate(gate: Gate, text: string): boolean {
 
   if (gate.all) {
     for (const nested of gate.all) {
-      if (!evaluateGate(nested, text)) return false;
+      if (!evaluateGate(nested, text, lowerText)) return false;
     }
   }
 
   if (gate.any && gate.any.length > 0) {
-    if (!gate.any.some(nested => evaluateGate(nested, text))) return false;
+    if (!gate.any.some(nested => evaluateGate(nested, text, lowerText))) return false;
   }
 
   if (gate.not) {
     for (const nested of gate.not) {
-      if (evaluateGate(nested, text)) return false;
-    }
-  }
-
-  if (gate.notAfter && gate.notAfter.length > 0) {
-    const lines = text.split('\n');
-    const anchor = findLastPositiveMatchLine(gate, lines);
-    if (anchor >= 0 && anchor < lines.length - 1) {
-      const suffix = lines.slice(anchor + 1).join('\n');
-      for (const nested of gate.notAfter) {
-        if (evaluateGate(nested, suffix)) return false;
-      }
+      if (evaluateGate(nested, text, lowerText)) return false;
     }
   }
 

@@ -1,12 +1,13 @@
 import { describe, it, expect } from 'vitest';
+import { CC_NONYOLO_BASH_PERMISSION_LINES } from '../runtime-captures.js';
 import { evaluateManifest, type AgentManifest } from '../../../src/agent/detect/manifest.js';
 import type { DetectionInput } from '../../../src/agent/detect/region.js';
 import claudeManifest from '../../../src/agent/detect/manifests/claude-code.json' with { type: 'json' };
 
 const manifest = claudeManifest as AgentManifest;
 
-function input(screen: string, oscTitle = ''): DetectionInput {
-  return { screen, oscTitle };
+function input(screen: string, oscTitle = '', oscProgress = ''): DetectionInput {
+  return { screen, oscTitle, oscProgress };
 }
 
 interface Expectation {
@@ -22,6 +23,7 @@ interface Case {
   name: string;
   lines: string[];
   osc?: string;
+  progress?: string;
   expect: Expectation;
 }
 
@@ -38,29 +40,7 @@ const BASH_PERMISSION_PROMPT = [
 const cases: Case[] = [
   {
     name: '非 YOLO bash 写文件权限 prompt（真实截屏 perm2-cc，issue #475）',
-    lines: [
-      "⏺ bx475",
-      "",
-      "✻ Churned for 10s",
-      "",
-      "❯ Run this exact bash command: touch /tmp/bx475-perm-probe",
-      "",
-      "⏺ Running 1 shell command…",
-      "  ⎿  $ touch /tmp/bx475-perm-probe",
-      "",
-      "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      " Bash command",
-      "",
-      "   touch /tmp/bx475-perm-probe",
-      "   Create empty file /tmp/bx475-perm-probe",
-      "",
-      " Do you want to proceed?",
-      " ❯ 1. Yes",
-      "   2. Yes, and always allow access to tmp/ from this project",
-      "   3. No",
-      "",
-      " Esc to cancel · Tab to amend · ctrl+e to explain",
-    ],
+    lines: CC_NONYOLO_BASH_PERMISSION_LINES,
     expect: { state: 'pending', rule: 'generic_permission_prompt', visibleBlocker: true },
   },
   {
@@ -70,15 +50,27 @@ const cases: Case[] = [
     expect: { state: 'working', rule: 'osc_title_working' },
   },
   {
+    name: 'detects OSC half-circle spinner as working (claude-code 2.1.228+, herdr charset)',
+    lines: [''],
+    osc: '◐ Baking…',
+    expect: { state: 'working', rule: 'osc_title_working' },
+  },
+  {
     name: 'detects OSC ✳ as idle',
     lines: [''],
     osc: '✳ ~/code/project',
-    expect: { state: 'idle', rule: 'osc_title_idle' },
+    expect: { state: 'idle', rule: 'osc_title_idle', visibleIdle: true },
+  },
+  {
+    name: 'detects OSC progress 4;0 as idle (herdr osc_progress region)',
+    lines: [''],
+    progress: '4;0;',
+    expect: { state: 'idle', rule: 'osc_progress_idle' },
   },
   {
     name: 'detects bash permission prompt as blocked',
     lines: [...BASH_PERMISSION_PROMPT],
-    expect: { state: 'pending', visibleBlocker: true },
+    expect: { state: 'pending', rule: 'bash_permission_prompt', visibleBlocker: true },
   },
   {
     name: 'detects transcript viewer as skipStateUpdate',
@@ -93,119 +85,115 @@ const cases: Case[] = [
     name: 'detects live blocked form (enter to select + navigation)',
     lines: [
       'some output',
-      '────────────────',
-      '  Enter to select · Esc to cancel',
-      '  ↑/↓ to navigate',
+      ' Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
     ],
-    expect: { state: 'pending', rule: 'live_blocked_form' },
+    expect: { state: 'pending', rule: 'live_blocked_form', visibleBlocker: true },
   },
   {
     name: 'detects dynamic workflow prompt as blocked',
-    lines: ['Run a dynamic workflow?', 'Esc to cancel'],
-    expect: { state: 'pending', rule: 'dynamic_workflow_prompt' },
+    lines: [
+      ' Run a dynamic workflow?',
+      ' Enter to run · Esc to cancel',
+    ],
+    expect: { state: 'pending', rule: 'dynamic_workflow_prompt', visibleBlocker: true },
   },
   {
     name: 'detects live prompt box as idle (prompt between horizontal rules)',
     lines: [
-      'output above',
-      '────────────────',
-      '  ❯ ',
-      '────────────────',
-      'status line',
+      'history output',
+      '──────────────',
+      '❯ ',
+      '──────────────',
     ],
     expect: { state: 'idle', rule: 'live_prompt_box', visibleIdle: true },
   },
   {
     name: 'model picker menu triggers skipStateUpdate',
     lines: [
-      'Select model',
-      'Enter to set as default',
-      'Esc to cancel',
+      ' Select model',
+      ' ❯ 1. Default (recommended)',
+      '   2. Opus',
+      ' Enter to set as default · Esc to cancel',
     ],
-    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
+    expect: { state: 'unknown', rule: 'model_picker_menu', skipStateUpdate: true },
   },
   {
-    name: 'detects active spinner as working',
-    lines: [
-      'some previous output',
-      '',
-      '· Reading packages/server/src/agent/tmux.ts… (12s',
-      '',
-      '  esc to interrupt',
-    ],
-    expect: { state: 'working' },
+    name: 'detects active spinner as working (herdr live_turn_working)',
+    lines: ['✻ Pondering… (3s · esc to interrupt)'],
+    expect: { state: 'working', rule: 'live_turn_working' },
   },
   {
-    name: 'detects idle composer prompt',
-    lines: [
-      'previous output done.',
-      '',
-      '❯ ',
-      '',
-    ],
-    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+    name: 'detects the ⏸⏵ status line with esc to interrupt as working',
+    lines: ['⏵ Thinking · esc to interrupt'],
+    expect: { state: 'working', rule: 'live_turn_working' },
   },
   {
-    name: 'falls back to idle on unrecognized screen',
-    lines: ['Welcome to Claude Code'],
+    name: 'a bare unboxed ❯ composer falls back to default idle (herdr: live_prompt_box needs the box)',
+    lines: ['some transcript', '❯ '],
     expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'screen idle overrides stale OSC working when no screen working signals',
-    lines: ['❯ ', ''],
-    osc: '⠁ Thinking',
-    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+    name: 'falls back to idle on unrecognized screen',
+    lines: ['just some random output'],
+    expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'NBSP composer (claude-code ≥2.1 non-yolo, no box chrome) still overrides stale OSC working',
-    lines: ['❯\u00a0', ''],
-    osc: '⠁ Thinking',
-    expect: { state: 'idle', rule: 'idle_composer_prompt' },
-  },
-  {
-    name: 'spinner_working outranks live_prompt_box when OSC title is empty',
+    name: 'a working OSC title outranks a boxed idle composer — no arbitration (herdr)',
     lines: [
-      '· Stewing… (5s',
-      '────────────────',
+      'done',
+      '──────────────',
       '❯ ',
-      '────────────────',
+      '──────────────',
     ],
-    osc: '',
-    expect: { state: 'working', rule: 'spinner_working' },
+    osc: '⠧ thinking',
+    expect: { state: 'working', rule: 'osc_title_working' },
   },
   {
-    name: 'model_picker_menu outranks runtime_menu',
+    name: 'a working OSC title outranks an NBSP composer screen (herdr: no screen idle rule matches it)',
+    lines: ['\u00a0❯ '],
+    osc: '⠧ thinking',
+    expect: { state: 'working', rule: 'osc_title_working' },
+  },
+  {
+    name: 'live_turn_working outranks live_prompt_box when both are visible',
     lines: [
-      'Select model',
-      '  Claude Sonnet 4',
-      '  Claude Opus 4',
-      'Enter to set as default · Esc to cancel',
+      '✻ Baking… (12s · esc to interrupt)',
+      '──────────────',
+      '❯ ',
+      '──────────────',
     ],
-    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
+    expect: { state: 'working', rule: 'live_turn_working' },
   },
   {
-    name: 'blocked wins over working spinner',
+    name: 'a blocked form outranks a working spinner (980 vs 970)',
     lines: [
-      '· Reading file… (3s',
-      'Do you want to proceed?',
-      'bash command',
-      '❯ Yes',
-      '2. No',
+      '✻ Baking… (12s · esc to interrupt)',
+      ' Enter to confirm · Esc to cancel',
     ],
-    expect: { state: 'pending' },
+    expect: { state: 'pending', rule: 'live_blocked_form' },
   },
   {
-    name: 'legacy blocker "waiting for permission" sets visibleBlocker',
-    lines: ['waiting for permission', 'yes', ''],
-    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker', visibleBlocker: true },
+    name: 'legacy blocker "waiting for permission" is pending (herdr: not a visible blocker)',
+    lines: ['waiting for permission'],
+    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker', visibleBlocker: false },
   },
   {
-    name: 'legacy blocker "tab to amend" sets visibleBlocker',
-    lines: ['Run this command?', 'Tab to amend', ''],
-    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker', visibleBlocker: true },
+    name: 'legacy blocker "tab to amend" is pending (herdr: not a visible blocker)',
+    lines: ['Tab to amend'],
+    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker', visibleBlocker: false },
   },
   {
-    name: 'stale transcript text does not suppress runtime_menu footer',
+    name: 'legacy blocker is suppressed by a bare ❯ line anywhere on screen (herdr not-gate)',
+    lines: ['waiting for permission', '❯', ''],
+    expect: { notRule: 'legacy_no_prompt_blocker' },
+  },
+  {
+    name: 'a bare > line does NOT suppress the legacy blocker (herdr not-gate is ❯ only)',
+    lines: ['waiting for permission', '>', ''],
+    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker' },
+  },
+  {
+    name: 'transcript text scrolled out of the bottom-3 window does not suppress a blocked form',
     lines: [
       'Showing detailed transcript',
       'line a',
@@ -213,20 +201,32 @@ const cases: Case[] = [
       '',
       'Enter to confirm · Esc to cancel',
     ],
-    expect: { notRule: 'transcript_viewer', rule: 'runtime_menu', state: 'pending' },
+    expect: { notRule: 'transcript_viewer', rule: 'live_blocked_form', state: 'pending' },
   },
   {
-    name: 'live_prompt_box does not match selection indicator ❯ Yes between rules',
+    name: 'a ❯ Yes selection between rules reads as a live prompt box under herdr (no strict empty-line shape)',
     lines: [
       'Would you like to proceed?',
       '────────────────',
       '❯ Yes',
       '────────────────',
     ],
-    expect: { notRule: 'live_prompt_box' },
+    expect: { state: 'idle', rule: 'live_prompt_box' },
   },
   {
-    name: 'transcript viewer content with historical menu footer still matches as transcript',
+    name: 'a wrapped footer without the transcript phrase in the bottom window no longer beats the composer (herdr shape)',
+    lines: [
+      'transcript body',
+      '────────────────',
+      '❯ ',
+      '────────────────',
+      'ctrl+o to toggle · esc to',
+      'close',
+    ],
+    expect: { notRule: 'transcript_viewer_wrapped', rule: 'live_prompt_box' },
+  },
+  {
+    name: 'a historical menu footer with the transcript phrase out of window classifies as the blocked form (herdr)',
     lines: [
       'Showing detailed transcript',
       'Earlier output from a previous menu:',
@@ -234,524 +234,105 @@ const cases: Case[] = [
       '',
       'ctrl+o to toggle',
     ],
-    expect: { rule: 'transcript_viewer', skipStateUpdate: true },
+    expect: { rule: 'live_blocked_form', state: 'pending' },
   },
   {
-    name: 'legacy blocker is suppressed by bare > prompt',
-    lines: ['waiting for permission', '>', ''],
-    expect: { notRule: 'legacy_no_prompt_blocker' },
-  },
-  {
-    name: 'legacy blocker is suppressed by esc to interrupt',
-    lines: ['waiting for permission', 'Esc to interrupt', ''],
-    expect: { notRule: 'legacy_no_prompt_blocker' },
-  },
-  {
-    name: 'stale bash permission prompt is suppressed by bare ❯ prompt',
+    name: 'a stale bash permission prompt keeps matching over a bare unboxed ❯-space (herdr: not-gate needs a bare ❯ line)',
     lines: [
       ...BASH_PERMISSION_PROMPT,
-      '────────────────',
-      '  ❯ ',
-      '────────────────',
-    ],
-    expect: { notRule: 'bash_permission_prompt' },
-  },
-  {
-    name: 'stale bash permission prompt above horizontal rules loses to current spinner',
-    lines: [
-      ...BASH_PERMISSION_PROMPT,
-      '────────────────',
-      '  ❯ continue',
-      '────────────────',
-      '· Running… (3s',
-      '  esc to interrupt',
-    ],
-    expect: { notRule: 'bash_permission_prompt', rule: 'spinner_working' },
-  },
-  {
-    name: 'stale esc-to-interrupt above idle prompt does not stay working',
-    lines: [
-      '────────────────',
-      '  ❯ previous',
-      '────────────────',
-      '  esc to interrupt',
       '',
-      '❯ ',
-    ],
-    expect: { notRule: 'esc_to_interrupt_working' },
-  },
-  {
-    name: 'stale esc-to-interrupt above an NBSP idle composer does not stay working (claude-code ≥2.1 non-yolo)',
-    lines: [
-      '────────────────',
-      '  ❯ previous',
-      '────────────────',
-      '  esc to interrupt',
-      '',
-      '❯\u00a0',
-    ],
-    expect: { state: 'idle', notRule: 'esc_to_interrupt_working' },
-  },
-  {
-    name: 'visible screen blocker overrides stale OSC working spinner',
-    lines: [
-      '  Do you want to proceed?',
-      '  bash command',
-      '  Tab to amend',
-      '  ❯ Yes',
-      '  2. No',
-    ],
-    osc: '⠁ Reading file',
-    expect: { state: 'pending', visibleBlocker: true, rule: 'bash_permission_prompt' },
-  },
-  {
-    name: 'screen idle overrides stale OSC working even with other output',
-    lines: ['some output', '❯ ', ''],
-    osc: '⠁ Reading file',
-    expect: { state: 'idle', rule: 'idle_composer_prompt' },
-  },
-  {
-    name: 'stale dynamic workflow prompt suppressed by bare ❯ prompt',
-    lines: [
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-      '',
-      '────────────────',
-      '  ❯ ',
-      '────────────────',
-    ],
-    expect: { notRule: 'dynamic_workflow_prompt' },
-  },
-  {
-    name: 'runtime_menu matches lowercase footer',
-    lines: [
-      'some output',
-      'enter to confirm · esc to cancel',
-    ],
-    expect: { state: 'pending', rule: 'runtime_menu' },
-  },
-  {
-    name: 'stale live_blocked_form suppressed by current spinner',
-    lines: [
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-      'agent continued',
-      '· Running… (3s',
-    ],
-    expect: { notRule: 'live_blocked_form' },
-  },
-  {
-    name: 'stale model_picker_menu loses to current spinner',
-    lines: [
-      'Select model',
-      '  Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-      '· Running… (3s',
-    ],
-    expect: { notRule: 'model_picker_menu' },
-  },
-  {
-    name: 'stale model_picker_menu loses to current runtime_menu',
-    lines: [
-      'Select model',
-      '  Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-      'output',
-      'Enter to confirm · Esc to cancel',
-    ],
-    expect: { notRule: 'model_picker_menu' },
-  },
-  {
-    name: 'generic_permission_prompt suppressed by bare ❯ prompt',
-    lines: [
-      'Do you want to proceed?',
-      'Esc to cancel',
-      '❯ 1. Yes',
-      '2. No',
-      '',
-      '❯ ',
-    ],
-    expect: { notRule: 'generic_permission_prompt' },
-  },
-  {
-    name: 'legacy_no_prompt_blocker scoped to after last horizontal rule',
-    lines: [
-      'waiting for permission',
-      'yes',
-      '────────────────',
-      '  ❯ continue',
-      '────────────────',
-      '· Running… (3s',
-    ],
-    expect: { notRule: 'legacy_no_prompt_blocker' },
-  },
-  {
-    name: 'spinner still matches when completed marker is above in tail(10)',
-    lines: [
-      '✻ Worked for 3s',
-      '· Reading file… (1s',
-      '  esc to interrupt',
-    ],
-    expect: { state: 'working', rule: 'spinner_working' },
-  },
-  {
-    name: 'stale model picker is suppressed by esc to interrupt',
-    lines: [
-      'Select model',
-      '  Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-      '  esc to interrupt',
-    ],
-    expect: { notRule: 'model_picker_menu' },
-  },
-  {
-    name: 'low-priority legacy blocker does not override OSC working',
-    lines: ['waiting for permission', 'yes', ''],
-    osc: '⠁ Reading file',
-    expect: { state: 'working', rule: 'osc_title_working' },
-  },
-  {
-    name: 'old bare prompt above current blocker does not suppress (notAfter position-aware)',
-    lines: [
-      '❯ ',
-      'some output',
-      ...BASH_PERMISSION_PROMPT,
+      '❯x',
     ],
     expect: { state: 'pending', rule: 'bash_permission_prompt' },
   },
   {
-    name: 'old esc-to-interrupt above current legacy blocker does not suppress',
+    name: 'a current spinner outranks a stale permission prompt (970 vs 850)',
     lines: [
-      'esc to interrupt',
-      'some output',
-      'waiting for permission',
-      'yes',
+      ...BASH_PERMISSION_PROMPT,
+      '',
+      '✻ Baking… (5s · esc to interrupt)',
     ],
-    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker' },
+    expect: { state: 'working', rule: 'live_turn_working' },
   },
   {
-    name: 'stale runtime menu suppressed by current spinner (notAfter)',
+    name: 'a stale spinner line inside the bottom-12 window keeps matching after Worked-for (herdr: window-only recency)',
     lines: [
-      'Enter to confirm · Esc to cancel',
-      '· Running… (3s',
-    ],
-    expect: { notRule: 'runtime_menu', state: 'working' },
-  },
-  {
-    name: 'completed spinner does not match when Worked-for follows (notAfter)',
-    lines: [
-      '· Running… (3s',
-      '✻ Worked for 3s',
-      '❯ ',
-    ],
-    expect: { notRule: 'spinner_working', state: 'idle' },
-  },
-  {
-    name: 'model picker skip overrides stale OSC working',
-    lines: [
-      'Select model',
-      '  Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-    ],
-    osc: '⠁ Reading file',
-    expect: { skipStateUpdate: true, rule: 'model_picker_menu' },
-  },
-  {
-    name: 'stale generic permission prompt suppressed by current spinner',
-    lines: [
-      'Do you want to proceed?',
-      'Esc to cancel',
-      '❯ 1. Yes',
-      '2. No',
-      '· Running… (3s',
-    ],
-    expect: { notRule: 'generic_permission_prompt', state: 'working' },
-  },
-  {
-    name: 'screen blocker wins over stale model picker when OSC is working',
-    lines: [
-      'Select model',
-      '  Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-      '────────────────',
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-    ],
-    osc: '⠁ Reading file',
-    expect: { state: 'pending', rule: 'dynamic_workflow_prompt' },
-  },
-  {
-    name: 'legacy blocker ❯ in options does not pollute notAfter anchor',
-    lines: [
-      'Do you want to proceed?',
-      '❯ Yes',
+      '✻ Baking… (5s · esc to interrupt)',
+      '✻ Worked for 10s',
       '',
       '❯ ',
     ],
-    expect: { notRule: 'legacy_no_prompt_blocker' },
+    expect: { state: 'working', rule: 'live_turn_working' },
   },
   {
-    name: 'model picker survives stale "Do you want to proceed?" in scrollback',
+    name: 'the bypass permissions banner is not idle evidence under herdr (default idle)',
+    lines: ['⏵⏵ bypass permissions on'],
+    expect: { state: 'idle', rule: undefined },
+  },
+  {
+    name: 'a working OSC title wins over the bypass permissions banner screen',
+    lines: ['⏵⏵ bypass permissions on'],
+    osc: '⠧ thinking',
+    expect: { state: 'working', rule: 'osc_title_working' },
+  },
+  {
+    name: 'a stale blocked-form footer outranks a current model picker (herdr: 980 vs 900, no position awareness)',
+    lines: [
+      ' Enter to select · Arrow keys to navigate · Esc to cancel',
+      '',
+      ' Select model',
+      ' Enter to set as default',
+    ],
+    expect: { state: 'pending', rule: 'live_blocked_form' },
+  },
+  {
+    name: 'model picker with do-you-want-to-proceed on screen is killed by its not-gate',
     lines: [
       'Do you want to proceed?',
-      'Tab to amend',
-      '❯ Yes',
-      '2. No',
-      '────────────────',
-      'Select model',
-      '  Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-    ],
-    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
-  },
-  {
-    name: 'stale runtime menu suppressed by current esc-to-interrupt',
-    lines: [
-      'Enter to confirm · Esc to cancel',
-      '  esc to interrupt',
-    ],
-    expect: { notRule: 'runtime_menu' },
-  },
-  {
-    name: 'stale bash permission prompt suppressed by current esc-to-interrupt',
-    lines: [
-      '─────────────────',
-      'Do you want to proceed?',
-      'Bash command: ls',
-      '❯ Yes',
-      '  2. No',
-      'Tab to amend · Ctrl+E to explain',
-      'esc to interrupt',
-    ],
-    expect: { notRule: 'bash_permission_prompt' },
-  },
-  {
-    name: 'stale generic permission prompt suppressed by current esc-to-interrupt',
-    lines: [
-      '─────────────────',
-      'Do you want to proceed? Esc to cancel',
-      '  1. Yes',
-      '  2. No',
-      'esc to interrupt',
-    ],
-    expect: { notRule: 'generic_permission_prompt' },
-  },
-  {
-    name: 'stale live_blocked_form suppressed by current esc-to-interrupt',
-    lines: [
-      '─────────────────',
-      'Enter to select · Esc to cancel',
-      'Tab/arrow keys to navigate',
-      'esc to interrupt',
-    ],
-    expect: { notRule: 'live_blocked_form' },
-  },
-  {
-    name: 'stale model picker suppressed by legacy blocker below',
-    lines: [
-      'Select model',
-      'Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-      '─────────────────',
-      'Review your answers',
-      '❯ Yes',
+      ' Select model',
+      ' Enter to set as default · Esc to cancel',
     ],
     expect: { notRule: 'model_picker_menu' },
   },
   {
-    name: 'stale model picker suppressed by "would you like to" blocker below',
-    lines: [
-      'Select model',
-      'Claude Sonnet 4',
-      'Enter to set as default · Esc to cancel',
-      '─────────────────',
-      'Would you like to install this extension?',
-      '❯ Yes',
-    ],
-    expect: { notRule: 'model_picker_menu' },
+    name: 'background shells status line is working (herdr background_shell_working)',
+    lines: ['⏸ plan mode · 2 shells ·'],
+    expect: { state: 'working', rule: 'background_shell_working' },
   },
   {
-    name: 'bypass permissions banner recognized as visible idle',
+    name: 'waiting-for-background-agents above the prompt box is working (herdr background_agents_working)',
     lines: [
-      '❯ summarize previous task',
-      '────────────────────────────────────────────────────────────────────────────────',
-      '  Opus 4.7 [#################   ] 87%',
-      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+      '✻ Waiting for 2 background agents to finish',
+      '',
+      '──────────────',
+      '❯ ',
+      '──────────────',
     ],
-    expect: { state: 'idle', rule: 'idle_composer_prompt', visibleIdle: true },
+    expect: { state: 'working', rule: 'background_agents_working' },
   },
   {
-    name: 'stale OSC working overridden by bypass permissions banner',
-    lines: [
-      '❯ summarize previous task',
-      '────────────────────────────────────────────────────────────────────────────────',
-      '  Opus 4.7 [#################   ] 87%',
-      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-    ],
-    osc: '⠁ Reading file',
-    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+    name: 'MCP tasks still running is working (herdr background_mcp_task_working)',
+    lines: ['· Running research task · 2 MCP tasks still running'],
+    expect: { state: 'working', rule: 'background_mcp_task_working' },
   },
   {
-    name: 'bypass permissions in mid-output does NOT trigger idle',
+    name: 'the /btw overlay is working (herdr btw_overlay_working)',
     lines: [
-      'still streaming',
-      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-      'more output',
+      '/btw session notes',
+      'esc to close',
     ],
-    osc: '⠁ Reading file',
-    expect: { notRule: 'idle_composer_prompt' },
-  },
-  {
-    name: 'bare ❯ in mid-tail does NOT trigger idle when output follows',
-    lines: [
-      'some output',
-      '❯',
-      'more streaming',
-    ],
-    osc: '⠁ Working',
-    expect: { notRule: 'idle_composer_prompt' },
-  },
-  {
-    name: 'stale model picker suppressed by bypass permissions below',
-    lines: [
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-      '─────────────────',
-      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-    ],
-    expect: { notRule: 'model_picker_menu' },
-  },
-  {
-    name: 'stale live_blocked_form loses to current model picker (footer with Esc)',
-    lines: [
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-    ],
-    expect: { notRule: 'live_blocked_form', rule: 'model_picker_menu', skipStateUpdate: true },
-  },
-  {
-    name: 'stale live_blocked_form loses to current model picker (footer without Esc)',
-    lines: [
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-    ],
-    expect: { notRule: 'live_blocked_form', rule: 'model_picker_menu', skipStateUpdate: true },
-  },
-  {
-    name: 'stale dynamic_workflow_prompt loses to current model picker (footer with Esc)',
-    lines: [
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-    ],
-    expect: { notRule: 'dynamic_workflow_prompt', rule: 'model_picker_menu', skipStateUpdate: true },
-  },
-  {
-    name: 'stale dynamic_workflow_prompt loses to current model picker (footer without Esc)',
-    lines: [
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-    ],
-    expect: { notRule: 'dynamic_workflow_prompt', rule: 'model_picker_menu', skipStateUpdate: true },
-  },
-  {
-    name: 'detects live_blocked_form with split footer (Enter/Esc on separate lines)',
-    lines: [
-      'Enter to select',
-      '↑/↓ to navigate',
-      'Esc to cancel',
-    ],
-    expect: { rule: 'live_blocked_form', state: 'pending' },
-  },
-  {
-    name: 'current live_blocked_form wins over stale model picker above',
-    lines: [
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-    ],
-    expect: { rule: 'live_blocked_form', state: 'pending' },
-  },
-  {
-    name: 'current dynamic_workflow_prompt wins over stale model picker above',
-    lines: [
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-    ],
-    expect: { rule: 'dynamic_workflow_prompt', state: 'pending' },
-  },
-  {
-    name: 'stale live_blocked_form loses to current model picker (split footer)',
-    lines: [
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-      'Esc to cancel',
-    ],
-    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
-  },
-  {
-    name: 'stale dynamic_workflow_prompt loses to current model picker (split footer)',
-    lines: [
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-      'Esc to cancel',
-    ],
-    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
-  },
-  {
-    name: 'stale model picker suppressed by mid-screen bypass with working output',
-    lines: [
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'some working output',
-      'more output',
-    ],
-    expect: { notRule: 'model_picker_menu' },
+    expect: { state: 'working', rule: 'btw_overlay_working' },
   },
 ];
 
 describe('claude-code manifest', () => {
-  it.each(cases)('$name', ({ lines, osc, expect: want }) => {
-    const result = evaluateManifest(manifest, input(lines.join('\n'), osc ?? ''));
+  it.each(cases)('$name', ({ lines, osc, progress, expect: want }) => {
+    const result = evaluateManifest(manifest, input(lines.join('\n'), osc ?? '', progress ?? ''));
     if (want.state !== undefined) expect(result.state).toBe(want.state);
     if ('rule' in want) expect(result.matchedRuleId).toBe(want.rule);
     if (want.notRule !== undefined) expect(result.matchedRuleId).not.toBe(want.notRule);
     if (want.visibleBlocker !== undefined) expect(result.visibleBlocker).toBe(want.visibleBlocker);
     if (want.visibleIdle !== undefined) expect(result.visibleIdle).toBe(want.visibleIdle);
     if (want.skipStateUpdate !== undefined) expect(result.skipStateUpdate).toBe(want.skipStateUpdate);
-  });
-
-  it.each([
-    { rule: 'bash_permission_prompt',    header: ['Do you want to proceed?', 'Bash command', '❯ Yes'],      state: 'pending', blocker: true },
-    { rule: 'generic_permission_prompt', header: ['Do you want to proceed?', 'Esc to cancel', '❯ 1. Yes'], state: 'pending', blocker: true },
-    { rule: 'runtime_menu',             header: ['Enter to confirm · Esc to cancel'],                       state: 'pending', blocker: true },
-    { rule: 'esc_to_interrupt_working',  header: ['Esc to interrupt'],                                       state: 'working', blocker: false },
-  ])('mid-screen bypass does NOT suppress $rule', ({ rule, header, state, blocker }) => {
-    const screen = [...header, '  ⏵⏵ bypass permissions on (shift+tab to cycle)', 'more output'].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe(state);
-    if (blocker) expect(result.visibleBlocker).toBe(true);
-    expect(result.matchedRuleId).toBe(rule);
   });
 });

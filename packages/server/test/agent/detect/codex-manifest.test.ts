@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { CODEX_NONYOLO_ESCALATION_LINES } from '../runtime-captures.js';
 import { evaluateManifest, type AgentManifest } from '../../../src/agent/detect/manifest.js';
 import type { DetectionInput } from '../../../src/agent/detect/region.js';
 import codexManifest from '../../../src/agent/detect/manifests/codex.json' with { type: 'json' };
@@ -28,45 +29,26 @@ interface Case {
 const cases: Case[] = [
   {
     name: '非 YOLO home 越界 escalation prompt（真实截屏 perm2-codex，issue #475）',
-    lines: [
-      "• Done.",
-      "",
-      "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "",
-      "› Run this exact bash command: touch ~/bx475-perm-probe",
-      "",
-      "",
-      "• Running touch ~/bx475-perm-probe",
-      "",
-      "",
-      "  Would you like to run the following command?",
-      "",
-      "  Environment: local",
-      "",
-      "  Reason: Do you want to allow creating /Users/devuser/bx475-perm-probe in your home directory?",
-      "",
-      "  $ touch ~/bx475-perm-probe",
-      "",
-      "› 1. Yes, proceed (y)",
-      "  2. Yes, and don't ask again for commands that start with `touch '~/bx475-perm-probe'` (p)",
-      "  3. No, and tell Codex what to do differently (esc)",
-      "",
-      "  Press enter to confirm or esc to cancel",
-    ],
+    lines: CODEX_NONYOLO_ESCALATION_LINES,
     expect: { state: 'pending', rule: 'live_strong_blocker', visibleBlocker: true },
   },
   {
     name: 'detects OSC "Action Required" as blocked',
     lines: [''],
     osc: 'Action Required',
-    expect: { state: 'pending', visibleBlocker: true },
+    expect: { state: 'pending', rule: 'osc_title_blocked', visibleBlocker: true },
   },
   {
-    name: 'detects OSC braille spinner as working',
+    name: 'detects an OSC spinner-frame title as working (herdr 10-frame set)',
+    lines: [''],
+    osc: '⠙ codex',
+    expect: { state: 'working', rule: 'osc_title_working' },
+  },
+  {
+    name: 'a braille char outside the herdr spinner set is idle evidence, not working',
     lines: [''],
     osc: '⠁ codex',
-    expect: { state: 'working' },
+    expect: { state: 'idle', rule: 'osc_title_idle' },
   },
   {
     name: 'detects transcript viewer as skipStateUpdate',
@@ -87,29 +69,29 @@ const cases: Case[] = [
     expect: { state: 'pending', rule: 'live_strong_blocker', visibleBlocker: true },
   },
   {
-    name: 'blocker with numbered selection is not cut by prompt marker',
+    name: 'a "› 1. Yes" selection line is itself a prompt marker and cuts the blocker region (herdr codex_prompt_line)',
     lines: [
       '›',
       'Allow command?',
       '› 1. Yes',
       '  2. No',
     ],
-    expect: { state: 'pending', rule: 'live_strong_blocker' },
+    expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'detects weak blocker [y/n] with visibleBlocker',
+    name: 'detects weak blocker [y/n] (herdr: weak_blocker is not a visible blocker)',
     lines: ['Continue? [y/n]'],
-    expect: { state: 'pending', rule: 'weak_blocker', visibleBlocker: true },
+    expect: { state: 'pending', rule: 'weak_blocker', visibleBlocker: false },
   },
   {
-    name: 'stale weak blocker does not override current working line',
+    name: 'a stale weak blocker keeps matching over a later Working line (herdr: no suppression)',
     lines: [
       'Do you want to continue?',
       'Yes (y)',
       '',
       'Working (8s)',
     ],
-    expect: { rule: 'working_line', state: 'working' },
+    expect: { state: 'pending', rule: 'weak_blocker' },
   },
   {
     name: 'OSC non-spinner non-action-required is idle',
@@ -118,17 +100,17 @@ const cases: Case[] = [
     expect: { state: 'idle', rule: 'osc_title_idle' },
   },
   {
-    name: 'stale weak blocker is suppressed by bare › prompt',
+    name: 'a stale weak blocker keeps matching over a bare › prompt (herdr: no suppression)',
     lines: [
       'Do you want to continue?',
       'Yes (y)',
       '',
       '›',
     ],
-    expect: { notRule: 'weak_blocker' },
+    expect: { state: 'pending', rule: 'weak_blocker' },
   },
   {
-    name: 'transcript viewer footer does not override active blocker when not on last line',
+    name: 'transcript viewer (p1000) outranks a strong blocker (p900) sharing the region (herdr priorities)',
     lines: [
       '› prompt here',
       '↑/↓ to scroll · pgup/pgdn to page · home/end to jump · q to quit',
@@ -137,7 +119,7 @@ const cases: Case[] = [
       'Allow command?',
       'rm -rf /tmp/test',
     ],
-    expect: { notRule: 'transcript_viewer', rule: 'live_strong_blocker' },
+    expect: { rule: 'transcript_viewer', skipStateUpdate: true },
   },
   {
     name: 'falls back to idle on unrecognized screen',
@@ -145,7 +127,7 @@ const cases: Case[] = [
     expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'visible screen blocker overrides stale OSC working spinner',
+    name: 'a screen blocker wins over a non-frame braille title (title is idle evidence at p100)',
     lines: [
       '› previous prompt',
       'Allow command?',
@@ -155,29 +137,40 @@ const cases: Case[] = [
     expect: { state: 'pending', visibleBlocker: true, rule: 'live_strong_blocker' },
   },
   {
-    name: 'stale strong blocker loses to current Working line',
+    name: 'a spinner-frame OSC title (p1050) outranks a screen blocker (p900) — no arbitration (herdr)',
+    lines: [
+      '› previous prompt',
+      'Allow command?',
+      'rm -rf /tmp/test',
+    ],
+    osc: '⠙ codex',
+    expect: { state: 'working', rule: 'osc_title_working' },
+  },
+  {
+    name: 'a stale strong blocker keeps matching over a later Working line (herdr: no suppression)',
     lines: [
       '› do something',
       'Allow command?',
       'rm -rf test',
       'Working (3s)',
     ],
-    expect: { notRule: 'live_strong_blocker', rule: 'working_line' },
+    expect: { state: 'pending', rule: 'live_strong_blocker' },
   },
   {
-    name: 'stale OSC Action Required overridden by visible idle prompt',
+    name: 'an Action Required OSC title (p1100) outranks a bare › prompt — no arbitration (herdr)',
     lines: ['›'],
     osc: 'Action Required',
-    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+    expect: { state: 'pending', rule: 'osc_title_blocked' },
   },
   {
-    name: 'stale OSC Action Required overridden by visible Working line',
+    name: 'an Action Required OSC title outranks a screen strong blocker (both pending, title p1100 wins)',
     lines: [
-      '› do something',
-      'Working (5s)',
+      '›',
+      'Allow command?',
+      'Press Enter to confirm or Esc to cancel',
     ],
     osc: 'Action Required',
-    expect: { state: 'working', rule: 'working_line' },
+    expect: { state: 'pending', rule: 'osc_title_blocked' },
   },
   {
     name: 'new blocker after old Working is not suppressed',
@@ -190,177 +183,71 @@ const cases: Case[] = [
     expect: { state: 'pending', rule: 'live_strong_blocker' },
   },
   {
-    name: 'arrow composer → at tail excludes stale esc-to-interrupt',
-    lines: [
-      '› old prompt',
-      'esc to interrupt',
-      '→ baxian git:(main)',
-    ],
-    expect: { notRule: 'esc_to_interrupt_working' },
-  },
-  {
-    name: 'OSC pending prefers screen blocker over screen idle evidence',
-    lines: [
-      '›',
-      'Allow command?',
-      'Press Enter to confirm or Esc to cancel',
-    ],
-    osc: 'Action Required',
-    expect: { state: 'pending', rule: 'live_strong_blocker' },
-  },
-  {
-    name: 'arrow composer → recognized as visible idle',
+    name: 'the → shell composer is not a codex prompt marker nor idle evidence (herdr: default idle)',
     lines: [
       'some output',
       '→ baxian git:(main)',
     ],
-    expect: { state: 'idle', rule: 'codex_idle_prompt', visibleIdle: true },
+    expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'stale OSC Action Required overridden by arrow composer →',
-    lines: ['→ baxian git:(main)'],
-    osc: 'Action Required',
-    expect: { state: 'idle', rule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'stale weak blocker suppressed by arrow composer →',
+    name: 'a stale weak blocker keeps matching over a shell composer below (herdr: no suppression)',
     lines: [
       'Continue? [y/n]',
       '→ baxian git:(main)',
     ],
-    expect: { notRule: 'weak_blocker' },
+    expect: { state: 'pending', rule: 'weak_blocker' },
   },
   {
-    name: 'stale strong blocker suppressed by arrow composer →',
+    name: 'a newer › marker cuts an older strong blocker out of the region',
     lines: [
       '› old prompt',
       'Allow command?',
-      'Press Enter to confirm or Esc to cancel',
-      '→ baxian git:(main)',
-    ],
-    expect: { notRule: 'live_strong_blocker' },
-  },
-  {
-    name: 'arrow composer with user input is NOT idle (strict shape)',
-    lines: ['→ run tests'],
-    expect: { notRule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'ready-anchor (› prompt + project footer) recognized as visible idle',
-    lines: [
-      '› do something',
-      '',
-      '  baxian · idle',
-    ],
-    expect: { state: 'idle', rule: 'codex_idle_prompt', visibleIdle: true },
-  },
-  {
-    name: 'stale OSC Action Required overridden by ready-anchor',
-    lines: [
-      '› previous task',
-      '',
-      '  baxian · idle',
-    ],
-    osc: 'Action Required',
-    expect: { state: 'idle', rule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'stale weak blocker suppressed by ready-anchor below',
-    lines: [
-      'Continue? [y/n]',
+      'Press enter to confirm or esc to cancel',
       '› finished task',
       '',
       '  baxian · idle',
     ],
-    expect: { notRule: 'weak_blocker' },
+    expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'stale strong blocker suppressed by ready-anchor below',
-    lines: [
-      '› old prompt',
-      'Allow command?',
-      'Press Enter to confirm or Esc to cancel',
-      '› finished task',
-      '',
-      '  baxian · idle',
-    ],
-    expect: { notRule: 'live_strong_blocker' },
-  },
-  {
-    name: 'ready-anchor in mid-screen does NOT trigger idle (must be at tail end)',
-    lines: [
-      '› old prompt',
-      '',
-      '  baxian · idle',
-      'Working (3s)',
-      'esc to interrupt',
-    ],
-    expect: { notRule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'arrow composer without git context still matches if single word',
-    lines: ['→ baxian'],
-    expect: { state: 'idle', rule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'YOLO mode banner recognized as visible idle',
+    name: 'the YOLO banner is not idle evidence under herdr (default idle only)',
     lines: ['permissions: YOLO mode'],
-    expect: { state: 'idle', rule: 'codex_idle_prompt', visibleIdle: true },
+    expect: { state: 'idle', rule: undefined },
   },
   {
-    name: 'stale OSC Action Required overridden by YOLO mode banner',
+    name: 'an Action Required title wins over a YOLO banner screen (herdr: title p1100)',
     lines: ['permissions: YOLO mode'],
     osc: 'Action Required',
-    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+    expect: { state: 'pending', rule: 'osc_title_blocked' },
   },
   {
-    name: 'stale weak blocker suppressed by YOLO mode below',
+    name: '• Working with esc to interrupt in the bottom window is working (screen_working_fallback)',
     lines: [
-      'Continue? [y/n]',
-      'permissions: YOLO mode',
-    ],
-    expect: { notRule: 'weak_blocker' },
-  },
-  {
-    name: 'YOLO text embedded in command does NOT trigger idle',
-    lines: ['grep "permissions: YOLO mode" config.ts'],
-    expect: { notRule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'bare › in mid-tail does NOT trigger idle when output follows',
-    lines: [
-      'Working (3s)',
-      '›',
-      'still streaming',
-    ],
-    osc: 'Action Required',
-    expect: { notRule: 'codex_idle_prompt' },
-  },
-  {
-    name: '→ composer in mid-tail does NOT trigger idle when output follows',
-    lines: [
-      'still streaming',
-      '→ baxian git:(main)',
-      'more output',
-    ],
-    osc: 'Action Required',
-    expect: { notRule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'stale OSC working overridden by visible screen idle',
-    lines: ['→ baxian git:(main)'],
-    osc: '⠁ codex',
-    expect: { state: 'idle', rule: 'codex_idle_prompt' },
-  },
-  {
-    name: 'stale OSC working overridden by ready-anchor idle',
-    lines: [
-      '› finished task',
+      '› task',
       '',
-      '  baxian · idle',
+      '• Working (12s • esc to interrupt)',
     ],
-    osc: '⠁ codex',
-    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+    expect: { state: 'working', rule: 'screen_working_fallback' },
+  },
+  {
+    name: '■ Conversation interrupted suppresses screen_working_fallback',
+    lines: [
+      '■ Conversation interrupted',
+      '• Working (12s • esc to interrupt)',
+    ],
+    expect: { notRule: 'screen_working_fallback' },
+  },
+  {
+    name: 'trust directory dialog at the top of the screen is pending',
+    lines: [
+      '> You are in /Users/dev/repo',
+      '',
+      'Do you trust the contents of this directory?',
+      '  1. Yes, continue',
+      '  2. No, exit',
+    ],
+    expect: { state: 'pending', rule: 'trust_directory', visibleBlocker: true },
   },
 ];
 
