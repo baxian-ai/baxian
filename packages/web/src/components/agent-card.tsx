@@ -1,5 +1,6 @@
 import {
   TASK_ACTIVE_STATUS_SET,
+  isAgentDispatching,
   type AgentRole,
   type AgentRuntime,
   type AgentSnapshot,
@@ -75,6 +76,9 @@ function baseBadge(agent: AgentSnapshot, t: Messages['agents']): Omit<AgentBadge
   }
   if (isAgentBootstrapping(agent)) {
     return { kind: 'runtime', label: t.bootstrappingBadge, cls: 'pill pill-review' };
+  }
+  if (isAgentDispatching(agent)) {
+    return { kind: 'runtime', label: t.dispatchingBadge, cls: 'pill pill-review', title: t.dispatchingTitle };
   }
   if (agent.tmuxSessionStatus === 'absent') {
     return { kind: 'alert', label: t.sessionStatus.absent, cls: 'pill pill-warn' };

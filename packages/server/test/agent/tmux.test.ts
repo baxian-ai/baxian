@@ -1464,6 +1464,20 @@ describe('TmuxManager', () => {
       ).rejects.toThrow(/repl not ready/);
     });
 
+    it('codex: accepts the idle pinned composer when tmux keeps styled blanks as whitespace rows', async () => {
+      primeExec(
+        okHeader('node'),
+        okBody(
+          '─ Worked for 9m 16s ───────\n \n \n'
+          + '› Ask Codex to do anything\n \n'
+          + '  gpt-5.6-sol xhigh · ~/.baxian/agents/qa/repo\n',
+        ),
+      );
+      await expect(
+        tmux.waitReplReady(PANE, 'codex', { timeoutMs: 200, intervalMs: 30 }),
+      ).resolves.toBeUndefined();
+    });
+
     it('keeps polling when only the proc title matches (anchor still missing)', async () => {
       primeExec(okHeader('node'), okBody('still booting\n'), okHeader('node'), okBody('permissions: YOLO mode\n'));
       await expect(tmux.waitReplReady(PANE, 'codex', { timeoutMs: 2000, intervalMs: 30 })).resolves.toBeUndefined();

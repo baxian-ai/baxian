@@ -53,6 +53,7 @@ export class BranchManager {
     if (result.stdout.length > 0) throw new DirtyWorkdirError(workdir);
   }
 
+  // 前置条件:调用方已刷新远端(RepoStore.ensure 的 30s 节流窗口),所以这里不自己 fetch
   async switchToTaskBranch(
     workdir: string,
     taskId: string,
@@ -65,7 +66,6 @@ export class BranchManager {
       throw new Error(`baxian task ${taskId} must use exact branch ${BRANCH_PREFIX}${taskId}`);
     }
     await this.assertClean(workdir);
-    await this.fetch(workdir);
     const localRef = `refs/heads/${branch}`;
     const local = await this.runner.exec(
       `git -C ${shellQuote(workdir)} show-ref --verify --quiet ${shellQuote(localRef)}`,

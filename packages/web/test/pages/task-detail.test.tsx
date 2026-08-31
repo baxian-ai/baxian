@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { render, screen, cleanup, fireEvent, act, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import type { ProjectConfig, TaskState } from '../../src/shared/index.js';
+import type { AgentBindingFacts, ProjectConfig, TaskState } from '../../src/shared/index.js';
 
 const { useProjectsMock } = vi.hoisted(() => ({
   useProjectsMock: vi.fn(),
@@ -169,15 +169,25 @@ function open(overrides: Partial<TaskState> = {}) {
   return renderPage();
 }
 
+const AGENTS = [
+  { id: 'bx-dev', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+  { id: 'bx-qa', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+];
+
+function bindAgent(agentId: string, binding: AgentBindingFacts): void {
+  useAgentsMock.mockReturnValue({
+    data: AGENTS.map(agent => (agent.id === agentId ? { ...agent, binding } : agent)),
+    loaded: true,
+    error: null,
+  });
+}
+
 beforeEach(() => {
   cleanup();
   useTaskMock.mockReset();
   useAgentsMock.mockReset();
   useAgentsMock.mockReturnValue({
-    data: [
-      { id: 'bx-dev', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
-      { id: 'bx-qa', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
-    ],
+    data: AGENTS,
     loaded: true,
     error: null,
   });
@@ -209,6 +219,39 @@ describe('TaskDetail page — header & info', () => {
     expect(container.textContent).not.toContain('Plan review · round 0');
     expect(container.textContent).toContain('Branch:');
     expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
+  });
+
+  it.each([
+    ['bx-dev', 'in_progress'],
+    ['bx-qa', 'review'],
+  ] as const)('marks the task as dispatching while %s still carries the bootstrap marker', (agentId, status) => {
+    bindAgent(agentId, {
+      id: agentId, projectId: 'baxian', updatedAt: '', taskId: 'task-010', bootstrappingTaskId: 'task-010',
+    });
+
+    open({ status });
+
+    expect(screen.getByTestId('task-dispatching').textContent)
+      .toContain('Dispatching to the agent');
+  });
+
+  it.each([
+    ['the agent is held for a human, marker or not', {
+      bootstrappingTaskId: 'task-010', status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+    }],
+    ['a question awaits an answer', {
+      bootstrappingTaskId: 'task-010',
+      needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
+    }],
+    ['the prompt is delivered and the marker is gone', {}],
+  ] as const)('stops calling it dispatching once %s', (_desc, bindingOverrides) => {
+    bindAgent('bx-dev', {
+      id: 'bx-dev', projectId: 'baxian', updatedAt: '', taskId: 'task-010', ...bindingOverrides,
+    });
+
+    open({ status: 'in_progress' });
+
+    expect(screen.queryByTestId('task-dispatching')).toBeNull();
   });
 
   it('shows regular-weight plan/code review counts beside the status pill', () => {

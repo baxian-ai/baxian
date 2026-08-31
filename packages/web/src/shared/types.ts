@@ -107,6 +107,7 @@ export interface AgentBindingFacts {
   lockToken?: string;
   workdir?: string;
   startedAt?: string;
+  bootstrappingTaskId?: string;
   updatedAt: string;
   paneId?: string;
   creationToken?: string;
@@ -143,6 +144,16 @@ export interface AgentSnapshot {
   reason?: string;
   message?: string;
   petId?: string;
+}
+
+// awaiting_human/needInput 下残留的标记是恢复流程的凭据,不是在途证据
+export function isAgentDispatching(agent: AgentSnapshot, taskId?: string): boolean {
+  const b = agent.binding;
+  return b?.bootstrappingTaskId !== undefined
+    && b.bootstrappingTaskId === b.taskId
+    && (taskId === undefined || b.taskId === taskId)
+    && b.status !== 'awaiting_human'
+    && b.needInput?.at === undefined;
 }
 
 type TaskOperation = 'advance' | 'verdict' | 'cancel' | 'retry';

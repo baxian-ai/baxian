@@ -14,6 +14,7 @@ import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import { useT } from '../i18n/index.tsx';
 import {
+  isAgentDispatching,
   isSpecStagePhase,
   needsGitReviewRecovery,
   TASK_TERMINAL_STATUS_SET,
@@ -523,6 +524,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const prHref = safeExternalHref(task.prUrl);
     const branchUrl = branchTreeUrl(prHref ?? undefined, task.branch ?? '');
     const attentionCopy = task.attention ? getTaskAttentionCopy(t, task.attention) : null;
+    const dispatching = (agents ?? []).some(agent => isAgentDispatching(agent, task.id));
 
     return (
       <div>
@@ -551,6 +553,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
         <div className="mb-3 flex flex-wrap items-center gap-3">
           <TaskStatusBadge task={task} className="text-sm" />
+          {dispatching && (
+            <span data-testid="task-dispatching" className="text-sm text-og-500" title={t.taskDetail.dispatchingHint}>
+              {t.taskDetail.dispatching}
+            </span>
+          )}
           {(task.specReviewRound ?? 0) > 0 && (
             <span className="text-sm text-og-500">{t.taskDetail.specReviewRound(task.specReviewRound ?? 0)}</span>
           )}

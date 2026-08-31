@@ -2910,6 +2910,360 @@ describe('manual dispatch binding recheck', () => {
     });
   });
 
+  it('releases a QA parked on a pending branch cleanup, delivers the review, and drops the stale attention', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'branch-cleanup-pending',
+        runbook: 'checkout cleanup failed: repl not ready',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
+    });
+    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockImplementation(event => manager.recordTaskAttention(event).then(() => true));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    });
+
+    const delivered = await taskStore.get('task-1');
+    expect(delivered?.reviewDispatch).toBeUndefined();
+    expect(delivered?.attention).toBeUndefined();
+    expect((await agentStore.get('qa-1'))?.status).not.toBe('awaiting_human');
+  });
+
+  it('still drops the stale attention when the intervention event cannot be delivered', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'branch-cleanup-pending',
+        runbook: 'checkout cleanup failed: repl not ready',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
+    });
+    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    });
+
+    const delivered = await taskStore.get('task-1');
+    expect(delivered?.reviewDispatch).toBeUndefined();
+    expect(delivered?.attention).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it('completes the delivered dispatch and keeps the attention when a participant state read fails', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'branch-cleanup-pending',
+        runbook: 'checkout cleanup failed: repl not ready',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
+    });
+    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    let promptDelivered = false;
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      promptDelivered = true;
+      return true;
+    });
+    const realGet = agentStore.get.bind(agentStore);
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
+      if (promptDelivered) throw new Error('agent state unreadable');
+      return realGet(id);
+    });
+
+    await manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    });
+
+    const delivered = await taskStore.get('task-1');
+    expect(delivered?.reviewDispatch).toBeUndefined();
+    expect(delivered?.reviewDispatchedAt).toBeDefined();
+    expect(delivered?.attention?.reason).toBe('branch-cleanup-pending');
+    warn.mockRestore();
+    error.mockRestore();
+  });
+
+  it('keeps the stale attention and the undelivered lease together when the completing write fails', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'branch-cleanup-pending',
+        runbook: 'checkout cleanup failed: repl not ready',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
+    });
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    const realSet = taskStore.set.bind(taskStore);
+    vi.spyOn(taskStore, 'set').mockImplementation(async (next) => {
+      if (next.reviewDispatch === undefined && next.reviewDispatchedAt !== undefined) {
+        throw new Error('task store write failed');
+      }
+      await realSet(next);
+    });
+
+    await expect(manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    })).rejects.toThrow(/task store write failed/);
+
+    const stuck = await taskStore.get('task-1');
+    expect(stuck?.reviewDispatch).toBeDefined();
+    expect(stuck?.attention?.reason).toBe('branch-cleanup-pending');
+  });
+
+  it('keeps a same-phase alert whose hold came back while the review was being delivered', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'branch-cleanup-pending',
+        runbook: 'checkout cleanup failed: repl not ready',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
+    });
+    let laterAlert = '';
+    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
+      if (event.data.phase !== 'git-review-dispatch-hold-cleared') {
+        throw new Error('event log write failed');
+      }
+      laterAlert = new Date().toISOString();
+      const liveQa = (await agentStore.get('qa-1'))!;
+      await agentStore.set({
+        ...liveQa,
+        taskId: 'task-1',
+        status: 'awaiting_human',
+        awaitingPhase: 'branch-cleanup-pending',
+        awaitingSince: laterAlert,
+        awaitingNonce: 'cleanup-hold-again',
+        updatedAt: laterAlert,
+      });
+      const live = (await taskStore.get('task-1'))!;
+      await taskStore.set({
+        ...live,
+        attention: { ...live.attention!, runbook: 'raised again mid-delivery', occurredAt: laterAlert },
+      });
+      throw new Error('event log write failed');
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    });
+
+    expect((await taskStore.get('task-1'))?.attention?.occurredAt).toBe(laterAlert);
+    warn.mockRestore();
+  });
+
+  it('drops the stale attention on a later retry when the first dispatch aborted after releasing the hold', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'branch-cleanup-pending',
+        runbook: 'checkout cleanup failed: repl not ready',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
+    });
+    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValueOnce(false).mockResolvedValue(true);
+
+    const generation = begun!.task.reviewDispatch!.generation;
+    await expect(manager.dispatchGitReviewLease('task-1', { expectedGeneration: generation }))
+      .rejects.toThrow(/Failed to start git QA review session/);
+    expect((await agentStore.get('qa-1'))?.status).not.toBe('awaiting_human');
+    expect((await taskStore.get('task-1'))?.attention?.reason).toBe('branch-cleanup-pending');
+
+    await manager.dispatchGitReviewLease('task-1', { expectedGeneration: generation });
+
+    const delivered = await taskStore.get('task-1');
+    expect(delivered?.reviewDispatch).toBeUndefined();
+    expect(delivered?.attention).toBeUndefined();
+    warn.mockRestore();
+    error.mockRestore();
+  });
+
+  it('drops an ack_unknown attention the confirmation cleared without a delivered event', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const generation = begun!.task.reviewDispatch!.generation;
+    const claimed = await manager.claimGitReviewDispatch('task-1', generation);
+    const internal = manager as unknown as {
+      markGitReviewDispatchUncertain: (
+        taskId: string, lease: NonNullable<TaskState['reviewDispatch']>,
+      ) => Promise<boolean>;
+      confirmUncertainGitReviewDispatch: (
+        taskId: string, expectedGeneration: string, verifiedHeadSha: string,
+      ) => Promise<TaskState | null>;
+    };
+    expect(await internal.markGitReviewDispatchUncertain('task-1', claimed!.lease)).toBe(true);
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'dispatch-failed:ack_unknown',
+        runbook: 'Verify the QA pane did not receive the review.',
+        occurredAt: TS,
+        recommendedActions: ['advance', 'cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      awaitingSince: TS, awaitingNonce: 'ack-hold', updatedAt: TS,
+    });
+    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    const confirmed = await internal.confirmUncertainGitReviewDispatch('task-1', generation, SHA1);
+    expect(confirmed?.reviewDispatch?.phase).toBe('pending');
+    expect((await agentStore.get('qa-1'))?.status).not.toBe('awaiting_human');
+    expect((await taskStore.get('task-1'))?.attention?.reason).toBe('dispatch-failed:ack_unknown');
+
+    await manager.dispatchGitReviewLease('task-1', { expectedGeneration: generation });
+
+    const delivered = await taskStore.get('task-1');
+    expect(delivered?.reviewDispatch).toBeUndefined();
+    expect(delivered?.attention).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it('keeps an attention that a different phase raised while the branch-cleanup hold was recovered', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const held = (await taskStore.get('task-1'))!;
+    await taskStore.set({
+      ...held,
+      attention: {
+        reason: 'platform-binding-mismatch',
+        runbook: 'binding drifted',
+        occurredAt: TS,
+        recommendedActions: ['cancel'],
+        generation: taskAttentionGeneration(held),
+      },
+    });
+    const qaLock = await lockManager.acquire('qa-1', 'task-1');
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
+    });
+    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    vi.spyOn(bus, 'emit').mockImplementation(event => manager.recordTaskAttention(event).then(() => true));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    });
+
+    expect((await taskStore.get('task-1'))?.attention?.reason).toBe('platform-binding-mismatch');
+  });
+
   it('fences the route snapshot before creating a missing git review lease', async () => {
     await seed({
       status: 'review', phase: undefined, signalToken: undefined, reviewDispatch: undefined,

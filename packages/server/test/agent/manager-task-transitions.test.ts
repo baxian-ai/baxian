@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { TaskState } from '../../src/shared/index.js';
 import { taskAttentionGeneration } from '../../src/shared/index.js';
-import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
+import { AgentManager, DispatchTerminalError, EnsureSessionError } from '../../src/agent/manager.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { makeTask } from '../helpers/fixtures.js';
 
@@ -829,6 +829,93 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
     });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-code-1', paneId: '%0' });
   }
+
+  it('clears the reentry marker when a concurrent change defeats the code transition', async () => {
+    const m = harness.createManager();
+    await seedSpecApproved({ status: 'spec-ready' });
+    const current = await harness.taskStore.get('task-code-1');
+    await harness.taskStore.set({ ...current!, status: 'cancelled' });
+
+    const result = await m.transitionToCodePhase('task-code-1');
+
+    expect(result).toBeNull();
+    const binding = await harness.agentStore.get('dev-1');
+    expect(binding?.bootstrappingTaskId).toBeUndefined();
+    expect(binding?.taskId).toBe('task-code-1');
+  });
+
+  it('propagates a marker rollback write failure instead of returning null from the defeated transition', async () => {
+    const m = harness.createManager();
+    await seedSpecApproved({ status: 'spec-ready' });
+    const current = await harness.taskStore.get('task-code-1');
+    await harness.taskStore.set({ ...current!, status: 'cancelled' });
+    const realUpdate = harness.agentStore.update.bind(harness.agentStore);
+    let devUpdates = 0;
+    vi.spyOn(harness.agentStore, 'update').mockImplementation(async (id, fn) => {
+      if (id === 'dev-1' && ++devUpdates === 2) throw new Error('simulated marker rollback write failure');
+      return realUpdate(id, fn);
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(m.transitionToCodePhase('task-code-1'))
+      .rejects.toThrow('simulated marker rollback write failure');
+    warnSpy.mockRestore();
+  });
+
+  it('propagates a marker rollback write failure from the handled dispatch rollback too', async () => {
+    const m = harness.createManager();
+    await seedSpecApproved({ status: 'spec-ready' });
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(m, 'continueSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: false, agentId: 'dev-1', handled: true }, 'workdir busy'),
+    );
+    const realUpdate = harness.agentStore.update.bind(harness.agentStore);
+    let devUpdates = 0;
+    vi.spyOn(harness.agentStore, 'update').mockImplementation(async (id, fn) => {
+      if (id === 'dev-1' && ++devUpdates === 2) throw new Error('simulated marker rollback write failure');
+      return realUpdate(id, fn);
+    });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(m.transitionToCodePhase('task-code-1'))
+      .rejects.toThrow('simulated marker rollback write failure');
+    errSpy.mockRestore();
+  });
+
+  it('clears the reentry marker when a handled ensure failure rolls the task back to spec-ready', async () => {
+    const m = harness.createManager();
+    await seedSpecApproved({ status: 'spec-ready' });
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(m, 'continueSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: false, agentId: 'dev-1', handled: true }, 'workdir busy'),
+    );
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(m.transitionToCodePhase('task-code-1')).rejects.toThrow('workdir busy');
+
+    const binding = await harness.agentStore.get('dev-1');
+    expect(binding?.bootstrappingTaskId).toBeUndefined();
+    expect(binding?.taskId).toBe('task-code-1');
+    expect((await harness.taskStore.get('task-code-1'))?.status).toBe('spec-ready');
+    errSpy.mockRestore();
+  });
+
+  it('marks the parked dev as bootstrapping through the code dispatch and clears it on delivery', async () => {
+    const m = harness.createManager();
+    await seedSpecApproved({ status: 'spec-ready' });
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    let markerDuringDispatch: string | undefined;
+    vi.spyOn(m, 'continueSession').mockImplementation(async () => {
+      markerDuringDispatch = (await harness.agentStore.get('dev-1'))?.bootstrappingTaskId;
+      return true;
+    });
+
+    const result = await m.transitionToCodePhase('task-code-1');
+
+    expect(result).not.toBeNull();
+    expect(markerDuringDispatch).toBe('task-code-1');
+    expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+  });
 
   it('holds the dev when the pr-created watcher prevents code-phase delivery', async () => {
     const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };

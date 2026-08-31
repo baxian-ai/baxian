@@ -168,6 +168,37 @@ describe('resolveAgentBadge', () => {
     expect(badge.kind).toBe('alert');
   });
 
+  it('ranks Dispatching above No session and Error, but below host unreachable', () => {
+    const marker = { taskId: 'task-1', bootstrappingTaskId: 'task-1' };
+    const badge = badgeFor({
+      runtimeStatus: 'error',
+      tmuxSessionStatus: 'absent',
+      binding: makeBinding('dev-1', marker),
+    });
+    expect(badge.label).toBe('Dispatching');
+    expect(badge.cls).toBe('pill pill-review');
+    expect(badge.kind).toBe('runtime');
+    expect(badgeFor({
+      tmuxSessionStatus: 'unreachable',
+      binding: makeBinding('dev-1', marker),
+    }).label).toBe('Host unreachable');
+  });
+
+  it('never calls a held or questioning binding Dispatching, marker or not', () => {
+    expect(badgeFor({
+      binding: makeBinding('dev-1', {
+        taskId: 'task-1', bootstrappingTaskId: 'task-1',
+        status: 'awaiting_human', awaitingReason: 'checkout failed',
+      }),
+    }).label).toBe('Held');
+    expect(badgeFor({
+      binding: makeBinding('dev-1', {
+        taskId: 'task-1', bootstrappingTaskId: 'task-1',
+        needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
+      }),
+    }).label).toBe('Awaiting reply');
+  });
+
   it('ranks a runtime error above a human hold', () => {
     const badge = badgeFor({
       runtimeStatus: 'error',

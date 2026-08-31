@@ -9,6 +9,9 @@ import { fakeRunner } from '../helpers/fake-runner.js';
 
 const CODEX_IDLE = '› \n\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
 const CODEX_BUSY = '• Working (12s • esc to interrupt)\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
+// tmux keeps styled blank cells, so the separator rows arrive as single spaces
+const CODEX_IDLE_STYLED_BLANKS =
+  '─ Worked for 9m 16s ───────\n \n \n› Ask Codex to do anything\n \n  gpt-5.5 xhigh · ~/repo\n';
 
 type WaitOpts = { stableIdle?: boolean };
 type WaitFn = (tmux: TmuxManager, paneId: string, runtime: string, timeoutMs: number, opts?: WaitOpts) => Promise<void>;
@@ -57,6 +60,15 @@ afterEach(async () => {
 });
 
 describe('waitForReplPromptReady 完整判定优先', () => {
+  it.each([
+    { mode: 'plain', opts: undefined },
+    { mode: 'stableIdle', opts: { stableIdle: true } as WaitOpts },
+  ])('钉底 composer 的空白分隔行不挡就绪判定（$mode）', async ({ opts }) => {
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
+    mockFrames([CODEX_IDLE_STYLED_BLANKS]);
+    await expect(waitReady(200, opts)).resolves.toBeUndefined();
+  });
+
   it('screen-only ready 不得绕过 working 的 OSC 标题', async () => {
     mockFrames([CODEX_IDLE], { cycle: true });
     vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('⠹ 分析');

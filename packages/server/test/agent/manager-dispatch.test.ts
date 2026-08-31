@@ -161,6 +161,48 @@ describe('AgentManager dispatch', () => {
     expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
   });
 
+  it.each(['fix', 'post-approve'])(
+    'leaves no bootstrap marker when an idle dev is reacquired for %s, since nothing clears it later',
+    async (phase) => {
+      const t = await harness.seedTask({
+        id: 'task-fix-marker', branch: 'bx/task-fix-marker', status: 'fixing',
+      });
+      await harness.seedAgent({ id: 'dev-1' });
+
+      const acquired = await harness.manager.acquireAgentForTask('dev-1', t.id, phase);
+
+      expect(acquired).toBe(true);
+      expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+    },
+  );
+
+  it('marks the parked dev as bootstrapping again when the same task re-enters for code', async () => {
+    const t = await harness.seedTask({
+      id: 'task-code-marker', branch: 'bx/task-code-marker', status: 'spec-ready',
+    });
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+
+    const acquired = await harness.manager.acquireAgentForTask('dev-1', t.id, 'code');
+
+    expect(acquired).toBe(true);
+    expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBe(t.id);
+  });
+
+  it.each(['review', 'recheck'])(
+    'marks the QA binding as bootstrapping when the %s lease is acquired, before the workdir is prepared',
+    async (qaPhase) => {
+      const t = await harness.seedTask({
+        id: 'task-qa-marker', branch: 'bx/task-qa-marker', status: 'review', qaAgentId: 'qa-1',
+      });
+      await harness.seedAgent({ id: 'qa-1' });
+
+      const acquired = await harness.manager.acquireAgentForTask('qa-1', t.id, qaPhase);
+
+      expect(acquired).toBe(true);
+      expect((await harness.agentStore.get('qa-1'))?.bootstrappingTaskId).toBe(t.id);
+    },
+  );
+
   it('startSession holds (not destructively cleans up) when clearing the bootstrap marker fails after delivery', async () => {
     const t = await harness.seedTask({
       id: 'task-deliver-2',

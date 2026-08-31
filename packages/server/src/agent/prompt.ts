@@ -171,11 +171,10 @@ const ROLE_CONTRACTS: Record<AgentRole, string> = {
 };
 
 const PROTOCOL =
-  `Baxian keeps this Agent+Task context across phases and owns routing/merge. Stay in workdir on its branch, follow ` +
-  `repository rules, and use normal engineering judgment.\n` +
-  `Emit each [bx:...] marker as assistant text alone on its own line, with placeholders replaced, only after its ` +
-  `conditions hold. For the nth paused human question emit \`[bx:need-input:<token>:<n>]\`; after its answer first ` +
-  `emit \`[bx:input-received:<token>:<n>]\`.`;
+  `baxian owns routing and merge; stay in workdir on its branch and follow repository rules.\n` +
+  `Emit each [bx:...] marker as assistant text alone on its own line, placeholders filled, only once its ` +
+  `conditions hold. For the nth human question emit \`[bx:need-input:<token>:<n>]\`; once answered emit ` +
+  `\`[bx:input-received:<token>:<n>]\` before anything else.`;
 
 function platformPromptForRole(role: AgentRole, prompts: PlatformAgentPrompts): string {
   const slices = role === 'dev'

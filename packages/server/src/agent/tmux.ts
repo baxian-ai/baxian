@@ -243,7 +243,8 @@ const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = {
 
 const READY_ANCHORS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /⏵⏵ bypass permissions on/,
-  codex: /permissions: YOLO mode|(?:^|\n)› [^\n]+\n\n\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\s+·[^\n]*(?:\n\s*)?$/,
+  // tmux keeps styled blank cells, so the row between composer and footer may hold whitespace
+  codex: /permissions: YOLO mode|(?:^|\n)› [^\n]+\n[^\S\n]*\n\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\s+·[^\n]*(?:\n\s*)?$/,
   opencode: NEVER_RE,
   qodercli: NEVER_RE,
 };

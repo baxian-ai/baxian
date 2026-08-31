@@ -57,6 +57,12 @@ describe('inline workflow wire protocol', () => {
     expect(scanNeedInputSignals(result)).toEqual([]);
   });
 
+  it('keeps the answer acknowledgement ordering and the repository-rules clause', () => {
+    expect(phasePrompt('develop'))
+      .toMatch(/\[bx:input-received:<token>:<n>\]` before anything else/);
+    expect(phasePrompt('develop')).toContain('follow repository rules');
+  });
+
   it('keeps the startup handshake unfilled so prompt echo cannot satisfy it', () => {
     const result = buildGreetingPrompt(TOKEN);
 

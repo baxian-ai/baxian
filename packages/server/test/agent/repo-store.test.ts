@@ -33,6 +33,8 @@ class TestRunner implements CommandRunner {
   failFetch = false;
   failOriginHead = false;
   emptyRemoteRefs = false;
+  remoteDefaultBranch: string | null = 'main';
+  fetchMissesRemoteDefault = false;
 
   constructor(
     private home: string,
@@ -45,13 +47,33 @@ class TestRunner implements CommandRunner {
     if (command === 'printf %s "$HOME"') {
       return { stdout: this.home, stderr: '', exitCode: 0 };
     }
-    if (command.includes('git fetch --all --prune')) {
+    if (command.includes('fetch origin --prune')) {
+      if (this.failFetch) return { stdout: '', stderr: 'network down', exitCode: 1 };
+      await this.applyFetchedRemoteHead(command, options);
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }
+    const targeted = command.match(/git fetch origin '(\+refs\/heads\/[^']+)'/);
+    if (targeted) {
+      const workdir = command.match(/^cd '([^']+)'/)?.[1] ?? '';
+      return local.exec(
+        `git -C ${shellQuote(workdir)} fetch ${shellQuote(this.cloneSource)} ` +
+        `${shellQuote(targeted[1]!)}`,
+        options,
+      );
+    }
+    if (command.includes('ls-remote --symref origin HEAD')) {
       if (this.failOriginHead) {
-        return { stdout: '', stderr: 'cannot determine remote HEAD', exitCode: 1 };
+        return { stdout: '', stderr: 'ls-remote failed', exitCode: 1 };
       }
-      return this.failFetch
-        ? { stdout: '', stderr: 'network down', exitCode: 1 }
-        : { stdout: '', stderr: '', exitCode: 0 };
+      if (this.remoteDefaultBranch === null) return { stdout: '', stderr: '', exitCode: 0 };
+      const tip = await local.exec(
+        `git -C ${shellQuote(this.cloneSource)} rev-parse ` +
+        `${shellQuote(`refs/heads/${this.remoteDefaultBranch}`)}`,
+      );
+      return {
+        stdout: `ref: refs/heads/${this.remoteDefaultBranch}\tHEAD\n${tip.stdout.trim()}\tHEAD\n`,
+        stderr: '', exitCode: 0,
+      };
     }
     if (this.emptyRemoteRefs && command.includes('for-each-ref') && command.includes('refs/remotes/')) {
       return { stdout: '', stderr: '', exitCode: 0 };
@@ -66,6 +88,24 @@ class TestRunner implements CommandRunner {
       return cloned;
     }
     return local.exec(command, options);
+  }
+
+  private async applyFetchedRemoteHead(command: string, options?: ExecOptions): Promise<void> {
+    const workdir = command.match(/^cd '([^']+)'/)?.[1] ?? '';
+    const refspec = await local.exec(
+      `git -C ${shellQuote(workdir)} config --get-all remote.origin.fetch`, options,
+    );
+    const covers = refspec.stdout.includes('refs/heads/*:refs/remotes/origin/*')
+      && !refspec.stdout.includes('^refs/heads/');
+    if (!covers) return;
+    const skip = this.fetchMissesRemoteDefault && this.remoteDefaultBranch !== null
+      ? ` ${shellQuote(`^refs/heads/${this.remoteDefaultBranch}`)}`
+      : '';
+    await local.exec(
+      `git -C ${shellQuote(workdir)} fetch ${shellQuote(this.cloneSource)} ` +
+      `'+refs/heads/*:refs/remotes/origin/*'${skip} --prune`,
+      options,
+    );
   }
 
   writeFile(path: string, content: Buffer | string): Promise<void> {
@@ -368,17 +408,204 @@ describe('RepoStore per-agent Workdir', () => {
     await expect(store.ensure()).rejects.toThrow(/git fetch failed/i);
   });
 
-  it('fails when origin/HEAD cannot be refreshed instead of hiding the warning', async () => {
+
+  it('always asks the remote which branch HEAD points at, and follows a rename', async () => {
     const path = join(tempDir, 'custom');
     await cloneAt(path);
+    await run(`git -C ${shellQuote(origin)} branch develop main`);
     const runner = new TestRunner(tempDir, origin);
-    runner.failOriginHead = true;
+    const cache = createRepoStoreCache();
+    const store = () => new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, cache, 'dev-1', path,
+    );
+    const originHead = () => run(`git -C ${shellQuote(path)} symbolic-ref refs/remotes/origin/HEAD`);
+    const nowSpy = vi.spyOn(Date, 'now');
+    const base = 1_800_000_000_000;
+
+    nowSpy.mockReturnValue(base);
+    await store().ensure();
+    expect(await originHead()).toBe('refs/remotes/origin/main');
+
+    runner.remoteDefaultBranch = 'develop';
+    nowSpy.mockReturnValue(base + 60_000);
+    await store().ensure();
+
+    expect(await originHead()).toBe('refs/remotes/origin/develop');
+    expect(runner.commands.filter(c => c.includes('ls-remote --symref'))).toHaveLength(2);
+  });
+
+  it('refetches the default branch when the fetch advertisement predates the HEAD switch', async () => {
+    const path = join(tempDir, 'custom');
+    await run(`git -C ${shellQuote(origin)} branch develop main`);
+    await cloneAt(path);
+    const seed = join(tempDir, 'seed');
+    await run(
+      `git -C ${shellQuote(seed)} checkout -q -B develop && ` +
+      `git -C ${shellQuote(seed)} commit -q --allow-empty -m advance && ` +
+      `git -C ${shellQuote(seed)} push -q origin develop`,
+    );
+    const runner = new TestRunner(tempDir, origin);
+    runner.remoteDefaultBranch = 'develop';
+    runner.fetchMissesRemoteDefault = true;
     const store = new RepoStore(
       runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
     );
 
-    await expect(store.ensure()).rejects.toThrow(/origin\/HEAD could not be refreshed/i);
+    await store.ensure();
+
+    expect(await run(`git -C ${shellQuote(path)} rev-parse origin/HEAD`))
+      .toBe(await run(`git -C ${shellQuote(origin)} rev-parse refs/heads/develop`));
   });
+
+  it('quotes a hierarchical default branch with shell metacharacters and keeps it usable end-to-end', async () => {
+    const path = join(tempDir, 'custom');
+    const hostile = 'feat/x;y$z';
+    await run(`git -C ${shellQuote(origin)} branch ${shellQuote(hostile)} main`);
+    await cloneAt(path);
+    await run(`git -C ${shellQuote(path)} config --unset-all remote.origin.fetch`);
+    await run(
+      `git -C ${shellQuote(path)} config --add remote.origin.fetch ` +
+      `'+refs/heads/main:refs/remotes/origin/main'`,
+    );
+    const runner = new TestRunner(tempDir, origin);
+    runner.remoteDefaultBranch = hostile;
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await store.ensure();
+
+    expect(await run(`git -C ${shellQuote(path)} symbolic-ref refs/remotes/origin/HEAD`))
+      .toBe(`refs/remotes/origin/${hostile}`);
+    expect(await run(`git -C ${shellQuote(path)} rev-parse refs/remotes/origin/HEAD`))
+      .toBe(await run(`git -C ${shellQuote(origin)} rev-parse ${shellQuote(`refs/heads/${hostile}`)}`));
+  });
+
+  it('fails closed when the remote advertises no HEAD symref, or the lookup itself fails', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const runner = new TestRunner(tempDir, origin);
+    const mkStore = () => new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    runner.remoteDefaultBranch = null;
+    await expect(mkStore().ensure()).rejects.toThrow(/remote HEAD/i);
+
+    runner.remoteDefaultBranch = 'main';
+    runner.failOriginHead = true;
+    await expect(mkStore().ensure()).rejects.toThrow(/remote HEAD/i);
+  });
+
+
+  it('fetches origin by name, so a remote opted out of --all still gets refreshed', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const runner = new TestRunner(tempDir, origin);
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await store.ensure();
+
+    const fetches = runner.commands.filter(c => /\bgit .*\bfetch\b/.test(c));
+    expect(fetches.length).toBeGreaterThan(0);
+    expect(fetches.every(c => !c.includes('--all'))).toBe(true);
+  });
+
+  it('refreshes the default branch tip when a negative refspec excludes it from the fetch', async () => {
+    const path = join(tempDir, 'custom');
+    await run(
+      `git -C ${shellQuote(origin)} branch develop main && ` +
+      `git clone -q ${shellQuote(origin)} ${shellQuote(path)} && ` +
+      `git -C ${shellQuote(path)} remote set-url origin ${shellQuote(PROJECT_REPO)} && ` +
+      `git -C ${shellQuote(path)} config --add remote.origin.fetch '^refs/heads/develop'`,
+    );
+    const seed = join(tempDir, 'seed');
+    await run(
+      `git -C ${shellQuote(seed)} checkout -q -B develop && ` +
+      `git -C ${shellQuote(seed)} commit -q --allow-empty -m advance && ` +
+      `git -C ${shellQuote(seed)} push -q origin develop`,
+    );
+    const remoteTip = await run(`git -C ${shellQuote(origin)} rev-parse refs/heads/develop`);
+    expect(await run(`git -C ${shellQuote(path)} rev-parse refs/remotes/origin/develop`))
+      .not.toBe(remoteTip);
+    const runner = new TestRunner(tempDir, origin);
+    runner.remoteDefaultBranch = 'develop';
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await store.ensure();
+
+    expect(await run(`git -C ${shellQuote(path)} rev-parse refs/remotes/origin/develop`))
+      .toBe(remoteTip);
+  });
+
+  it('adopts a brand-new default branch the refspec never tracked', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    await run(`git -C ${shellQuote(path)} config --unset-all remote.origin.fetch`);
+    await run(
+      `git -C ${shellQuote(path)} config --add remote.origin.fetch ` +
+      `'+refs/heads/main:refs/remotes/origin/main'`,
+    );
+    await run(`git -C ${shellQuote(origin)} branch develop main`);
+    const runner = new TestRunner(tempDir, origin);
+    runner.remoteDefaultBranch = 'develop';
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await store.ensure();
+
+    expect(await run(`git -C ${shellQuote(path)} symbolic-ref refs/remotes/origin/HEAD`))
+      .toBe('refs/remotes/origin/develop');
+    expect(await run(`git -C ${shellQuote(path)} rev-parse origin/develop`))
+      .toBe(await run(`git -C ${shellQuote(origin)} rev-parse refs/heads/develop`));
+  });
+
+
+  it('skips refreshes only inside the throttle window, and a clock rollback counts as stale', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const runner = new TestRunner(tempDir, origin);
+    const cache = createRepoStoreCache();
+    const store = (c = cache) => new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, c, 'dev-1', path,
+    );
+    const fetches = () => runner.commands.filter(c => c.includes('fetch origin --prune')).length;
+    const nowSpy = vi.spyOn(Date, 'now');
+    const base = 1_800_000_000_000;
+
+    nowSpy.mockReturnValue(base);
+    await store().ensure();
+    await store().ensure();
+    expect(fetches()).toBe(1);
+
+    await store(createRepoStoreCache()).ensure();
+    expect(fetches()).toBe(2);
+
+    nowSpy.mockReturnValue(base - 60 * 60_000);
+    await store().ensure();
+    expect(fetches()).toBe(3);
+  });
+
+  it('rebuilds origin/HEAD when the fetch leaves no usable symref behind', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    await run(`git -C ${shellQuote(path)} symbolic-ref -d refs/remotes/origin/HEAD`);
+    const runner = new TestRunner(tempDir, origin);
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await store.ensure();
+
+    expect(await run(`git -C ${shellQuote(path)} symbolic-ref refs/remotes/origin/HEAD`))
+      .toBe('refs/remotes/origin/main');
+  });
+
 
   it('rejects a clone whose remote-tracking ref listing succeeds but is empty', async () => {
     const path = join(tempDir, 'custom');
@@ -431,6 +658,12 @@ class ScriptedRunner implements CommandRunner {
     this.commands.push(command);
     if (command === 'printf %s "$HOME"' || command === `cd ${shellQuote(this.home)} && pwd -P`) {
       return { stdout: this.home, stderr: '', exitCode: 0 };
+    }
+    if (command.includes('ls-remote --symref origin HEAD')) {
+      return { stdout: `ref: refs/heads/main\tHEAD\n${'a'.repeat(40)}\tHEAD\n`, stderr: '', exitCode: 0 };
+    }
+    if (command.includes('rev-parse --verify --quiet')) {
+      return { stdout: `${'a'.repeat(40)}\n`, stderr: '', exitCode: 0 };
     }
     for (const [pattern, result] of this.rules) {
       if (!pattern.test(command)) continue;

@@ -84,6 +84,23 @@ describe('BranchManager', () => {
     expect(await run(`git -C ${shellQuote(workdir)} config --get branch.bx/task-1.merge`)).toBe('refs/heads/bx/task-1');
   });
 
+  it('never fetches on its own: remote refresh belongs to the caller that prepared the workdir', async () => {
+    const seen: string[] = [];
+    const recording: CommandRunner = {
+      exec: (command, options) => { seen.push(command); return local.exec(command, options); },
+      writeFile: (path, content) => local.writeFile(path, content),
+      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
+    };
+    const manager = new BranchManager(recording);
+
+    await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+    await manager.parkOnDefaultDetached(workdir);
+    await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+
+    expect(await manager.currentRef(workdir)).toBe('refs/heads/bx/task-1');
+    expect(seen.filter(c => /\bgit .*\bfetch\b/.test(c))).toEqual([]);
+  });
+
   it('refuses to adopt a pre-existing local branch without baxian task binding proof', async () => {
     await run(`git -C ${shellQuote(workdir)} branch bx/task-1`);
 

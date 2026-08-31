@@ -432,6 +432,7 @@ export function canDispatchWithBinding(binding: AgentBindingFacts | null | undef
 const RECOVERABLE_QA_DISPATCH_HOLD_PHASES = new Set<string>([
   'checkout-preparation-failed',
   'dirty-workdir',
+  'branch-cleanup-pending',
 ]);
 
 export function isRecoverableQaDispatchHold(binding: AgentBindingFacts | null | undefined): boolean {
@@ -439,6 +440,11 @@ export function isRecoverableQaDispatchHold(binding: AgentBindingFacts | null | 
     && binding.awaitingPhase != null
     && RECOVERABLE_QA_DISPATCH_HOLD_PHASES.has(binding.awaitingPhase);
 }
+
+const GIT_REVIEW_DISPATCH_HOLD_PHASES = new Set<string>([
+  ...RECOVERABLE_QA_DISPATCH_HOLD_PHASES,
+  'dispatch-failed:ack_unknown',
+]);
 
 export interface PendingDispatchRetry {
   kind: 'qa-recheck' | 'dev-fix';
@@ -2063,6 +2069,8 @@ export class AgentManager {
       : null;
     const sameTaskLocked = existingToken !== null;
     const reentryPhases = new Set(['fix', 'post-approve', 'code']);
+    // fix / post-approve 由 continueSession 投递,没有配对的 clearBootstrapMarker
+    const unfinalizedPhases = new Set(['fix', 'post-approve']);
     const sameTaskReentry =
       state?.taskId === taskId &&
       !state.creationToken &&
@@ -2098,7 +2106,7 @@ export class AgentManager {
           projectId: cfg.projectId,
           taskId,
           lockToken: token,
-          ...(phase === 'code' && !sameTaskReentry ? { bootstrappingTaskId: taskId } : {}),
+          ...(!unfinalizedPhases.has(phase) ? { bootstrappingTaskId: taskId } : {}),
           updatedAt: now,
         };
       });
@@ -5598,12 +5606,33 @@ export class AgentManager {
       }
       next.reviewDispatchedAt = now;
       delete next.reviewDispatch;
-      if (next.attention?.reason === 'git-review-dispatch-recovery-uncertain') {
+      if (next.attention?.reason === 'git-review-dispatch-recovery-uncertain'
+        || await this.dispatchHoldAttentionIsStale(next)) {
         delete next.attention;
       }
       await this.taskStore.set(next);
       return true;
     });
+  }
+
+  // a hold and its task attention are written as a pair, so no live hold means this one was consumed
+  private async dispatchHoldAttentionIsStale(task: TaskState): Promise<boolean> {
+    const reason = task.attention?.reason;
+    if (reason === undefined || !GIT_REVIEW_DISPATCH_HOLD_PHASES.has(reason)) return false;
+    for (const participantId of [task.agentId, task.qaAgentId]) {
+      if (!participantId) continue;
+      let participant: AgentBindingFacts | null;
+      try {
+        participant = await this.agentStore.get(participantId);
+      } catch (err) {
+        console.error(`[AgentManager] hold liveness probe for ${participantId} failed:`, err);
+        return false;
+      }
+      if (participant?.taskId === task.id
+        && participant.status === 'awaiting_human'
+        && participant.awaitingPhase === reason) return false;
+    }
+    return true;
   }
 
   private async recoverPendingGitReviewDispatchHold(
@@ -8976,9 +9005,14 @@ export class AgentManager {
     }
   }
 
-  private async clearBootstrapMarker(agentId: string, taskId: string): Promise<void> {
+  private async clearBootstrapMarker(
+    agentId: string,
+    taskId: string,
+    expectedLockToken?: string,
+  ): Promise<void> {
     await this.agentStore.update(agentId, (latest) => {
       if (!latest || latest.taskId !== taskId || latest.bootstrappingTaskId === undefined) return AGENT_STORE_NOOP;
+      if (expectedLockToken !== undefined && latest.lockToken !== expectedLockToken) return AGENT_STORE_NOOP;
       const { bootstrappingTaskId: _delivered, ...rest } = latest;
       return { ...rest, updatedAt: new Date().toISOString() };
     });
@@ -9600,6 +9634,13 @@ export class AgentManager {
       if (!released) {
         await this.resetGitReviewDispatchClaim(taskId, lease);
         throw new ApiError(409, `QA agent ${qaId} could not be released for git review dispatch`);
+      }
+      if (previousQa.status === 'awaiting_human' && previousQa.awaitingPhase !== undefined) {
+        await this.emitIntervention(task.projectId, qaId, taskId, {
+          phase: 'git-review-dispatch-hold-cleared',
+          previousPhase: previousQa.awaitingPhase,
+          generation: lease.generation,
+        });
       }
       opts.onSideEffect?.();
     }
@@ -11575,6 +11616,16 @@ export class AgentManager {
             err,
           );
         }
+      } else {
+        try {
+          await this.clearBootstrapMarker(devAgentId, taskId, acquiredLockToken);
+        } catch (clearErr) {
+          console.warn(
+            `[AgentManager] transitionToCodePhase(${taskId}): clearing the reentry bootstrap marker failed:`,
+            clearErr,
+          );
+          throw clearErr;
+        }
       }
       return null;
     }
@@ -11617,6 +11668,17 @@ export class AgentManager {
               phase: 'code-rollback-dev-release-failed',
               devAgentId,
             });
+          }
+        } else {
+          try {
+            await this.clearBootstrapMarker(devAgentId, taskId, acquiredLockToken);
+          } catch (clearErr) {
+            // 原始派发错误在这里落日志,抛出去的是更需要处理的回滚失败
+            console.error(
+              `[AgentManager] transitionToCodePhase dispatch(dev=${devAgentId}) failed:`,
+              err,
+            );
+            throw clearErr;
           }
         }
       } else if (!(err instanceof EnsureSessionError && err.partial.handled)) {

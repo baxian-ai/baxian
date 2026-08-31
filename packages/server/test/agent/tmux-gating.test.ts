@@ -187,6 +187,14 @@ describe('hasRuntimeReadyView', () => {
     expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
   });
 
+  it('reads the codex pinned composer as idle once the styled blank rows arrive trimmed', () => {
+    const screen = '─ Worked for 9m 16s ───────\n\n\n'
+      + '› Ask Codex to do anything\n\n'
+      + '  gpt-5.6-sol xhigh · ~/.baxian/agents/qa/repo\n';
+    expect.soft(classifyScreen('codex', screen).state).toBe('idle');
+    expect.soft(hasRuntimeReadyView(screen, 'codex')).toBe(true);
+  });
+
   it('treats a claude-styled spinner above the codex prompt as stale (codex working detection rides the OSC title)', () => {
     const screen = '· Thinking… (5s)\n→ baxian git:(main)\n';
     expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);

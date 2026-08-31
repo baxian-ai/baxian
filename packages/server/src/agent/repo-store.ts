@@ -729,18 +729,62 @@ export class RepoStore {
   }
 
   private async fetchIfStale(cacheKey: string, absRepoPath: string): Promise<void> {
-    const last = this.cache.lastFetchAt.get(cacheKey) ?? 0;
-    if (Date.now() - last < FETCH_THROTTLE_MS) return;
-    const result = await execNetwork(
-      this.runner,
-      `cd ${shellQuote(absRepoPath)} && ${GIT_NET_ENV} git fetch --all --prune && git remote set-head origin --auto`,
-    );
-    if (result.exitCode !== 0) {
+    // 时钟回拨会让差值变负,那时必须当成过期,否则会一直跳过刷新直到墙钟追上
+    const sinceLastFetch = Date.now() - (this.cache.lastFetchAt.get(cacheKey) ?? 0);
+    if (sinceLastFetch >= 0 && sinceLastFetch < FETCH_THROTTLE_MS) return;
+    const inRepo = `cd ${shellQuote(absRepoPath)} && ${GIT_NET_ENV} `;
+    const [fetched, listed] = await Promise.all([
+      execNetwork(this.runner, `${inRepo}git fetch origin --prune`),
+      execNetwork(this.runner, `${inRepo}git ls-remote --symref origin HEAD`),
+    ]);
+    if (fetched.exitCode !== 0) {
+      throw new Error(`git fetch failed at ${absRepoPath}: ${fetched.stderr}`);
+    }
+    await this.syncOriginHead(absRepoPath, listed);
+    this.cache.lastFetchAt.set(cacheKey, Date.now());
+  }
+
+  private async syncOriginHead(absRepoPath: string, listed: ExecResult): Promise<void> {
+    const branch = listed.exitCode === 0
+      ? /^ref: refs\/heads\/(\S+)\s+HEAD$/m.exec(listed.stdout)?.[1]
+      : undefined;
+    const advertisedTip = /^([0-9a-f]{40,64})\s+HEAD$/m.exec(listed.stdout)?.[1];
+    if (branch === undefined || advertisedTip === undefined) {
       throw new Error(
-        `git fetch failed or origin/HEAD could not be refreshed at ${absRepoPath}: ${result.stderr}`,
+        `remote HEAD could not be resolved to a branch at ${absRepoPath}: ` +
+        `${listed.stderr || listed.stdout || 'no symref advertised'}`,
       );
     }
-    this.cache.lastFetchAt.set(cacheKey, Date.now());
+    const tracking = `refs/remotes/origin/${branch}`;
+    // fetch 与 ls-remote 是两条独立连接,只有本地跟到广告里的 OID 才算刷新过这条基线
+    const tracked = await this.probe(
+      `git -C ${shellQuote(absRepoPath)} rev-parse --verify --quiet ${shellQuote(tracking)}`,
+      'origin default branch',
+    );
+    if (tracked.stdout.trim() !== advertisedTip) {
+      await this.fetchDefaultBranch(absRepoPath, branch);
+    }
+    const pointed = await this.probe(
+      `git -C ${shellQuote(absRepoPath)} symbolic-ref refs/remotes/origin/HEAD ` +
+      `${shellQuote(tracking)}`, 'origin/HEAD',
+    );
+    if (pointed.exitCode !== 0) {
+      throw new Error(`origin/HEAD could not be set at ${absRepoPath}: ${pointed.stderr}`);
+    }
+  }
+
+  // refspec 排除的分支不会被上面的 fetch 刷新,只能再定向拉一次
+  private async fetchDefaultBranch(absRepoPath: string, branch: string): Promise<void> {
+    const refspec = `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
+    const fetched = await execNetwork(
+      this.runner,
+      `cd ${shellQuote(absRepoPath)} && ${GIT_NET_ENV} git fetch origin ${shellQuote(refspec)}`,
+    );
+    if (fetched.exitCode !== 0) {
+      throw new Error(
+        `default branch ${branch} could not be refreshed at ${absRepoPath}: ${fetched.stderr}`,
+      );
+    }
   }
 
   private async runUnderMutex<T>(key: string, fn: () => Promise<T>): Promise<T> {
