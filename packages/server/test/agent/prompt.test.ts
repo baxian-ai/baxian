@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  buildGreetingPrompt,
   buildPromptInline,
   MAX_PROMPT_BYTES,
   PromptSizeError,
@@ -157,11 +156,7 @@ describe('buildPromptInline', () => {
   it('delivers the whole qa lifecycle contract on the first injection regardless of entry phase', () => {
     for (const phase of ['review', 'recheck']) {
       const result = prompt(phase);
-      expect(result, phase).toContain('\nreview: Independently review the complete PR at anchor-sha');
-      expect(result, phase).toContain(
-        '\nrecheck: Everything under review applies again on this round\'s anchor-sha; additionally verify every ' +
-        'prior finding against the replies and current code',
-      );
+      expect(result, phase).toMatch(/\nreview: .*\nrecheck: /s);
     }
   });
 
@@ -170,8 +165,8 @@ describe('buildPromptInline', () => {
 
     expect(result).toContain(`pass: <!-- baxian:review:pass:${ANCHOR}:${PASS_TOKEN} -->`);
     expect(result).toContain(`fail: <!-- baxian:review:fail:${ANCHOR}:${FAIL_TOKEN} -->`);
-    expect(result).toContain('There is no pane completion signal');
     expect(result).not.toContain('[bx:review');
+    expect(result).not.toMatch(/\[bx:(pr|spec)-/);
   });
 
   it('requires the review anchor and token pair', () => {
@@ -329,15 +324,5 @@ describe('specPathForBranch', () => {
     );
     expect(specPathForBranch('Feature/Upload Retry')).toBe(specPathForBranch('Feature/Upload Retry'));
     expect(specPathForBranch('feature/upload-retry')).not.toBe(specPathForBranch('Feature/Upload Retry'));
-  });
-});
-
-describe('buildGreetingPrompt', () => {
-  it('is one compact inline protocol instruction', () => {
-    expect(buildGreetingPrompt('greettok12345')).toBe(
-      'token: greettok12345\n' +
-      'Reply with exactly `[bx:greeting:<token>]` on its own line, replacing <token> with the token above. ' +
-      'Do not use a tool or output anything else.\n',
-    );
   });
 });

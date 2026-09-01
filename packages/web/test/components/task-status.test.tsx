@@ -85,53 +85,55 @@ describe('formatTaskTimestamp', () => {
 });
 
 describe('taskStatusLabel', () => {
-  it('returns the English label by default (no I18nProvider / default locale)', () => {
-    expect(taskStatusLabel('pending')).toBe('Waiting to start');
-  });
-
-  it('returns the Chinese label after syncLocaleFromConfig switches locale to zh-CN', () => {
+  it('follows the active locale dictionary', () => {
+    expect(taskStatusLabel('pending')).toBe(getMessages().status.pending);
+    const english = taskStatusLabel('pending');
     syncLocaleFromConfig('zh-CN');
-    expect(taskStatusLabel('pending')).toBe('待开始');
+    expect(taskStatusLabel('pending')).toBe(getMessages().status.pending);
+    expect(taskStatusLabel('pending')).not.toBe(english);
   });
 
   it('uses phase and assignment context to describe what is happening', () => {
-    expect(taskStatusLabel({ status: 'pending', preferredAgentId: '' })).toBe('Unassigned');
-    expect(taskStatusLabel({ status: 'in_progress', phase: 'spec' })).toBe('Drafting plan');
-    expect(taskStatusLabel({ status: 'in_progress', phase: 'code' })).toBe('Developing');
-    expect(taskStatusLabel({ status: 'review', phase: 'code' })).toBe('Reviewing code');
-    expect(taskStatusLabel({ status: 'fixing', phase: 'spec' })).toBe('Revising plan');
-    expect(taskStatusLabel({ status: 'max_rounds', phase: 'code' })).toBe('Code review needs a decision');
+    const m = getMessages();
+    expect(taskStatusLabel({ status: 'pending', preferredAgentId: '' })).toBe(m.statusContext.pendingUnassigned);
+    expect(taskStatusLabel({ status: 'in_progress', phase: 'spec' })).toBe(m.statusContext.inProgressSpec);
+    expect(taskStatusLabel({ status: 'in_progress', phase: 'code' })).toBe(m.statusContext.inProgressCode);
+    expect(taskStatusLabel({ status: 'review', phase: 'code' })).toBe(m.statusContext.reviewCode);
+    expect(taskStatusLabel({ status: 'fixing', phase: 'spec' })).toBe(m.statusContext.fixingSpec);
+    expect(taskStatusLabel({ status: 'max_rounds', phase: 'code' })).toBe(m.statusContext.maxRoundsCode);
   });
 });
 
 describe('TaskStatusBadge', () => {
   it('shows a readable contextual pill while preserving the machine status as data', () => {
     render(<TaskStatusBadge task={{ status: 'review', phase: 'spec' }} />);
-    const badge = screen.getByText('Reviewing plan');
+    const badge = screen.getByText(getMessages().statusContext.reviewSpec);
     expect(badge.className).toContain('pill-review');
     expect(badge.getAttribute('data-status')).toBe('review');
-    expect(badge.getAttribute('title')).toBe('Reviewing plan');
+    expect(badge.getAttribute('title')).toBe(getMessages().statusContext.reviewSpec);
   });
 });
 
 describe('getTaskAttentionCopy', () => {
   it.each([
-    ['confirm-merge-timeout', 'The final checks could not finish'],
-    ['review-verdict-overdue', 'Review needs your attention'],
-    ['runtime-session-missing', 'The linked agent was interrupted'],
-    ['delivery-not-confirmed', 'The next step did not start'],
-    ['unexpected-condition', 'This task needs your attention'],
-  ])('maps %s to a user-facing title', (reason, title) => {
-    expect(getTaskAttentionCopy(getMessages(), attention(reason, ['cancel'])).title).toBe(title);
+    ['confirm-merge-timeout', 'attentionMergeTitle'],
+    ['review-verdict-overdue', 'attentionReviewTitle'],
+    ['runtime-session-missing', 'attentionAgentTitle'],
+    ['delivery-not-confirmed', 'attentionHandoffTitle'],
+    ['unexpected-condition', 'attentionDefaultTitle'],
+  ] as const)('maps %s to the %s copy', (reason, key) => {
+    const m = getMessages();
+    expect(getTaskAttentionCopy(m, attention(reason, ['cancel'])).title).toBe(m.taskDetail[key]);
   });
 
   it('selects guidance by recommended-action priority and has retry/cancel fallbacks', () => {
-    expect(getTaskAttentionCopy(getMessages(), attention('unknown', ['retry', 'advance', 'verdict'])).guidance)
-      .toBe('Review the PR and the discussion below, then confirm the result or request changes.');
-    expect(getTaskAttentionCopy(getMessages(), attention('unknown', ['retry'])).guidance)
-      .toBe('This task cannot continue in its current run. Run it again from the beginning when you are ready.');
-    expect(getTaskAttentionCopy(getMessages(), attention('unknown', ['cancel'])).guidance)
-      .toBe('Review the task details, then cancel it if you no longer want it to continue.');
+    const m = getMessages();
+    expect(getTaskAttentionCopy(m, attention('unknown', ['retry', 'advance', 'verdict'])).guidance)
+      .toBe(m.taskDetail.attentionVerdictGuidance);
+    expect(getTaskAttentionCopy(m, attention('unknown', ['retry'])).guidance)
+      .toBe(m.taskDetail.attentionRetryGuidance);
+    expect(getTaskAttentionCopy(m, attention('unknown', ['cancel'])).guidance)
+      .toBe(m.taskDetail.attentionCancelGuidance);
   });
 });
 

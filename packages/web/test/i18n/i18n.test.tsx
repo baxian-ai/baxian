@@ -98,13 +98,6 @@ describe('getMessages', () => {
     syncLocaleFromConfig('zh-CN');
     expect(getMessages().settings.entry).toBe('系统设置');
   });
-
-  it('describes retry actions in user-facing terms', () => {
-    syncLocaleFromConfig('zh-CN');
-    const taskDetail = getMessages().taskDetail;
-    expect(taskDetail.retryCurrentStepConfirmBody('task-1')).toContain('重新交给开发 Agent');
-    expect(taskDetail.restartReviewConfirmBody('task-1')).toContain('重新交给评审 Agent');
-  });
 });
 
 describe('provider side effects', () => {

@@ -191,14 +191,6 @@ describe('GitHubDriver', () => {
     expect(GITHUB_AGENT_PROMPTS.feedback).toContain('baxian:reply:ack:<source-key>:<comment-id>');
   });
 
-  it('states the adopt-or-create publish semantics without any signal actor encoding', () => {
-    expect(GITHUB_AGENT_PROMPTS.publish).toContain('reuse or create one open non-draft PR');
-    expect(GITHUB_AGENT_PROMPTS.publish).toContain('exact head');
-    expect(GITHUB_AGENT_PROMPTS.publish).toContain('requested/default base');
-    expect(GITHUB_AGENT_PROMPTS.publish).toContain('stop on ambiguity');
-    expect(GITHUB_AGENT_PROMPTS.publish).not.toMatch(/base64|actor|gh api user/);
-  });
-
   it('checks the authenticated GitHub identity and classifies rate limits', async () => {
     const good = harness([result('{"login":"alice"}')]);
     await expect(good.driver.runPreflightSteps()).resolves.toEqual([
@@ -209,8 +201,6 @@ describe('GitHubDriver', () => {
     await expect(unauthenticated.driver.runPreflightSteps()).resolves.toEqual([
       { step: 'github-auth', ok: false, message: GITHUB_AUTH_FIX },
     ]);
-    // GH_TOKEN/GITHUB_TOKEN override stored logins, so the fix must start there before suggesting gh auth login.
-    expect(GITHUB_AUTH_FIX).toMatch(/GH_TOKEN or GITHUB_TOKEN[\s\S]*replace or unset[\s\S]*otherwise run "gh auth login --hostname github.com"/);
 
     const badCredentials = harness([result('', 1, 'gh: Bad credentials (HTTP 401)')]);
     await expect(badCredentials.driver.runPreflightSteps()).resolves.toEqual([

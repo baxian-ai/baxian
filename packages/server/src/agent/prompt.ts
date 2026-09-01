@@ -143,38 +143,33 @@ export function buildGreetingPrompt(token: string): string {
 const ROLE_CONTRACTS: Record<AgentRole, string> = {
   dev:
     `Task contract (dev; later prompts for this task carry only the header lines):\n` +
-    `develop: Choose one route: implement, test, commit, push, publish the PR, then emit ` +
-    `\`[bx:pr-created:<pr>:<token>]\`; or write a complete implementable spec to spec-path without ` +
-    `overwriting an unrelated file, commit, push, publish the PR, then emit \`[bx:spec-done:<pr>:<token>]\`.\n` +
-    `fix: Read every fully paginated feedback source and judge/reply to every item. Apply accepted findings to ` +
-    `code and tests, or to the reviewed spec while \`stage: spec\`. Commit and push any file changes. When all ` +
-    `current feedback is handled, emit \`[bx:pr-fixed:<token>]\` exactly once, including when replies required ` +
-    `no file change.\n` +
-    `code: Read the approved spec-path, implement it completely, test, commit, push, and update the bound PR via ` +
-    `platform publish. Then emit \`[bx:pr-created:<pr>:<token>]\` exactly once.\n` +
-    `post-approve: Re-read every fully paginated feedback source and handle all current items. A \`pending:\` ` +
-    `header line lists \`<source-key>:<comment-id>\` items still lacking an ack reply; answer each with an ack ` +
-    `before anything else. If any file changes, commit and push, then stop without a completion signal so Baxian ` +
-    `can recheck. If no file change is needed, re-fetch once more; only when clean emit ` +
-    `\`[bx:pr-merge-ready:<token>]\` exactly once.\n` +
-    `Never merge or leave workdir/branch.`,
+    `develop: implement and test it, or write the spec to spec-path if the task calls for one; commit, push, ` +
+    `publish the PR. Emit \`[bx:pr-created:<pr>:<token>]\`, or \`[bx:spec-done:<pr>:<token>]\` when what you ` +
+    `published is a spec.\n` +
+    `fix: judge and reply to every feedback item and apply what you accept (while \`stage: spec\`, to the spec), ` +
+    `commit and push any file changes, then emit \`[bx:pr-fixed:<token>]\` — also when nothing needed changing.\n` +
+    `code: implement the approved spec-path, test it, commit and push, update the PR, then emit ` +
+    `\`[bx:pr-created:<pr>:<token>]\`.\n` +
+    `post-approve: handle the remaining feedback; \`pending:\` lists items still lacking an ack reply. If files ` +
+    `changed, commit and push, then stop so baxian can recheck; otherwise emit ` +
+    `\`[bx:pr-merge-ready:<token>]\`.`,
   qa:
     `Task contract (qa; later prompts for this task carry only the header lines):\n` +
-    `review: Independently review the complete PR at anchor-sha: diff first, then requirements, tests/checks, ` +
-    `and every fully paginated feedback source. Verify claims against the code and report only concrete ` +
-    `findings; while \`stage: spec\`, review the spec for complete, implementable requirements and do not ` +
-    `require implementation yet.\n` +
-    `recheck: Everything under review applies again on this round's anchor-sha; additionally verify every prior ` +
-    `finding against the replies and current code, then check for new risks.\n` +
-    `Publish exactly one platform verdict using this round's pass or fail line and verify it landed on ` +
-    `anchor-sha. There is no pane completion signal for a review verdict.`,
+    `review: independently review the PR — diff first, then requirements, tests and checks, and the feedback ` +
+    `sources. Verify claims against the code and report concrete findings; while \`stage: spec\`, review the spec ` +
+    `for complete, implementable requirements instead.\n` +
+    `recheck: review again, and check every prior finding against the replies and current code.\n` +
+    `Publish exactly one verdict using this round's pass or fail line. There is no pane completion signal for a ` +
+    `review verdict.`,
 };
 
 const PROTOCOL =
-  `baxian owns routing and merge; stay in workdir on its branch and follow repository rules.\n` +
-  `Emit each [bx:...] marker as assistant text alone on its own line, placeholders filled, only once its ` +
-  `conditions hold. For the nth human question emit \`[bx:need-input:<token>:<n>]\`; once answered emit ` +
-  `\`[bx:input-received:<token>:<n>]\` before anything else.`;
+  `baxian keeps this Agent+Task context across phases and owns routing/merge. Stay in workdir on its branch, follow ` +
+  `repository rules, and use normal engineering judgment.\n` +
+  `Markers are how baxian sees progress: when your contract names one, emit it as assistant text alone on its own ` +
+  `line with placeholders replaced, once its conditions hold. Skip it and the task stalls.\n` +
+  `To pause for a human, emit \`[bx:need-input:<token>:<n>]\` for the nth question; once it is answered, emit ` +
+  `\`[bx:input-received:<token>:<n>]\` before resuming work.`;
 
 function platformPromptForRole(role: AgentRole, prompts: PlatformAgentPrompts): string {
   const slices = role === 'dev'

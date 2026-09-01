@@ -150,7 +150,7 @@ vite.config.ts.timestamp-*
 # Git worktrees
 .worktrees/
 
-# Baxian runtime state
+# baxian runtime state
 .baxian/
 .baxian-worktrees/
 

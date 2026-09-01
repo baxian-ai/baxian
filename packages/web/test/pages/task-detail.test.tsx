@@ -302,7 +302,7 @@ describe('TaskDetail page — header & info', () => {
     });
 
     expect(screen.getByText('The local task branch was kept for now')).toBeTruthy();
-    expect(screen.getByText('Baxian could not safely remove the local task branch, so it kept the branch to avoid losing work.')).toBeTruthy();
+    expect(screen.getByText('baxian could not safely remove the local task branch, so it kept the branch to avoid losing work.')).toBeTruthy();
     expect(screen.getByText('Technical details')).toBeTruthy();
     expect(screen.getByText('runtime is not idle; local branch cleanup deferred')).toBeTruthy();
   });
@@ -317,7 +317,7 @@ describe('TaskDetail page — header & info', () => {
     });
 
     expect(screen.getByText('The local task branch was kept')).toBeTruthy();
-    expect(screen.getByText('Baxian deliberately kept the local task branch. You can inspect or remove it later.')).toBeTruthy();
+    expect(screen.getByText('baxian deliberately kept the local task branch. You can inspect or remove it later.')).toBeTruthy();
     expect(screen.getByText('Technical details')).toBeTruthy();
     expect(screen.getByText('remote branch is absent; preserving the local branch without retry')).toBeTruthy();
   });
@@ -489,7 +489,7 @@ describe('TaskDetail page — actions & states', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run task again' }));
     const dialog = await findConfirmDialog();
     expect(within(dialog).getByText('Run task task-010 again?')).toBeTruthy();
-    expect(within(dialog).getByText('The PR is already merged. Baxian will create a new task with the same title and description and start it from the beginning.')).toBeTruthy();
+    expect(within(dialog).getByText('The PR is already merged. baxian will create a new task with the same title and description and start it from the beginning.')).toBeTruthy();
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Run task again' }));
     });
@@ -882,7 +882,7 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run task again' }));
     const dialog = await findConfirmDialog();
     expect(within(dialog).getByText('Run task task-010 again?')).toBeTruthy();
-    expect(within(dialog).getByText('Baxian will create a new task and start it from the beginning. This task remains in the history.')).toBeTruthy();
+    expect(within(dialog).getByText('baxian will create a new task and start it from the beginning. This task remains in the history.')).toBeTruthy();
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Run task again' }));
     });
@@ -983,7 +983,7 @@ describe('TaskDetail page — human confirmation gates', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and merge' }));
     const dialog = await findConfirmDialog();
     expect(within(dialog).getByText('Confirm and merge PR #55?')).toBeTruthy();
-    expect(within(dialog).getByText('Baxian will merge PR #55, finish the task, and release its agents.')).toBeTruthy();
+    expect(within(dialog).getByText('baxian will merge PR #55, finish the task, and release its agents.')).toBeTruthy();
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm and merge' }));
     });
