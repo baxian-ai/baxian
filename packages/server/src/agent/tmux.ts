@@ -293,6 +293,13 @@ function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRuntimeKin
   return RUNTIME_COMPLETION_POPUP_RE.test(footer.join(' '));
 }
 
+// manifest 不建模这三类遮挡,但它们会吃掉按键:就绪/提交/派发探针必须共用同一份并集
+export function hasNativeOverlay(stripped: string, runtime: AgentRuntimeKind): boolean {
+  return detectStartupDialog(stripped, runtime)
+    || TRUST_DIALOGS[runtime].test(stripped)
+    || detectRuntimeCompletionPopup(stripped, runtime);
+}
+
 const CODEX_BACKTRACK_HINT_RE = /(?:^|\n)[ \t]*esc again to edit previous message[ \t]*(?:\n[ \t]*)*$/i;
 
 function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind): boolean {
@@ -331,7 +338,7 @@ export function hasRuntimeReadyView(
 ): boolean {
   if (detection.state !== 'idle') return false;
   if (!isTrustedIdleRule(runtime, detection.matchedRuleId) && !hasLaunchReadyCue(stripped, runtime)) return false;
-  return !detectStartupDialog(stripped, runtime) && !TRUST_DIALOGS[runtime].test(stripped);
+  return !hasNativeOverlay(stripped, runtime);
 }
 
 export type AdoptPaneState =
@@ -1065,9 +1072,7 @@ export class TmuxManager {
       const enterWouldSubmit =
         detection.state !== 'pending'
         && !detection.skipStateUpdate
-        && !detectStartupDialog(visible, runtime)
-        && !TRUST_DIALOGS[runtime].test(visible)
-        && !detectRuntimeCompletionPopup(visible, runtime);
+        && !hasNativeOverlay(visible, runtime);
       if (
         opts.resend
         && enterWouldSubmit

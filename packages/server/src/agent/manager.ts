@@ -10634,7 +10634,7 @@ export class AgentManager {
     // 标题规则优先级最高:屏幕判 idle 不作数,必须带标题复核
     if (detection.state === 'idle') detection = classifyScreen(runtime, cap, await tmux.readPaneTitle(pane));
     const ready = hasRuntimeReadyView(cap, runtime, detection);
-    if (detection.state === 'pending' || detection.skipStateUpdate || detectStartupDialog(cap, runtime)) {
+    if (detection.state === 'pending' || detection.skipStateUpdate) {
       throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
     }
     return { cap, ready, working: detection.state === 'working' };

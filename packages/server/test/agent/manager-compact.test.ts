@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentManager } from '../../src/agent/manager.js';
-import { TmuxManager, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
+import { TmuxManager, ReplNotReadyError, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
 import type { AgentStore } from '../../src/state/agent-store.js';
 import type { LockManager } from '../../src/state/lock.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
@@ -581,5 +581,36 @@ describe('waitForReplPromptReady (narrow-pane width-independent idle detection)'
     await expect(
       callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('dev-1', '%6'), 'claude-code', 200),
     ).rejects.toThrow(/repl not ready/);
+  });
+
+  function setStableSpacingMs(ms: number): void {
+    (manager as never as { readyStableSpacingMs: number }).readyStableSpacingMs = ms;
+  }
+
+  it('stableIdle: a trust dialog never joins the idle streak and times out as a retryable ReplNotReadyError', async () => {
+    setStableSpacingMs(5);
+    mockPaneState('2.1.199', 'Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit\n', 'baxian');
+    const tmux = new TmuxManager(mockRunner);
+    await expect(
+      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('dev-1', '%6'), 'claude-code', 100, { stableIdle: true }),
+    ).rejects.toBeInstanceOf(ReplNotReadyError);
+  });
+
+  it('stableIdle: a codex completion popup never joins the idle streak even though the YOLO banner anchor reads as idle', async () => {
+    setStableSpacingMs(5);
+    mockPaneState('codex', 'permissions: YOLO mode\n\n› $bax\n  $baxian-task  Dispatch\n\n  Press enter to insert or esc to close\n', 'codex');
+    const tmux = new TmuxManager(mockRunner);
+    await expect(
+      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('qa-1', '%7'), 'codex', 100, { stableIdle: true }),
+    ).rejects.toBeInstanceOf(ReplNotReadyError);
+  });
+
+  it('stableIdle: the same codex banner with an empty composer still passes (control)', async () => {
+    setStableSpacingMs(5);
+    mockPaneState('codex', 'permissions: YOLO mode\n\n› \n\n  gpt-5.5 xhigh · ~/repo\n', 'codex');
+    const tmux = new TmuxManager(mockRunner);
+    await expect(
+      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('qa-1', '%7'), 'codex', 1000, { stableIdle: true }),
+    ).resolves.toBeUndefined();
   });
 });

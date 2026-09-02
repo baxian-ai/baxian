@@ -3,7 +3,7 @@ import type { BaxianConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager } from '../../src/agent/manager.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
+import { TmuxManager, ReplNotReadyError, type PaneRef } from '../../src/agent/tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from '../../src/agent/branch.js';
 import { TEST_SESSION_REF, useManagerSuiteHarness } from '../helpers/manager-harness.js';
 
@@ -52,7 +52,7 @@ describe('AgentManager dispatch', () => {
     return prompts;
   }
 
-  function mockEnsureSession(over: { createdSession?: boolean; freshRuntime?: boolean; paneId?: string; workdir?: string } = {}): void {
+  function mockEnsureSession(over: { createdSession?: boolean; freshRuntime?: boolean; paneId?: string; workdir?: string; pane?: PaneRef } = {}): void {
     vi.spyOn(harness.manager, 'ensureSession').mockImplementation(async (agentId) => ({
       ok: true,
       createdSession: false,
@@ -368,6 +368,42 @@ describe('AgentManager dispatch', () => {
     expect(harness.manager.getPendingDispatchRetry(t.id)).toMatchObject({
       kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'tokA12345678',
       qaPhase: 'recheck',
+    });
+  });
+
+  it('startSession recheck 遇 codex 补全浮层（manifest 判 idle）→ 与遇忙同路：登记 qa-recheck pending 并抛 busyPending', async () => {
+    harness.manager = await makeManagedCloneManager();
+    const t = await harness.seedTask({
+      id: 'task-popup', branch: 'bx/task-popup', status: 'review',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 8, qaAgentId: 'qa-1', signalToken: 'tokP12345678',
+    });
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await harness.acquireAgentLock('qa-1', t.id);
+
+    mockEnsureSession({ pane: { session: TEST_SESSION_REF, paneId: '%0', claim: 'qa-1' } });
+    vi.spyOn(
+      harness.manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockRestore();
+    const popup = 'permissions: YOLO mode\n\n› $bax\n  $baxian-task  Dispatch\n\n  Press enter to insert or esc to close\n';
+    (harness.manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => ({
+      ...workdirRunner(),
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('pane_current_command')) return { stdout: 'BX_PANE_OKcodex\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK\n', stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n${popup}`, stderr: '', exitCode: 0 };
+      }),
+    });
+    Object.assign(harness.manager, { cleanComposerWaitMs: 50, readyStableSpacingMs: 5 });
+
+    await expect(harness.manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'tokP12345678',
+    })).rejects.toMatchObject({
+      partial: expect.objectContaining({ handled: true, busyPending: true }),
+    });
+    expect(await harness.lockManager.isLocked('qa-1')).toBe(true);
+    expect(harness.manager.getPendingDispatchRetry(t.id)).toMatchObject({
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'tokP12345678', qaPhase: 'recheck',
     });
   });
 

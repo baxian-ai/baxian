@@ -187,6 +187,12 @@ describe('hasRuntimeReadyView', () => {
     expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
   });
 
+  it('codex: a completion popup is not ready even with the YOLO banner anchor on screen (Enter would insert, not submit)', () => {
+    const banner = 'permissions: YOLO mode\n\n';
+    expect(hasRuntimeReadyView(`${banner}› \n\n  gpt-5.5 xhigh · ~/repo\n`, 'codex')).toBe(true);
+    expect(hasRuntimeReadyView(`${banner}› $bax\n  $baxian-task  Dispatch\n\n  Press enter to insert or esc to close\n`, 'codex')).toBe(false);
+  });
+
   it('reads the codex pinned composer as idle once the styled blank rows arrive trimmed', () => {
     const screen = '─ Worked for 9m 16s ───────\n\n\n'
       + '› Ask Codex to do anything\n\n'
