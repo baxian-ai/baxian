@@ -90,12 +90,18 @@ function shouldGatePendingIdle(
   if (tmuxObservation.runtimeStatusHint !== 'pending') return false;
   if (tmuxObservation.reason !== 'PENDING_IDLE') return false;
   if (agentId && task?.qaAgentId === agentId && task.status === 'review') return false;
+  if (qaWaitingOnDev(task, agentId)) return true;
   return !(task && WORKING_TASK_STATUSES.has(task.status));
+}
+
+function qaWaitingOnDev(task: TaskState | undefined, agentId?: string): boolean {
+  return !!task && !!agentId && task.qaAgentId === agentId && WORKING_TASK_STATUSES.has(task.status);
 }
 
 function deriveTaskBoundStatus(task: TaskState | undefined, agentId?: string): AgentRuntimeStatus {
   if (!task) return 'working';
   if (agentId && task.qaAgentId === agentId && task.status === 'review') return 'working';
+  if (qaWaitingOnDev(task, agentId)) return 'waiting';
   if (WORKING_TASK_STATUSES.has(task.status)) return 'working';
   if (WAITING_TASK_STATUSES.has(task.status)) return 'waiting';
   if (ERROR_TASK_STATUSES.has(task.status)) return 'error';

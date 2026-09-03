@@ -423,3 +423,35 @@ describe('buildAllAgentSnapshots — batched bootstrap error load', () => {
     expect(latestBootstrapForAgent).not.toHaveBeenCalled();
   });
 });
+
+describe('QA participant while dev is fixing', () => {
+  const fixingQaTask = (): TaskState => ({ ...task('fixing'), qaAgentId: 'qa-1' });
+  const pendingIdle = (): TmuxSessionObservation => presentObs({
+    runtimeStatusHint: 'pending',
+    reason: 'PENDING_IDLE',
+    message: 'idle',
+    latestError: { id: 'err-1', agentId: 'qa-1', reason: 'PENDING_IDLE', message: 'idle', occurredAt: NOW },
+  });
+
+  it('QA bound to a fixing task is waiting on dev, so PENDING_IDLE is suppressed', () => {
+    expect(deriveRuntimeStatus(binding({ id: 'qa-1', taskId: 'task-1' }), pendingIdle(), fixingQaTask())).toBe('waiting');
+    expect(deriveRuntimeStatus(binding({ id: 'qa-1', taskId: 'task-1' }), presentObs(), fixingQaTask())).toBe('waiting');
+  });
+
+  it('dev bound to the same fixing task still surfaces PENDING_IDLE', () => {
+    expect(deriveRuntimeStatus(binding({ taskId: 'task-1' }), pendingIdle(), fixingQaTask())).toBe('pending');
+  });
+
+  it('agentSnapshot drops the PENDING_IDLE reason/message/latestError for the waiting QA', () => {
+    const snapshot = agentSnapshot(
+      { id: 'qa-1', projectId: 'proj' },
+      binding({ id: 'qa-1', taskId: 'task-1' }),
+      pendingIdle(),
+      fixingQaTask(),
+    );
+    expect(snapshot.runtimeStatus).toBe('waiting');
+    expect(snapshot.reason).toBeUndefined();
+    expect(snapshot.message).toBeUndefined();
+    expect(snapshot.latestError).toBeUndefined();
+  });
+});

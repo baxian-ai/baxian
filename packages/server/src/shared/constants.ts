@@ -121,4 +121,4 @@ export function isTaskOpen(status: TaskStatus): boolean {
 
 export const TASK_LIST_PAGE_SIZE = 20;
 
-export const REVIEW_VERDICT_TIMEOUT_MS = 10 * 60 * 1000;
+export const REVIEW_VERDICT_TIMEOUT_MS = 30 * 60 * 1000;

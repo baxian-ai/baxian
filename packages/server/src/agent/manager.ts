@@ -2402,12 +2402,14 @@ export class AgentManager {
           }
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
         } catch (err) {
-          if (opts.deferWhenBusy && err instanceof ReplNotReadyError && cfg.role !== 'dev') {
+          // busy is a deferral, not a failure: rethrown so callers can tell it from a lost lock/config (both return false);
+          // judged on the binding read under the lock, never the caller's snapshot (a hold cleared by Resume must not re-hold)
+          if (opts.deferWhenBusy && state.status !== 'awaiting_human' && err instanceof ReplNotReadyError && cfg.role !== 'dev') {
             console.warn(
               `[AgentManager] releaseAgentForTask: agent ${agentId} REPL is busy; refusing release without a hold ` +
               `(the pass can be re-queued): ${err.message}`,
             );
-            return false;
+            throw err;
           }
           const reason = err instanceof DirtyWorkdirError
             ? err.message
@@ -7494,6 +7496,7 @@ export class AgentManager {
     createdSession: boolean,
     err: unknown,
     dispatch: { passToken?: string; pendingBudget?: { since: number; budgetAlerted?: boolean } },
+    origin = 'startSession',
   ): Promise<EnsureSessionError | null> {
     if (!(err instanceof ReplNotReadyError)) return null;
     if (phase !== 'review' && phase !== 'recheck') return null;
@@ -7504,7 +7507,7 @@ export class AgentManager {
       current = await this.taskStore.get(taskId);
     } catch (readErr) {
       console.warn(
-        `[AgentManager] startSession[${phase}]: busy on task ${taskId} but pass token could not be verified; ` +
+        `[AgentManager] ${origin}[${phase}]: busy on task ${taskId} but pass token could not be verified; ` +
         `falling back to the non-pending failure path:`,
         readErr,
       );
@@ -7512,7 +7515,7 @@ export class AgentManager {
     }
     if (current?.signalToken !== passToken) {
       console.warn(
-        `[AgentManager] startSession[${phase}]: busy on task ${taskId} but the review pass was superseded ` +
+        `[AgentManager] ${origin}[${phase}]: busy on task ${taskId} but the review pass was superseded ` +
         `(expected ${passToken}, now ${current?.signalToken ?? 'gone'}); not queueing a pending retry`,
       );
       return null;
@@ -7524,7 +7527,7 @@ export class AgentManager {
       qaPhase: phase,
     }, dispatch.pendingBudget);
     console.warn(
-      `[AgentManager] startSession[${phase}]: QA pane busy for task ${taskId}; ` +
+      `[AgentManager] ${origin}[${phase}]: QA pane busy for task ${taskId}; ` +
       `${phase} queued for redispatch when idle (${(err.message.split('\n')[0])})`,
     );
     return new EnsureSessionError(
@@ -9575,6 +9578,16 @@ export class AgentManager {
       && this.gitReviewLeaseMatches(task, lease);
   }
 
+  private async yieldGitReviewClaimToPendingRetry(
+    taskId: string,
+    lease: Pick<ReviewDispatchLease, 'generation' | 'claimId' | 'signalToken'>,
+  ): Promise<TaskState> {
+    await this.resetGitReviewDispatchClaim(taskId, lease);
+    const pending = await this.taskStore.get(taskId);
+    if (!pending) throw new ApiError(404, `Task ${taskId} disappeared during git review dispatch`);
+    return pending;
+  }
+
   async dispatchGitReviewLease(
     taskId: string,
     opts: {
@@ -9616,21 +9629,31 @@ export class AgentManager {
           'dispatch-unsupported',
         );
       }
-      const released = await this.releaseAgentForTask(qaId, taskId, 'idle', {
-        expectedTask: { status: 'review', phase: task.phase, signalToken: lease.signalToken },
-        expectedReviewDispatch: lease,
-        ...(previousQa.lockToken !== undefined ? { expectedLockToken: previousQa.lockToken } : {}),
-        ...(previousQa.status === 'awaiting_human'
-          ? {
-              allowAwaitingHuman: true,
-              expectedHold: {
-                phase: previousQa.awaitingPhase,
-                since: previousQa.awaitingSince,
-                nonce: previousQa.awaitingNonce,
-              },
-            }
-          : {}),
-      });
+      let released: boolean;
+      try {
+        released = await this.releaseAgentForTask(qaId, taskId, 'idle', {
+          expectedTask: { status: 'review', phase: task.phase, signalToken: lease.signalToken },
+          expectedReviewDispatch: lease,
+          ...(previousQa.lockToken !== undefined ? { expectedLockToken: previousQa.lockToken } : {}),
+          ...(previousQa.status === 'awaiting_human'
+            ? {
+                allowAwaitingHuman: true,
+                expectedHold: {
+                  phase: previousQa.awaitingPhase,
+                  since: previousQa.awaitingSince,
+                  nonce: previousQa.awaitingNonce,
+                },
+              }
+            : { deferWhenBusy: true }),
+        });
+      } catch (err) {
+        const busyPend = await this.queueQaBusyPendingRetry(taskId, qaId, qaPhase, false, err, {
+          passToken: lease.signalToken,
+          ...(opts.pendingBudget !== undefined ? { pendingBudget: opts.pendingBudget } : {}),
+        }, 'dispatchGitReviewLease');
+        if (!busyPend) throw err;
+        return this.yieldGitReviewClaimToPendingRetry(taskId, lease);
+      }
       if (!released) {
         await this.resetGitReviewDispatchClaim(taskId, lease);
         throw new ApiError(409, `QA agent ${qaId} could not be released for git review dispatch`);
@@ -9724,10 +9747,7 @@ export class AgentManager {
         throw err;
       }
       if (err instanceof EnsureSessionError && err.partial.busyPending) {
-        await this.resetGitReviewDispatchClaim(taskId, lease);
-        const pending = await this.taskStore.get(taskId);
-        if (!pending) throw new ApiError(404, `Task ${taskId} disappeared during git review dispatch`);
-        return pending;
+        return this.yieldGitReviewClaimToPendingRetry(taskId, lease);
       }
       await resetKnownUndelivered();
       if (!(err instanceof EnsureSessionError && err.partial.handled)) await releaseOwnAcquire();
@@ -10126,19 +10146,21 @@ export class AgentManager {
     const task = await this.taskStore.get(taskId);
     if (!task || task.status !== 'fixing') return false;
     const qaAgentId = requireTaskQaAgentId(task, 'dispatchGitFixToDev');
-    const qaState = await this.agentStore.get(qaAgentId);
-    const qaReleased = qaState?.taskId !== task.id
-      ? true
-      : await this.releaseAgentForTask(
-          qaAgentId,
-          task.id,
-          'idle',
-          { allowAwaitingHuman: true },
-        ).catch(err => {
-          console.error(`[AgentManager] git fix QA release(${qaAgentId}) failed:`, err);
-          return false;
-        });
+    let qaReleased = (await this.agentStore.get(qaAgentId))?.taskId !== task.id;
+    let qaBusy = false;
     if (!qaReleased) {
+      try {
+        qaReleased = await this.releaseAgentForTask(qaAgentId, task.id, 'idle', {
+          allowAwaitingHuman: true,
+          deferWhenBusy: true,
+        });
+      } catch (err) {
+        // a busy QA (verdict posted, still printing) stays bound without a hold; the fix reconciler retries the release
+        qaBusy = err instanceof ReplNotReadyError;
+        if (!qaBusy) console.error(`[AgentManager] git fix QA release(${qaAgentId}) failed:`, err);
+      }
+    }
+    if (!qaReleased && !qaBusy) {
       await this.emitIntervention(task.projectId, task.agentId, task.id, {
         phase: 'qa-release-failed-but-dev-dispatched',
         qaAgentId,

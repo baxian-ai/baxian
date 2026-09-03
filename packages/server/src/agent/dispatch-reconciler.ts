@@ -5,6 +5,7 @@ import type { AgentStore } from '../state/agent-store.js';
 import type { TaskStore } from '../state/task-store.js';
 import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
 import type { TmuxSessionStatusStore, TmuxSessionObservation } from './tmux-probe-poller.js';
+import { ReplNotReadyError } from './tmux.js';
 import {
   type AgentManager,
   type PendingDispatchRetry,
@@ -225,6 +226,10 @@ export class DispatchReconciler {
   }
 
   private async reconcileFix(task: TaskState): Promise<void> {
+    // QA housekeeping must never block the dev fix: a failed store read here is logged and retried next cycle
+    await this.releaseQaDeferredWhileBusy(task).catch(err => {
+      console.warn(`[dispatch-reconciler] deferred QA release for ${task.id} skipped this cycle:`, err);
+    });
     const devId = task.agentId;
     if (!devId) return;
     const entry = this.opts.manager.getPendingDispatchRetry(task.id);
@@ -408,6 +413,17 @@ export class DispatchReconciler {
       console.warn(`[dispatch-reconciler] redispatch ${task.id} (${action}) failed:`, err);
       return;
     }
+    // a lease handed back as pending means nothing was delivered: same token → the QA was busy and this pass is queued again;
+    // another token → an external pass took over inside the requeue window and must not inherit this lineage
+    if (result.reviewDispatch?.phase === 'pending') {
+      if (result.signalToken === tokenAtDecision) {
+        console.warn(`[dispatch-reconciler] redispatch ${task.id} (${action}) queued again (QA busy)`);
+      } else {
+        console.warn(`[dispatch-reconciler] redispatch ${task.id} (${action}) superseded by an external pass while re-queued; dropping this lineage`);
+        this.attempts.delete(task.id);
+      }
+      return;
+    }
     const after = this.opts.manager.getPendingDispatchRetry(task.id);
     if (after?.kind === 'qa-recheck' && after.signalToken === tokenAtDecision) {
       this.opts.manager.clearPendingDispatchRetryIfMatches(task.id, {
@@ -485,6 +501,36 @@ export class DispatchReconciler {
     } catch (err) {
       console.warn(`[dispatch-reconciler] audit emit failed for ${task.id}:`, err);
     }
+  }
+
+  private async releaseQaDeferredWhileBusy(task: TaskState): Promise<void> {
+    const qaId = task.qaAgentId;
+    // the probe is a free pre-check: a pane still printing would only burn the release's 5s wait inside the task lock
+    if (!qaId || this.opts.statusStore.get(qaId).runtimeStatusHint === 'working') return;
+    const qa = await this.opts.agentStore.get(qaId);
+    if (qa?.taskId !== task.id || qa.status === 'awaiting_human') return;
+    let released = false;
+    try {
+      released = await this.opts.manager.releaseAgentForTask(qaId, task.id, 'idle', {
+        deferWhenBusy: true,
+        expectedTask: { status: 'fixing' },
+      });
+    } catch (err) {
+      if (err instanceof ReplNotReadyError) return;
+      console.warn(`[dispatch-reconciler] deferred QA release for ${task.id} failed:`, err);
+    }
+    if (!released) await this.alertQaReleaseRefused(task.id, qaId);
+  }
+
+  private async alertQaReleaseRefused(taskId: string, qaId: string): Promise<void> {
+    const [fresh, qa] = await Promise.all([this.opts.taskStore.get(taskId), this.opts.agentStore.get(qaId)]);
+    if (fresh?.status !== 'fixing' || fresh.attention !== undefined
+      || qa?.taskId !== taskId || qa.status === 'awaiting_human') return;
+    await this.emitIntervention(fresh, fresh.agentId, {
+      phase: 'qa-release-failed-but-dev-dispatched',
+      qaAgentId: qaId,
+      note: `QA agent ${qaId} stayed bound to task ${taskId} after its verdict but could not be released (the server log names the refusal). The dev fix is unaffected; inspect the QA binding and its task lock, then Resume or Delete the QA agent.`,
+    });
   }
 
   private async emitIntervention(task: TaskState, agentId: string, data: Record<string, unknown>): Promise<boolean> {

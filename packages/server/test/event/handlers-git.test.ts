@@ -9,6 +9,7 @@ import type { EventBus } from '../../src/event/bus.js';
 import { recoverGitPostApprovePending, registerEventHandlers } from '../../src/event/handlers.js';
 import type { BaxianEvent, TaskState } from '../../src/shared/index.js';
 import { DirtyWorkdirError } from '../../src/agent/branch.js';
+import { ReplNotReadyError } from '../../src/agent/tmux.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
 import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
@@ -17,12 +18,17 @@ const SHA2 = 'b'.repeat(40);
 const POST_APPROVE_GENERATION = 'feedfeedfeed';
 const RECOVERY_READY_AT = '2000-01-01T00:00:00.000Z';
 
+type Harness = Awaited<ReturnType<typeof createManagerHarness>>;
+
 let tempDir: string;
 let taskStore: TaskStore;
 let lockManager: LockManager;
 let eventBus: EventBus;
 let manager: AgentManager;
 let emitted: BaxianEvent[];
+let agentStore: Harness['agentStore'];
+let seedAgent: Harness['seedAgent'];
+let acquireAgentLock: Harness['acquireAgentLock'];
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'bx-handlers-git-'));
@@ -39,7 +45,7 @@ beforeEach(async () => {
     }],
   });
   const harness = await createManagerHarness(tempDir, { config });
-  ({ taskStore, lockManager, eventBus, manager, events: emitted } = harness);
+  ({ taskStore, lockManager, eventBus, manager, events: emitted, agentStore, seedAgent, acquireAgentLock } = harness);
   vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
   vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
     ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
@@ -2954,6 +2960,43 @@ describe('generation-fenced review dispatch', () => {
     expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
       phase: 'git-review-dispatch-failed', qaPhase: 'review',
     });
+  });
+
+  it('pr.updated while the QA is still printing its previous verdict: no hold, no failed attention, recheck queued', async () => {
+    await taskStore.set(gitTask({
+      status: 'fixing', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    }));
+    await seedAgent({ id: 'qa-1', taskId: 'task-1', paneId: '%1', workdir: '/tmp/qa' });
+    await acquireAgentLock('qa-1', 'task-1');
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+    const acquire = vi.spyOn(manager, 'acquireAgentForTask');
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { prNumber: 42, headSha: SHA2, action: 'synchronize' },
+    });
+
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('review');
+    expect(task?.reviewDispatch?.phase).toBe('pending');
+    expect(manager.getPendingDispatchRetry('task-1')).toMatchObject({
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: task?.signalToken,
+    });
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe('task-1');
+    expect(qa?.status).toBeUndefined();
+    expect(acquire).not.toHaveBeenCalled();
+    expect(emitted.filter(event => event.type === 'human.intervention')).toEqual([]);
   });
 
   it('keeps an ack-unknown delivery as an uncertain lease instead of failing the task', async () => {

@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import type { StreamSubMode } from '../shared/index.js';
 import { usePaneStream } from '../hooks/use-pane-stream.ts';
+import { attachRenderer } from './terminal-renderer.ts';
 import { TerminalKeyPad, type ArrowKey } from './terminal-key-pad.tsx';
 import { ImageUploadButton } from './image-upload-button.tsx';
 import { useT } from '../i18n/index.tsx';
@@ -299,6 +300,7 @@ export function PaneTerminal({
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container);
+    const renderer = attachRenderer(term, container);
     termRef.current = term;
     fitRef.current = fit;
     const renderDisposable = isStaticPreview
@@ -408,11 +410,7 @@ export function PaneTerminal({
       termRef.current = null;
       fitRef.current = null;
       refitToContainerRef.current = null;
-      try {
-        term.dispose();
-      } catch (err) {
-        console.warn('[pane-terminal] dispose failed:', err);
-      }
+      renderer.dispose();
     };
   }, [agentId, autoFocus, canResize, forwardInput, interactive, streamMode, resize]);
 

@@ -3,10 +3,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BaxianConfig, BaxianEvent, TaskState, AgentBindingFacts } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG, taskAttentionGeneration } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG, REVIEW_VERDICT_TIMEOUT_MS, taskAttentionGeneration } from '../../src/shared/index.js';
 import { AgentManager } from '../../src/agent/manager.js';
 import { DispatchReconciler } from '../../src/agent/dispatch-reconciler.js';
 import { TmuxSessionStatusStore, type TmuxSessionObservation } from '../../src/agent/tmux-probe-poller.js';
+import { ReplNotReadyError } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -210,7 +211,7 @@ describe('DispatchReconciler attention and manual reset', () => {
 
   it('emits a persistent-attention source event when a review verdict is overdue', async () => {
     await seedTask({
-      reviewDispatchedAt: new Date(Date.now() - 11 * 60_000).toISOString(),
+      reviewDispatchedAt: new Date(Date.now() - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString(),
     });
     await seedQa();
 
@@ -227,7 +228,7 @@ describe('DispatchReconciler attention and manual reset', () => {
 
   it('does not overwrite an existing attention with a recurring overdue alert', async () => {
     const task = await seedTask({
-      reviewDispatchedAt: new Date(Date.now() - 11 * 60_000).toISOString(),
+      reviewDispatchedAt: new Date(Date.now() - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString(),
     });
     await taskStore.set({
       ...task,
@@ -250,7 +251,7 @@ describe('DispatchReconciler attention and manual reset', () => {
     await seedTask({
       phase: 'spec',
       deliveryConfirmation: { phase: 'spec', source: 'signal', at: NOW },
-      reviewDispatchedAt: new Date(Date.now() - 11 * 60_000).toISOString(),
+      reviewDispatchedAt: new Date(Date.now() - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString(),
     });
     await seedQa();
 
@@ -356,6 +357,105 @@ describe('DispatchReconciler review 侧补派', () => {
     expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
     expect(audits()).toHaveLength(1);
     expect(interventions()).toHaveLength(0);
+  });
+
+  it('pending qa-recheck 补派时释放阶段 QA 仍忙（同代重排、lease 退回 pending）→ 保留登记与预算，不写 recovered 审计', async () => {
+    const t = await seedTask({ signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef' });
+    await taskStore.set({
+      ...t,
+      reviewDispatch: {
+        generation: 'decafdecaf12', phase: 'pending', qaPhase: 'recheck', signalToken: t.signalToken!,
+        headSha: SHA, passToken: 'abcdef123456', failToken: '123456abcdef', effectiveRound: 2, updatedAt: NOW,
+      },
+    });
+    await seedQa();
+    const lockToken = await lockManager.acquire('qa-1', t.id);
+    await agentStore.update('qa-1', latest => ({ ...latest!, lockToken: lockToken! }));
+    manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken, qaPhase: 'recheck' });
+    const before = manager.getPendingDispatchRetry(t.id)!;
+    obs();
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%0', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', ''));
+    const acquire = vi.spyOn(manager, 'acquireAgentForTask');
+
+    await mkReconciler().pollOnce();
+
+    expect(acquire).not.toHaveBeenCalled();
+    expect((await taskStore.get(t.id))?.reviewDispatch?.phase).toBe('pending');
+    expect(manager.getPendingDispatchRetry(t.id)).toMatchObject({
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken, since: before.since,
+    });
+    expect((await agentStore.get('qa-1'))?.status).toBeUndefined();
+    expect(audits()).toHaveLength(0);
+    expect(interventions()).toHaveLength(0);
+  });
+
+  it('busy 让权窗口（claim 退回后、读回前）被外部新 pass 接管 → 不把旧 pass 的失败次数挂到 successor', async () => {
+    const t = await seedTask({ signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef' });
+    await taskStore.set({
+      ...t,
+      reviewDispatch: {
+        generation: 'decafdecaf12', phase: 'pending', qaPhase: 'recheck', signalToken: t.signalToken!,
+        headSha: SHA, passToken: 'abcdef123456', failToken: '123456abcdef', effectiveRound: 2, updatedAt: NOW,
+      },
+    });
+    await seedQa();
+    const lockToken = await lockManager.acquire('qa-1', t.id);
+    await agentStore.update('qa-1', latest => ({ ...latest!, lockToken: lockToken! }));
+    manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken, qaPhase: 'recheck' });
+    obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%0', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', ''));
+    const SUCCESSOR_SHA = 'b'.repeat(40);
+    const resetClaim = (manager as unknown as {
+      resetGitReviewDispatchClaim: (...args: unknown[]) => Promise<boolean>;
+    }).resetGitReviewDispatchClaim.bind(manager);
+    let successorBegun = false;
+    vi.spyOn(manager as unknown as { resetGitReviewDispatchClaim: (...args: unknown[]) => Promise<boolean> }, 'resetGitReviewDispatchClaim')
+      .mockImplementation(async (...args) => {
+        const reset = await resetClaim(...args);
+        if (reset && !successorBegun) {
+          successorBegun = true;
+          expect(await manager.beginGitReviewPass(t.id, {
+            fromStatus: ['review'], headSha: SUCCESSOR_SHA, bumpRound: false, patch: { latestHeadSha: SUCCESSOR_SHA },
+          })).not.toBeNull();
+        }
+        return reset;
+      });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+    const rec = mkReconciler({ maxAttempts: 2 });
+
+    dispatchSpy.mockRejectedValueOnce(new Error('transport down'));
+    await rec.pollOnce();
+    await rec.pollOnce();
+
+    expect(successorBegun).toBe(true);
+    const successor = await taskStore.get(t.id);
+    expect(successor?.signalToken).not.toBe(t.signalToken);
+    expect(successor?.reviewDispatch).toMatchObject({ phase: 'pending', signalToken: successor?.signalToken });
+    expect(dispatchSpy).toHaveBeenCalledTimes(2);
+
+    await rec.pollOnce();
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+    dispatchSpy.mockRejectedValueOnce(new Error('transport down'));
+    await rec.pollOnce();
+    dispatchSpy.mockRejectedValueOnce(new Error('transport down'));
+    await rec.pollOnce();
+
+    expect(dispatchSpy).toHaveBeenCalledTimes(4);
+    expect(interventions().map(e => (e.data as { phase?: string }).phase)).not.toContain('dispatch-reconcile-attempts-exhausted');
   });
 
   it('reconciler keeps missing phase and token as explicit decision-time fence fields', async () => {
@@ -1394,5 +1494,162 @@ describe('DispatchReconciler 补派恢复与有界升级', () => {
     expect(dispatchSpy).not.toHaveBeenCalled();
     await rec.pollOnce();
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('reconcileFix: QA release deferred while its REPL was busy', () => {
+  async function seedDevWithPendingFix(task: TaskState): Promise<ReturnType<typeof vi.spyOn>> {
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', taskId: task.id, workdir: '/tmp/repo', paneId: '%1',
+      startedAt: NOW, updatedAt: NOW,
+    } as AgentBindingFacts);
+    manager.registerPendingDispatchRetry(task.id, { kind: 'dev-fix', agentId: 'dev-1', signalToken: task.signalToken });
+    statusStore.set('dev-1', { tmuxSessionStatus: 'present', observedAt: freshObservedAt() });
+    return vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+  }
+
+  it('fixing 阶段 QA 仍绑定且无 hold、探测非忙 → 每轮对账重试延后释放', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    await seedQa();
+    obs();
+    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await mkReconciler().pollOnce();
+
+    expect(release).toHaveBeenCalledWith('qa-1', t.id, 'idle', expect.objectContaining({ deferWhenBusy: true }));
+  });
+
+  it('探测判 QA 仍在工作 → 本轮不进入释放（不占全局任务锁等待）', async () => {
+    await seedTask({ status: 'fixing' });
+    await seedQa();
+    obs({ runtimeStatusHint: 'working' });
+    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await mkReconciler().pollOnce();
+
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it('QA 已落 hold 或已解绑 → 不重试释放', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    obs();
+    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await seedQa({ status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending', awaitingSince: NOW });
+    await mkReconciler().pollOnce();
+    await seedQa({ taskId: undefined });
+    await mkReconciler().pollOnce();
+
+    expect(release).not.toHaveBeenCalled();
+    expect((await taskStore.get(t.id))?.status).toBe('fixing');
+  });
+
+  it('QA 仍忙（抛 ReplNotReadyError）→ 静默延后，同轮 dev-fix 补投照常', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    await seedQa();
+    obs();
+    const continueSpy = await seedDevWithPendingFix(t);
+    vi.spyOn(manager, 'releaseAgentForTask').mockRejectedValue(new ReplNotReadyError('%0', 'codex', ''));
+
+    await mkReconciler().pollOnce();
+
+    expect(continueSpy).toHaveBeenCalledWith(t.id, 'dev-1', 'fix', expect.anything());
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+    expect((await agentStore.get('qa-1'))?.taskId).toBe(t.id);
+  });
+
+  it('QA 释放抛出其他异常 → 告警后继续，同轮 dev-fix 补投不受阻断', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    await seedQa();
+    obs();
+    const continueSpy = await seedDevWithPendingFix(t);
+    vi.spyOn(manager, 'releaseAgentForTask').mockRejectedValue(new Error('agent store unavailable'));
+
+    await mkReconciler().pollOnce();
+
+    expect(continueSpy).toHaveBeenCalledWith(t.id, 'dev-1', 'fix', expect.anything());
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+    expect(interventions().map(e => e.data.phase)).toEqual(['qa-release-failed-but-dev-dispatched']);
+  });
+
+  it('QA 释放返回 false（绑定仍在但已不持任务锁）→ 发一次 qa-release-failed-but-dev-dispatched，同轮 dev-fix 照常', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    await seedQa();
+    obs();
+    const continueSpy = await seedDevWithPendingFix(t);
+
+    await mkReconciler().pollOnce();
+
+    expect(continueSpy).toHaveBeenCalledWith(t.id, 'dev-1', 'fix', expect.anything());
+    expect((await agentStore.get('qa-1'))?.taskId).toBe(t.id);
+    expect(interventions()).toHaveLength(1);
+    expect(interventions()[0]).toMatchObject({
+      agentId: 'dev-1',
+      taskId: t.id,
+      data: { phase: 'qa-release-failed-but-dev-dispatched', qaAgentId: 'qa-1' },
+    });
+  });
+
+  it('任务已有 attention → 释放被拒不重复告警，仍每轮重试', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    await taskStore.set({
+      ...t,
+      attention: {
+        reason: 'qa-release-failed-but-dev-dispatched', runbook: 'r', occurredAt: NOW,
+        recommendedActions: ['cancel'], generation: taskAttentionGeneration(t),
+      },
+    });
+    await seedQa();
+    obs();
+    const release = vi.spyOn(manager, 'releaseAgentForTask');
+    const rec = mkReconciler();
+
+    await rec.pollOnce();
+    await rec.pollOnce();
+
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(interventions()).toHaveLength(0);
+  });
+
+  it('QA 绑定预读持续失败 → 本轮跳过辅助释放，同轮 dev-fix 补投照常', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    await seedQa();
+    obs();
+    const continueSpy = await seedDevWithPendingFix(t);
+    const readBinding = agentStore.get.bind(agentStore);
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
+      if (id === 'qa-1') throw new Error('EIO');
+      return readBinding(id);
+    });
+    const release = vi.spyOn(manager, 'releaseAgentForTask');
+
+    await mkReconciler().pollOnce();
+
+    expect(release).not.toHaveBeenCalled();
+    expect(continueSpy).toHaveBeenCalledWith(t.id, 'dev-1', 'fix', expect.anything());
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+    expect(interventions()).toHaveLength(0);
+  });
+
+  it('释放被拒后的告警复核读取失败 → 本轮不告警，同轮 dev-fix 补投照常', async () => {
+    const t = await seedTask({ status: 'fixing' });
+    await seedQa();
+    obs();
+    const continueSpy = await seedDevWithPendingFix(t);
+    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
+    const readBinding = agentStore.get.bind(agentStore);
+    let qaReads = 0;
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
+      if (id === 'qa-1' && ++qaReads === 2) throw new Error('EIO');
+      return readBinding(id);
+    });
+
+    await mkReconciler().pollOnce();
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(qaReads).toBe(2);
+    expect(continueSpy).toHaveBeenCalledWith(t.id, 'dev-1', 'fix', expect.anything());
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+    expect(interventions()).toHaveLength(0);
   });
 });

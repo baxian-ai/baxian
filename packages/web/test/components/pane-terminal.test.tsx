@@ -81,6 +81,22 @@ class FakeFitAddon {
   fit(): void { FakeFitAddon.fitCount++; }
 }
 
+const attachedRenderers: Array<{ term: FakeTerminal; container: Element; disposed: boolean; attachedAfterOpen: boolean }> = [];
+
+vi.mock('../../src/components/terminal-renderer.ts', () => ({
+  attachRenderer: (term: FakeTerminal, container: Element) => {
+    const record = { term, container, disposed: false, attachedAfterOpen: term.host !== null };
+    attachedRenderers.push(record);
+    return {
+      kind: 'webgl',
+      dispose: () => {
+        record.disposed = true;
+        term.dispose();
+      },
+    };
+  },
+}));
+
 vi.mock('@xterm/xterm', () => ({ Terminal: FakeTerminal }));
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: FakeFitAddon }));
@@ -138,6 +154,7 @@ class MockResizeObserver {
 beforeEach(() => {
   fakeTerminals.length = 0;
   FakeFitAddon.fitCount = 0;
+  attachedRenderers.length = 0;
   MockResizeObserver.lastCallback = null;
   (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = MockWebSocket;
   (globalThis as unknown as { ResizeObserver: typeof MockResizeObserver }).ResizeObserver =
@@ -262,6 +279,26 @@ describe('parseOsc52Clipboard wired to the real xterm OSC parser (chunk reassemb
 });
 
 describe('PaneTerminal', () => {
+  it('attaches the renderer policy to the xterm container after open (block glyphs need WebGL/canvas)', async () => {
+    const { term } = await renderPane({ mode: 'full', interactive: true });
+    expect(attachedRenderers).toHaveLength(1);
+    expect(attachedRenderers[0]!.term).toBe(term);
+    expect(attachedRenderers[0]!.container).toBe(term.host);
+    expect(attachedRenderers[0]!.attachedAfterOpen).toBe(true);
+  });
+
+  it('preview terminals attach the same renderer policy (agent cards render the same glyphs)', async () => {
+    await renderPane({ mode: 'preview', interactive: false, maxLines: 6 });
+    expect(attachedRenderers).toHaveLength(1);
+  });
+
+  it('unmount disposes the renderer, which owns terminal disposal', async () => {
+    const { term, unmount } = await renderPane({ mode: 'full', interactive: true });
+    unmount();
+    expect(attachedRenderers[0]!.disposed).toBe(true);
+    expect(term.disposed).toBe(true);
+  });
+
   it('applies Zed light theme to the xterm instance', async () => {
     const { PaneTerminal, ZED_LIGHT_THEME, TERMINAL_BG } = await importPane();
     const { container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />);

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { TaskState } from '../../src/shared/index.js';
+import type { BaxianEvent, TaskState } from '../../src/shared/index.js';
 import type { AgentManager } from '../../src/agent/manager.js';
 import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
 import { BranchManager } from '../../src/agent/branch.js';
@@ -22,6 +22,7 @@ let agentStore: AgentStore;
 let taskStore: TaskStore;
 let lockManager: LockManager;
 let manager: AgentManager;
+let events: BaxianEvent[];
 let createManager: ManagerHarness['createManager'];
 let seedAgent: ManagerHarness['seedAgent'];
 let seedTask: ManagerHarness['seedTask'];
@@ -102,6 +103,7 @@ function useReleaseHarness(lockSeededAgents = false): void {
       seedAgent,
       seedTask,
       acquireAgentLock,
+      events,
     } = harness);
     vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {
       await onBranchCleanup?.();
@@ -440,7 +442,7 @@ describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
     expect(await lockManager.isLocked('qa-1')).toBe(true);
   });
 
-  it('QA REPL 仍忙 → 拒绝释放但不落 hold（忙碌不是清理失败，可再排队）', async () => {
+  it('QA REPL 仍忙 → 抛 ReplNotReadyError 且不落 hold（忙碌不是清理失败，可再排队）', async () => {
     const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
     await acquireAgentLock('qa-1', t.id);
@@ -454,9 +456,9 @@ describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
     ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
     const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
 
-    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true });
+    await expect(manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true }))
+      .rejects.toBeInstanceOf(ReplNotReadyError);
 
-    expect(released).toBe(false);
     expect(parkSpy).not.toHaveBeenCalled();
     const qa = await agentStore.get('qa-1');
     expect(qa?.taskId).toBe(t.id);
@@ -481,9 +483,9 @@ describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
     );
     const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
 
-    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true });
+    await expect(manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true }))
+      .rejects.toBeInstanceOf(ReplNotReadyError);
 
-    expect(released).toBe(false);
     expect(parkSpy).not.toHaveBeenCalled();
     const qa = await agentStore.get('qa-1');
     expect(qa?.taskId).toBe(t.id);
@@ -695,5 +697,133 @@ describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
     expect(await agentStore.get('qa-1')).toMatchObject({
       status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
     });
+  });
+});
+
+describe('dispatchGitFixToDev QA release', () => {
+  useReleaseHarness();
+
+  const interventionPhases = (): string[] => events
+    .filter(e => e.type === 'human.intervention')
+    .map(e => String((e.data as { phase?: string }).phase));
+
+  async function seedFixingWithBoundQa(opts: { lock?: boolean } = {}): Promise<TaskState> {
+    const t = await seedTask({ status: 'fixing', agentId: 'dev-1', qaAgentId: 'qa-1', signalToken: 'tok-fix' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    if (opts.lock !== false) await acquireAgentLock('qa-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { acquireAgentForTask: (...args: unknown[]) => Promise<boolean> },
+      'acquireAgentForTask',
+    ).mockResolvedValue(false);
+    return t;
+  }
+
+  it('QA REPL 仍忙（判决已发、总结未打完）→ 延后释放：保持绑定、不落 hold、不发释放失败干预', async () => {
+    const t = await seedFixingWithBoundQa();
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+
+    await manager.dispatchGitFixToDev(t.id);
+
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBeUndefined();
+    expect(qa?.awaitingPhase).toBeUndefined();
+    expect(interventionPhases()).not.toContain('qa-release-failed-but-dev-dispatched');
+    expect(interventionPhases()).toContain('dev-acquire-failed-fix');
+  });
+
+  it('QA 清理真正失败（落 hold）→ 仍发 qa-release-failed-but-dev-dispatched', async () => {
+    const t = await seedFixingWithBoundQa();
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockResolvedValue(undefined);
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockRejectedValue(new Error('git checkout failed'));
+
+    await manager.dispatchGitFixToDev(t.id);
+
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.status).toBe('awaiting_human');
+    expect(qa?.awaitingPhase).toBe('branch-cleanup-pending');
+    expect(interventionPhases()).toContain('qa-release-failed-but-dev-dispatched');
+  });
+
+  it('QA 释放因非忙碌原因被拒（不再持有任务锁）→ 不落 hold 但仍发 qa-release-failed-but-dev-dispatched', async () => {
+    const t = await seedFixingWithBoundQa({ lock: false });
+    const wait = vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockResolvedValue(undefined);
+
+    await manager.dispatchGitFixToDev(t.id);
+
+    expect(wait).not.toHaveBeenCalled();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBeUndefined();
+    expect(interventionPhases()).toContain('qa-release-failed-but-dev-dispatched');
+  });
+
+  it('QA 已在 hold 中且 REPL 忙 → 不延后，沿用 hold 路径并告警', async () => {
+    const t = await seedFixingWithBoundQa();
+    await agentStore.update('qa-1', latest => ({
+      ...latest!,
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: new Date().toISOString(),
+    }));
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+
+    await manager.dispatchGitFixToDev(t.id);
+
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.status).toBe('awaiting_human');
+    expect(qa?.awaitingPhase).toBe('branch-cleanup-pending');
+    expect(interventionPhases()).toContain('qa-release-failed-but-dev-dispatched');
+  });
+
+  it('hold 在快照后、释放取锁前被 Resume 清除且 REPL 仍忙 → 按锁内绑定延后，不再误落 branch-cleanup-pending', async () => {
+    const t = await seedFixingWithBoundQa();
+    await agentStore.update('qa-1', latest => ({
+      ...latest!,
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+      awaitingSince: new Date().toISOString(),
+    }));
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+    const readBinding = agentStore.get.bind(agentStore);
+    let resumedInWindow = false;
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
+      const snapshot = await readBinding(id);
+      if (id === 'qa-1' && !resumedInWindow) {
+        resumedInWindow = true;
+        expect((await manager.resumeAgent('qa-1')).resumed).toBe(true);
+      }
+      return snapshot;
+    });
+
+    await manager.dispatchGitFixToDev(t.id);
+
+    expect(resumedInWindow).toBe(true);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).not.toBe('awaiting_human');
+    expect(qa?.awaitingPhase).toBeUndefined();
+    expect(interventionPhases()).not.toContain('branch-cleanup-pending');
+    expect(interventionPhases()).not.toContain('qa-release-failed-but-dev-dispatched');
+    expect(interventionPhases()).toContain('dev-acquire-failed-fix');
   });
 });
