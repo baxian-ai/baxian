@@ -280,6 +280,25 @@ describe('PaneStreamer', () => {
       streamer.destroy();
     });
 
+    it('snapshot restores the SGR mouse encoding that the serialize addon drops', async () => {
+      const { streamer, fakePty } = makeStreamer();
+      await streamer.subscribeAtomic(cbs);
+
+      fakePty.emitData('\x1b[?1006h\x1b[?1000h\x1b[?1002h');
+      await flush(streamer);
+      const withSgr = await streamer.subscribeAtomic(NOOP_CBS);
+      expect(withSgr.snapshot.data).toContain('\x1b[?1002h');
+      expect(withSgr.snapshot.data.endsWith('\x1b[?1006h')).toBe(true);
+
+      fakePty.emitData('\x1b[?1006l\x1b[?1000l\x1b[?1002l');
+      await flush(streamer);
+      const withoutSgr = await streamer.subscribeAtomic(NOOP_CBS);
+      expect(withoutSgr.snapshot.data).not.toContain('\x1b[?1006h');
+      expect(withoutSgr.snapshot.data).not.toContain('\x1b[?1002h');
+
+      streamer.destroy();
+    });
+
     it('live callbacks added in subscribeAtomic see subsequent data with seq > snapshotSeq (no overlap)', async () => {
       const { streamer, fakePty } = makeStreamer();
 

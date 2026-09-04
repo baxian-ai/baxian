@@ -202,10 +202,14 @@ function normalizeSessionProbeTimeoutMs(value: number): number {
   return Math.min(Math.trunc(value), MAX_TIMER_DELAY_MS);
 }
 
+const SGR_MOUSE_MODE = 1006;
+const SGR_MOUSE_ON = `\x1b[?${SGR_MOUSE_MODE}h`;
+
 export class PaneStreamer {
   private pty: MinimalPty | null = null;
   private headless: xterm.Terminal;
   private serialize: SerializeAddon;
+  private sgrMouse = false;
   private onPtyDataChain: Promise<void> = Promise.resolve();
   private nextSeq = 0;
   private lastBroadcastSeq = -1;
@@ -283,6 +287,20 @@ export class PaneStreamer {
     });
     this.serialize = new SerializeAddon();
     this.headless.loadAddon(this.serialize);
+    // serialize 只能还原鼠标追踪模式、还原不了 SGR 坐标编码；缺了它 xterm.js 会把滚轮报文按 X10 走 onBinary 静默丢掉
+    this.headless.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
+      if (params.includes(SGR_MOUSE_MODE)) this.sgrMouse = true;
+      return false;
+    });
+    this.headless.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => {
+      if (params.includes(SGR_MOUSE_MODE)) this.sgrMouse = false;
+      return false;
+    });
+  }
+
+  private snapshotData(): string {
+    const data = this.serialize.serialize();
+    return this.sgrMouse ? data + SGR_MOUSE_ON : data;
   }
 
   private async ensureStarted(): Promise<void> {
@@ -644,7 +662,7 @@ export class PaneStreamer {
       const snapshot = {
         cols: this.headless.cols,
         rows: this.headless.rows,
-        data: this.serialize.serialize(),
+        data: this.snapshotData(),
       };
       const seq = this.lastBroadcastSeq;
       for (const cb of [...this.refreshCbs]) {
@@ -692,7 +710,7 @@ export class PaneStreamer {
           const snapshot: PaneSnapshot = {
             cols: this.headless.cols,
             rows: this.headless.rows,
-            data: this.serialize.serialize(),
+            data: this.snapshotData(),
           };
           const snapshotSeq = this.lastBroadcastSeq;
           if (cbs.onLive) this.live.add(cbs.onLive);
@@ -724,7 +742,7 @@ export class PaneStreamer {
           const snapshot: PaneSnapshot = {
             cols: this.headless.cols,
             rows: this.headless.rows,
-            data: this.serialize.serialize(),
+            data: this.snapshotData(),
           };
           resolve({ snapshot, snapshotSeq: this.lastBroadcastSeq });
         });
