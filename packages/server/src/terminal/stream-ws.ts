@@ -8,6 +8,8 @@ import type {
 import {
   extractTokenFromProtocols,
   isAllowedOrigin,
+  enforceSocketAuthorization,
+  SOCKET_AUTH_REVOKED,
   sanitizePtySize,
 } from './ws-auth.js';
 import { sanitizeWebInput } from './key-sanitizer.js';
@@ -68,11 +70,14 @@ function handleConnection(
   socket: import('@fastify/websocket').WebSocket,
   request: FastifyRequest,
 ): void {
+  const suppliedToken = extractTokenFromProtocols(request.headers['sec-websocket-protocol']);
+  const enforceAuthorization = () => enforceSocketAuthorization(socket, app.ctx.config.server.token, suppliedToken);
+  if (!enforceAuthorization()) return;
   const subs = new Map<string, SubState>();
   const agentSubs = new Map<string, AgentEntry>();
 
   function safeSend(msg: StreamServerMsg): void {
-    if (socket.readyState !== socket.OPEN) return;
+    if (!enforceAuthorization()) return;
     try {
       socket.send(JSON.stringify(msg));
     } catch (err) {
@@ -191,6 +196,7 @@ function handleConnection(
         snapshotSeq = result.snapshotSeq;
       }
 
+      if (!enforceAuthorization()) releaseSub(subscriberId);
       if (subState.phase === 'released') {
         if (isCreator && installUnsub) {
           const live = agentSubs.get(agentId);
@@ -385,6 +391,7 @@ function handleConnection(
   }
 
   socket.on('message', async (raw: { toString(): string }) => {
+    if (!enforceAuthorization()) return;
     let msg: StreamClientMsg;
     try {
       msg = JSON.parse(raw.toString()) as StreamClientMsg;
@@ -456,14 +463,16 @@ function handleConnection(
     }
   });
 
-  socket.on('close', () => {
+  const releaseSubscriptions = () => {
     for (const [sid, s] of [...subs]) {
       if (s.mode === 'full' && s.phase === 'active') {
         void emitIntervention(app, s.agentId, 'close');
       }
       releaseSub(sid);
     }
-  });
+  };
+  socket.on('close', releaseSubscriptions);
+  socket.on(SOCKET_AUTH_REVOKED, releaseSubscriptions);
 
   socket.on('error', (err: unknown) => {
     console.warn('[stream-ws] socket error:', err);

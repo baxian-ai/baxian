@@ -7,6 +7,8 @@ import type {
 import {
   extractTokenFromProtocols,
   isAllowedOrigin,
+  enforceSocketAuthorization,
+  SOCKET_AUTH_REVOKED,
 } from '../terminal/ws-auth.js';
 import {
   buildAgentSnapshotById,
@@ -46,10 +48,13 @@ function handleConnection(
   socket: import('@fastify/websocket').WebSocket,
   request: FastifyRequest,
 ): void {
+  const suppliedToken = extractTokenFromProtocols(request.headers['sec-websocket-protocol']);
+  const enforceAuthorization = () => enforceSocketAuthorization(socket, app.ctx.config.server.token, suppliedToken);
+  if (!enforceAuthorization()) return;
   const subs = new Map<EventsTopic, () => void>();
 
   function safeSend(msg: EventsServerMsg): void {
-    if (socket.readyState !== socket.OPEN) return;
+    if (!enforceAuthorization()) return;
     try {
       socket.send(JSON.stringify(msg));
     } catch (err) {
@@ -113,6 +118,7 @@ function handleConnection(
   }
 
   socket.on('message', async (raw: { toString(): string }) => {
+    if (!enforceAuthorization()) return;
     let msg: EventsClientMsg;
     try {
       msg = JSON.parse(raw.toString()) as EventsClientMsg;
@@ -152,7 +158,7 @@ function handleConnection(
     }
   });
 
-  socket.on('close', () => {
+  const releaseSubscriptions = () => {
     for (const unsub of subs.values()) {
       try {
         unsub();
@@ -160,7 +166,9 @@ function handleConnection(
       }
     }
     subs.clear();
-  });
+  };
+  socket.on('close', releaseSubscriptions);
+  socket.on(SOCKET_AUTH_REVOKED, releaseSubscriptions);
 
   socket.on('error', (err: unknown) => {
     console.warn('[events-ws] socket error:', err);

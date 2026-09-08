@@ -8960,12 +8960,26 @@ export class AgentManager {
 
     if (boundTask.status !== 'in_progress' || boundTask.agentId !== state.id) return false;
     const dispatchPhase = boundTask.specReviewRound !== undefined ? 'code' : 'develop';
-    if (await this.bootstrapPromptWasDelivered(
+    const delivered = await this.bootstrapPromptWasDelivered(
       state.taskId,
       boundTask.createdAt,
       state.id,
       dispatchPhase,
-    )) {
+    );
+    if (delivered === null) {
+      await this.markAwaitingHuman(
+        state.id,
+        'recovery-failed',
+        'Event history is incomplete or unreadable; prompt delivery cannot be verified. '
+        + 'Resume only after confirming delivery in the terminal; it keeps the task binding. '
+        + 'Resume does not recheck or replay the prompt. If delivery is confirmed absent, cancel and redispatch; '
+        + 'otherwise keep this hold. Find file:line diagnostics under [EventLog] or read errors in the server log '
+        + 'and repair the history for future recovery checks.',
+        { expectedTaskId: state.taskId, expectedLockToken: state.lockToken },
+      );
+      return true;
+    }
+    if (delivered) {
       await this.clearBootstrapMarker(state.id, state.taskId);
       return false;
     }
@@ -8993,18 +9007,19 @@ export class AgentManager {
     createdAtIso: string,
     agentId: string,
     phase: 'develop' | 'code',
-  ): Promise<boolean> {
+  ): Promise<boolean | null> {
     const today = new Date().toISOString().slice(0, 10);
     const from = createdAtIso.slice(0, 10);
     try {
-      const events = await this.eventBus.readRange(from, today);
-      return events.some((event) => event.type === 'session.started'
+      const { events, complete } = await this.eventBus.readRangeWithStatus(from, today);
+      const delivered = events.some((event) => event.type === 'session.started'
         && event.taskId === taskId
         && event.agentId === agentId
         && event.data.phase === phase);
+      return delivered ? true : complete ? false : null;
     } catch (err) {
       console.warn(`[recover] bootstrapPromptWasDelivered read failed for task=${taskId}:`, err);
-      return false;
+      return null;
     }
   }
 

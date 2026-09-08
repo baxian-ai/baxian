@@ -211,6 +211,103 @@ async function pingBarrier(ws: WebSocket, reader: ReturnType<typeof attachMessag
 }
 
 describe('streamWsPlugin /api/stream — preValidation', () => {
+  it('revokes terminal access and releases subscriptions immediately when the token changes', async () => {
+    const { app, port, ctx } = await startApp({ configToken: 'old-token' });
+    runningApp = app;
+    ctx.configPath = join(tempDir, 'config.json');
+    const { streamer, unsubscribe, releaseFullHold } = makeFakeStreamer();
+    const psm = fakePsm(streamer);
+    ctx.paneStreamerManager = psm;
+    const ws = openWs(port, { protocols: `baxian.token.${HEX('old-token')}` });
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'full', 'full');
+    send(ws, { op: 'input', subscriberId: 'full', data: 'before' });
+    await waitFor(() => vi.mocked(psm.enqueueInput).mock.calls.length === 1);
+    const serverSocket = [...app.websocketServer.clients][0];
+
+    const response = await app.inject({
+      method: 'PATCH', url: '/api/config', headers: { authorization: 'Bearer old-token' },
+      payload: { server: { token: 'new-token' } },
+    });
+    expect(response.statusCode).toBe(200);
+    serverSocket.emit('message', Buffer.from(JSON.stringify({ op: 'input', subscriberId: 'full', data: 'after' })));
+    await waitFor(() => ws.readyState === WebSocket.CLOSED);
+    expect(psm.enqueueInput).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(releaseFullHold).toHaveBeenCalledOnce();
+
+    const old = openWs(port, { protocols: `baxian.token.${HEX('old-token')}` });
+    expect(await waitForOpenOrError(old)).toEqual({ kind: 'error', status: 401 });
+    const fresh = openWs(port, { protocols: `baxian.token.${HEX('new-token')}` });
+    const freshReader = attachMessageReader(fresh);
+    await waitOpen(fresh);
+    await subscribeActive(fresh, freshReader, 'fresh', 'full');
+    fresh.close();
+  });
+
+  it.each(['closing', 'closed'])('cleans up an in-flight terminal subscription when the revoked socket is %s', async (socketState) => {
+    const { app, port, ctx } = await startApp({ configToken: 'old-token' });
+    runningApp = app;
+    ctx.configPath = join(tempDir, 'config.json');
+    const { streamer, unsubscribe, releaseFullHold } = makeFakeStreamer();
+    let resolveSnapshot!: (value: unknown) => void;
+    streamer.subscribeAtomic.mockImplementation(() => new Promise(resolve => { resolveSnapshot = resolve; }));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(port, { protocols: `baxian.token.${HEX('old-token')}` });
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'pending', agentId: 'dev-1', mode: 'full' });
+    await waitFor(() => streamer.subscribeAtomic.mock.calls.length === 1);
+    const finishSnapshot = () => resolveSnapshot({ snapshot: { cols: 80, rows: 24, data: '' }, snapshotSeq: 0, unsubscribe });
+    if (socketState === 'closing') {
+      const socket = [...app.websocketServer.clients][0];
+      const close = socket.close.bind(socket);
+      vi.spyOn(socket, 'close').mockImplementationOnce((code, reason) => {
+        close(code, reason);
+        finishSnapshot();
+      });
+    }
+    const response = await app.inject({
+      method: 'PATCH', url: '/api/config', headers: { authorization: 'Bearer old-token' },
+      payload: { server: { token: 'new-token' } },
+    });
+    expect(response.statusCode).toBe(200);
+    await waitFor(() => ws.readyState === WebSocket.CLOSED);
+    if (socketState === 'closed') finishSnapshot();
+    await waitFor(() => unsubscribe.mock.calls.length === 1);
+    expect(streamer.acquireFullHold).not.toHaveBeenCalled();
+    expect(releaseFullHold).not.toHaveBeenCalled();
+  });
+
+  it('releases terminal resources immediately and times out a peer that does not acknowledge revocation', async () => {
+    const { app, port, ctx } = await startApp({ configToken: 'old-token' });
+    runningApp = app;
+    ctx.configPath = join(tempDir, 'config.json');
+    const { streamer, unsubscribe, releaseFullHold } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(port, { protocols: `baxian.token.${HEX('old-token')}` });
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'full', 'full');
+    const socket = [...app.websocketServer.clients][0];
+    ws.pause();
+    try {
+      const response = await app.inject({
+        method: 'PATCH', url: '/api/config', headers: { authorization: 'Bearer old-token' },
+        payload: { server: { token: 'new-token' } },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(socket.readyState).toBe(WebSocket.CLOSING);
+      expect(unsubscribe).toHaveBeenCalledOnce();
+      expect(releaseFullHold).toHaveBeenCalledOnce();
+      await waitFor(() => socket.readyState === WebSocket.CLOSED, 2500);
+      expect(unsubscribe).toHaveBeenCalledOnce();
+      expect(releaseFullHold).toHaveBeenCalledOnce();
+    } finally {
+      ws.resume();
+    }
+  });
+
   it('rejects with 403 when Origin host does not match Host', async () => {
     const { app, port: p } = await startApp();
     runningApp = app;

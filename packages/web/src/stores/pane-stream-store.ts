@@ -5,7 +5,7 @@ import type {
 } from '../shared/index.js';
 import { getAuthToken } from '../api.ts';
 import { ReconnectScheduler } from './reconnect-scheduler.ts';
-import { defaultWsFactory, toHex, wsUrl, type WebSocketFactory } from './ws-shared.ts';
+import { defaultWsFactory, handleAuthRevokedClose, toHex, wsUrl, type WebSocketFactory } from './ws-shared.ts';
 
 export interface SnapshotPayload {
   cols: number;
@@ -245,10 +245,11 @@ export class PaneStreamClient {
       this.handleMessage(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (ws !== this.ws) return;
       this.ws = null;
       if (this.explicitlyClosed) return;
+      if (handleAuthRevokedClose(event, token, this.tokenProvider())) return;
       if (this.subs.size === 0) return;
       this.scheduleReconnect();
     };

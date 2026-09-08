@@ -1,3 +1,24 @@
+import type { WebSocket } from '@fastify/websocket';
+
+export const SOCKET_AUTH_REVOKED = Symbol('socket-auth-revoked');
+
+export function revokeSocketAuthorization(socket: WebSocket, authRequired = true): void {
+  socket.close(authRequired ? 4401 : 1000, 'token changed');
+  // Release application resources without waiting for the peer's close handshake.
+  socket.emit(SOCKET_AUTH_REVOKED);
+}
+
+export function enforceSocketAuthorization(
+  socket: WebSocket,
+  currentToken: string | undefined,
+  suppliedToken: string | undefined,
+): boolean {
+  if (socket.readyState !== socket.OPEN) return false;
+  if (!currentToken || suppliedToken === currentToken) return true;
+  revokeSocketAuthorization(socket);
+  return false;
+}
+
 export function decodeHex(hex: string): string | undefined {
   if (!/^[0-9a-fA-F]*$/.test(hex) || hex.length % 2 !== 0) return undefined;
   try {

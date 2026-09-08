@@ -381,22 +381,25 @@ export interface PrReviewItem {
   anchorSha?: string;
 }
 
-export type EventType =
-  | 'task.created'
-  | 'task.assigned'
-  | 'task.updated'
-  | 'session.started'
-  | 'pr.created'
-  | 'pr.updated'
-  | 'pr.merged'
-  | 'review.submitted'
-  | 'review.max_rounds'
-  | 'spec.ready'
-  | 'pr.fix.submitted'
-  | 'agent.bootstrap_failed'
-  | 'agent.bootstrap_succeeded'
-  | 'agent.recovered'
-  | 'human.intervention';
+export const EVENT_TYPES = [
+  'task.created',
+  'task.assigned',
+  'task.updated',
+  'session.started',
+  'pr.created',
+  'pr.updated',
+  'pr.merged',
+  'review.submitted',
+  'review.max_rounds',
+  'spec.ready',
+  'pr.fix.submitted',
+  'agent.bootstrap_failed',
+  'agent.bootstrap_succeeded',
+  'agent.recovered',
+  'human.intervention',
+] as const;
+
+export type EventType = typeof EVENT_TYPES[number];
 
 export interface BaxianEvent {
   id: string;

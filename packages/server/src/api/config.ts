@@ -11,6 +11,7 @@ import { withConfigLock } from '../config/mutex.js';
 import { applyConfigHotReload, prepareConfigHotReload } from '../config/hot-reload.js';
 import { activeParticipantBlockers, gitBindingBlockerDetails, gitBindingBlockers } from './platform-guard.js';
 import { agentIsLive } from '../agent/liveness.js';
+import { revokeSocketAuthorization } from '../terminal/ws-auth.js';
 
 function hostRefKey(host: unknown): string {
   return JSON.stringify(host ?? null);
@@ -231,6 +232,11 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
           const hotReload = await prepareConfigHotReload(app.ctx, validated);
           await saveConfig(app.ctx.configPath!, validated);
           app.ctx.config = validated;
+          if (current.server.token !== validated.server.token) {
+            for (const socket of app.websocketServer.clients) {
+              revokeSocketAuthorization(socket, !!validated.server.token);
+            }
+          }
           await applyConfigHotReload(app.ctx, validated, hotReload);
         },
       );

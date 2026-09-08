@@ -72,6 +72,13 @@ export interface BuildAppOpts {
 
 const IS_API_REQUEST = /^\/api(\/|\?|$)/;
 
+const WEBSOCKET_OPTIONS = {
+  maxPayload: 1024 * 1024,
+  maxFragments: 1024,
+  maxBufferedChunks: 4096,
+  closeTimeout: 1000,
+};
+
 const ASSET_EXTENSIONS = new Set([
   'js', 'mjs', 'cjs', 'css', 'map',
   'ico', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif', 'bmp',
@@ -132,7 +139,7 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
     reply.status(500).send({ error: 'internal_error' });
   });
   await app.register(cors, { origin: false });
-  await app.register(websocket);
+  await app.register(websocket, { options: WEBSOCKET_OPTIONS });
   app.decorate('ctx', ctx);
   app.addHook('onClose', async () => {
     app.ctx.tmuxProbePoller?.stop();

@@ -16,7 +16,7 @@ class MockWebSocket {
   protocols?: string | string[];
   readyState = MockWebSocket.CONNECTING;
   onopen: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event?: Pick<CloseEvent, 'code'>) => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((evt: { data: string }) => void) | null = null;
   sent: string[] = [];
@@ -44,9 +44,9 @@ class MockWebSocket {
     this.onopen?.();
   }
 
-  closeFromServer(): void {
+  closeFromServer(code = 1006): void {
     this.readyState = MockWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code });
   }
 
   push(msg: object): void {
@@ -86,6 +86,37 @@ function makeClient(opts: { token?: string | null } = {}): { client: EventsClien
 }
 
 describe('EventsClient', () => {
+  it.each([
+    { code: 4401, changedToken: false, unauthorized: true },
+    { code: 1006, changedToken: false, unauthorized: false },
+    { code: 1000, changedToken: false, unauthorized: false },
+    { code: 4401, changedToken: true, unauthorized: false },
+  ])('handles revocation separately from network closure: $code, token changed=$changedToken', ({ code, changedToken, unauthorized }) => {
+    const opts = { token: 'old-token' };
+    const { client, lastWs } = makeClient(opts);
+    const onUnauthorized = vi.fn();
+    window.addEventListener('baxian:unauthorized', onUnauthorized);
+    try {
+      const unsubscribe = client.subscribe('agents', vi.fn());
+      const ws = lastWs();
+      ws.open();
+      if (changedToken) opts.token = 'new-token';
+      ws.closeFromServer(code);
+      expect(onUnauthorized).toHaveBeenCalledTimes(unauthorized ? 1 : 0);
+      vi.advanceTimersByTime(30_000);
+      expect(MockWebSocket.instances).toHaveLength(unauthorized ? 1 : 2);
+      unsubscribe();
+      opts.token = 'new-token';
+      client.subscribe('agents', vi.fn());
+      expect(lastWs().protocols).toEqual(['baxian.token.6e65772d746f6b656e']);
+      lastWs().open();
+      expect(lastWs().sentParsed().some(message => message.op === 'subscribe')).toBe(true);
+    } finally {
+      client.close();
+      window.removeEventListener('baxian:unauthorized', onUnauthorized);
+    }
+  });
+
   it('subscribe before WS open queues the op and sends on onopen', () => {
     const { client, lastWs } = makeClient();
     client.subscribe('agents', vi.fn());

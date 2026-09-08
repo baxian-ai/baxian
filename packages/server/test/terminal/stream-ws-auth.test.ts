@@ -1,14 +1,42 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import type { WebSocket } from '@fastify/websocket';
 import {
   decodeHex,
   extractTokenFromProtocols,
   isAllowedOrigin,
+  enforceSocketAuthorization,
   sanitizePtySize,
 } from '../../src/terminal/ws-auth.js';
 
 const toHex = (s: string): string => Buffer.from(s, 'utf8').toString('hex');
 
 describe('ws-auth', () => {
+  describe('enforceSocketAuthorization', () => {
+    it.each([
+      { current: undefined, supplied: undefined },
+      { current: 'token', supplied: 'token' },
+    ])('allows an open socket with matching access: $current', ({ current, supplied }) => {
+      const close = vi.fn();
+      const socket = { readyState: 1, OPEN: 1, close, emit: vi.fn() } as unknown as WebSocket;
+      expect(enforceSocketAuthorization(socket, current, supplied)).toBe(true);
+      expect(close).not.toHaveBeenCalled();
+    });
+
+    it.each(['old-token', undefined])('closes a connection with revoked credentials: %s', supplied => {
+      const close = vi.fn();
+      const socket = { readyState: 1, OPEN: 1, close, emit: vi.fn() } as unknown as WebSocket;
+      expect(enforceSocketAuthorization(socket, 'new-token', supplied)).toBe(false);
+      expect(close).toHaveBeenCalledExactlyOnceWith(4401, 'token changed');
+    });
+
+    it.each([2, 3])('rejects buffered messages after a socket starts closing: %s', readyState => {
+      const close = vi.fn();
+      const socket = { readyState, OPEN: 1, close, emit: vi.fn() } as unknown as WebSocket;
+      expect(enforceSocketAuthorization(socket, undefined, undefined)).toBe(false);
+      expect(close).not.toHaveBeenCalled();
+    });
+  });
+
   describe('decodeHex', () => {
     it('round-trips arbitrary token strings', () => {
       const tokens = ['abc-123', '中文 token', 'a/b+c=d', ''];

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventLog } from '../../src/event/log.js';
@@ -27,6 +27,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true });
 });
 
@@ -55,6 +56,67 @@ describe('EventLog', () => {
 
   it('returns empty array for date with no events', async () => {
     expect(await log.readDate('2026-01-01')).toEqual([]);
+  });
+
+  it('preserves valid rows around malformed JSON and reports incomplete history', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const first = makeEvent({ id: 'first' });
+    const last = makeEvent({ id: 'last' });
+    await writeFile(join(tempDir, 'events', '2026-04-28.jsonl'),
+      `${JSON.stringify(first)}\n{"secret":"do-not-log"\n${JSON.stringify(last)}\n`);
+
+    expect(await log.readDate('2026-04-28')).toEqual([first, last]);
+    expect(await log.readRangeWithStatus('2026-04-28', '2026-04-28')).toEqual({
+      events: [first, last], complete: false,
+    });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('2026-04-28.jsonl:2'));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('do-not-log');
+  });
+
+  it.each(['null', '[]', '{}', '42', '{"type":"session.started","data":null}'])(
+    'treats invalid event shape %s as incomplete instead of a valid record', async (line) => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await writeFile(join(tempDir, 'events', '2026-04-28.jsonl'), `${line}\n`);
+      expect(await log.readRangeWithStatus('2026-04-28', '2026-04-28')).toEqual({
+        events: [], complete: false,
+      });
+    },
+  );
+
+  it('keeps new appends separate from an unterminated crash tail', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const before = makeEvent({ id: 'before' });
+    const after = makeEvent({ id: 'after' });
+    await log.append(before);
+    await appendFile(join(tempDir, 'events', '2026-04-28.jsonl'), '{"id":');
+    await log.append(after);
+    expect(await log.readDate('2026-04-28')).toEqual([before, after]);
+  });
+
+  it('reports complete empty history when the directory exists with no matching dates', async () => {
+    expect(await log.readRangeWithStatus('2026-04-28', '2026-04-29')).toEqual({
+      events: [], complete: true,
+    });
+  });
+
+  it.each(['session.startd', 'future.event'])('keeps unknown type %s readable without claiming complete history', async (type) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const event = { ...makeEvent(), type };
+    await writeFile(join(tempDir, 'events', '2026-04-28.jsonl'), `${JSON.stringify(event)}\n`);
+    expect(await log.readDate('2026-04-28')).toEqual([event]);
+    expect(await log.readRangeWithStatus('2026-04-28', '2026-04-28')).toEqual({ events: [event], complete: false });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('2026-04-28.jsonl:1'));
+  });
+
+  it('propagates file read errors instead of returning empty history', async () => {
+    await mkdir(join(tempDir, 'events', '2026-04-28.jsonl'));
+    await expect(log.readDate('2026-04-28')).rejects.toMatchObject({ code: 'EISDIR' });
+    await expect(log.readRange('2026-04-28', '2026-04-28')).rejects.toMatchObject({ code: 'EISDIR' });
+  });
+
+  it('propagates a missing event directory instead of claiming there were no deliveries', async () => {
+    await rm(join(tempDir, 'events'), { recursive: true });
+    await expect(log.readRange('2026-04-28', '2026-04-29')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('reads events across date range', async () => {

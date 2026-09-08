@@ -93,6 +93,112 @@ async function waitForPredicate(predicate: () => boolean, timeoutMs = 1000): Pro
 }
 
 describe('events ws plugin (/api/realtime)', () => {
+  it('rejects a connection validated with the old token while its upgrade was pending', async () => {
+    const ctx = await createTestContext(tempDir);
+    ctx.config.server.token = 'old-token';
+    ctx.configPath = join(tempDir, 'config.json');
+    ctx.eventBroker = new EventBroker();
+    const app = await buildApp(ctx);
+    runningApp = app;
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const validated = new Promise<void>(resolve => { entered = resolve; });
+    app.addHook('preHandler', async request => {
+      if (request.url === '/api/realtime') {
+        entered();
+        await pending;
+      }
+    });
+    await app.listen({ host: '127.0.0.1', port: 0 });
+    const port = (app.server.address() as { port: number }).port;
+    const ws = openWs(port, `baxian.token.${Buffer.from('old-token').toString('hex')}`);
+    const opening = waitOpen(ws);
+    try {
+      await validated;
+      const response = await app.inject({
+        method: 'PATCH', url: '/api/config', headers: { authorization: 'Bearer old-token' },
+        payload: { server: { token: 'new-token' } },
+      });
+      expect(response.statusCode).toBe(200);
+    } finally {
+      release();
+    }
+    await opening;
+    await waitForPredicate(() => ws.readyState === WebSocket.CLOSED);
+    expect(ctx.eventBroker.hasSubscribers('agents')).toBe(false);
+  });
+
+  it.each([
+    { before: 'old-token', after: 'new-token' },
+    { before: undefined, after: 'new-token' },
+    { before: 'old-token', after: '' },
+  ])('revokes existing event subscriptions when token changes: $before -> $after', async ({ before, after }) => {
+    const { app, port, ctx, broker } = await startApp({ configToken: before });
+    ctx.configPath = join(tempDir, 'config.json');
+    const protocol = before ? `baxian.token.${Buffer.from(before).toString('hex')}` : undefined;
+    const ws = openWs(port, protocol);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    const initial = nextMsg(ws);
+    ws.send(JSON.stringify({ op: 'subscribe', topic: 'agents' }));
+    await initial;
+    expect(broker.hasSubscribers('agents')).toBe(true);
+    const closed = new Promise<number>(resolve => ws.once('close', code => resolve(code)));
+
+    const response = await app.inject({
+      method: 'PATCH', url: '/api/config',
+      headers: before ? { authorization: `Bearer ${before}` } : {},
+      payload: { server: { token: after } },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(await closed).toBe(after ? 4401 : 1000);
+    await waitForPredicate(() => ws.readyState === WebSocket.CLOSED);
+    await waitForPredicate(() => !broker.hasSubscribers('agents'));
+    const fresh = openWs(port, after ? `baxian.token.${Buffer.from(after).toString('hex')}` : undefined);
+    expect((await waitOpen(fresh)).kind).toBe('open');
+    fresh.close();
+  });
+
+  it.each([
+    { patch: { server: { token: '***' } }, status: 200 },
+    { patch: { review: { rounds: 4 } }, status: 200 },
+    { patch: { server: { token: 'old-token' } }, status: 200 },
+    { patch: { server: { token: 'new-token', port: -1 } }, status: 400 },
+  ])('preserves connections when a patch does not commit a token change: $patch', async ({ patch, status }) => {
+    const { app, port, ctx } = await startApp({ configToken: 'old-token' });
+    ctx.configPath = join(tempDir, 'config.json');
+    const ws = openWs(port, `baxian.token.${Buffer.from('old-token').toString('hex')}`);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    const response = await app.inject({
+      method: 'PATCH', url: '/api/config', headers: { authorization: 'Bearer old-token' }, payload: patch,
+    });
+    expect(response.statusCode).toBe(status);
+    const pong = nextMsg(ws);
+    ws.send(JSON.stringify({ op: 'ping' }));
+    expect(await pong).toEqual({ type: 'pong' });
+    ws.close();
+  });
+
+  it('accepts a small fragmented message and closes a connection exceeding the fragment limit', async () => {
+    const { port } = await startApp();
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    const pong = nextMsg(ws);
+    ws.send('{"op":', { fin: false });
+    ws.send('"ping"}');
+    expect(await pong).toEqual({ type: 'pong' });
+    for (let i = 0; i < 1025; i++) ws.send(' ', { fin: false });
+    await waitForPredicate(() => ws.readyState === WebSocket.CLOSED);
+  });
+
+  it('closes a connection sending more than 1 MiB in one message', async () => {
+    const { port } = await startApp();
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    ws.send(' '.repeat(1024 * 1024 + 1));
+    await waitForPredicate(() => ws.readyState === WebSocket.CLOSED);
+  });
+
   it('rejects with 401 when no token is presented and config requires one', async () => {
     const { port } = await startApp({ configToken: 'secret' });
     const ws = openWs(port);

@@ -16,7 +16,7 @@ class MockWebSocket {
   protocols?: string | string[];
   readyState = MockWebSocket.CONNECTING;
   onopen: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event?: Pick<CloseEvent, 'code'>) => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((evt: { data: string }) => void) | null = null;
   sent: string[] = [];
@@ -45,9 +45,9 @@ class MockWebSocket {
     this.readyState = MockWebSocket.OPEN;
     this.onopen?.();
   }
-  closeFromServer(): void {
+  closeFromServer(code = 1006): void {
     this.readyState = MockWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code });
   }
   push(msg: object): void {
     this.onmessage?.({ data: JSON.stringify(msg) });
@@ -62,14 +62,14 @@ function ackSubscribe(ws: MockWebSocket, subscriberId: string, opts: { data: str
   ws.push({ type: 'subscribed', subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: opts.seq });
 }
 
-function makeClient(opts: { wsUrl?: string } = {}): { client: PaneStreamClient; lastWs: () => MockWebSocket } {
+function makeClient(opts: { wsUrl?: string; token?: string | null } = {}): { client: PaneStreamClient; lastWs: () => MockWebSocket } {
   const factory = (url: string, protocols?: string[]) => {
     return new MockWebSocket(url, protocols) as unknown as WebSocket;
   };
   const client = new PaneStreamClient({
     wsUrl: opts.wsUrl ?? 'ws://test.local/api/stream',
     wsFactory: factory,
-    tokenProvider: () => null,
+    tokenProvider: () => opts.token ?? null,
   });
   return {
     client,
@@ -91,6 +91,37 @@ afterEach(() => {
 });
 
 describe('PaneStreamClient', () => {
+  it.each([
+    { code: 4401, changedToken: false, unauthorized: true },
+    { code: 1006, changedToken: false, unauthorized: false },
+    { code: 1000, changedToken: false, unauthorized: false },
+    { code: 4401, changedToken: true, unauthorized: false },
+  ])('handles revocation separately from network closure: $code, token changed=$changedToken', ({ code, changedToken, unauthorized }) => {
+    const opts = { token: 'old-token' };
+    const { client, lastWs } = makeClient(opts);
+    const onUnauthorized = vi.fn();
+    window.addEventListener('baxian:unauthorized', onUnauthorized);
+    try {
+      const handle = client.subscribe({ agentId: 'dev-1', mode: 'full', onSnapshot: vi.fn(), onData: vi.fn() });
+      const ws = lastWs();
+      ws.open();
+      if (changedToken) opts.token = 'new-token';
+      ws.closeFromServer(code);
+      expect(onUnauthorized).toHaveBeenCalledTimes(unauthorized ? 1 : 0);
+      vi.advanceTimersByTime(30_000);
+      expect(MockWebSocket.instances).toHaveLength(unauthorized ? 1 : 2);
+      handle.unsubscribe();
+      opts.token = 'new-token';
+      client.subscribe({ agentId: 'dev-1', mode: 'full', onSnapshot: vi.fn(), onData: vi.fn() });
+      expect(lastWs().protocols).toEqual(['baxian.token.6e65772d746f6b656e']);
+      lastWs().open();
+      expect(lastWs().sentParsed().some(message => message.op === 'subscribe')).toBe(true);
+    } finally {
+      client.close();
+      window.removeEventListener('baxian:unauthorized', onUnauthorized);
+    }
+  });
+
   it('subscribe before WS open queues subscribe and sends after onopen', () => {
     const { client, lastWs } = makeClient();
     const onSnapshot = vi.fn();

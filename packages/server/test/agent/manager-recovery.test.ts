@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentBindingFacts, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
@@ -159,6 +159,95 @@ afterEach(async () => {
 });
 
 describe('recover()', () => {
+  it.each([false, true])('uses delivery evidence rather than treating an unknown event type as harmless absence: delivered=%s', async (delivered) => {
+    const date = new Date().toISOString().slice(0, 10);
+    await seedAgent({ id: 'dev-1', taskId: 'task-1', bootstrappingTaskId: 'task-1', paneId: '%0' });
+    await seedRecoveryTask({ id: 'task-1' });
+    const event = {
+      id: 'unknown', type: 'session.startd', timestamp: `${date}T00:00:00Z`,
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1', data: { phase: 'develop' },
+    };
+    await writeFile(join(tempDir, 'events', `${date}.jsonl`), `${JSON.stringify(event)}\n`);
+    if (delivered) await eventBus.emit({ ...event, id: 'delivered', type: 'session.started' });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { cleanupSpy } = await runRecovery({ agents: [] });
+    expect(cleanupSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+    const state = await agentStore.get('dev-1');
+    if (delivered) {
+      expect(state?.bootstrappingTaskId).toBeUndefined();
+      expect(state?.status).not.toBe('awaiting_human');
+    } else {
+      expect(state).toMatchObject({ bootstrappingTaskId: 'task-1', awaitingPhase: 'recovery-failed' });
+    }
+  });
+
+  it('preserves a confirmed delivery even when another event line is truncated', async () => {
+    const date = new Date().toISOString().slice(0, 10);
+    await seedAgent({ id: 'dev-1', taskId: 'task-1', bootstrappingTaskId: 'task-1', paneId: '%0' });
+    await seedRecoveryTask({ id: 'task-1' });
+    await eventBus.emit({
+      id: 'delivered', type: 'session.started', timestamp: `${date}T00:00:00Z`,
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1', data: { phase: 'develop' },
+    });
+    await appendFile(join(tempDir, 'events', `${date}.jsonl`), '{"id":');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { cleanupSpy } = await runRecovery({ agents: [] });
+
+    expect(cleanupSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+    expect(await agentStore.get('dev-1')).toMatchObject({ taskId: 'task-1' });
+    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
+  it.each(['develop', 'code'] as const)(
+    'holds a %s bootstrap when damaged history cannot prove whether it was delivered', async (phase) => {
+      const date = new Date().toISOString().slice(0, 10);
+      await seedAgent({ id: 'dev-1', taskId: 'task-1', bootstrappingTaskId: 'task-1', paneId: '%0' });
+      await seedRecoveryTask({ id: 'task-1', ...(phase === 'code' ? { specReviewRound: 1 } : {}) });
+      await writeFile(join(tempDir, 'events', `${date}.jsonl`), '{"id":');
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { cleanupSpy, watchSpy } = await runRecovery({ agents: [] });
+
+      expect(cleanupSpy).not.toHaveBeenCalled();
+      expect(watchSpy).not.toHaveBeenCalled();
+      expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+      expect(await agentStore.get('dev-1')).toMatchObject({
+        taskId: 'task-1', bootstrappingTaskId: 'task-1',
+        status: 'awaiting_human', awaitingPhase: 'recovery-failed',
+      });
+      expect(await lockManager.isLocked('dev-1')).toBe(true);
+      const held = await agentStore.get('dev-1');
+      const readHistory = vi.spyOn(eventBus, 'readRangeWithStatus');
+      const start = vi.spyOn(manager, 'startSession');
+      await expect(manager.resumeAgent('dev-1')).resolves.toEqual({ resumed: true, releasedBinding: false });
+      expect(readHistory).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+      expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+      expect(await agentStore.get('dev-1')).toMatchObject({ taskId: 'task-1', lockToken: held?.lockToken });
+      expect((await agentStore.get('dev-1'))?.status).not.toBe('awaiting_human');
+      expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+      expect(await lockManager.isLocked('dev-1')).toBe(true);
+    },
+  );
+
+  it('preserves the task and binding on an event log read failure', async () => {
+    const date = new Date().toISOString().slice(0, 10);
+    await seedAgent({ id: 'dev-1', taskId: 'task-1', bootstrappingTaskId: 'task-1', paneId: '%0' });
+    await seedRecoveryTask({ id: 'task-1' });
+    await mkdir(join(tempDir, 'events', `${date}.jsonl`));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { cleanupSpy } = await runRecovery({ agents: [] });
+
+    expect(cleanupSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBe('task-1');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+    expect(warn).toHaveBeenCalled();
+  });
+
   it('reclaims orphaned maintenance and task locks but preserves an exactly bound task lock', async () => {
     const maintenanceToken = await lockManager.acquire('dev-1', 'maintenance:branch-reconcile');
     const orphanedTaskToken = await lockManager.acquire('orphan-1', 'task-orphaned');

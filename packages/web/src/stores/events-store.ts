@@ -1,7 +1,7 @@
 import type { EventsClientMsg, EventsServerMsg, EventsTopic } from '../shared/index.js';
 import { getAuthToken } from '../api.ts';
 import { ReconnectScheduler } from './reconnect-scheduler.ts';
-import { defaultWsFactory, toHex, wsUrl, type WebSocketFactory } from './ws-shared.ts';
+import { defaultWsFactory, handleAuthRevokedClose, toHex, wsUrl, type WebSocketFactory } from './ws-shared.ts';
 
 export interface EventsErrorPayload {
   code: string;
@@ -182,10 +182,11 @@ export class EventsClient {
       this.handleMessage(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (ws !== this.ws) return;
       this.ws = null;
       if (this.explicitlyClosed) return;
+      if (handleAuthRevokedClose(event, token, this.tokenProvider())) return;
       if (!opened) {
         this.broadcastConnectionError({
           code: 'connection_failed',

@@ -1,4 +1,16 @@
+import { UNAUTHORIZED_EVENT } from '../api.ts';
+
 export type WebSocketFactory = (url: string, protocols?: string[]) => WebSocket;
+
+export function handleAuthRevokedClose(
+  event: CloseEvent | undefined,
+  connectedToken: string | null,
+  currentToken: string | null,
+): boolean {
+  if (event?.code !== 4401 || connectedToken !== currentToken) return false;
+  window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+  return true;
+}
 
 export function toHex(s: string): string {
   return Array.from(new TextEncoder().encode(s))

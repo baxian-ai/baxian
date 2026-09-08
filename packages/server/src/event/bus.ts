@@ -1,5 +1,5 @@
 import type { BaxianEvent, EventType } from '../shared/index.js';
-import type { EventLog } from './log.js';
+import type { EventLog, EventLogReadResult } from './log.js';
 
 export type EventHandler = (event: BaxianEvent) => void | Promise<void>;
 
@@ -35,6 +35,10 @@ export class EventBus {
 
   async readRange(from: string, to: string): Promise<BaxianEvent[]> {
     return this.log.readRange(from, to);
+  }
+
+  async readRangeWithStatus(from: string, to: string): Promise<EventLogReadResult> {
+    return this.log.readRangeWithStatus(from, to);
   }
 }
 
