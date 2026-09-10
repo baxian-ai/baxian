@@ -527,6 +527,7 @@ export const enUS = {
     platformDegraded: (repo: string) => `Platform polling degraded for ${repo} — reviews and PR updates may lag until connectivity recovers`,
     platformUnreachable: (repo: string) => `Platform unreachable for ${repo} — task progress is paused and will resume automatically once connectivity recovers`,
     platformAccessDenied: (repo: string, detail?: string) => `Platform access denied for ${repo} — credentials are invalid or lack permission; task progress stays paused until they are fixed manually.${detail ? ` ${detail}` : ''}`,
+    platformRepoNotFound: (repo: string) => `Platform returned not-found for ${repo} — the repository or a requested resource does not exist, was renamed/deleted, or the current credentials cannot see it; task progress stays paused until this is fixed manually`,
     platformRateLimited: (repo: string, until: string) => `Platform polling rate-limited for ${repo} until ${new Date(until).toLocaleTimeString()} — updates will resume automatically`,
   },
   terminal: {

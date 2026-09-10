@@ -256,6 +256,11 @@ const TRUST_DIALOGS: Record<AgentRuntimeKind, RegExp> = {
   qodercli: /Do you trust the files in this folder[\s\S]{0,500}Trust folder/,
 };
 
+// claude-code 2.1.26x 起对话框预选 No, exit,盲按 Enter 会直接退出 REPL
+const TRUST_ACCEPT_CURSOR: Partial<Record<AgentRuntimeKind, RegExp>> = {
+  'claude-code': /^[ \t]*[❯›>][ \t]*(?:\d+\.[ \t]*)?Yes, I trust this folder/m,
+};
+
 const STARTUP_DIALOG_SIGNALS: readonly RegExp[] = [
   /Press (?:enter|return|any key) to (?:continue|proceed)/i,
   /Enter to confirm[^\n]{0,40}Esc to cancel/i,
@@ -354,12 +359,18 @@ export class ReplNotReadyError extends Error {
     public readonly runtime: AgentRuntimeKind,
     public readonly lastScreen: string,
     detail?: string,
+    public readonly shellForeground = false,
   ) {
     const head = `repl not ready (paneId=${paneId}, runtime=${runtime}) within timeout`;
     const tail = lastScreen ? `\nLast pane snapshot:\n${lastScreen}` : '';
     super(detail ? `${head}: ${detail}${tail}` : `${head}${tail}`);
     this.name = 'ReplNotReadyError';
   }
+}
+
+// REPL 已退回 shell 时,屏幕上残留的对话框文字不再是一个可关闭的对话框
+export function isBlockedOnStartupDialog(err: unknown, runtime: AgentRuntimeKind): err is ReplNotReadyError {
+  return err instanceof ReplNotReadyError && !err.shellForeground && detectStartupDialog(err.lastScreen, runtime);
 }
 
 const SHELL_PROC_TITLES = /^(?:zsh|bash|sh|fish|dash|ash|ksh|mksh|tcsh|csh|nu|xonsh|pwsh)$/;
@@ -1094,10 +1105,24 @@ export class TmuxManager {
     const deadline = Date.now() + (opts.timeoutMs ?? 10_000);
     const interval = opts.intervalMs ?? 500;
     const dialogPattern = TRUST_DIALOGS[runtime];
+    const readScreen = async (): Promise<string> =>
+      stripAnsi(await this.capturePaneById(pane, { ansi: true, scrollback: 50 }));
     while (Date.now() < deadline) {
-      const cap = await this.capturePaneById(pane, { ansi: true, scrollback: 50 });
-      const stripped = stripAnsi(cap);
+      const stripped = await readScreen();
       if (dialogPattern.test(stripped)) {
+        const acceptCursor = TRUST_ACCEPT_CURSOR[runtime];
+        if (acceptCursor && !acceptCursor.test(stripped)) {
+          // 只发一次 Down 再在 deadline 内轮询:重发会把已落到 Yes 的光标弹回,慢重绘下单次抓屏会误判
+          await this.sendKeysToPane(pane, 'Down');
+          let landed = false;
+          while (Date.now() < deadline) {
+            await sleep(interval);
+            const moved = await readScreen();
+            if (acceptCursor.test(moved)) { landed = true; break; }
+            if (!dialogPattern.test(moved)) break;
+          }
+          if (!landed) return false;
+        }
         await this.sendKeysToPane(pane, 'Enter');
         await sleep(800);
         return true;
@@ -1149,20 +1174,24 @@ export class TmuxManager {
     const cmdOpts = opts.perCommandTimeoutMs ? { timeout: opts.perCommandTimeoutMs } : undefined;
     let lastStripped = '';
     let lastTitle: string | undefined;
-    while (Date.now() < deadline) {
+    // 见过 runtime 后回落 shell 才提前放弃;没见过=启动钩子尚未 exec runtime,等到窗口耗尽仍是 shell 才据实报告
+    let sawRuntime = false;
+    while (true) {
       const current = await this.displayMessage(pane, '#{pane_current_command}', cmdOpts);
-      if (failFastOnShell && SHELL_PROC_TITLES.test(current)) {
+      if (failFastOnShell && sawRuntime && SHELL_PROC_TITLES.test(current)) {
         throw new ReplNotReadyError(
           pane.paneId,
           runtime,
           lastStripped,
           `pane_current_command=${current} (shell), failFastOnShell triggered`,
+          true,
         );
       }
       const cap = await this.capturePaneById(pane, { ansi: true, scrollback, timeoutMs: opts.perCommandTimeoutMs });
       const stripped = stripAnsi(cap);
       lastStripped = stripped;
       if (procTitle.test(current)) {
+        sawRuntime = true;
         const screenOnly = classifyScreen(runtime, stripped);
         // 标题规则优先级最高:屏幕单独判 ready 也必须带标题复核后才能返回
         const worthTitleRead = opts.titleIdleFastPath
@@ -1172,6 +1201,20 @@ export class TmuxManager {
           lastTitle = await this.readPaneTitle(pane, cmdOpts);
           if (hasRuntimeReadyView(stripped, runtime, classifyScreen(runtime, stripped, lastTitle))) return;
         }
+      }
+      // deadline 判在就绪判定之后:deadline 前已开始的探测要跑完就绪判定,不能因回包跨时就丢弃已 ready 的会话
+      if (Date.now() >= deadline) {
+        // 窗口耗尽前台仍是 shell=真的退回/没起来,据实报告交调用方回滚;runtime 前台只是没 ready,普通超时
+        if (failFastOnShell && SHELL_PROC_TITLES.test(current)) {
+          throw new ReplNotReadyError(
+            pane.paneId,
+            runtime,
+            lastStripped,
+            `pane_current_command=${current} (shell) at deadline, failFastOnShell triggered`,
+            true,
+          );
+        }
+        break;
       }
       await sleep(interval);
     }

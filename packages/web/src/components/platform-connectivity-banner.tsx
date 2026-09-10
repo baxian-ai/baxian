@@ -8,12 +8,15 @@ function isRateLimited(poller: PollerSnapshot): boolean {
     && Date.parse(poller.rateLimitedUntil) > Date.now();
 }
 
-type BannerKind = 'access-denied' | 'failed' | 'rate-limited' | 'degraded';
+type BannerKind = 'access-denied' | 'not-found' | 'failed' | 'rate-limited' | 'degraded';
 
 // Access denied needs a human; it must never be masked by a self-healing failure listed earlier.
+// A repo the platform keeps reporting as missing (private repo invisible to the token, renamed, deleted) never self-heals either.
 function worst(pollers: PollerSnapshot[]): { poller: PollerSnapshot; kind: BannerKind } | null {
   const refused = pollers.find((p) => p.lastErrorClass === 'ACCESS_DENIED');
   if (refused) return { poller: refused, kind: 'access-denied' };
+  const missing = pollers.find((p) => p.health === 'failed' && p.lastErrorClass === 'NOT_FOUND');
+  if (missing) return { poller: missing, kind: 'not-found' };
   const failed = pollers.find((p) => p.health === 'failed');
   if (failed) return { poller: failed, kind: 'failed' };
   const rateLimited = pollers.find(isRateLimited);
@@ -32,11 +35,13 @@ export function PlatformConnectivityBanner() {
 
   const text = kind === 'access-denied'
     ? t.banner.platformAccessDenied(poller.repo, poller.lastErrorMessage)
-    : kind === 'failed'
-      ? t.banner.platformUnreachable(poller.repo)
-      : kind === 'rate-limited'
-        ? t.banner.platformRateLimited(poller.repo, poller.rateLimitedUntil!)
-        : t.banner.platformDegraded(poller.repo);
+    : kind === 'not-found'
+      ? t.banner.platformRepoNotFound(poller.repo)
+      : kind === 'failed'
+        ? t.banner.platformUnreachable(poller.repo)
+        : kind === 'rate-limited'
+          ? t.banner.platformRateLimited(poller.repo, poller.rateLimitedUntil!)
+          : t.banner.platformDegraded(poller.repo);
 
   return (
     <div

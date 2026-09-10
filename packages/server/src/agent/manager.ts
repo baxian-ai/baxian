@@ -85,7 +85,7 @@ import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js
 import {
   TmuxManager,
   ReplNotReadyError,
-  detectStartupDialog,
+  isBlockedOnStartupDialog,
   hasRuntimeReadyView,
   hasReplProcTitle,
   isShellProcTitle,
@@ -288,6 +288,8 @@ type ReleaseRuntime =
   | { kind: 'absent' }
   | { kind: 'pane'; pane: PaneRef }
   | { kind: 'hold'; reason: string };
+
+type SessionRollbackOutcome = 'gone' | 'unconfirmed' | 'superseded';
 
 function normalizedDir(left: string | null | undefined): string | null {
   if (!left) return null;
@@ -1017,19 +1019,31 @@ export class AgentManager {
     partial: { sessionRef?: TmuxSessionRef; genAtCreate?: number },
     reason: string,
     opts: { expectCreationToken?: string } = {},
-  ): Promise<void> {
-    await this.runUnderSessionLifecycle(agentId, async () => {
+  ): Promise<SessionRollbackOutcome> {
+    return this.runUnderSessionLifecycle(agentId, () =>
+      this.rollbackCreatedSessionLocked(agentId, partial, reason, opts),
+    );
+  }
+
+  // 必须在生命周期锁内调用:不自行获取锁,便于与失败收尾放进同一临界区(见 rollbackThenFinalize)
+  private async rollbackCreatedSessionLocked(
+    agentId: string,
+    partial: { sessionRef?: TmuxSessionRef; genAtCreate?: number },
+    reason: string,
+    opts: { expectCreationToken?: string } = {},
+  ): Promise<SessionRollbackOutcome> {
+    {
       try {
         const ref = partial.sessionRef;
         if (!ref) {
           console.warn(`[AgentManager] ${agentId} rollback (${reason}) skipped: no session ref recorded`);
-          return;
+          return 'gone';
         }
         if ((this.adoptGeneration.get(agentId) ?? 0) !== (partial.genAtCreate ?? 0)) {
           console.warn(
             `[AgentManager] ${agentId} rollback (${reason}) skipped: session adopted since create — leaving it to its successor`,
           );
-          return;
+          return 'superseded';
         }
         if (opts.expectCreationToken !== undefined) {
           let fresh;
@@ -1040,23 +1054,23 @@ export class AgentManager {
               `[AgentManager] ${agentId} rollback (${reason}) skipped: agent store read failed — session left in place:`,
               storeErr,
             );
-            return;
+            return 'unconfirmed';
           }
           if (!fresh) {
             console.warn(`[AgentManager] ${agentId} rollback (${reason}) skipped: agent record gone`);
-            return;
+            return 'gone';
           }
           if (fresh.creationToken !== opts.expectCreationToken) {
             console.warn(
               `[AgentManager] ${agentId} rollback (${reason}) skipped: creationToken rotated — leaving the session to its successor`,
             );
-            return;
+            return 'superseded';
           }
         }
         const cfg = this.getAgentConfig(agentId);
         if (!cfg) {
           console.warn(`[AgentManager] ${agentId} rollback (${reason}) skipped: agent no longer in config`);
-          return;
+          return 'gone';
         }
         const runner = this.createRunnerFor(cfg);
         const outcome = await new TmuxManager(runner).killSessionRef(ref, { kind: 'emptyOr', claim: agentId });
@@ -1064,15 +1078,36 @@ export class AgentManager {
           console.warn(
             `[AgentManager] ${agentId} rollback (${reason}): tmux generation/claim changed — leaving session ${ref.sessionId} untouched`,
           );
-        } else if (outcome === 'killed') {
+          return 'unconfirmed';
+        }
+        if (outcome === 'killed') {
           console.warn(`[AgentManager] ${agentId} rollback (${reason}): killed created session ${ref.sessionId}`);
         }
+        return 'gone';
       } catch (cleanupErr) {
         console.warn(
           `[AgentManager] created-session rollback (${reason}) failed for ${agentId}:`,
           cleanupErr,
         );
+        return 'unconfirmed';
       }
+    }
+  }
+
+  // 回滚确认与失败收尾同处一个生命周期临界区:gone 立即收尾,其间后继无法排入拿锁改写状态
+  private async rollbackThenFinalize(
+    agentId: string,
+    partial: { sessionRef?: TmuxSessionRef; genAtCreate?: number },
+    reason: string,
+    creationToken: string,
+    failureMessage: string,
+  ): Promise<SessionRollbackOutcome> {
+    return this.runUnderSessionLifecycle(agentId, async () => {
+      const outcome = await this.rollbackCreatedSessionLocked(agentId, partial, reason, {
+        expectCreationToken: creationToken,
+      });
+      if (outcome === 'gone') await this.markBootstrapFailed(agentId, creationToken, failureMessage);
+      return outcome;
     });
   }
 
@@ -1204,6 +1239,7 @@ export class AgentManager {
       await tmux.waitReplReady(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
+        failFastOnShell: true,
       });
       return { ok: true, createdSession: true, freshRuntime: true, paneId: pane.paneId, pane, workdir, sessionRef: createdRef };
     } catch (err) {
@@ -1218,7 +1254,7 @@ export class AgentManager {
       if (createdRef) partial.sessionRef = createdRef;
       if (err instanceof ReplNotReadyError) {
         partial.lastScreen = err.lastScreen;
-        if (createdSession && detectStartupDialog(err.lastScreen, runtime)) {
+        if (createdSession && isBlockedOnStartupDialog(err, runtime)) {
           partial.dialogPending = true;
         }
       }
@@ -1296,19 +1332,18 @@ export class AgentManager {
           }
         }
         await this.markDialogPending(agentId, creationToken);
-        void this.outsideTaskMutationScope(
-          () => this.slowPollDialogPending(agentId, creationToken),
-        ).catch((pollErr) => {
-          console.warn(`[bootstrap] slowPoll for ${agentId} crashed:`, pollErr);
-        });
+        this.launchSlowPoll(agentId, creationToken);
         return;
       }
-      if (err instanceof EnsureSessionError && err.partial.createdSession) {
-        await this.rollbackCreatedSession(agentId, err.partial, 'hard-failure rollback', {
-          expectCreationToken: creationToken,
-        });
-      }
       const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof EnsureSessionError && err.partial.createdSession) {
+        const rolledBack = await this.rollbackThenFinalize(agentId, err.partial, 'hard-failure rollback', creationToken, message);
+        if (rolledBack !== 'unconfirmed') return;
+        // 会话可能仍在:清状态会把它悬空(Retry → 409),先挂起交慢轮询继续确认
+        await this.markDialogPending(agentId, creationToken);
+        this.launchSlowPoll(agentId, creationToken);
+        return;
+      }
       await this.markBootstrapFailed(agentId, creationToken, message);
     }
   }
@@ -1492,10 +1527,15 @@ export class AgentManager {
     await this.agentStore.update(agentId, (fresh) => {
       if (!fresh) return AGENT_STORE_NOOP;
       if (creationToken !== undefined && fresh.creationToken !== creationToken) return AGENT_STORE_NOOP;
+      // 清掉对话框挂起字段:否则 awaiting_human/agent_dialog_pending 会挡住 Resume
       return {
         ...fresh,
         paneId: undefined,
         creationToken: undefined,
+        status: undefined,
+        awaitingPhase: undefined,
+        awaitingReason: undefined,
+        awaitingSince: undefined,
         updatedAt: now,
       };
     });
@@ -1576,17 +1616,9 @@ export class AgentManager {
       }
     }
     err.partial.handled = true;
-    const snapshotPaneId = state.paneId;
-    const snapshotTaskId = state.taskId;
-    void this.outsideTaskMutationScope(() => this.slowPollDialogPending(
-      agentId,
-      state.creationToken,
-      {
-        ...(snapshotPaneId !== undefined ? { expectedPaneId: snapshotPaneId } : {}),
-        expectedTaskId: snapshotTaskId,
-      },
-    )).catch((pollErr) => {
-      console.warn(`[runtime] slowPoll for ${agentId} crashed:`, pollErr);
+    this.launchSlowPoll(agentId, state.creationToken, {
+      ...(state.paneId !== undefined ? { expectedPaneId: state.paneId } : {}),
+      expectedTaskId: state.taskId,
     });
     return true;
   }
@@ -1600,6 +1632,13 @@ export class AgentManager {
       await new Promise(r => setTimeout(r, 25));
     }
     throw new Error(`waitForBootstrapSettled(${agentId}) timed out after ${timeoutMs}ms`);
+  }
+
+  private launchSlowPoll(...args: Parameters<AgentManager['slowPollDialogPending']>): void {
+    void this.outsideTaskMutationScope(() => this.slowPollDialogPending(...args))
+      .catch((pollErr) => {
+        console.warn(`[AgentManager] slowPoll for ${args[0]} crashed:`, pollErr);
+      });
   }
 
   private async slowPollDialogPending(
@@ -1629,10 +1668,29 @@ export class AgentManager {
       const state = await this.agentStore.get(agentId);
       if (!state) return;
       if (generationMismatch(state)) return;
+      const isBootstrapPath = creationToken !== undefined;
+      // 锁内读代次:接管在入口 bump 后还要持锁干活,锁外读到的代次分不清接管是已完成还是正在进行
+      const genAtProbe = isBootstrapPath
+        ? await this.runUnderSessionLifecycle(agentId, async () => this.adoptGeneration.get(agentId) ?? 0)
+        : 0;
       let pane: PaneRef;
       try {
         pane = await this.resolveClaimedPane(tmux, agentId);
-      } catch {
+      } catch (resolveErr) {
+        // PaneGoneError = session confirmed gone/not-ours; a transient probe failure is not, so re-probe
+        if (isBootstrapPath && resolveErr instanceof PaneGoneError) {
+          const finalized = await this.runUnderSessionLifecycle(agentId, async () => {
+            // 锁外探到的 absent 可能落在后继销毁旧会话与建好新会话之间:锁内重探,会话仍归我们就交给下一轮
+            try {
+              if ((await tmux.getSessionSnapshot(agentId))?.claim === agentId) return false;
+            } catch {
+              return false;
+            }
+            await this.markBootstrapFailed(agentId, creationToken, 'tmux session for the bootstrapping agent is gone');
+            return true;
+          });
+          if (finalized) return;
+        }
         continue;
       }
       const paneId = pane.paneId;
@@ -1642,8 +1700,20 @@ export class AgentManager {
           timeoutMs: 1_000,
           intervalMs: 200,
           scrollback: 0,
+          failFastOnShell: true,
         });
-      } catch {
+      } catch (err) {
+        // 会话未确认销毁前不清状态:unconfirmed 下会话可能仍 present,清了反而挡住 Retry
+        if (creationToken !== undefined && err instanceof ReplNotReadyError && err.shellForeground) {
+          const rolledBack = await this.rollbackThenFinalize(
+            agentId,
+            { sessionRef: pane.session, genAtCreate: genAtProbe },
+            'slow-poll: REPL exited to shell while dialog pending',
+            creationToken,
+            'REPL exited to the shell while a startup dialog was pending',
+          );
+          if (rolledBack !== 'unconfirmed') return;
+        }
         continue;
       }
 
@@ -1654,7 +1724,6 @@ export class AgentManager {
       let projectIdForEmit = '';
       let taskIdForEmit: string | undefined;
       let wrote = false;
-      const isBootstrapPath = creationToken !== undefined;
       if (isBootstrapPath && !(await this.runGreetingHandshake(agentId, cfg, pane))) {
         await this.markGreetingFailed(agentId, creationToken);
         return;
@@ -1915,10 +1984,11 @@ export class AgentManager {
           await tmux.waitReplReady(pane, runtime, {
             timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
             scrollback: 0,
+            failFastOnShell: true,
           });
           return { ok: true, createdSession: false, freshRuntime: true, paneId, pane, workdir, sessionRef };
         } catch (trustErr) {
-          if (trustErr instanceof ReplNotReadyError && detectStartupDialog(trustErr.lastScreen, runtime)) {
+          if (isBlockedOnStartupDialog(trustErr, runtime)) {
             throw new EnsureSessionError(
               {
                 createdSession: false,
@@ -1947,10 +2017,11 @@ export class AgentManager {
       await tmux.waitReplReady(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
+        failFastOnShell: true,
       });
       return { ok: true, createdSession: false, freshRuntime: true, paneId, pane, workdir, sessionRef };
     } catch (relErr) {
-      if (relErr instanceof ReplNotReadyError && detectStartupDialog(relErr.lastScreen, runtime)) {
+      if (isBlockedOnStartupDialog(relErr, runtime)) {
         throw new EnsureSessionError(
           {
             createdSession: false,
@@ -4071,6 +4142,7 @@ export class AgentManager {
       await tmux.waitReplReady(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
+        failFastOnShell: true,
       });
       await this.setSessionOptions(
         tmux,
@@ -9258,15 +9330,9 @@ export class AgentManager {
         if (err instanceof EnsureSessionError && err.partial.dialogPending) {
           if (await this.rollbackUndeliveredBootstrap(state)) continue;
           await this.markDialogPending(state.id, state.creationToken);
-          void this.outsideTaskMutationScope(() => this.slowPollDialogPending(
-            state.id,
-            state.creationToken,
-            {
-              ...(state.paneId !== undefined ? { expectedPaneId: state.paneId } : {}),
-              expectedTaskId: state.taskId,
-            },
-          )).catch((pollErr) => {
-            console.warn(`[recover] slowPoll for ${state.id} crashed:`, pollErr);
+          this.launchSlowPoll(state.id, state.creationToken, {
+            ...(state.paneId !== undefined ? { expectedPaneId: state.paneId } : {}),
+            expectedTaskId: state.taskId,
           });
           continue;
         }

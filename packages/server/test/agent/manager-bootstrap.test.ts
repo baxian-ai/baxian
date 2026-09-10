@@ -2,16 +2,16 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianEvent } from '../../src/shared/index.js';
+import type { AgentBindingFacts, BaxianEvent } from '../../src/shared/index.js';
 import { EnsureSessionError, DispatchTerminalError, type AgentManager } from '../../src/agent/manager.js';
-import { TmuxManager } from '../../src/agent/tmux.js';
+import { TmuxManager, TmuxOutcomeUnknownError, ReplNotReadyError } from '../../src/agent/tmux.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
 import type { AgentStore } from '../../src/state/agent-store.js';
 import type { LockManager } from '../../src/state/lock.js';
 import type { EventBus } from '../../src/event/bus.js';
 import type { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
-import { fakeRunner } from '../helpers/fake-runner.js';
+import { fakeRunner, type FakeRunnerRule } from '../helpers/fake-runner.js';
 import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
@@ -74,6 +74,12 @@ afterEach(async () => {
   vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
+
+function spyKills(): { byRef: ReturnType<typeof vi.spyOn> } {
+  return {
+    byRef: vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed'),
+  };
+}
 
 describe('AgentManager.startBootstrapAsync', () => {
   it('success records paneId and clears the creation token', async () => {
@@ -141,12 +147,6 @@ describe('AgentManager.startBootstrapAsync', () => {
     )).toBe(true);
   });
 
-  function spyKills(): { byRef: ReturnType<typeof vi.spyOn> } {
-    return {
-      byRef: vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed'),
-    };
-  }
-
   it('hard failure with the same token rolls back by generation-bound session ref', async () => {
     vi.spyOn(manager, 'ensureSession').mockRejectedValue(
       new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
@@ -158,6 +158,66 @@ describe('AgentManager.startBootstrapAsync', () => {
 
     expect(kills.byRef).toHaveBeenCalledWith(REF, { kind: 'emptyOr', claim: 'dev-1' });
     expect(warn.mock.calls.some(c => String(c[0]).includes('killed created session $7'))).toBe(true);
+  });
+
+  it('created-session hard failure: rollback not confirmed (refused) hands off to slow poll instead of clearing over a live session', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom to shell'),
+    );
+    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('refused');
+    const slowPollSpy = vi
+      .spyOn(manager as unknown as {
+        slowPollDialogPending: (id: string, token: string | undefined) => Promise<void>;
+      }, 'slowPollDialogPending')
+      .mockResolvedValue(undefined);
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBe('token-abc');
+    expect(state?.awaitingPhase).toBe('agent_dialog_pending');
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+    expect(slowPollSpy).toHaveBeenCalledWith('dev-1', 'token-abc');
+  });
+
+  it('created-session hard failure: confirmed killed rollback finalizes without a slow-poll handoff', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
+    );
+    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+    const slowPollSpy = vi
+      .spyOn(manager as unknown as {
+        slowPollDialogPending: (id: string, token: string | undefined) => Promise<void>;
+      }, 'slowPollDialogPending')
+      .mockResolvedValue(undefined);
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
+    expect((await agentStore.get('dev-1'))?.creationToken).toBeUndefined();
+    expect(slowPollSpy).not.toHaveBeenCalled();
+  });
+
+  it('a successor queued on the lifecycle lock during hard-failure rollback is finalized against, not clobbered after', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
+    );
+    const m = manager as unknown as { runUnderSessionLifecycle: (id: string, fn: () => Promise<void>) => Promise<void> };
+    let tokenSeenBySuccessor: string | undefined | 'UNSET' = 'UNSET';
+    let successorDone: Promise<void> = Promise.resolve();
+    // the successor grabs the same lock while the rollback kill is running; finalize must complete before it runs
+    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(async () => {
+      successorDone = m.runUnderSessionLifecycle('dev-1', async () => {
+        tokenSeenBySuccessor = (await agentStore.get('dev-1'))?.creationToken;
+      });
+      return 'killed';
+    });
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await successorDone;
+
+    expect(tokenSeenBySuccessor).toBeUndefined();
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
   });
 
   it('hard failure with a rotated token leaves the session to its successor', async () => {
@@ -174,6 +234,8 @@ describe('AgentManager.startBootstrapAsync', () => {
   });
 
   it('rollback stands down when the session was adopted after create', async () => {
+    // the successor reuses the same creationToken, so the token guard alone can't tell it from the losing bootstrap
+    await agentStore.update('dev-1', (s) => s ? { ...s, paneId: '%0' } : null);
     vi.spyOn(manager, 'ensureSession').mockImplementation(async () => {
       (manager as unknown as { adoptGeneration: Map<string, number> }).adoptGeneration.set('dev-1', 1);
       throw new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom');
@@ -183,8 +245,12 @@ describe('AgentManager.startBootstrapAsync', () => {
 
     await manager.startBootstrapAsync('dev-1', 'token-abc');
 
+    const state = await agentStore.get('dev-1');
     expect(kills.byRef).not.toHaveBeenCalled();
     expect(warn.mock.calls.some(c => String(c[0]).includes('session adopted since create'))).toBe(true);
+    expect(state?.creationToken).toBe('token-abc');
+    expect(state?.paneId).toBe('%0');
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
   });
 
   it('rollback is skipped when no session ref was recorded', async () => {
@@ -619,26 +685,137 @@ describe('AgentManager.waitForBootstrapSettled', () => {
 
 describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
   const TOKEN = 'token-abc';
+  const DIALOG_SCREEN = ' Enter to confirm · Esc to cancel\n';
+  const DIALOG_STILL_PENDING = new ReplNotReadyError('%0', 'claude-code', DIALOG_SCREEN, 'dialog still pending', false);
+  const EXITED_TO_SHELL = new ReplNotReadyError('%0', 'claude-code', DIALOG_SCREEN, 'exited to shell', true);
+  const realSetTimeout = globalThis.setTimeout;
+  const realDateNow = Date.now;
+  let simNow = 0;
 
-  it('no longer hard-fails after 10 minutes when the dialog stays unresolved', async () => {
+  // 虚拟时钟:sleep 立即回调并推进 Date.now,waitReplReady 的 1 s deadline 不再真等
+  beforeEach(() => {
+    simNow = realDateNow();
+    Date.now = () => simNow;
+    globalThis.setTimeout = ((fn: () => void, ms = 0) => {
+      simNow += ms;
+      return realSetTimeout(fn, 0);
+    }) as unknown as typeof globalThis.setTimeout;
+  });
+  afterEach(() => {
+    Date.now = realDateNow;
+    globalThis.setTimeout = realSetTimeout;
+  });
+
+  type PollScope = { expectedPaneId?: string; expectedTaskId?: string };
+  function slowPoll(token: string | undefined, opts?: PollScope): Promise<void> {
+    return (manager as unknown as {
+      slowPollDialogPending: (id: string, token: string | undefined, opts?: PollScope) => Promise<void>;
+    }).slowPollDialogPending('dev-1', token, opts);
+  }
+
+  function useRunner(runner: CommandRunner): void {
+    vi.spyOn(manager as unknown as {
+      createRunnerFor: (agent: unknown) => CommandRunner;
+    }, 'createRunnerFor').mockReturnValue(runner);
+  }
+
+  async function seedPendingBootstrap(overrides: Partial<AgentBindingFacts> = {}): Promise<void> {
     await agentStore.update('dev-1', (s) => s ? {
       ...s,
       creationToken: TOKEN,
+      paneId: '%0',
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+      awaitingReason: 'startup dialog',
+      awaitingSince: NOW,
       updatedAt: NOW,
+      ...overrides,
     } : null);
+  }
 
+  function shellExitRunner(screen = DIALOG_SCREEN, rules: FakeRunnerRule[] = []): ReturnType<typeof fakeRunner> {
+    return fakeRunner({ agents: { 'dev-1': { process: 'zsh', screen } }, rules });
+  }
+
+  function sentKillSession(runner: ReturnType<typeof fakeRunner>): boolean {
+    return runner.exec.mock.calls.some(c => String(c[0]).includes('kill-session'));
+  }
+
+  // ends the loop on poll n by handing back a rotated token; never writes to the store (update() re-enters get() under its mutex)
+  function rotateTokenAtPoll(n: number, onFirstPoll?: () => void): { polls: () => number } {
+    const realGet = agentStore.get.bind(agentStore);
+    let polls = 0;
+    const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+      polls++;
+      if (polls === 1) onFirstPoll?.();
+      const state = await realGet(id);
+      if (polls < n || !state) return state;
+      getSpy.mockRestore();
+      return { ...state, creationToken: 'token-force-exit' };
+    });
+    return { polls: () => polls };
+  }
+
+  // a successor ensure holds the lifecycle lock from its generation bump until its session work is done
+  function fakeTakeover(): { start: () => void; release: () => void; done: () => boolean } {
+    let done = false;
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const m = manager as unknown as {
+      adoptGeneration: Map<string, number>;
+      runUnderSessionLifecycle: (id: string, fn: () => Promise<void>) => Promise<void>;
+    };
+    return {
+      start: () => {
+        void m.runUnderSessionLifecycle('dev-1', async () => {
+          m.adoptGeneration.set('dev-1', 1);
+          await gate;
+          done = true;
+        });
+      },
+      release: () => release(),
+      done: () => done,
+    };
+  }
+
+  // absent until the takeover has rebuilt the session as $2/%1
+  function rebuiltSessionRunner(
+    takeover: ReturnType<typeof fakeTakeover>,
+    onFirstSnapshot?: () => void,
+  ): ReturnType<typeof fakeRunner> {
+    let snapshots = 0;
+    return fakeRunner({
+      agents: { 'dev-1': { paneId: '%1', process: 'claude', screen: DIALOG_SCREEN } },
+      rules: [{
+        match: 'list-sessions',
+        reply: () => {
+          if (++snapshots === 1) onFirstSnapshot?.();
+          return { stdout: takeover.done() ? '4242|1700000000|$2|dev-1\n' : '' };
+        },
+      }],
+    });
+  }
+
+  async function expectSuccessorStateUntouched(): Promise<void> {
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBe(TOKEN);
+    expect(state?.paneId).toBe('%0');
+    expect(state?.awaitingPhase).toBe('agent_dialog_pending');
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+  }
+
+  it('no longer hard-fails after 10 minutes while the session cannot be probed (transient), dialog unresolved', async () => {
+    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: TOKEN, updatedAt: NOW } : null);
+
+    // A transient probe failure (not PaneGoneError) must keep polling, never hard-fail on a time budget.
+    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot')
+      .mockRejectedValue(new TmuxOutcomeUnknownError('list-sessions outcome unknown (transient): exit 255: Connection reset by peer'));
     const failSpy = vi.spyOn(manager, 'failTasksForAgent').mockResolvedValue({ failedCount: 0, releasedPartners: 0 });
     const releaseSpy = vi.spyOn(lockManager, 'releaseIfOwner');
-    const realSetTimeout = globalThis.setTimeout;
-    const fastSetTimeout = ((fn: () => void) => realSetTimeout(fn, 0)) as unknown as typeof globalThis.setTimeout;
-    globalThis.setTimeout = fastSetTimeout;
-    const realDateNow = Date.now;
-    let simNow = realDateNow();
-    Date.now = () => simNow;
     let iterations = 0;
     const realGet = agentStore.get.bind(agentStore);
     const realSet = agentStore.set.bind(agentStore);
-    const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
       iterations++;
       simNow += 5 * 60_000;
       if (iterations === 200) {
@@ -647,46 +824,21 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
       }
       return realGet(id);
     });
-    try {
-      await (manager as unknown as {
-        slowPollDialogPending: (id: string, token: string) => Promise<void>;
-      }).slowPollDialogPending('dev-1', TOKEN);
+    await slowPoll(TOKEN);
 
-      expect(failSpy).not.toHaveBeenCalled();
-      expect(releaseSpy).not.toHaveBeenCalled();
-      expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-      expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
-    } finally {
-      Date.now = realDateNow;
-      getSpy.mockRestore();
-      failSpy.mockRestore();
-      releaseSpy.mockRestore();
-      globalThis.setTimeout = realSetTimeout;
-    }
+    expect(failSpy).not.toHaveBeenCalled();
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
   });
 
   it('exits cleanly when creationToken is cleared mid-flight (DELETE/recreate)', async () => {
-    await agentStore.update('dev-1', (s) => s ? {
-      ...s,
-      paneId: '%0',
-      creationToken: 'token-newer',
-      updatedAt: NOW,
-    } : null);
+    await agentStore.update('dev-1', (s) => s ? { ...s, paneId: '%0', creationToken: 'token-newer', updatedAt: NOW } : null);
+    await slowPoll(TOKEN);
 
-    const realSetTimeout = globalThis.setTimeout;
-    const fastSetTimeout = ((fn: () => void) => realSetTimeout(fn, 0)) as unknown as typeof globalThis.setTimeout;
-    globalThis.setTimeout = fastSetTimeout;
-    try {
-      await (manager as unknown as {
-        slowPollDialogPending: (id: string, token: string) => Promise<void>;
-      }).slowPollDialogPending('dev-1', TOKEN);
-
-      expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-      expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
-      expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
-    } finally {
-      globalThis.setTimeout = realSetTimeout;
-    }
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
+    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
   });
 
   it('recovers a runtime dialog after the tmux pane was recreated (stale stored paneId)', async () => {
@@ -711,7 +863,7 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
       '› ',
     ].join('\n');
 
-    const dispatchRunner = fakeRunner({
+    useRunner(fakeRunner({
       rules: [
         { match: 'list-sessions', reply: { stdout: '9999|1700000000|$1|dev-1\n' } },
         { match: 'list-panes', reply: { stdout: '%2 node\n' } },
@@ -729,11 +881,7 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
         },
       ],
       defaultResult: {},
-    });
-
-    vi.spyOn(manager as unknown as {
-      createRunnerFor: (agent: unknown) => CommandRunner;
-    }, 'createRunnerFor').mockReturnValue(dispatchRunner);
+    }));
     vi.spyOn(manager, 'getAgentConfig').mockReturnValue({
       id: 'dev-1',
       projectId: 'proj',
@@ -743,71 +891,216 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
       workdir: '/tmp/repo',
       yolo: true,
     });
+    rotateTokenAtPoll(13);
+    await slowPoll(undefined, { expectedPaneId: '%1', expectedTaskId: 'task-1' });
 
-    const realSetTimeout = globalThis.setTimeout;
-    globalThis.setTimeout = ((fn: () => void) => realSetTimeout(fn, 0)) as unknown as typeof globalThis.setTimeout;
-    const realGet = agentStore.get.bind(agentStore);
-    let polls = 0;
-    const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
-      polls++;
-      if (polls > 12) await agentStore.delete(id);
-      return realGet(id);
+    const state = await agentStore.get('dev-1');
+    expect(state?.awaitingPhase).toBe('agent_dialog_resolved_runtime');
+    expect(state?.paneId).toBe('%2');
+    expect(state?.awaitingReason).toContain('cancel it if it is still active');
+    const intervention = events.find(e =>
+      e.type === 'human.intervention'
+      && e.taskId === 'task-1'
+      && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',
+    );
+    expect(intervention?.data.note).toContain('cancel it if it is still active');
+    expect(intervention?.data.note).not.toBe('Runtime dialog resolved; agent REPL ready. Click Resume to continue.');
+  });
+
+  it('bootstrap path: REPL exited to a shell → rolls back the dead session and clears the dialog hold so Retry/Resume can rebuild', async () => {
+    await seedPendingBootstrap();
+    const shellRunner = shellExitRunner();
+    useRunner(shellRunner);
+    await slowPoll(TOKEN);
+
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
+    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
+    // Recovery-ready: the dialog hold and creation token are gone so Resume is not rejected and Retry is not blocked.
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
+    expect(state?.status).toBeUndefined();
+    // The leftover shell session was actually torn down (guarded kill), not left present to block Retry.
+    expect(sentKillSession(shellRunner)).toBe(true);
+  });
+
+  it('bootstrap path: a successor queued on the lifecycle lock during rollback is finalized against, not clobbered after', async () => {
+    await seedPendingBootstrap();
+    useRunner(shellExitRunner());
+    const m = manager as unknown as { runUnderSessionLifecycle: (id: string, fn: () => Promise<void>) => Promise<void> };
+    let tokenSeenBySuccessor: string | undefined | 'UNSET' = 'UNSET';
+    let successorDone: Promise<void> = Promise.resolve();
+    // the losing poll confirms shell → rolls back; a same-token successor queues on the lock while the kill runs
+    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(async () => {
+      successorDone = m.runUnderSessionLifecycle('dev-1', async () => {
+        tokenSeenBySuccessor = (await agentStore.get('dev-1'))?.creationToken;
+      });
+      return 'killed';
     });
-    try {
-      await (manager as unknown as {
-        slowPollDialogPending: (
-          id: string,
-          token: string | undefined,
-          opts: { expectedPaneId?: string; expectedTaskId?: string },
-        ) => Promise<void>;
-      }).slowPollDialogPending('dev-1', undefined, { expectedPaneId: '%1', expectedTaskId: 'task-1' });
 
-      const state = await realGet('dev-1');
-      expect(state?.awaitingPhase).toBe('agent_dialog_resolved_runtime');
-      expect(state?.paneId).toBe('%2');
-      expect(state?.awaitingReason).toContain('cancel it if it is still active');
-      const intervention = events.find(e =>
-        e.type === 'human.intervention'
-        && e.taskId === 'task-1'
-        && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',
-      );
-      expect(intervention?.data.note).toContain('cancel it if it is still active');
-      expect(intervention?.data.note).not.toBe('Runtime dialog resolved; agent REPL ready. Click Resume to continue.');
-    } finally {
-      globalThis.setTimeout = realSetTimeout;
-      getSpy.mockRestore();
-    }
+    await slowPoll(TOKEN);
+    await successorDone;
+
+    // finalize ran inside the same critical section as the rollback, so the successor never observes a live token to clobber
+    expect(tokenSeenBySuccessor).toBeUndefined();
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
+  });
+
+  it('bootstrap path: half-created session left as a plain shell (no dialog text) → rolls back and finalizes so Retry can rebuild', async () => {
+    await seedPendingBootstrap();
+    // A create that failed before the launch command leaves a plain shell — no runtime ever started, no dialog on screen.
+    const shellRunner = shellExitRunner('➜  repo git:(main)\n');
+    useRunner(shellRunner);
+    await slowPoll(TOKEN);
+
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
+    expect(sentKillSession(shellRunner)).toBe(true);
+  });
+
+  it('bootstrap path: a successor adopting during the readiness probe is not killed by the losing slow poll', async () => {
+    await seedPendingBootstrap();
+    useRunner(shellExitRunner());
+    // A successor adopts the same ref (bumps adoptGeneration) while this poll's waitReplReady is still running.
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockImplementation(async () => {
+      (manager as unknown as { adoptGeneration: Map<string, number> }).adoptGeneration.set('dev-1', 1);
+      throw EXITED_TO_SHELL;
+    });
+    const killSpy = spyKills().byRef;
+    await slowPoll(TOKEN);
+
+    expect(killSpy).not.toHaveBeenCalled();
+    await expectSuccessorStateUntouched();
+  });
+
+  it('bootstrap path: a session ref replaced mid-probe (no panes match) is re-probed, not finalized as failed', async () => {
+    await seedPendingBootstrap();
+    // getSinglePaneByRef throws a plain Error (not PaneGoneError) for a stale ref, so this path must re-probe
+    useRunner(shellExitRunner(DIALOG_SCREEN, [{ match: 'list-panes', reply: { stdout: '' } }]));
+    const killSpy = spyKills().byRef;
+    const loop = rotateTokenAtPoll(4);
+    await slowPoll(TOKEN);
+
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(loop.polls()).toBeGreaterThan(1);
+  });
+
+  it('bootstrap path: a takeover that begins during this poll\'s probe and rebuilds the session is not finalized as gone', async () => {
+    await seedPendingBootstrap();
+    const takeover = fakeTakeover();
+    // the successor bumped, killed the old ref and is still building the new one when this poll's snapshot lands
+    useRunner(rebuiltSessionRunner(takeover, () => {
+      takeover.start();
+      realSetTimeout(takeover.release, 0);
+    }));
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(DIALOG_STILL_PENDING);
+    const killSpy = spyKills().byRef;
+    const loop = rotateTokenAtPoll(3);
+    await slowPoll(TOKEN);
+
+    await expectSuccessorStateUntouched();
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(loop.polls()).toBeGreaterThan(1);
+  });
+
+  it('bootstrap path: a takeover already in flight when this poll samples (generation bumped, old session destroyed, new one not yet built) is not finalized as gone', async () => {
+    await seedPendingBootstrap();
+    const takeover = fakeTakeover();
+    takeover.start();
+    useRunner(rebuiltSessionRunner(takeover));
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(DIALOG_STILL_PENDING);
+    const killSpy = spyKills().byRef;
+    // the successor finishes only after this poll has already started its iteration
+    const loop = rotateTokenAtPoll(3, () => realSetTimeout(takeover.release, 0));
+    await slowPoll(TOKEN);
+
+    await expectSuccessorStateUntouched();
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(loop.polls()).toBeGreaterThan(1);
+  });
+
+  it('bootstrap path: a takeover already in flight that relaunches the runtime in the same pane is not killed by a shell observed before it finished', async () => {
+    await seedPendingBootstrap();
+    const takeover = fakeTakeover();
+    takeover.start();
+    useRunner(shellExitRunner());
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockImplementation(async () => {
+      throw takeover.done() ? DIALOG_STILL_PENDING : EXITED_TO_SHELL;
+    });
+    const killSpy = spyKills().byRef;
+    const loop = rotateTokenAtPoll(3, () => realSetTimeout(takeover.release, 0));
+    await slowPoll(TOKEN);
+
+    await expectSuccessorStateUntouched();
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(loop.polls()).toBeGreaterThan(1);
+  });
+
+  for (const variant of [
+    { label: 'refused (session ref changed / adopted)', kill: () => vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('refused') },
+    { label: 'unknown (SSH connection reset)', kill: () => vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockRejectedValue(new TmuxOutcomeUnknownError('kill outcome unknown: exit 255: Connection reset by peer')) },
+  ]) {
+    it(`bootstrap path: session teardown ${variant.label} → keeps the dialog hold and re-probes instead of clearing state over a live session`, async () => {
+      await seedPendingBootstrap();
+      useRunner(shellExitRunner());
+      const killSpy = variant.kill();
+      const loop = rotateTokenAtPoll(4);
+      await slowPoll(TOKEN);
+
+      // A not-confirmed-gone session must NOT be treated as failed: no bootstrap_failed, hold not cleared.
+      expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+      expect(killSpy).toHaveBeenCalled();
+      expect(loop.polls()).toBeGreaterThan(1);
+    });
+  }
+
+  it('bootstrap path: kill applied but response lost (unknown) → next cycle sees the session gone and finalizes', async () => {
+    await seedPendingBootstrap();
+    let killApplied = false;
+    useRunner(shellExitRunner(DIALOG_SCREEN, [
+      { match: 'list-sessions', reply: () => ({ stdout: killApplied ? '' : '4242|1700000000|$1|dev-1\n' }) },
+    ]));
+    // Remote kill actually succeeds, but SSH drops before the reply → the session is gone yet the outcome is unknown.
+    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(async () => {
+      killApplied = true;
+      throw new TmuxOutcomeUnknownError('kill outcome unknown: exit 255: Connection reset by peer');
+    });
+    await slowPoll(TOKEN);
+
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
+  });
+
+  it('bootstrap path: does not roll back or fail when the creation token was already rotated to a successor', async () => {
+    await seedPendingBootstrap({ creationToken: 'token-newer' });
+    const shellRunner = shellExitRunner();
+    useRunner(shellRunner);
+    await slowPoll(TOKEN);
+
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+    expect(sentKillSession(shellRunner)).toBe(false);
+    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
   });
 
   it('exits when agentStore record is deleted (DELETE path collapses the loop)', async () => {
-    await agentStore.update('dev-1', (s) => s ? {
-      ...s, creationToken: TOKEN, updatedAt: NOW,
-    } : null);
-
-    const realSetTimeout = globalThis.setTimeout;
-    const fastSetTimeout = ((fn: () => void) => realSetTimeout(fn, 0)) as unknown as typeof globalThis.setTimeout;
-    globalThis.setTimeout = fastSetTimeout;
+    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: TOKEN, updatedAt: NOW } : null);
     const realGet = agentStore.get.bind(agentStore);
     let polls = 0;
-    const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
       polls++;
-      if (polls === 2) {
-        await agentStore.delete('dev-1');
-      }
+      if (polls === 2) await agentStore.delete('dev-1');
       return realGet(id);
     });
-    try {
-      await (manager as unknown as {
-        slowPollDialogPending: (id: string, token: string) => Promise<void>;
-      }).slowPollDialogPending('dev-1', TOKEN);
+    await slowPoll(TOKEN);
 
-      expect(polls).toBeGreaterThanOrEqual(2);
-      expect(polls).toBeLessThan(10);
-      expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-      expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
-    } finally {
-      globalThis.setTimeout = realSetTimeout;
-      getSpy.mockRestore();
-    }
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(polls).toBeLessThan(10);
+    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
+    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
   });
 });

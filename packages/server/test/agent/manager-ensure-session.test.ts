@@ -476,6 +476,34 @@ describe('AgentManager.ensureSession', () => {
     expect(tmuxSessions.has('dev-1')).toBe(true);
   });
 
+  function mockCreatePathPane(screen: string, paneCurrentCommand: string): void {
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('new-session')) {
+        const name = cmd.match(/-s '([^']+)'/)?.[1] ?? '';
+        const sessionId = `$${nextSessionId++}`;
+        tmuxSessions.set(name, { claim: name, readyOnce: false, sessionId });
+        return { stdout: `9999|1700000000|${sessionId}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('list-panes')) return { stdout: '%0 zsh\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${screen}`, stderr: '', exitCode: 0 };
+      if (cmd.includes('display-message')) return { stdout: `BX_PANE_OK${paneCurrentCommand}\n`, stderr: '', exitCode: 0 };
+      return makeMockExec()(cmd);
+    });
+  }
+
+  it('REPL that exited back to the shell with dialog text left on screen is a bootstrap failure, not a pending dialog', async () => {
+    mockCreatePathPane(' Enter to confirm · Esc to cancel\n➜  repo git:(main)\n', 'zsh');
+    const err = await manager.ensureSession('dev-1', 'create').then(
+      () => { throw new Error('expected throw'); },
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(EnsureSessionError);
+    const e = err as EnsureSessionError;
+    expect(e.partial.createdSession).toBe(true);
+    expect(e.partial.dialogPending).toBeFalsy();
+    expect(e.message).toMatch(/shell/);
+  });
+
   it.each([
     {
       label: 'dialog signal triggers dialogPending=true',
@@ -494,18 +522,7 @@ describe('AgentManager.ensureSession', () => {
       message: undefined,
     },
   ])('waitReplReady captures last screen ($label)', async ({ screen, dialogPending, lastScreen, message }) => {
-    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('new-session')) {
-        const name = cmd.match(/-s '([^']+)'/)?.[1] ?? '';
-        const sessionId = `$${nextSessionId++}`;
-        tmuxSessions.set(name, { claim: name, readyOnce: false, sessionId });
-        return { stdout: `9999|1700000000|${sessionId}\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('list-panes')) return { stdout: '%0 zsh\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${screen}`, stderr: '', exitCode: 0 };
-      if (cmd.includes('display-message')) return { stdout: 'BX_PANE_OKnode\n', stderr: '', exitCode: 0 };
-      return makeMockExec()(cmd);
-    });
+    mockCreatePathPane(screen, 'node');
     try {
       await manager.ensureSession('dev-1', 'create');
       throw new Error('expected throw');

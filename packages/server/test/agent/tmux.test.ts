@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog } from '../../src/agent/tmux.js';
+import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError, ReplNotReadyError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog } from '../../src/agent/tmux.js';
 import type { PaneRef } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { blank, CC_NONYOLO_BASH_PERMISSION, CODEX_NONYOLO_ESCALATION } from './runtime-captures.js';
@@ -1343,13 +1343,67 @@ describe('TmuxManager', () => {
   });
 
   describe('handleTrustDialog', () => {
-    it('detects the claude trust dialog and sends Enter', async () => {
+    const sentKeys = (): string[] =>
+      runner.exec.mock.calls.map(c => String(c[0])).filter(c => c.includes('send-keys'));
+    const CC_TRUST_BODY = ' Accessing workspace:\n\n /Users/example/.baxian/agents/example-dev/repo\n\n'
+      + ' Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what\'s in this\n'
+      + ' folder first.\n\n Claude Code\'ll be able to read, edit, and execute files here.\n\n Security guide\n\n';
+    const CC_TRUST_NO_PRESELECTED = `${CC_TRUST_BODY} ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n`;
+    const CC_TRUST_YES_HIGHLIGHTED = `${CC_TRUST_BODY}   No, exit\n ❯ Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n`;
+
+    it('legacy claude dialog preselecting Yes: sends Enter directly', async () => {
       primeExec(okBody('Quick safety check\n❯ 1. Yes, I trust this folder\n'), '');
       const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 50 });
       expect(answered).toBe(true);
-      const sentKeys = runner.exec.mock.calls[1][0] as string;
-      expect(sentKeys).toContain('send-keys');
-      expect(sentKeys).toContain("'Enter'");
+      expect(sentKeys()).toHaveLength(1);
+      expect(sentKeys()[0]).toContain("'Enter'");
+    });
+
+    it('claude dialog preselecting "No, exit": moves the cursor Down onto Yes before Enter', async () => {
+      primeExec(okBody(CC_TRUST_NO_PRESELECTED), '', okBody(CC_TRUST_YES_HIGHLIGHTED), '');
+      const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 50 });
+      expect(answered).toBe(true);
+      expect(sentKeys()).toHaveLength(2);
+      expect(sentKeys()[0]).toContain("'Down'");
+      expect(sentKeys()[1]).toContain("'Enter'");
+    });
+
+    it('claude dialog with Yes already highlighted (current wording): sends Enter directly', async () => {
+      primeExec(okBody(CC_TRUST_YES_HIGHLIGHTED), '');
+      const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 50 });
+      expect(answered).toBe(true);
+      expect(sentKeys()).toHaveLength(1);
+      expect(sentKeys()[0]).toContain("'Enter'");
+    });
+
+    it('sends Down once then keeps polling until a slow redraw lands the cursor on Yes', async () => {
+      let captures = 0;
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('send-keys')) return { stdout: '', stderr: '', exitCode: 0 };
+        if (cmd.includes('capture-pane')) {
+          captures += 1;
+          // 1st = top-of-loop detect (No); 2nd = right after Down, redraw not yet done (No); 3rd = Yes
+          return { stdout: `BX_PANE_OK\n${captures >= 3 ? CC_TRUST_YES_HIGHLIGHTED : CC_TRUST_NO_PRESELECTED}`, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 2000, intervalMs: 50 });
+      expect(answered).toBe(true);
+      const downs = sentKeys().filter(k => k.includes("'Down'"));
+      expect(downs).toHaveLength(1);
+      expect(sentKeys().at(-1)).toContain("'Enter'");
+    });
+
+    it('never presses Enter and gives up for a human when the cursor never leaves "No, exit"', async () => {
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('send-keys')) return { stdout: '', stderr: '', exitCode: 0 };
+        if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${CC_TRUST_NO_PRESELECTED}`, stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 400, intervalMs: 50 });
+      expect(answered).toBe(false);
+      expect(sentKeys().filter(k => k.includes("'Down'"))).toHaveLength(1);
+      expect(sentKeys().some(k => k.includes("'Enter'"))).toBe(false);
     });
 
     it('returns false (already past dialog) when ready anchor is already visible', async () => {
@@ -1484,13 +1538,79 @@ describe('TmuxManager', () => {
       expect(runner.exec.mock.calls.length).toBeGreaterThanOrEqual(4);
     });
 
-    it('failFastOnShell:true aborts immediately when proc_current_command is a shell', async () => {
-      primeExec(okHeader('zsh'));
+    function mockPane(procAtRead: (read: number) => string, screen: string): { procReads: () => number } {
+      let procReads = 0;
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('pane_current_command')) {
+          return { stdout: okHeader(procAtRead(++procReads)), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) return { stdout: okBody(screen), stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      return { procReads: () => procReads };
+    }
+
+    it('failFastOnShell:true waits through a shell that has not started the runtime yet, then succeeds', async () => {
+      // slow shell preexec/env hooks: the foreground is the shell before the runtime binary execs
+      const pane = mockPane(read => read <= 2 ? 'zsh' : 'claude', '⏵⏵ bypass permissions on (shift+tab to cycle)\n');
       await expect(
         tmux.waitReplReady(PANE, 'claude-code', {
-          timeoutMs: 5000, intervalMs: 30, failFastOnShell: true,
+          timeoutMs: 5000, intervalMs: 10, failFastOnShell: true,
         }),
-      ).rejects.toThrow(/failFastOnShell/);
+      ).resolves.toBeUndefined();
+      expect(pane.procReads()).toBeGreaterThanOrEqual(3);
+    });
+
+    it('failFastOnShell:true aborts once a previously-observed runtime falls back to the shell', async () => {
+      mockPane(read => read >= 2 ? 'zsh' : 'claude', 'booting…\n');
+      const err = await tmux.waitReplReady(PANE, 'claude-code', {
+        timeoutMs: 5000, intervalMs: 10, failFastOnShell: true,
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+      expect((err as Error).message).toMatch(/failFastOnShell/);
+    });
+
+    it('failFastOnShell:true re-checks the foreground at the deadline so a last-moment exit to shell is marked shellForeground', async () => {
+      // REPL still alive during the loop, then exits to the shell right before the deadline re-check
+      mockPane(read => read >= 2 ? 'zsh' : 'claude', 'booting…\n Enter to confirm · Esc to cancel\n');
+      const err = await tmux.waitReplReady(PANE, 'claude-code', {
+        timeoutMs: 40, intervalMs: 50, failFastOnShell: true,
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+    });
+
+    it('failFastOnShell:true reports shellForeground at the deadline for a plain shell that never started the runtime', async () => {
+      // plain shell prompt: no startup dialog text, and the runtime was never observed
+      mockPane(() => 'zsh', '➜  repo git:(main)\n');
+      const err = await tmux.waitReplReady(PANE, 'claude-code', {
+        timeoutMs: 40, intervalMs: 50, failFastOnShell: true,
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+    });
+
+    it('completes the readiness check for a probe that started before the deadline but returned after it', async () => {
+      let procReads = 0;
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('pane_current_command')) {
+          procReads += 1;
+          // the 2nd foreground probe starts in-window but its reply crosses the deadline; the runtime is ready by then
+          if (procReads >= 2) await new Promise((r) => setTimeout(r, 40));
+          return { stdout: okHeader('claude'), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          const screen = procReads >= 2 ? '⏵⏵ bypass permissions on (shift+tab to cycle)\n' : 'booting…\n';
+          return { stdout: okBody(screen), stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      await expect(
+        tmux.waitReplReady(PANE, 'claude-code', {
+          timeoutMs: 30, intervalMs: 5, failFastOnShell: true,
+        }),
+      ).resolves.toBeUndefined();
     });
 
     it.each([

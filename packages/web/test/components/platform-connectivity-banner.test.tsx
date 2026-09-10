@@ -135,6 +135,32 @@ describe('PlatformConnectivityBanner', () => {
     expect(screen.queryByText(/Platform unreachable/)).toBeNull();
   });
 
+  it('reports a not-found needing manual fix instead of self-healing unreachable when a failed poller keeps getting NOT_FOUND', () => {
+    pollersState.data = [snapshot({
+      repo: 'https://github.com/org/private.git',
+      health: 'failed',
+      consecutiveFailures: 3,
+      lastErrorClass: 'NOT_FOUND',
+      lastErrorMessage: 'read task 42: op prView failed (exit 1, class NOT_FOUND): gh: Not Found (HTTP 404)',
+    })];
+    render(<PlatformConnectivityBanner />);
+    expect(screen.getByText(/not-found/i)).not.toBeNull();
+    expect(screen.getByText(/org\/private/)).not.toBeNull();
+    expect(screen.queryByText(/Platform unreachable/)).toBeNull();
+  });
+
+  it('keeps the self-healing degraded notice for a NOT_FOUND that has not yet reached failed', () => {
+    pollersState.data = [snapshot({
+      repo: 'https://github.com/org/private.git',
+      health: 'degraded',
+      consecutiveFailures: 1,
+      lastErrorClass: 'NOT_FOUND',
+    })];
+    render(<PlatformConnectivityBanner />);
+    expect(screen.getByText(/Platform polling degraded/)).not.toBeNull();
+    expect(screen.queryByText(/not-found/i)).toBeNull();
+  });
+
   it('shows the driver-supplied recovery instruction instead of a hard-coded platform command', () => {
     pollersState.data = [snapshot({
       repo: 'https://corp.example/team/repo.git',
