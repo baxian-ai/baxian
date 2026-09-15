@@ -323,6 +323,7 @@ export class TmuxProbePoller {
               ansi: false,
               scrollback: 0,
               timeoutMs: this.probeTimeoutMs,
+              runtime: agent.runtime,
             }),
             this.agentStore
               ? this.agentStore.get(agent.id).then((binding) => binding?.taskId ?? null)

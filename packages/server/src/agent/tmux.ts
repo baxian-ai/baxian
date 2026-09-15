@@ -212,6 +212,7 @@ export interface CapturePaneOpts {
   ansi?: boolean;
   scrollback?: number;
   timeoutMs?: number;
+  runtime?: AgentRuntimeKind;
 }
 
 export interface WaitOpts {
@@ -378,6 +379,35 @@ const SHELL_PROC_TITLES = /^(?:zsh|bash|sh|fish|dash|ash|ksh|mksh|tcsh|csh|nu|xo
 const ANSI_PATTERN = /\x1b\[[0-9;]*[A-Za-z]/g;
 
 const stripAnsi = (s: string): string => s.replace(ANSI_PATTERN, '');
+
+const CODEX_SPARKLE_GLYPHS = /[⠁⠂⠄⠈⠐⠠⡀⢀]/g;
+// » 是 Ultra effort 的 composer 前缀(effort_ignition.rs prompt_glyph)
+const CODEX_COMPOSER_LINE = new RegExp(`^(?:${ANSI_PATTERN.source}|[ \t])*[›»]`);
+// composer 块在提示行上方还有留白行和远程图片附件行([Image #N]),星点同样铺在这些行的空格上
+const CODEX_COMPOSER_ROW_ABOVE = new RegExp(`^(?:${ANSI_PATTERN.source}|[ \t]|\\[Image #\\d+\\])*$`);
+const CODEX_RESPONSE_MARKER = /^([ \t]*)[•■✗✓]/;
+
+// › 也是历史用户消息的前缀:其后出现回复标记即历史消息(herdr #4015 同一判据),说明 composer 被其他 view 顶替、不在屏上;
+// 草稿续行缩进在提示符之后(LIVE_PREFIX_COLS),历史 cell 的标记与提示符同列或更靠左,以此区分草稿里的 •/✓ 行
+function isHistoryPrompt(probe: string[], top: number): boolean {
+  const promptIndent = stripAnsi(probe[top]).search(/[›»]/);
+  return probe.slice(top + 1).some((line) => {
+    const marker = CODEX_RESPONSE_MARKER.exec(stripAnsi(line));
+    return marker !== null && marker[1].length <= promptIndent;
+  });
+}
+
+// codex 0.154 起(tui.whimsy)只在 composer 块的空格格子上逐帧重绘单点 braille 星点:会顶掉 › 后、[Image #N] 内的空格并让帧比对永不收敛;块外的 braille 是真实正文
+function blankSparkles(body: string, runtime: AgentRuntimeKind | undefined): string {
+  if (runtime !== 'codex') return body;
+  const lines = body.split('\n');
+  const probe = lines.map(line => line.replace(CODEX_SPARKLE_GLYPHS, ' '));
+  let top = probe.length - 1;
+  while (top >= 0 && !CODEX_COMPOSER_LINE.test(probe[top])) top--;
+  if (top < 0 || isHistoryPrompt(probe, top)) return body;
+  while (top > 0 && CODEX_COMPOSER_ROW_ABOVE.test(probe[top - 1])) top--;
+  return lines.slice(0, top).concat(probe.slice(top)).join('\n');
+}
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
@@ -876,7 +906,7 @@ export class TmuxManager {
       [`capture-pane ${flags.join(' ')} -t ${pane.paneId}`],
       execOpts,
     );
-    return body;
+    return blankSparkles(body, opts.runtime);
   }
 
   async injectPrompt(pane: PaneRef, prompt: string, agentId: string): Promise<void> {
@@ -1026,14 +1056,18 @@ export class TmuxManager {
     }
   }
 
-  async capturePaneSnapshot(pane: PaneRef): Promise<string> {
+  async capturePaneSnapshot(pane: PaneRef, runtime?: AgentRuntimeKind): Promise<string> {
     const { header, body } = await this.guardedPaneRead(
       pane,
       '|#{history_size}',
       [`capture-pane -t ${pane.paneId} -e -p`],
     );
     const history = header.replace(/^\|/, '').trim();
-    return `${stripAnsi(body)}\n---history_size:${history}---`;
+    // 这条 capture-pane 不带 -J/-N,tmux 已裁掉行尾空格:星点置空后要再裁一次,否则最右星点的列位置仍让两帧长度不同
+    const visible = runtime === 'codex'
+      ? blankSparkles(stripAnsi(body), runtime).replace(/ +$/gm, '')
+      : stripAnsi(body);
+    return `${visible}\n---history_size:${history}---`;
   }
 
   async sendEnter(pane: PaneRef): Promise<void> {
@@ -1046,13 +1080,16 @@ export class TmuxManager {
     await this.sendKeysToPane(pane, 'C-c');
   }
 
-  async captureSettledSnapshot(pane: PaneRef, opts: WaitOpts = {}): Promise<string> {
+  async captureSettledSnapshot(
+    pane: PaneRef,
+    opts: WaitOpts & { runtime?: AgentRuntimeKind } = {},
+  ): Promise<string> {
     const deadline = Date.now() + (opts.timeoutMs ?? 3_000);
     const interval = Math.max(opts.intervalMs ?? 150, MIN_POLL_INTERVAL_MS);
-    let prev = await this.capturePaneSnapshot(pane);
+    let prev = await this.capturePaneSnapshot(pane, opts.runtime);
     while (Date.now() < deadline) {
       await sleep(interval);
-      const cur = await this.capturePaneSnapshot(pane);
+      const cur = await this.capturePaneSnapshot(pane, opts.runtime);
       if (cur === prev) return cur;
       prev = cur;
     }
@@ -1074,7 +1111,7 @@ export class TmuxManager {
     const resendIntervalMs = Math.max(opts.resendIntervalMs ?? 3_000, interval);
     let lastResend = Date.now();
     while (Date.now() < deadline) {
-      const visible = stripHistorySuffix(await this.capturePaneSnapshot(pane));
+      const visible = stripHistorySuffix(await this.capturePaneSnapshot(pane, runtime));
       if (!baselineWorking && classifyScreen(runtime, visible).state === 'working') return;
       const title = await this.readPaneTitle(pane);
       const detection = classifyScreen(runtime, visible, title);
@@ -1106,7 +1143,7 @@ export class TmuxManager {
     const interval = opts.intervalMs ?? 500;
     const dialogPattern = TRUST_DIALOGS[runtime];
     const readScreen = async (): Promise<string> =>
-      stripAnsi(await this.capturePaneById(pane, { ansi: true, scrollback: 50 }));
+      stripAnsi(await this.capturePaneById(pane, { ansi: true, scrollback: 50, runtime }));
     while (Date.now() < deadline) {
       const stripped = await readScreen();
       if (dialogPattern.test(stripped)) {
@@ -1129,7 +1166,7 @@ export class TmuxManager {
       }
       const current = await this.displayMessage(pane, '#{pane_current_command}');
       if (hasReplProcTitle(current, runtime)) {
-        const freshStripped = stripAnsi(await this.capturePaneById(pane, { ansi: false, scrollback: 0 }));
+        const freshStripped = stripAnsi(await this.capturePaneById(pane, { ansi: false, scrollback: 0, runtime }));
         if (hasRuntimeReadyView(freshStripped, runtime)) return false;
       }
       await sleep(interval);
@@ -1149,7 +1186,7 @@ export class TmuxManager {
       opts,
     );
     const current = header.trim();
-    const stripped = stripAnsi(body);
+    const stripped = blankSparkles(stripAnsi(body), runtime);
 
     if (REPL_PROC_TITLES[runtime].test(current)) {
       if (READY_ANCHORS[runtime].test(stripped)) return { kind: 'live-runtime' };
@@ -1187,7 +1224,7 @@ export class TmuxManager {
           true,
         );
       }
-      const cap = await this.capturePaneById(pane, { ansi: true, scrollback, timeoutMs: opts.perCommandTimeoutMs });
+      const cap = await this.capturePaneById(pane, { ansi: true, scrollback, timeoutMs: opts.perCommandTimeoutMs, runtime });
       const stripped = stripAnsi(cap);
       lastStripped = stripped;
       if (procTitle.test(current)) {

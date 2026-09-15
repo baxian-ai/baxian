@@ -143,7 +143,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     const escKeys = sentKeys.filter(k => k.includes("'Escape'"));
     expect(escKeys.length).toBeGreaterThanOrEqual(2);
     expect(sentKeys.some(k => k.includes('send-keys -l') && k.includes('/clear'))).toBe(false);
-    expect(sentKeys.some(k => k.includes('%1') && k.includes('C-c'))).toBe(false);
+    expect(sentKeys.some(k => k.includes('%0') && k.includes('C-c'))).toBe(true);
+    expect(sentKeys.some(k => k.includes('%1') && k.includes('C-c'))).toBe(true);
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
@@ -600,6 +601,13 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
   const NODE_HUMAN_SESSION = 'running diagnostics…\n> \n';
   const CLAUDE_DIRTY = '❯ 修复 web terminal 乱码\n';
   const CLAUDE_CLEARED = '❯ \n';
+  const CLAUDE_RESTORED_PROMPT =
+    ' ▐▛███▛█   Claude Code v2.1.267\n'
+    + '────────\n'
+    + '❯ hold. Skip it and the task stalls.\n'
+    + '  To pause for a human, emit `[bx:need-input:<token>:<n>]` for the nth question; once\n'
+    + '  it is answered, emit `[bx:input-received:<token>:<n>]` before resuming work.\n'
+    + '────────\n';
   const RUNNING_TURN_A = '• Working (12s)\n  esc to interrupt\n';
   const RUNNING_TURN_B = '• Working (13s)\n  esc to interrupt\n';
   const CLAUDE_RUN_A = '✶ Grooving… (12s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
@@ -647,6 +655,25 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
   it('C-c clears a Claude dirty composer and verifies the empty ❯ prompt (dev-1: claude-code)', async () => {
     Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
     const keys = spyClearFlow(CLAUDE_DIRTY, CLAUDE_CLEARED, { proc: 'claude' });
+
+    await harness.seedAgent({ id: 'dev-1', paneId: '%3' });
+    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('dev-1'))!, cfgOf(harness.manager, 'dev-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape', 'C-c']);
+  });
+
+  it('C-c clears the composer even though ESC leaves an idle-looking screen: claude-code restores the interrupted prompt into the composer (dev-1)', async () => {
+    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyKeys('claude');
+    let cleared = false;
+    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => {
+      keys.push(k);
+      if (k === 'C-c') cleared = true;
+    });
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
+      .mockImplementation(async () => (cleared ? CLAUDE_CLEARED : CLAUDE_RESTORED_PROMPT));
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('✳ Claude Code');
 
     await harness.seedAgent({ id: 'dev-1', paneId: '%3' });
     const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('dev-1'))!, cfgOf(harness.manager, 'dev-1'));
@@ -878,10 +905,10 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
 
     expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape']);
+    expect(keys).toEqual(['Escape', 'C-c']);
   });
 
-  it('returns ready on ESC alone, without capturing or escalating, when the pane is already idle', async () => {
+  it('an already idle pane gets its composer cleared after ESC without liveness sampling (idle screen is no proof the composer is empty)', async () => {
     const keys = spyKeys();
     vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
     const captureSpy = vi.spyOn(TmuxManager.prototype, 'capturePaneById');
@@ -891,8 +918,33 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     const ok = await callInterrupt(harness.manager, state, cfgOf(harness.manager, 'qa-1'));
 
     expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape']);
+    expect(keys).toEqual(['Escape', 'C-c']);
     expect(captureSpy).not.toHaveBeenCalled();
+  });
+
+  it('holds the pane mutex until the composer clear and ready confirmation finish, so a concurrent Compact is refused (409)', async () => {
+    const keys = spyKeys();
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
+    let releaseSpace!: () => void;
+    const spaceStarted = new Promise<void>(started => {
+      vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockImplementation(() => {
+        started();
+        return new Promise<void>(resolve => { releaseSpace = resolve; });
+      });
+    });
+    const inFlight = (harness.manager as unknown as { compactInFlight: Set<string> }).compactInFlight;
+
+    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
+    const interrupt = callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
+    await spaceStarted;
+
+    expect(inFlight.has('qa-1')).toBe(true);
+    await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({ status: 409 });
+
+    releaseSpace();
+    expect(await interrupt).toBe(true);
+    expect(keys).toEqual(['Escape', 'C-c']);
+    expect(inFlight.has('qa-1')).toBe(false);
   });
 
   it('injectAndAwaitAck aborts a dispatch whose bound task went terminal while waiting for the pane mutex', async () => {

@@ -359,6 +359,65 @@ describe('TmuxProbePoller', () => {
       });
     });
 
+    it('codex sparkle-only repaints (single-dot braille) do not reset the idle timer', async () => {
+      const codexAgent: AgentConfig = { ...makeAgent('qa-1'), runtime: 'codex', role: 'qa' };
+      await runProbeScenario({
+        agents: [codexAgent],
+        agentId: 'qa-1',
+        binding: { taskId: 'task-001' },
+        exec: makeExec({
+          listPanes: codexPane,
+          classify: codexRuntimePane,
+          capturePane: scripted([text('› \n⠁  ⠂'), text('› \n ⠄⠈ ')]),
+          paneTitle: text('Codex | repo'),
+        }),
+        steps: [{}, { advance: FIVE_MIN + 1 }],
+        expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
+      });
+    });
+
+    it('codex transcript output that only changes among single-dot braille still resets the idle timer', async () => {
+      const codexAgent: AgentConfig = { ...makeAgent('qa-1'), runtime: 'codex', role: 'qa' };
+      await runProbeScenario({
+        agents: [codexAgent],
+        agentId: 'qa-1',
+        binding: { taskId: 'task-001' },
+        exec: makeExec({
+          listPanes: codexPane,
+          classify: codexRuntimePane,
+          capturePane: scripted([
+            text('Braille progress: ⠁\n› '),
+            text('Braille progress: ⠂\n› '),
+            text('Braille progress: ⠄\n› '),
+          ]),
+          paneTitle: text('Retry | repo'),
+        }),
+        steps: [{}, { advance: 4 * 60 * 1000 }, { advance: 4 * 60 * 1000 }],
+        expectClear: true,
+      });
+    });
+
+    it('codex output under a history › (composer off screen) that changes only among single-dot braille still resets the idle timer', async () => {
+      const codexAgent: AgentConfig = { ...makeAgent('qa-1'), runtime: 'codex', role: 'qa' };
+      await runProbeScenario({
+        agents: [codexAgent],
+        agentId: 'qa-1',
+        binding: { taskId: 'task-001' },
+        exec: makeExec({
+          listPanes: codexPane,
+          classify: codexRuntimePane,
+          capturePane: scripted([
+            text('› run the command\n• Ran progress\n  └ Braille progress: ⠁'),
+            text('› run the command\n• Ran progress\n  └ Braille progress: ⠂'),
+            text('› run the command\n• Ran progress\n  └ Braille progress: ⠄'),
+          ]),
+          paneTitle: text('Retry | repo'),
+        }),
+        steps: [{}, { advance: 4 * 60 * 1000 }, { advance: 4 * 60 * 1000 }],
+        expectClear: true,
+      });
+    });
+
     it('a viewer resize (idle→idle reflow at a NEW pane width) does NOT reset the PENDING_IDLE grace', async () => {
       const idleReflowed: ExecResult = text('done\n❯ ');
       await runProbeScenario({

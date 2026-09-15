@@ -1826,7 +1826,7 @@ export class AgentManager {
       let stripped: string;
       try {
         const pane = await this.resolveClaimedPane(tmux, agentId, state.paneId);
-        stripped = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
+        stripped = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0, runtime: agentRuntimeKindFor(cfg) });
       } catch {
         continue;
       }
@@ -3778,24 +3778,35 @@ export class AgentManager {
         console.warn(`[AgentManager] interruptPaneAndWaitReady: send Escape failed for pane ${paneId}:`, err);
         return false;
       }
-      if (await this.paneReachedReplReady(tmux, pane, runtime, 10_000)) return true;
+      // ESC 后屏幕判 idle ≠ composer 干净:claude-code 会把被打断的 prompt 回填进 composer,而 ❯ + 正文仍判 idle
+      if (await this.paneReachedReplReady(tmux, pane, runtime, 10_000)) {
+        return await this.clearComposerAndConfirmReady(tmux, pane, runtime);
+      }
       if (!(await this.paneRunsRuntime(tmux, pane, runtime))) return false;
       if (await this.paneHasLiveTurn(tmux, pane, runtime)) {
         console.warn(`[AgentManager] interruptPaneAndWaitReady: pane ${paneId} still running a turn after ESC; holding`);
         return false;
       }
       if (!(await this.paneRunsRuntime(tmux, pane, runtime))) return false;
-      try {
-        await tmux.sendKeysToPane(pane, 'C-c');
-        await new Promise(r => setTimeout(r, 200));
-      } catch (err) {
-        console.warn(`[AgentManager] interruptPaneAndWaitReady: send C-c (composer clear) failed for pane ${paneId}:`, err);
-        return false;
-      }
-      return this.paneReachedReplReady(tmux, pane, runtime, this.cleanComposerWaitMs);
+      // finally 会释放 pane 锁:必须 await,否则清稿按键跑在锁外
+      return await this.clearComposerAndConfirmReady(tmux, pane, runtime);
     } finally {
       this.compactInFlight.delete(cfg.id);
     }
+  }
+
+  private async clearComposerAndConfirmReady(
+    tmux: TmuxManager,
+    pane: PaneRef,
+    runtime: AgentRuntimeKind,
+  ): Promise<boolean> {
+    try {
+      await tmux.clearComposerDraft(pane);
+    } catch (err) {
+      console.warn(`[AgentManager] interruptPaneAndWaitReady: composer clear failed for pane ${pane.paneId}:`, err);
+      return false;
+    }
+    return this.paneReachedReplReady(tmux, pane, runtime, this.cleanComposerWaitMs);
   }
 
   private async paneHasLiveTurn(tmux: TmuxManager, pane: PaneRef, runtime: AgentRuntimeKind): Promise<boolean> {
@@ -3803,7 +3814,7 @@ export class AgentManager {
     const sample = async (phase: string): Promise<{ frame: string; title: string } | null> => {
       try {
         return {
-          frame: await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 }),
+          frame: await tmux.capturePaneById(pane, { ansi: false, scrollback: 0, runtime }),
           title: await tmux.readPaneTitle(pane),
         };
       } catch (err) {
@@ -8445,7 +8456,7 @@ export class AgentManager {
   ): Promise<{ acked: boolean; composerDelivered: boolean; aborted?: boolean }> {
     const paneId = pane.paneId;
     const preTitle = await tmux.readPaneTitle(pane);
-    const preFrame = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
+    const preFrame = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0, runtime });
     const preDetection = classifyScreen(runtime, preFrame, preTitle);
     if (preDetection.state === 'pending') {
       throw new ReplNotReadyError(
@@ -8514,7 +8525,7 @@ export class AgentManager {
     let baseline: string;
     let baselineTitle = '';
     try {
-      baseline = await tmux.captureSettledSnapshot(pane, { timeoutMs: this.dispatchSettleTimeoutMs });
+      baseline = await tmux.captureSettledSnapshot(pane, { timeoutMs: this.dispatchSettleTimeoutMs, runtime });
       baselineTitle = await tmux.readPaneTitle(pane);
       if (guardBeforePaste) {
         const submitted = await this.withTaskLock(async () => {
@@ -10732,7 +10743,7 @@ export class AgentManager {
     if (!hasReplProcTitle(current, runtime)) {
       throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
     }
-    const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
+    const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0, runtime });
     let detection = classifyScreen(runtime, cap);
     // 标题规则优先级最高:屏幕判 idle 不作数,必须带标题复核
     if (detection.state === 'idle') detection = classifyScreen(runtime, cap, await tmux.readPaneTitle(pane));

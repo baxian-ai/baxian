@@ -819,6 +819,26 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     expect(pasteIdx).toBeGreaterThan(ccIdx);
   });
 
+  it('keeps a qodercli pane whose spinner frame is a single-dot braille as working: no C-c before the paste', async () => {
+    const sent: string[] = [];
+    const screen = '⠁ Thinking...\nType your message or @path/to/file\n';
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|5\n${screen}`, stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${screen}`, stderr: '', exitCode: 0 };
+      return undefined;
+    });
+    const localManager = makeInjectManager(runner, 150, 150);
+    const t = await harness.seedTask({ signalToken: 'qoder-T1' });
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await harness.acquireAgentLock('dev-1');
+    await callInjectAndAwaitAck(
+      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'qodercli', async () => true,
+    ).catch(() => undefined);
+    const pasteIdx = sent.findIndex(c => c.includes('paste-buffer'));
+    expect(pasteIdx).toBeGreaterThanOrEqual(0);
+    expect(ccCmds(sent.slice(0, pasteIdx))).toHaveLength(0);
+  });
+
   it('aborts the dispatch without pasting when the pre-inject composer clear fails (unconfirmed clear must not paste onto a leftover draft)', async () => {
     const sent: string[] = [];
     let pasted = false;

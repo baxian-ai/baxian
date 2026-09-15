@@ -1300,6 +1300,124 @@ describe('TmuxManager', () => {
     });
   });
 
+  describe('capturePaneById codex sparkle blanking', () => {
+    it('blanks single-dot braille only inside the composer band; transcript braille above it is real content', async () => {
+      primeExec(okBody(
+        'Braille progress: ⠁\n'
+        + '\n'
+        + ' ⠂  ⠄\n'
+        + '› draft⠈\n'
+        + '  ⠐ line two⠠\n'
+        + '⡀    ⢀\n'
+        + '  gpt-6-astra xhigh · ~/repo\n',
+      ));
+      await expect(tmux.capturePaneById(PANE, { ansi: false, scrollback: 0, runtime: 'codex' })).resolves.toBe(
+        'Braille progress: ⠁\n'
+        + '\n'
+        + '     \n'
+        + '› draft \n'
+        + '    line two \n'
+        + '      \n'
+        + '  gpt-6-astra xhigh · ~/repo\n',
+      );
+    });
+
+    it('absorbs remote image attachment rows ([Image #N]) and the blanks above them into the band', async () => {
+      primeExec(okBody(
+        'Braille progress: ⠁\n'
+        + '\n'
+        + ' ⠂   \n'
+        + '[Image #1] ⠄  ⠈\n'
+        + '⠐  \n'
+        + '› draft⡀\n'
+        + '  ⢀\n'
+        + '  gpt-6-astra xhigh · ~/repo\n',
+      ));
+      await expect(tmux.capturePaneById(PANE, { ansi: false, scrollback: 0, runtime: 'codex' })).resolves.toBe(
+        'Braille progress: ⠁\n'
+        + '\n'
+        + '     \n'
+        + '[Image #1]     \n'
+        + '   \n'
+        + '› draft \n'
+        + '   \n'
+        + '  gpt-6-astra xhigh · ~/repo\n',
+      );
+    });
+
+    it('tolerates a sparkle inside an [Image #N] label ([Image⠐#2]) while locating the band', async () => {
+      primeExec(okBody(
+        'Braille progress: ⠁\n'
+        + ' ⠂\n'
+        + '[Image #1]  ⠄\n'
+        + '[Image⠐#2]\n'
+        + '⠈\n'
+        + '› draft⠠\n'
+        + '  gpt-6-astra xhigh · ~/repo\n',
+      ));
+      await expect(tmux.capturePaneById(PANE, { ansi: false, scrollback: 0, runtime: 'codex' })).resolves.toBe(
+        'Braille progress: ⠁\n'
+        + '  \n'
+        + '[Image #1]   \n'
+        + '[Image #2]\n'
+        + ' \n'
+        + '› draft \n'
+        + '  gpt-6-astra xhigh · ~/repo\n',
+      );
+    });
+
+    it('keeps output after a history › untouched when the composer is off screen (a response marker follows the prompt)', async () => {
+      primeExec(okBody(
+        '› run the command\n'
+        + '• Working (4s • esc to interrupt)\n'
+        + '  └ Braille progress: ⠁\n',
+      ));
+      await expect(tmux.capturePaneById(PANE, { ansi: false, scrollback: 0, runtime: 'codex' })).resolves.toBe(
+        '› run the command\n'
+        + '• Working (4s • esc to interrupt)\n'
+        + '  └ Braille progress: ⠁\n',
+      );
+    });
+
+    it('anchors on the Ultra » composer and leaves the history › output above it untouched', async () => {
+      primeExec(okBody(
+        '› run the command\n'
+        + '• Ran echo ⠁\n'
+        + '\n'
+        + '⠂  ⠄\n'
+        + '» draft⠈\n'
+        + '  ⠐\n'
+        + '  gpt-6-astra ultra · ~/repo\n',
+      ));
+      await expect(tmux.capturePaneById(PANE, { ansi: false, scrollback: 0, runtime: 'codex' })).resolves.toBe(
+        '› run the command\n'
+        + '• Ran echo ⠁\n'
+        + '\n'
+        + '    \n'
+        + '» draft \n'
+        + '   \n'
+        + '  gpt-6-astra ultra · ~/repo\n',
+      );
+    });
+
+    it.each([
+      ['column-0 composer', '› Please review⠁\n  • include tests⠂\n  ✓ done⠄\n⠈\n  gpt-6-astra xhigh · ~/repo\n',
+        '› Please review \n  • include tests \n  ✓ done \n \n  gpt-6-astra xhigh · ~/repo\n'],
+      ['indented composer', 'prior output\n  › Please review⠁\n    • include tests⠂\n  ⠄\n',
+        'prior output\n  › Please review \n    • include tests \n   \n'],
+    ])('%s: draft continuation lines starting with •/✓ are composer content, not history replies', async (_label, screen, expected) => {
+      primeExec(okBody(screen));
+      await expect(tmux.capturePaneById(PANE, { ansi: false, scrollback: 0, runtime: 'codex' })).resolves.toBe(expected);
+    });
+
+    it('leaves the body untouched when no composer is on screen', async () => {
+      primeExec(okBody('Braille progress: ⠁\n⠂ ⠄\n'));
+      await expect(tmux.capturePaneById(PANE, { ansi: false, scrollback: 0, runtime: 'codex' })).resolves.toBe(
+        'Braille progress: ⠁\n⠂ ⠄\n',
+      );
+    });
+  });
+
   describe('captureSettledSnapshot (best-effort pre-Enter settle)', () => {
     const primeSnapshot = (visible: string, history: number): void => {
       primeExec(composeSnapStdout(visible, history));
@@ -1321,6 +1439,61 @@ describe('TmuxManager', () => {
       const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10 });
       expect(snap).toBe(buildSnapshot('f3\n', 0));
       expect(runner.exec.mock.calls.length).toBeGreaterThanOrEqual(4);
+    });
+
+    it('codex: treats sparkle-only repaints (single-dot braille) as settled and blanks them in the snapshot', async () => {
+      primeSnapshot('› draft⠁\n ⠂  ⠄ \n', 0);
+      primeSnapshot('› draft \n⠈    ⡀\n', 0);
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10, runtime: 'codex' });
+      expect(snap).toBe(buildSnapshot('› draft\n\n', 0));
+      expect(runner.exec.mock.calls.length).toBe(2);
+    });
+
+    it('codex: settles when only the rightmost sparkle column differs (capture-pane trims trailing blanks per line)', async () => {
+      primeSnapshot('› draft⠁\n  ⠂\n', 0);
+      primeSnapshot('› draft\n⠈      ⡀\n', 0);
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10, runtime: 'codex' });
+      expect(snap).toBe(buildSnapshot('› draft\n\n', 0));
+      expect(runner.exec.mock.calls.length).toBe(2);
+    });
+
+    it('codex: settles an indented bare composer whose sparkles move below it', async () => {
+      primeSnapshot('  › \n ⠁ \n', 0);
+      primeSnapshot('  › \n  ⠂\n', 0);
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10, runtime: 'codex' });
+      expect(snap).toBe(buildSnapshot('  ›\n\n', 0));
+      expect(runner.exec.mock.calls.length).toBe(2);
+    });
+
+    it('codex: settles when sparkles move right of and above an [Image #1] attachment row', async () => {
+      primeSnapshot('⠁\n[Image #1] ⠂\n\n› draft\n', 0);
+      primeSnapshot('  ⠄\n[Image #1]    ⠈\n⠐\n› draft\n', 0);
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10, runtime: 'codex' });
+      expect(snap).toBe(buildSnapshot('\n[Image #1]\n\n› draft\n', 0));
+      expect(runner.exec.mock.calls.length).toBe(2);
+    });
+
+    it('codex: settles when a sparkle lands inside the [Image #2] label between two frames', async () => {
+      primeSnapshot('[Image #1]\n[Image #2]  ⠁\n› x\n', 0);
+      primeSnapshot('[Image #1] ⠂\n[Image⠐#2]\n› x\n', 0);
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10, runtime: 'codex' });
+      expect(snap).toBe(buildSnapshot('[Image #1]\n[Image #2]\n› x\n', 0));
+      expect(runner.exec.mock.calls.length).toBe(2);
+    });
+
+    it('codex: settles a multi-line draft whose second line starts with • while sparkles move', async () => {
+      primeSnapshot('› Please review⠁\n  • include tests\n ⠂\n', 0);
+      primeSnapshot('› Please review\n  • include tests ⠄\n⠈\n', 0);
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10, runtime: 'codex' });
+      expect(snap).toBe(buildSnapshot('› Please review\n  • include tests\n\n', 0));
+      expect(runner.exec.mock.calls.length).toBe(2);
+    });
+
+    it('non-codex: single-dot braille stays in the snapshot untouched', async () => {
+      primeSnapshot('⠁ Thinking...\n', 0);
+      primeSnapshot('⠁ Thinking...\n', 0);
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10, runtime: 'qodercli' });
+      expect(snap).toBe(buildSnapshot('⠁ Thinking...\n', 0));
     });
 
     it('returns the latest snapshot when the pane never settles within the timeout', async () => {
@@ -1490,12 +1663,72 @@ describe('TmuxManager', () => {
           '  esc again to edit previous message\n',
         'codex' as const,
       ],
+      [
+        'codex: accepts the idle composer while Astra sparkles (single-dot braille) play over the composer band',
+        'node\n',
+        '─ Worked for 6m 54s ─────────────────────────────\n' +
+          '⠁   ⠈         ⠄                 ⠁ ⢀                ⠐      ⠂\n' +
+          '› Ask Codex to do anything⡀                          ⠁⠐  ⠈\n' +
+          '       ⢀⠐                 ⠄         ⠠        ⢀ ⢀    ⠠     ⡀\n' +
+          '  gpt-6-astra xhigh · ~/.baxian/agents/qa/repo · Retry\n',
+        'codex' as const,
+      ],
+      [
+        'codex: accepts the sparkled idle composer on the -e capture path (escapes around glyphs and before ›)',
+        'node\n',
+        '─ Worked for 3m 03s ─────────────────────────────\n' +
+          '\x1b[38;2;200;200;255m⠁\x1b[39m   \x1b[38;2;90;90;140m⠈\x1b[39m\n' +
+          '\x1b[1m›\x1b[0m Ask Codex to do anything\x1b[38;2;1;2;3m⡀\x1b[0m\n' +
+          '  \x1b[38;2;7;7;7m⠂\x1b[39m\n' +
+          '  gpt-6-astra xhigh · ~/.baxian/agents/qa/repo\n',
+        'codex' as const,
+      ],
+      [
+        'codex: accepts an INDENTED bare › with sparkles below it (band anchor tolerates leading blanks)',
+        'node\n',
+        'prior output\n  › \n  ⠁  \n',
+        'codex' as const,
+      ],
+      [
+        'codex: accepts an indented › wrapped in escapes and blanks with sparkles around it',
+        'node\n',
+        'prior output\n\x1b[2m  \x1b[0m›\x1b[0m \n \x1b[38;2;1;2;3m⠂\x1b[39m \n',
+        'codex' as const,
+      ],
+      [
+        'codex: accepts the idle composer when a sparkle replaces the space after ›',
+        'node\n',
+        '─ Worked for 2m 10s ─────────────────────────────\n\n' +
+          '›⠁Ask Codex to do anything\n' +
+          '  ⠂      ⠄\n' +
+          '  gpt-6-astra xhigh · ~/.baxian/agents/qa/repo\n',
+        'codex' as const,
+      ],
     ])('%s', async (_label, procTitle, anchor, runtimeKind) => {
       primeExec(okHeader(procTitle.trim()), okBody(anchor));
       await expect(
         tmux.waitReplReady(PANE, runtimeKind, { timeoutMs: 1000, intervalMs: 30 }),
       ).resolves.toBeUndefined();
     });
+
+    it.each(['⠁', '⠂', '⠄', '⠈', '⠐', '⠠', '⡀', '⢀'])(
+      'qodercli: a %s spinner frame at line start stays working evidence (sparkle blanking is codex-only)',
+      async (frame) => {
+        runner.exec.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('pane_current_command')) {
+            return { stdout: okHeader('qodercli'), stderr: '', exitCode: 0 };
+          }
+          return {
+            stdout: okBody(`${frame} Thinking...\nType your message or @path/to/file\n`),
+            stderr: '',
+            exitCode: 0,
+          };
+        });
+        await expect(
+          tmux.waitReplReady(PANE, 'qodercli', { timeoutMs: 120, intervalMs: 30 }),
+        ).rejects.toThrow(/repl not ready/);
+      },
+    );
 
     it('codex: does not accept an idle-prompt-shaped snippet while output continues after it', async () => {
       runner.exec.mockImplementation(async (cmd: string) => {
