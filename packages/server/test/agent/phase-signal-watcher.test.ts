@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   PhaseSignalWatcher,
+  REJECTED_FRAME_CAP,
   type NeedInputCommitIntent,
   type NeedInputCommitResult,
 } from '../../src/agent/phase-signal-watcher.js';
@@ -1703,4 +1704,229 @@ describe('PhaseSignalWatcher terminal-control semantics', () => {
     }
   });
 
+});
+
+describe('task-create side channel', () => {
+  const token = 'spawntok1234';
+  const frame = (title: string, tok = token) => `[bx:task-create:${title}:${tok}]`;
+
+  function makeSpawnWatcher(opts: { spawn?: 'ok' | 'throw' | 'none'; failEmits?: number } = {}) {
+    const base = makeWatcher();
+    const spawns: Array<{ taskId: string; projectId: string; agentId: string; token: string; title: string }> = [];
+    let failEmits = opts.failEmits ?? 0;
+    const watcher = new PhaseSignalWatcher({
+      paneStreamerManager: { ensure: vi.fn(() => base.streamer) } as unknown as PaneStreamerManager,
+      eventBus: { emit: async (event: BaxianEvent) => {
+        if (failEmits > 0) { failEmits -= 1; throw new Error('log disk full'); }
+        base.captured.push(event);
+      } } as unknown as EventBus,
+      resolveAgent: (id) => (id === DEV_AGENT.id ? DEV_AGENT : undefined),
+      commitNeedInputWatermark: async (intent) => { base.commits.push(intent); return 'ok'; },
+      ...(opts.spawn === 'none' ? {} : {
+        spawnTask: async (intent) => {
+          spawns.push(intent);
+          if (opts.spawn === 'throw') throw new Error('store down');
+        },
+      }),
+    });
+    const rejections = () => base.captured.filter(e => (e.data as { phase?: string }).phase === 'task-create-rejected');
+    return { watcher, streamer: base.streamer, captured: base.captured, commits: base.commits, spawns, rejections };
+  }
+
+  it('spawns once for a live frame and not again while the frame sits in the rolling buffer', async () => {
+    const { watcher, streamer, spawns } = makeSpawnWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    streamer.triggerLive(`${frame('fix+auth+refresh')}\n`);
+    streamer.triggerLive('more output\n');
+    streamer.triggerLive('and more\n');
+    expect(spawns).toEqual([
+      { taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id, token, title: 'fix auth refresh' },
+    ]);
+  });
+
+  it('matches the worst-case legal frame at every split point, including the closing bracket alone', async () => {
+    const longToken = 't'.repeat(64);
+    const raw = `[bx:task-create:${'x'.repeat(200)}:${longToken}]`;
+    const wrapped = raw.replace(/.{40}/g, '$&\r\n');
+    for (let cut = 1; cut < wrapped.length; cut++) {
+      const { watcher, streamer, spawns } = makeSpawnWatcher();
+      await startWatch(watcher, { expectedKinds: 'pr-created', token: longToken });
+      streamer.triggerLive(wrapped.slice(0, cut));
+      streamer.triggerLive(wrapped.slice(cut));
+      expect(spawns.map(s => s.title), `cut=${cut}`).toEqual(['x'.repeat(200)]);
+    }
+  });
+
+  it('consumes several frames in one chunk and shares the boundary with need-input', async () => {
+    const { watcher, streamer, spawns, commits } = makeSpawnWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: { epoch: 1, askSeq: 0, answeredSeq: 0 } });
+    streamer.triggerLive(`${frame('one')} [bx:need-input:${token}:1] ${frame('two')}\n`);
+    expect(spawns.map(s => s.title)).toEqual(['one', 'two']);
+    expect(commits).toHaveLength(1);
+  });
+
+  it('scans the arm-time snapshot for frames and rejects an oversized one visibly', async () => {
+    const { watcher, streamer, spawns, rejections } = makeSpawnWatcher();
+    streamer.setSnapshot(`${frame('from+screen')} ${frame('y'.repeat(201))}`);
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    expect(spawns.map(s => s.title)).toEqual(['from screen']);
+    expect(rejections()).toHaveLength(1);
+    expect(rejections()[0].data).toMatchObject({ reason: 'title-too-long', length: 201 });
+  });
+
+  it('ignores foreign tokens and stays silent without a spawn dependency', async () => {
+    const { watcher, streamer, spawns, captured } = makeSpawnWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    streamer.triggerLive(`${frame('x', 'othertoken12')}\n`);
+    expect(spawns).toEqual([]);
+    expect(captured).toEqual([]);
+
+    const silent = makeSpawnWatcher({ spawn: 'none' });
+    await startWatch(silent.watcher, { expectedKinds: 'pr-created', token });
+    silent.streamer.triggerLive(`${frame('x')}\n`);
+    expect(silent.captured).toEqual([]);
+  });
+
+  it('reports an empty or oversized title once per frame and never spawns it', async () => {
+    const { watcher, streamer, spawns, rejections } = makeSpawnWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    streamer.triggerLive(`${frame('')}\n`);
+    streamer.triggerLive(`${frame('+++')}\n`);
+    streamer.triggerLive(`${frame('')}\n`);
+    expect(spawns).toEqual([]);
+    expect(rejections().map(e => e.data)).toEqual([
+      expect.objectContaining({ phase: 'task-create-rejected', reason: 'empty-title', length: 0, token }),
+      expect.objectContaining({ phase: 'task-create-rejected', reason: 'empty-title', length: 3, token }),
+    ]);
+    expect(rejections()[0].taskId).toBe('t1');
+  });
+
+  it('lets the phase signal fire when it shares a chunk with a rejected frame or a failing spawn', async () => {
+    const rejected = makeSpawnWatcher();
+    await startWatch(rejected.watcher, { expectedKinds: 'pr-created', token });
+    rejected.streamer.triggerLive(`${frame('')}\n${buildPhaseSignal('pr-created', token, 7)}\n`);
+    expect(rejected.captured.map(e => e.type)).toEqual(['human.intervention', 'pr.created']);
+
+    const failing = makeSpawnWatcher({ spawn: 'throw' });
+    await startWatch(failing.watcher, { expectedKinds: 'pr-created', token });
+    failing.streamer.triggerLive(`${frame('later')}\n${buildPhaseSignal('pr-created', token, 7)}\n`);
+    await flushMicrotasks();
+    expect(failing.spawns).toHaveLength(1);
+    expect(failing.captured.map(e => e.type)).toEqual(['pr.created']);
+  });
+
+  it('matches the worst-case CJK frame hard-wrapped at 20 terminal columns at every split point', async () => {
+    const longToken = 'c'.repeat(64);
+    const raw = `[bx:task-create:${'题'.repeat(200)}:${longToken}]`;
+    const wrapAtColumns = (text: string, columns: number): string => {
+      let out = '';
+      let used = 0;
+      for (const ch of text) {
+        const width = ch === '题' ? 2 : 1;
+        if (used + width > columns) { out += '\r\n'; used = 0; }
+        out += ch;
+        used += width;
+      }
+      return out;
+    };
+    const wrapped = wrapAtColumns(raw, 20);
+    expect(wrapped.length).toBeLessThanOrEqual(330);
+    for (let cut = 1; cut < wrapped.length; cut++) {
+      const { watcher, streamer, spawns } = makeSpawnWatcher();
+      await startWatch(watcher, { expectedKinds: 'pr-created', token: longToken });
+      streamer.triggerLive(wrapped.slice(0, cut));
+      streamer.triggerLive(wrapped.slice(cut));
+      expect(spawns.map(s => s.title), `cut=${cut}`).toEqual(['题'.repeat(200)]);
+    }
+  });
+
+  it('persists the wire payload of a rejected frame, bounded to 200 code units', async () => {
+    const { watcher, streamer, rejections } = makeSpawnWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    streamer.triggerLive(`${frame(`a+${'b'.repeat(300)}`)}\n`);
+    expect(rejections()[0].data).toEqual({
+      phase: 'task-create-rejected', reason: 'title-too-long', length: 302, token,
+      payload: `a+${'b'.repeat(198)}`,
+    });
+    expect(rejections()[0].data).not.toHaveProperty('title');
+  });
+
+  it('bounds the rejected-frame memory: fixed-size identities, capped count, oldest evicted first', async () => {
+    const { watcher, streamer, spawns, captured, rejections } = makeSpawnWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    const flood = REJECTED_FRAME_CAP * 4;
+    for (let i = 0; i < flood; i++) streamer.triggerLive(`${frame(`${i}+${'z'.repeat(4096)}`)}\n`);
+    expect(rejections()).toHaveLength(flood);
+    const entry = watcher['entries'].get('t1:dev-1') as { rejectedFrames: Set<string> };
+    expect(entry.rejectedFrames.size).toBe(REJECTED_FRAME_CAP);
+    for (const id of entry.rejectedFrames) expect(id.length).toBeLessThanOrEqual(32);
+
+    streamer.triggerLive(`${frame(`${flood - 1}+${'z'.repeat(4096)}`)}\n`);
+    expect(rejections()).toHaveLength(flood);
+    streamer.triggerLive(`${frame(`0+${'z'.repeat(4096)}`)}\n`);
+    expect(rejections()).toHaveLength(flood + 1);
+
+    streamer.triggerLive(`${frame('still+works')}\n${buildPhaseSignal('pr-created', token, 9)}\n`);
+    expect(spawns.map(s => s.title)).toEqual(['still works']);
+    expect(captured.at(-1)?.type).toBe('pr.created');
+  });
+
+  it('consumes frames only up to the first armed completion signal, in live chunks and snapshots', async () => {
+    const before = makeSpawnWatcher();
+    await startWatch(before.watcher, { expectedKinds: 'pr-created', token });
+    before.streamer.triggerLive(`${frame('early')}\n${buildPhaseSignal('pr-created', token, 7)}\n${frame('late')}\n`);
+    expect(before.spawns.map(s => s.title)).toEqual(['early']);
+    expect(before.captured.map(e => e.type)).toEqual(['pr.created']);
+
+    const after = makeSpawnWatcher();
+    await startWatch(after.watcher, { expectedKinds: 'pr-created', token });
+    after.streamer.triggerLive(`${buildPhaseSignal('pr-created', token, 7)}\n`);
+    after.streamer.triggerLive(`${frame('too+late')}\n`);
+    expect(after.spawns).toEqual([]);
+
+    const snap = makeSpawnWatcher();
+    snap.streamer.setSnapshot(`${frame('seen')} ${buildPhaseSignal('pr-created', token, 7)} ${frame('unseen')}`);
+    await startWatch(snap.watcher, { expectedKinds: 'pr-created', token });
+    expect(snap.spawns.map(s => s.title)).toEqual(['seen']);
+    expect(snap.captured.map(e => e.type)).toEqual(['pr.created']);
+
+    const passive = makeSpawnWatcher();
+    await startWatch(passive.watcher, { expectedKinds: PASSIVE_VERDICT_WATCH, token });
+    passive.streamer.triggerLive(`${buildPhaseSignal('pr-created', token, 7)}\n${frame('qa+follow+up')}\n`);
+    expect(passive.spawns.map(s => s.title)).toEqual(['qa follow up']);
+  });
+
+  it('forgets a rejected frame whose notification did not persist, so its next appearance is reported', async () => {
+    const { watcher, streamer, rejections } = makeSpawnWatcher({ failEmits: 1 });
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    streamer.triggerLive(`${frame('')}\n`);
+    await flushMicrotasks();
+    expect(rejections()).toHaveLength(0);
+    streamer.triggerLive(`${frame('')}\n`);
+    await flushMicrotasks();
+    expect(rejections()).toHaveLength(1);
+    streamer.triggerLive(`${frame('')}\n`);
+    await flushMicrotasks();
+    expect(rejections()).toHaveLength(1);
+  });
+
+  it('documents the boundary: duplicates in flight merge into the failing notification and are not replayed', async () => {
+    const { watcher, streamer, rejections } = makeSpawnWatcher({ failEmits: 1 });
+    await startWatch(watcher, { expectedKinds: 'pr-created', token });
+    streamer.triggerLive(`${frame('')} ${frame('')}\n`);
+    await flushMicrotasks();
+    expect(rejections()).toHaveLength(0);
+    streamer.triggerLive(`${frame('')}\n`);
+    await flushMicrotasks();
+    expect(rejections()).toHaveLength(1);
+  });
+
+  it('stops consuming once the task watch is stopped, as after a QA verdict', async () => {
+    const { watcher, streamer, spawns } = makeSpawnWatcher();
+    await startWatch(watcher, { expectedKinds: PASSIVE_VERDICT_WATCH, token });
+    streamer.triggerLive(`${frame('before')}\n`);
+    watcher.stop('t1');
+    streamer.triggerLive(`${frame('after')}\n`);
+    expect(spawns.map(s => s.title)).toEqual(['before']);
+  });
 });

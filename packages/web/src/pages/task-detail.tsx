@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.ts';
 import { AgentCard } from '../components/agent-card.tsx';
 import { inputCls } from '../components/form-styles.ts';
@@ -568,6 +568,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         <div className="mb-4 flex flex-wrap items-center gap-2">{renderActions(task)}</div>
         <div className="mb-4 text-sm text-og-500">
           {t.taskDetail.createdAtPrefix}{formatTaskTimestamp(task.createdAt, false)}{t.taskDetail.updatedAtPrefix}{formatTaskTimestamp(task.updatedAt, false)}
+          {task.origin && (
+            <>
+              {t.taskDetail.originPrefix}
+              <Link to={taskDetailPath(task.projectId, task.origin.taskId)} className="underline hover:text-og-700">
+                {task.origin.taskId}
+              </Link>
+            </>
+          )}
         </div>
 
         {task.attention && attentionCopy && (

@@ -44,6 +44,7 @@ export const TASK_IMAGE_MAX_COUNT = 4;
 export const AGENT_HOST_UPLOAD_DIR = '/tmp/baxian/upload';
 export const IMAGE_UPLOAD_ROUTE_BODY_LIMIT = 8 * 1024 * 1024;
 export const TASK_CREATE_ROUTE_BODY_LIMIT = 32 * 1024 * 1024;
+export const TITLE_MAX_LEN = 200;
 export const MAX_CONFIG_BACKUPS = 7;
 
 export const PET_ATLAS_WIDTH = 1536;

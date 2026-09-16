@@ -8,6 +8,7 @@ import { AgentManager } from '../../src/agent/manager.js';
 import { DispatchReconciler } from '../../src/agent/dispatch-reconciler.js';
 import { TmuxSessionStatusStore, type TmuxSessionObservation } from '../../src/agent/tmux-probe-poller.js';
 import { ReplNotReadyError } from '../../src/agent/tmux.js';
+import { BranchManager } from '../../src/agent/branch.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -1651,5 +1652,125 @@ describe('reconcileFix: QA release deferred while its REPL was busy', () => {
     expect(continueSpy).toHaveBeenCalledWith(t.id, 'dev-1', 'fix', expect.anything());
     expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
     expect(interventions()).toHaveLength(0);
+  });
+});
+
+describe('reconcile: spec-ready 任务上延后释放的 QA', () => {
+  it('spec-ready 任务 QA 仍绑定且无 hold、探测非忙 → 每轮对账重试延后释放', async () => {
+    const t = await seedTask({ status: 'spec-ready', phase: 'spec' });
+    await seedQa();
+    obs();
+    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await mkReconciler().pollOnce();
+
+    expect(release).toHaveBeenCalledWith('qa-1', t.id, 'idle', expect.objectContaining({
+      deferWhenBusy: true,
+      expectedTask: { status: 'spec-ready' },
+    }));
+  });
+
+  it('探测判 QA 仍在工作、或 QA 已落 hold → 本轮不释放', async () => {
+    const t = await seedTask({ status: 'spec-ready', phase: 'spec' });
+    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await seedQa();
+    obs({ runtimeStatusHint: 'working' });
+    await mkReconciler().pollOnce();
+    await seedQa({ status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending', awaitingSince: NOW });
+    obs();
+    await mkReconciler().pollOnce();
+
+    expect(release).not.toHaveBeenCalled();
+    expect((await taskStore.get(t.id))?.status).toBe('spec-ready');
+  });
+
+  it('预检查通过后、release 加锁前 QA 刚落 hold → 锁内复核拒绝释放：hold、绑定、任务锁均保留，不告警', async () => {
+    const t = await seedTask({ status: 'spec-ready', phase: 'spec' });
+    await seedQa();
+    const lockToken = (await lockManager.acquire('qa-1', t.id))!;
+    await agentStore.update('qa-1', latest => ({ ...latest!, lockToken }));
+    obs();
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'absent' });
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+    const release = manager.releaseAgentForTask.bind(manager);
+    vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async (...args) => {
+      await manager.markAwaitingHuman('qa-1', 'branch-cleanup-pending', 'checkout cleanup failed: ssh exit 255', {
+        expectedTaskId: t.id,
+      });
+      return release(...args);
+    });
+
+    await mkReconciler().pollOnce();
+
+    expect(await agentStore.get('qa-1')).toMatchObject({
+      taskId: t.id, lockToken, status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+    });
+    expect(await lockManager.isOwner('qa-1', t.id, lockToken)).toBe(true);
+    expect(interventions().map(e => e.data.phase)).toEqual(['branch-cleanup-pending']);
+  });
+
+  it('spec-ready 写入后、park 释放 QA 前对账器先完成释放 → park 视已解绑为成功，不发 spec-ready-qa-release-failed', async () => {
+    const t = await seedTask({ status: 'review', phase: 'spec', specReviewRound: 1 });
+    await seedQa();
+    const lockToken = (await lockManager.acquire('qa-1', t.id))!;
+    await agentStore.update('qa-1', latest => ({ ...latest!, lockToken }));
+    obs();
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'absent' });
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+    const rec = mkReconciler();
+    // park 写入 spec-ready 后还要停泊 dev，对账器在这个窗口里先一步释放 QA
+    vi.spyOn(manager, 'markAgentWaiting').mockImplementation(async () => {
+      await rec.pollOnce();
+      return true;
+    });
+
+    const parked = await manager.parkTaskAtSpecReady(t.id);
+
+    expect(parked?.status).toBe('spec-ready');
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(interventions()).toEqual([]);
+  });
+
+  it('QA 仍忙（抛 ReplNotReadyError）→ 静默延后，不告警', async () => {
+    const t = await seedTask({ status: 'spec-ready', phase: 'spec' });
+    await seedQa();
+    obs();
+    vi.spyOn(manager, 'releaseAgentForTask').mockRejectedValue(new ReplNotReadyError('%0', 'codex', ''));
+
+    await mkReconciler().pollOnce();
+
+    expect((await agentStore.get('qa-1'))?.taskId).toBe(t.id);
+    expect(interventions()).toHaveLength(0);
+  });
+
+  it('QA 释放返回 false（绑定仍在但已不持任务锁）→ 发一次 spec-ready-qa-release-failed，已有 attention 不重复', async () => {
+    const t = await seedTask({ status: 'spec-ready', phase: 'spec' });
+    await seedQa();
+    obs();
+    const rec = mkReconciler();
+
+    await rec.pollOnce();
+    await taskStore.set({
+      ...(await taskStore.get(t.id))!,
+      attention: {
+        reason: 'spec-ready-qa-release-failed', runbook: 'r', occurredAt: NOW,
+        recommendedActions: ['cancel'], generation: taskAttentionGeneration(t),
+      },
+    });
+    await rec.pollOnce();
+
+    expect(interventions()).toHaveLength(1);
+    expect(interventions()[0]).toMatchObject({
+      agentId: 'qa-1',
+      taskId: t.id,
+      data: { phase: 'spec-ready-qa-release-failed', qaAgentId: 'qa-1' },
+    });
   });
 });

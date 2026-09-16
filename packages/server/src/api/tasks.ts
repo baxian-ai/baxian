@@ -7,6 +7,7 @@ import {
   TASK_TERMINAL_STATUS_SET,
   TASK_ACTIVE_STATUS_SET,
   TASK_STATUS_SET,
+  TITLE_MAX_LEN,
 } from '../shared/index.js';
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
 import { buildDriverReviewTimeline } from '../platform/review-timeline.js';
@@ -14,7 +15,6 @@ import { PrConversationCache, prReviewCacheRevision } from '../platform/pr-conve
 import type { TaskVerdictAction } from '../agent/manager.js';
 import { ApiError } from '../errors.js';
 
-const TITLE_MAX_LEN = 200;
 const DESCRIPTION_MAX_LEN = 16_000;
 
 interface TaskQuery {

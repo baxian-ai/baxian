@@ -205,6 +205,17 @@ afterEach(() => {
 });
 
 describe('TaskDetail page — header & info', () => {
+  it('names the task that spawned this one and links to its detail page', () => {
+    const { container } = open({ origin: { taskId: 'task-003', title: 'original wire title' } });
+    expect(container.textContent).toContain('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00 · From task-003');
+    expect(screen.getByRole('link', { name: 'task-003' }).getAttribute('href')).toBe('/project/baxian/task/task-003');
+  });
+
+  it('omits the origin line for tasks created by a human', () => {
+    const { container } = open();
+    expect(container.textContent).not.toContain('· From');
+  });
+
   it('renders the task id + title at the top and the full modal-equivalent body', () => {
     const { container } = open({ title: 'Clean tests' });
 

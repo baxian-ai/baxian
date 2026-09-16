@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { TaskState } from '../../src/shared/index.js';
 import { taskAttentionGeneration } from '../../src/shared/index.js';
 import { AgentManager, DispatchTerminalError, EnsureSessionError } from '../../src/agent/manager.js';
+import { ReplNotReadyError } from '../../src/agent/tmux.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { makeTask } from '../helpers/fixtures.js';
 
@@ -200,8 +201,51 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
       'qa-1',
       'task-spec-1',
       'idle',
-      { expectedTask: parkedGeneration },
+      { expectedTask: parkedGeneration, deferWhenBusy: true },
     );
+  });
+
+  it('QA REPL 仍忙（APPROVE 已发、仍在收尾）→ 延后释放：QA 保持绑定、不落 hold、不告警', async () => {
+    const m = specManager();
+    await seedSpecTask({ status: 'review', specReviewRound: 1 });
+    await harness.seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    await harness.seedAgent({ id: 'qa-1', taskId: 'task-spec-1', paneId: '%1' });
+    vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(
+      m as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(
+      m as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+
+    const result = await m.parkTaskAtSpecReady('task-spec-1');
+
+    expect(result?.status).toBe('spec-ready');
+    const qa = await harness.agentStore.get('qa-1');
+    expect(qa?.taskId).toBe('task-spec-1');
+    expect(qa?.status).toBeUndefined();
+    expect(harness.events.filter(e => e.type === 'human.intervention')).toEqual([]);
+  });
+
+  it('QA 释放被拒且非忙（返回 false）→ 仍发 spec-ready-qa-release-failed', async () => {
+    const m = specManager();
+    await seedSpecTask({ status: 'review', specReviewRound: 1 });
+    await harness.seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    await harness.seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
+    vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(false);
+
+    await m.parkTaskAtSpecReady('task-spec-1');
+
+    expect(harness.events.filter(e => e.type === 'human.intervention')).toEqual([
+      expect.objectContaining({
+        agentId: 'qa-1',
+        taskId: 'task-spec-1',
+        data: { phase: 'spec-ready-qa-release-failed', qaAgentId: 'qa-1' },
+      }),
+    ]);
   });
 
   it('parks from fixing with an explicit specReviewRound patch', async () => {

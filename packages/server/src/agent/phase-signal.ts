@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { TITLE_MAX_LEN } from '../shared/index.js';
 
 export type PhaseSignalKind =
   | 'pr-created'
@@ -159,4 +160,26 @@ export function scanAskAnswerSignals(visible: string): AskAnswerSignal[] {
     ...scanInputReceivedSignals(visible).map(s => ({ ...s, kind: 'answer' as const })),
   ];
   return merged.sort((a, b) => a.index - b.index);
+}
+
+export type TaskCreateSignal =
+  & { token: string; raw: string; index: number }
+  & ({ title: string } | { reject: 'empty-title' | 'title-too-long'; length: number });
+
+const TASK_CREATE_RE = new RegExp(`\\[bx:task-create:([^\\[\\]]*):(${TOKEN_RANGE})\\]`, 'g');
+
+export function scanTaskCreateSignals(visible: string): TaskCreateSignal[] {
+  const out: TaskCreateSignal[] = [];
+  for (const m of compactSignalText(visible).matchAll(TASK_CREATE_RE)) {
+    const base = { token: m[2], raw: m[0], index: m.index ?? 0 };
+    const wire = m[1];
+    if (wire.length > TITLE_MAX_LEN) {
+      out.push({ ...base, reject: 'title-too-long', length: wire.length });
+      continue;
+    }
+    const title = wire.replace(/\+/g, ' ').trim();
+    if (title === '') out.push({ ...base, reject: 'empty-title', length: wire.length });
+    else out.push({ ...base, title });
+  }
+  return out;
 }

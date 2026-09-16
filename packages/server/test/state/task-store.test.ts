@@ -811,3 +811,42 @@ describe('TaskStore git review fields', () => {
     }
   });
 });
+
+describe('TaskStore origin and strict id allocation', () => {
+  it('round-trips origin and keeps it schema-valid', async () => {
+    const child = makeTask({ id: 'task-child', status: 'pending', origin: { taskId: 'task-001', title: 'fix auth' } });
+    await store.set(child);
+    expect((await store.get('task-child'))?.origin).toEqual({ taskId: 'task-001', title: 'fix auth' });
+  });
+
+  it('reads legacy records without origin unchanged', async () => {
+    await writeUnsanitizedTask('task-legacy', { title: 'T', description: '' });
+    expect((await store.get('task-legacy'))?.origin).toBeUndefined();
+  });
+
+  it('rejects malformed origin: non-object, unsafe or self-referencing taskId, empty or oversized title', async () => {
+    const cases: Array<[string, unknown]> = [
+      ['task-o1', 'task-001'],
+      ['task-o2', { taskId: '../x', title: 't' }],
+      ['task-o3', { taskId: 'task-o3', title: 't' }],
+      ['task-o4', { taskId: 'task-001', title: '' }],
+      ['task-o5', { taskId: 'task-001', title: 'x'.repeat(201) }],
+      ['task-o6', { taskId: 'task-001' }],
+      ['task-o7', { taskId: 'task-001', title: '   ' }],
+      ['task-o8', { taskId: 'task-001', title: ' fix auth' }],
+      ['task-o9', { taskId: 'task-001', title: 'fix\nauth' }],
+      ['task-o10', { taskId: 'task-001', title: 'fix\tauth' }],
+      ['task-o11', { taskId: 'task-001', title: 'fix\u00a0auth' }],
+      ['task-o12', { taskId: 'task-001', title: 'fix\u2028auth' }],
+    ];
+    for (const [id, origin] of cases) {
+      await writeUnsanitizedTask(id, { title: 'T', description: '', origin });
+      await expect(store.get(id), id).rejects.toBeInstanceOf(TaskSchemaError);
+    }
+  });
+
+  it('nextId propagates a directory read failure instead of restarting at task-001', async () => {
+    const missing = new TaskStore(join(tasksDir, 'missing'));
+    await expect(missing.nextId()).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});

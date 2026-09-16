@@ -382,6 +382,7 @@ export const enUS = {
     dispatchingHint: 'baxian is preparing the workspace, switching branches, and injecting the prompt; this step usually takes a few seconds.',
     createdAtPrefix: 'Created ',
     updatedAtPrefix: ' · Updated ',
+    originPrefix: ' · From ',
     editTask: 'Edit task',
     startTask: 'Start task',
     startReview: 'Start review',

@@ -99,6 +99,8 @@ export class DispatchReconciler {
           await this.reconcileFix(task);
         } else if (task.status === 'in_progress') {
           await this.reconcileInitialDispatch(task);
+        } else if (task.status === 'spec-ready') {
+          await this.releaseQaDeferredWhileBusy(task);
         }
       } catch (err) {
         console.warn(`[dispatch-reconciler] task ${task.id} reconcile failed:`, err);
@@ -513,23 +515,29 @@ export class DispatchReconciler {
     try {
       released = await this.opts.manager.releaseAgentForTask(qaId, task.id, 'idle', {
         deferWhenBusy: true,
-        expectedTask: { status: 'fixing' },
+        expectedTask: { status: task.status },
+        // spec-ready 下 shouldReleaseHeldBinding 会放行已 hold 的 QA，"无 hold" 的预检查必须在锁内复核
+        expectedHold: { phase: undefined, since: undefined, nonce: undefined },
       });
     } catch (err) {
       if (err instanceof ReplNotReadyError) return;
       console.warn(`[dispatch-reconciler] deferred QA release for ${task.id} failed:`, err);
     }
-    if (!released) await this.alertQaReleaseRefused(task.id, qaId);
+    if (!released) await this.alertQaReleaseRefused(task, qaId);
   }
 
-  private async alertQaReleaseRefused(taskId: string, qaId: string): Promise<void> {
-    const [fresh, qa] = await Promise.all([this.opts.taskStore.get(taskId), this.opts.agentStore.get(qaId)]);
-    if (fresh?.status !== 'fixing' || fresh.attention !== undefined
-      || qa?.taskId !== taskId || qa.status === 'awaiting_human') return;
+  private async alertQaReleaseRefused(task: TaskState, qaId: string): Promise<void> {
+    const [fresh, qa] = await Promise.all([this.opts.taskStore.get(task.id), this.opts.agentStore.get(qaId)]);
+    if (fresh?.status !== task.status || fresh.attention !== undefined
+      || qa?.taskId !== task.id || qa.status === 'awaiting_human') return;
+    if (fresh.status === 'spec-ready') {
+      await this.emitIntervention(fresh, qaId, { phase: 'spec-ready-qa-release-failed', qaAgentId: qaId });
+      return;
+    }
     await this.emitIntervention(fresh, fresh.agentId, {
       phase: 'qa-release-failed-but-dev-dispatched',
       qaAgentId: qaId,
-      note: `QA agent ${qaId} stayed bound to task ${taskId} after its verdict but could not be released (the server log names the refusal). The dev fix is unaffected; inspect the QA binding and its task lock, then Resume or Delete the QA agent.`,
+      note: `QA agent ${qaId} stayed bound to task ${task.id} after its verdict but could not be released (the server log names the refusal). The dev fix is unaffected; inspect the QA binding and its task lock, then Resume or Delete the QA agent.`,
     });
   }
 

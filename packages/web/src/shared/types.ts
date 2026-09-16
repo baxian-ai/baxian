@@ -213,6 +213,7 @@ export interface TaskState {
   postApproveRevoked?: { generation: string; reason: 'request-changes' | 'redispatch-cap'; at: string };
   attention?: TaskAttention;
   replacementTaskId?: string;
+  origin?: { taskId: string; title: string };
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;

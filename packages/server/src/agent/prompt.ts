@@ -8,7 +8,7 @@ import {
 } from '../shared/index.js';
 import { buildReviewTokenLine } from '../platform/markers.js';
 import type { PlatformAgentPrompts, PlatformPromptContext } from '../platform/types.js';
-import { scanNeedInputSignals, scanPhaseSignals } from './phase-signal.js';
+import { scanNeedInputSignals, scanPhaseSignals, scanTaskCreateSignals } from './phase-signal.js';
 import { visibleText } from './vt-visible-text.js';
 
 export const MAX_PROMPT_BYTES = 80 * 1024;
@@ -169,7 +169,11 @@ const PROTOCOL =
   `Markers are how baxian sees progress: when your contract names one, emit it as assistant text alone on its own ` +
   `line with placeholders replaced, once its conditions hold. Skip it and the task stalls.\n` +
   `To pause for a human, emit \`[bx:need-input:<token>:<n>]\` for the nth question; once it is answered, emit ` +
-  `\`[bx:input-received:<token>:<n>]\` before resuming work.`;
+  `\`[bx:input-received:<token>:<n>]\` before resuming work.\n` +
+  `To hand baxian a follow-up task for a human to triage, emit \`[bx:task-create:<title>:<token>]\` — title only, ` +
+  `1–200 characters, spaces written as \`+\`, no \`[\` or \`]\`; longer or empty titles are rejected. Emit it before ` +
+  `your phase signal (dev) or before publishing your verdict (qa); it is queued as pending in this project and never ` +
+  `dispatched automatically.`;
 
 function platformPromptForRole(role: AgentRole, prompts: PlatformAgentPrompts): string {
   const slices = role === 'dev'
@@ -203,6 +207,9 @@ function assertNoFilledSignal(body: string, phase: DispatchPhase, signalToken: s
     }
     if (scanNeedInputSignals(arm).some(s => s.token === signalToken)) {
       throw new Error(`${phase} prompt must not contain a filled need-input signal literal`);
+    }
+    if (scanTaskCreateSignals(arm).some(s => s.token === signalToken)) {
+      throw new Error(`${phase} prompt must not contain a filled task-create signal literal`);
     }
   }
 }

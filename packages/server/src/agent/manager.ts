@@ -108,6 +108,7 @@ import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import {
   PhaseSignalWatcher,
   type NeedInputCommitIntent,
+  type SpawnTaskIntent,
   type NeedInputCommitResult,
   type PhaseSignalWatcherStartArgs,
 } from './phase-signal-watcher.js';
@@ -606,6 +607,7 @@ export class AgentManager {
             eventBus: deps.eventBus,
             resolveAgent: (id) => this.getAgentConfig(id),
             commitNeedInputWatermark: (intent) => this.commitNeedInputWatermark(intent),
+            spawnTask: (intent) => this.spawnTaskFromSignal(intent),
           })
         : undefined);
     this.needInputRetryIntervalMs = deps.needInputRetryIntervalMs ?? DEFAULT_NEED_INPUT_RETRY_INTERVAL_MS;
@@ -2612,6 +2614,7 @@ export class AgentManager {
       allowAwaitingHuman?: boolean;
       expectedTask?: Partial<TaskGenerationGuard>;
       expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
+      deferWhenBusy?: boolean;
     },
   ): Promise<boolean> {
     const state = await this.agentStore.get(agentId);
@@ -2740,6 +2743,101 @@ export class AgentManager {
         await persistCleanup(result.task, cfg.id, result.cleanup);
       }
     }
+  }
+
+  private readonly spawnRetry = new Map<string, SpawnTaskIntent & { lastError: string; notified: boolean; final?: 'project-missing' }>();
+  private readonly spawnRetryInFlight = new Set<string>();
+  private spawnRetryTimer: ReturnType<typeof setInterval> | null = null;
+
+  async spawnTaskFromSignal(intent: SpawnTaskIntent): Promise<void> {
+    const key = `${intent.taskId}\0${intent.title}`;
+    let outcome: 'done' | 'source-missing' | 'project-missing';
+    try {
+      outcome = await this.withTaskLock(() => this.trySpawnTask(intent));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const previous = this.spawnRetry.get(key);
+      const entry = { ...intent, lastError: message, notified: previous?.notified ?? false };
+      this.spawnRetry.set(key, entry);
+      this.ensureSpawnRetryTimer();
+      if (!previous) {
+        console.error(`[AgentManager] task-create from ${intent.taskId} failed, queued for retry: ${message}`);
+      } else if (previous.lastError !== message) {
+        console.warn(`[AgentManager] task-create from ${intent.taskId} still failing: ${message}`);
+      }
+      if (!entry.notified) {
+        entry.notified = await this.emitIntervention(intent.projectId, intent.agentId, intent.taskId, {
+          phase: 'task-create-failed', title: intent.title, token: intent.token, error: message,
+        });
+      }
+      return;
+    }
+    this.spawnRetry.delete(key);
+    this.ensureSpawnRetryTimer();
+    if (outcome === 'source-missing') {
+      console.warn(`[AgentManager] task-create dropped: source ${intent.taskId} no longer exists`);
+    } else if (outcome === 'project-missing') {
+      console.error(`[AgentManager] task-create from ${intent.taskId} abandoned: project ${intent.projectId} no longer configured`);
+      const persisted = await this.emitFinalSpawnFailure(intent);
+      if (!persisted && !this.spawnRetry.has(key)) {
+        this.spawnRetry.set(key, { ...intent, lastError: 'project-missing', notified: false, final: 'project-missing' });
+        this.ensureSpawnRetryTimer();
+      }
+    }
+  }
+
+  // A final verdict only retries its notification; the intent itself is closed and must never create.
+  private emitFinalSpawnFailure(intent: SpawnTaskIntent): Promise<boolean> {
+    return this.emitIntervention(intent.projectId, intent.agentId, intent.taskId, {
+      phase: 'task-create-failed', reason: 'project-missing', title: intent.title, token: intent.token,
+    });
+  }
+
+  private async trySpawnTask(intent: SpawnTaskIntent): Promise<'done' | 'source-missing' | 'project-missing'> {
+    const source = await this.taskStore.get(intent.taskId);
+    if (!source) return 'source-missing';
+    if (!this.getProjectConfig(source.projectId)) return 'project-missing';
+    const child = await this.createTask(source.projectId, {
+      title: intent.title,
+      description: '',
+      preferredAgentId: '',
+      origin: { taskId: source.id, title: intent.title },
+    });
+    console.info(`[AgentManager] task-create from ${source.id} via ${intent.agentId} -> ${child.id}`);
+    return 'done';
+  }
+
+  private ensureSpawnRetryTimer(): void {
+    if (this.spawnRetry.size === 0) {
+      if (this.spawnRetryTimer) {
+        clearInterval(this.spawnRetryTimer);
+        this.spawnRetryTimer = null;
+      }
+      return;
+    }
+    if (this.spawnRetryTimer) return;
+    this.spawnRetryTimer = setInterval(() => {
+      void this.outsideTaskMutationScope(() => this.spawnRetryPass());
+    }, this.needInputRetryIntervalMs);
+    this.spawnRetryTimer.unref?.();
+  }
+
+  private async spawnRetryPass(): Promise<void> {
+    for (const [key, entry] of [...this.spawnRetry.entries()]) {
+      if (this.spawnRetryInFlight.has(key)) continue;
+      this.spawnRetryInFlight.add(key);
+      try {
+        if (entry.final) {
+          const persisted = await this.emitFinalSpawnFailure(entry);
+          if (persisted && this.spawnRetry.get(key) === entry) this.spawnRetry.delete(key);
+        } else {
+          await this.spawnTaskFromSignal(entry);
+        }
+      } finally {
+        this.spawnRetryInFlight.delete(key);
+      }
+    }
+    this.ensureSpawnRetryTimer();
   }
 
   private readonly needInputRetry = new Map<string, { askSeq: number; answeredSeq: number }>();
@@ -7087,9 +7185,16 @@ export class AgentManager {
       preferredAgentId: string;
       branch?: string;
       images?: { bytes: Buffer; ext: string }[];
+      origin?: { taskId: string; title: string };
     },
   ): Promise<TaskState> {
     return this.withTaskLock(async () => {
+      const origin = input.origin;
+      if (origin) {
+        const existing = (await this.taskStore.listStrict({ projectId }))
+          .find(task => task.origin?.taskId === origin.taskId && task.origin.title === origin.title);
+        if (existing) return existing;
+      }
       const taskId = await this.taskStore.nextId();
       const now = new Date().toISOString();
       if (input.branch) {
@@ -7126,6 +7231,7 @@ export class AgentManager {
         createdAt: now,
         updatedAt: now,
         ...(imageFilenames ? { images: imageFilenames } : {}),
+        ...(input.origin ? { origin: input.origin } : {}),
       };
 
       if (input.preferredAgentId === '') {
@@ -10956,11 +11062,19 @@ export class AgentManager {
         });
       }
     }
-    const released = await this.releaseAgentForTask(qaAgentId, taskId, 'idle', {
-      expectedTask: parkedGeneration,
-    })
-      .catch(() => false);
-    if (!released) {
+    let released = false;
+    let qaBusy = false;
+    try {
+      // the reconciler may have released the QA while the dev was parking; an unbound QA is a success, not a failure
+      released = await this.releaseAgentIfBound(qaAgentId, taskId, {
+        expectedTask: parkedGeneration,
+        deferWhenBusy: true,
+      });
+    } catch (err) {
+      // a QA still printing after its APPROVE stays bound without a hold; the reconciler releases it once idle
+      qaBusy = err instanceof ReplNotReadyError;
+    }
+    if (!released && !qaBusy) {
       await this.emitIntervention(parked.projectId, qaAgentId, taskId, {
         phase: 'spec-ready-qa-release-failed',
         qaAgentId,

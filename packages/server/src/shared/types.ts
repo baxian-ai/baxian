@@ -303,6 +303,7 @@ export interface TaskState {
   outbox?: TaskOutboxEntry[];
   attention?: TaskAttention;
   replacementTaskId?: string;
+  origin?: { taskId: string; title: string };
   pendingRedispatch?: boolean;
   redispatchCount?: number;
   status: TaskStatus;

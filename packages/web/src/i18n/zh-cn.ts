@@ -381,6 +381,7 @@ export const zhCN: Messages = {
     dispatchingHint: 'baxian 正在准备工作区、切换分支并注入提示词，这一步通常需要十几秒。',
     createdAtPrefix: '创建于 ',
     updatedAtPrefix: ' · 更新于 ',
+    originPrefix: ' · 来自 ',
     editTask: '编辑任务',
     startTask: '开始任务',
     startReview: '开始评审',

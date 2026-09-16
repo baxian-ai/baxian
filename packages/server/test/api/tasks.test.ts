@@ -1050,3 +1050,14 @@ describe('POST /api/tasks/:id/pr-review/refresh', () => {
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'no-pr' });
   });
 });
+
+describe('POST /api/tasks id allocation', () => {
+  it('fails the request instead of overwriting an existing task when the directory read fails', async () => {
+    await seedTask(app.ctx.taskStore, makeTask({ id: 'task-001', status: 'pending', title: 'keep me' }));
+    vi.spyOn(app.ctx.taskStore, 'nextId').mockRejectedValueOnce(Object.assign(new Error('EIO: scandir'), { code: 'EIO' }));
+    const res = await post('/api/tasks', createPayload({ preferredAgentId: '' }));
+    expect(res.statusCode).toBe(500);
+    expect((await app.ctx.taskStore.get('task-001'))?.title).toBe('keep me');
+    expect((await app.ctx.taskStore.list()).map(t => t.id)).toEqual(['task-001']);
+  });
+});

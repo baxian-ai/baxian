@@ -6,6 +6,7 @@ import {
   isRecord,
   mapWithConcurrency,
   FS_READ_CONCURRENCY,
+  TITLE_MAX_LEN,
   TASK_PHASE_SET,
   TASK_TERMINAL_STATUS_SET,
   TERMINAL_INTERVENTION_PHASES,
@@ -32,7 +33,7 @@ const TASK_FIELDS = [
   'maxRoundsContinues',
   'postApproveRevoked', 'postApproveHeadSha', 'attention',
   'passToken', 'failToken', 'postApproveToken', 'postApproveGeneration', 'postApprovePhase', 'reviewDispatch', 'platformBinding', 'baseBranch',
-  'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'replacementTaskId', 'pendingRedispatch', 'redispatchCount',
+  'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'replacementTaskId', 'origin', 'pendingRedispatch', 'redispatchCount',
 ] as const;
 
 const REVIEW_TOKEN_RE = /^[0-9a-f]{12}$/;
@@ -147,6 +148,14 @@ function validateTask(raw: Record<string, unknown>): void {
   if (raw.replacementTaskId !== undefined
     && (!SAFE_ID.test(raw.replacementTaskId as string) || raw.replacementTaskId === raw.id)) {
     throw taskSchemaError('replacementTaskId', 'a different safe task id when present');
+  }
+  if (raw.origin !== undefined) {
+    const origin = raw.origin;
+    if (!isRecord(origin) || typeof origin.taskId !== 'string' || !SAFE_ID.test(origin.taskId) || origin.taskId === raw.id
+      || typeof origin.title !== 'string' || origin.title.length === 0 || origin.title.length > TITLE_MAX_LEN
+      || origin.title !== origin.title.trim() || /[^\S ]/.test(origin.title)) {
+      throw taskSchemaError('origin', 'a { taskId, title } record naming a different safe task id and a trimmed 1-200 char title whose only whitespace is plain spaces');
+    }
   }
   if (!Number.isInteger(raw.reviewRound) || (raw.reviewRound as number) < 0) {
     throw taskSchemaError('reviewRound', 'an integer >= 0');
@@ -543,12 +552,7 @@ export class TaskStore {
   }
 
   async nextId(): Promise<string> {
-    let files: string[];
-    try {
-      files = await readdir(this.dir);
-    } catch {
-      files = [];
-    }
+    const files = await readdir(this.dir);
     const maxNum = files.reduce((max, f) => {
       const match = f.match(/^task-(\d+)\.json$/);
       return match ? Math.max(max, parseInt(match[1], 10)) : max;

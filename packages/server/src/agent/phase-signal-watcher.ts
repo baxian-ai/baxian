@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { AgentConfig, BaxianEvent, EventType } from '../shared/index.js';
 import type { EventBus } from '../event/bus.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
@@ -6,9 +7,11 @@ import {
   scanAskAnswerSignals,
   scanPhaseSignalMatches,
   scanPhaseSignals,
+  scanTaskCreateSignals,
   type NeedInputSignal,
   type PhaseSignal,
   type PhaseSignalKind,
+  type TaskCreateSignal,
 } from './phase-signal.js';
 import { visibleText } from './vt-visible-text.js';
 
@@ -22,6 +25,14 @@ export interface NeedInputCommitIntent {
 
 export type NeedInputCommitResult = 'ok' | 'fenced' | 'error';
 
+export interface SpawnTaskIntent {
+  agentId: string;
+  taskId: string;
+  projectId: string;
+  token: string;
+  title: string;
+}
+
 interface SettlingEntry {
   active: number;
   promise: Promise<void>;
@@ -31,6 +42,8 @@ interface SettlingEntry {
 const MATCH_BUFFER_CHARS = 1024;
 
 const STALE_TOKEN_WARN_CAP = 32;
+
+export const REJECTED_FRAME_CAP = 64;
 
 const KIND_TO_EVENT_TYPE: Record<Exclude<PhaseSignalKind, 'greeting'>, EventType> = {
   'pr-created': 'pr.created',
@@ -52,7 +65,8 @@ interface WatchEntry {
   epoch: number;
   snapshotReconcile: boolean;
   commitEnabled: boolean;
-  needInputBuffer: string;
+  sideChannelBuffer: string;
+  rejectedFrames: Set<string>;
   recovered: boolean;
   buffer: string;
   unsubscribe: () => void;
@@ -64,6 +78,7 @@ export interface PhaseSignalWatcherDeps {
   eventBus: EventBus;
   resolveAgent: (agentId: string) => AgentConfig | undefined;
   commitNeedInputWatermark?: (intent: NeedInputCommitIntent) => Promise<NeedInputCommitResult>;
+  spawnTask?: (intent: SpawnTaskIntent) => Promise<void>;
 }
 
 export interface PhaseSignalWatcherStartArgs {
@@ -210,7 +225,8 @@ export class PhaseSignalWatcher {
       epoch: args.needInput?.epoch ?? 0,
       snapshotReconcile: args.needInputInherit === true && args.needInput !== undefined,
       commitEnabled: args.needInput !== undefined,
-      needInputBuffer: '',
+      sideChannelBuffer: '',
+      rejectedFrames: new Set(),
       recovered: args.recovered ?? false,
       buffer: '',
       unsubscribe: () => undefined,
@@ -532,33 +548,84 @@ export class PhaseSignalWatcher {
     if (this.markAnswered(entry)) this.commitWatermark(entry);
   }
 
-  private scanNeedInput(entry: WatchEntry, chunk: string, isSnapshot: boolean): void {
+  private scanSideChannel(entry: WatchEntry, chunk: string, isSnapshot: boolean): void {
     if (isSnapshot) {
-      entry.needInputBuffer = chunk.slice(-MATCH_BUFFER_CHARS);
-      if (!entry.snapshotReconcile) return;
-      let maxAsk = 0;
-      let maxAnswer = 0;
-      for (const sig of scanAskAnswerSignals(chunk)) {
-        if (sig.token !== entry.expectedToken || sig.seq === undefined) continue;
-        if (sig.kind === 'ask') maxAsk = Math.max(maxAsk, sig.seq);
-        else maxAnswer = Math.max(maxAnswer, sig.seq);
-      }
-      const askSeq = Math.max(entry.askSeq, maxAsk);
-      const answeredSeq = Math.min(askSeq, Math.max(entry.answeredSeq, maxAnswer));
-      if (askSeq === entry.askSeq && answeredSeq === entry.answeredSeq) return;
-      entry.askSeq = askSeq;
-      entry.answeredSeq = answeredSeq;
-      this.commitWatermark(entry);
+      entry.sideChannelBuffer = chunk.slice(-MATCH_BUFFER_CHARS);
+      this.reconcileNeedInputSnapshot(entry, chunk);
+      this.consumeTaskCreate(entry, scanTaskCreateSignals(chunk).filter(this.beforeCompletion(entry, chunk)));
       return;
     }
-    const combined = entry.needInputBuffer + chunk;
-    const oldRegionLen = compactBoundaryIndex(combined, entry.needInputBuffer.length);
-    entry.needInputBuffer = combined.slice(-MATCH_BUFFER_CHARS);
+    const combined = entry.sideChannelBuffer + chunk;
+    const oldRegionLen = compactBoundaryIndex(combined, entry.sideChannelBuffer.length);
+    const inNewRegion = (sig: { index: number; raw: string }): boolean => sig.index + sig.raw.length > oldRegionLen;
     for (const sig of scanAskAnswerSignals(combined)) {
-      if (sig.token !== entry.expectedToken) continue;
-      if (sig.index + sig.raw.length <= oldRegionLen) continue;
+      if (sig.token !== entry.expectedToken || !inNewRegion(sig)) continue;
       if (sig.kind === 'ask') this.onAskSignal(entry, sig);
       else this.onAnswerSignal(entry, sig);
+    }
+    const beforeCompletion = this.beforeCompletion(entry, combined);
+    this.consumeTaskCreate(entry, scanTaskCreateSignals(combined).filter(sig => inNewRegion(sig) && beforeCompletion(sig)));
+    entry.sideChannelBuffer = combined.slice(-MATCH_BUFFER_CHARS);
+  }
+
+  // Text after the armed completion frame has no consumer once the entry fires; a frame printed later in
+  // the same chunk or screen must behave exactly like one printed in the next chunk.
+  private beforeCompletion(entry: WatchEntry, text: string): (sig: { index: number; raw: string }) => boolean {
+    const completion = scanPhaseSignalMatches(text).find(m =>
+      m.signal.kind !== 'greeting' && entry.expectedKinds.has(m.signal.kind) && m.signal.token === entry.expectedToken,
+    );
+    if (!completion) return () => true;
+    return sig => sig.index + sig.raw.length <= completion.index;
+  }
+
+  private reconcileNeedInputSnapshot(entry: WatchEntry, snapshot: string): void {
+    if (!entry.snapshotReconcile) return;
+    let maxAsk = 0;
+    let maxAnswer = 0;
+    for (const sig of scanAskAnswerSignals(snapshot)) {
+      if (sig.token !== entry.expectedToken || sig.seq === undefined) continue;
+      if (sig.kind === 'ask') maxAsk = Math.max(maxAsk, sig.seq);
+      else maxAnswer = Math.max(maxAnswer, sig.seq);
+    }
+    const askSeq = Math.max(entry.askSeq, maxAsk);
+    const answeredSeq = Math.min(askSeq, Math.max(entry.answeredSeq, maxAnswer));
+    if (askSeq === entry.askSeq && answeredSeq === entry.answeredSeq) return;
+    entry.askSeq = askSeq;
+    entry.answeredSeq = answeredSeq;
+    this.commitWatermark(entry);
+  }
+
+  private consumeTaskCreate(entry: WatchEntry, signals: readonly TaskCreateSignal[]): void {
+    const spawn = this.deps.spawnTask;
+    if (!spawn) return;
+    for (const sig of signals) {
+      if (sig.token !== entry.expectedToken) continue;
+      if ('reject' in sig) {
+        const frameId = this.rememberRejectedFrame(entry, sig.raw);
+        if (frameId === null) continue;
+        const payload = sig.raw.slice('[bx:task-create:'.length, -(sig.token.length + 2));
+        console.warn(
+          `[PhaseSignalWatcher] rejected task-create frame (${sig.reject}, length=${sig.length}) for task=${entry.taskId} `
+          + `agent=${entry.agentId}`,
+        );
+        void this.emitInterventionFireAndForget({
+          taskId: entry.taskId,
+          projectId: entry.projectId,
+          agentId: entry.agentId,
+          phase: 'task-create-rejected',
+          details: { reason: sig.reject, length: sig.length, token: sig.token, payload: payload.slice(0, 200) },
+        }).then((persisted) => { if (!persisted) entry.rejectedFrames.delete(frameId); });
+        continue;
+      }
+      void spawn({
+        agentId: entry.agentId,
+        taskId: entry.taskId,
+        projectId: entry.projectId,
+        token: sig.token,
+        title: sig.title,
+      }).catch((err) => {
+        console.warn(`[PhaseSignalWatcher] spawnTask failed for task=${entry.taskId} title=${JSON.stringify(sig.title)}:`, err);
+      });
     }
   }
 
@@ -566,7 +633,7 @@ export class PhaseSignalWatcher {
     if (this.entries.get(entryKey(entry.taskId, entry.agentId)) !== entry) return;
     if (entry.fired) return;
     const combined = entry.buffer + chunk;
-    this.scanNeedInput(entry, chunk, isSnapshot);
+    this.scanSideChannel(entry, chunk, isSnapshot);
     const oldRegionLen = compactBoundaryIndex(combined, entry.buffer.length);
     const matches = scanPhaseSignalMatches(combined);
     entry.buffer = combined.slice(-MATCH_BUFFER_CHARS);
@@ -632,6 +699,17 @@ export class PhaseSignalWatcher {
     }
   }
 
+  private rememberRejectedFrame(entry: WatchEntry, raw: string): string | null {
+    const id = createHash('sha256').update(raw).digest('base64url').slice(0, 22);
+    if (entry.rejectedFrames.has(id)) return null;
+    entry.rejectedFrames.add(id);
+    if (entry.rejectedFrames.size > REJECTED_FRAME_CAP) {
+      const oldest = entry.rejectedFrames.values().next().value;
+      if (oldest !== undefined) entry.rejectedFrames.delete(oldest);
+    }
+    return id;
+  }
+
   private async emitCompletion(
     event: BaxianEvent,
     entry: WatchEntry,
@@ -677,7 +755,8 @@ export class PhaseSignalWatcher {
     agentId: string;
     phase: string;
     error?: string;
-  }): Promise<void> {
+    details?: Record<string, unknown>;
+  }): Promise<boolean> {
     try {
       await this.deps.eventBus.emit({
         id: '',
@@ -689,13 +768,16 @@ export class PhaseSignalWatcher {
         data: {
           phase: data.phase,
           ...(data.error ? { error: data.error } : {}),
+          ...(data.details ?? {}),
         },
       });
+      return true;
     } catch (emitErr) {
       console.warn(
         `[PhaseSignalWatcher] intervention emit (${data.phase}) failed for task=${data.taskId}:`,
         emitErr,
       );
+      return false;
     }
   }
 }
