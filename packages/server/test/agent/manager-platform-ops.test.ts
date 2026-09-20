@@ -3,15 +3,15 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type {
+  AgentBindingFacts,
   BaxianConfig,
+  BaxianEvent,
   CodeVerdictOutboxEntry,
   SpecVerdictOutboxEntry,
   TaskState,
 } from '../../src/shared/index.js';
 import { taskAttentionGeneration } from '../../src/shared/index.js';
-import {
-  DispatchTerminalError, PlatformMergeRecheckError, type AgentManager,
-} from '../../src/agent/manager.js';
+import { DispatchTerminalError, type AgentManager } from '../../src/agent/manager.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import type { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -26,7 +26,9 @@ import {
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 import { buildAckMarker, buildReviewTokenLine } from '../../src/platform/markers.js';
 import { PrConversationCache, prReviewCacheRevision } from '../../src/platform/pr-conversation-cache.js';
-import { createManagerHarness } from '../helpers/manager-harness.js';
+import { BranchManager } from '../../src/agent/branch.js';
+import { createManagerHarness, repoStoreStandIn } from '../helpers/manager-harness.js';
+import { fakeRunner, type FakeRunner } from '../helpers/fake-runner.js';
 import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
 const SHA1 = 'a'.repeat(40);
@@ -62,6 +64,7 @@ class FakeDriver implements PlatformDriver {
   comments: Record<string, NormalizedRow[] | Error> = { 'issue-comments': [], 'inline-comments': [], 'reviews': [] };
   ops: Array<{ op: string; vars: RecordedVars }> = [];
   mergeError: Error | undefined;
+  onPrView: (() => Promise<void>) | undefined;
 
   async runPreflightSteps(): Promise<Array<{ step: string; ok: boolean; message: string }>> {
     return [];
@@ -69,6 +72,7 @@ class FakeDriver implements PlatformDriver {
 
   async prView(prNumber: number): Promise<NormalizedRow> {
     this.ops.push({ op: 'prView', vars: { prNumber } });
+    await this.onPrView?.();
     if (this.prViewResult instanceof Error) throw this.prViewResult;
     return this.prViewResult;
   }
@@ -172,7 +176,39 @@ let lockManager: LockManager;
 let taskStore: TaskStore;
 let manager: AgentManager;
 let createManager: Awaited<ReturnType<typeof createManagerHarness>>['createManager'];
+let eventBus: EventBus;
+let events: BaxianEvent[];
 let driver: FakeDriver;
+let runner: FakeRunner;
+let refuseSendKeys: boolean;
+let execHook: ((command: string) => void | Promise<void>) | null;
+
+const pastedPanes = (): string[] => runner.pastedPrompts.map(prompt => prompt.pane);
+
+// 依次在 runner 的 tmux 轨迹里找到每个片段,且每个都出现在前一个之后
+function traceOrder(...needles: Array<string | RegExp>): boolean {
+  const trace = runner.exec.mock.calls.map(call => call[0] as string);
+  let from = 0;
+  for (const needle of needles) {
+    const at = trace.findIndex((command, index) => index >= from
+      && (typeof needle === 'string' ? command.includes(needle) : needle.test(command)));
+    if (at === -1) return false;
+    from = at + 1;
+  }
+  return true;
+}
+
+// 投递后拒绝一切 send-keys:Enter 与随后的清稿都失败 → 生产侧判 ack_unknown
+function failAckAfterPaste(): void {
+  execHook = (command) => {
+    if (command.includes('paste-buffer')) refuseSendKeys = true;
+  };
+}
+
+function deliverNormally(): void {
+  execHook = null;
+  refuseSendKeys = false;
+}
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'bx-mgr-platform-'));
@@ -188,13 +224,45 @@ beforeEach(async () => {
       ]],
     }],
   });
-  const harness = await createManagerHarness(tempDir, { config });
-  ({ manager, createManager, agentStore, taskStore, lockManager } = harness);
+  refuseSendKeys = false;
+  execHook = null;
+  runner = fakeRunner({
+    session: 'present',
+    rules: [{ match: (command) => refuseSendKeys && command.includes('send-keys'), reply: { outcome: 'refused' } }],
+    onExec: async (command) => { await execHook?.(command); },
+  });
+  const harness = await createManagerHarness(tempDir, {
+    config,
+    deps: {
+      runnerFactory: () => runner,
+      platformRunner: runner,
+      // git 仓库边界替身(E4),其余走 live runtime 的真实 tmux 协议
+      repoStoreFactory: repoStoreStandIn(tempDir),
+      compactIdlePollMs: 1,
+      readyStableSpacingMs: 1,
+      runtimeLivenessProbeMs: 1,
+      bootstrapTimeoutsMs: { trustDialog: 300, waitReplReady: 1_000 },
+    },
+  });
+  ({ manager, createManager, agentStore, taskStore, lockManager, eventBus, events } = harness);
   driver = new FakeDriver();
   vi.spyOn(manager, 'platformDriverFor').mockReturnValue(driver as unknown as PlatformDriver);
+  // git 仓库边界替身(E4)
+  vi.spyOn(BranchManager.prototype, 'assertClean').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockResolvedValue({ status: 'deleted' });
+  vi.spyOn(BranchManager.prototype, 'currentRef').mockImplementation(async (workdir) => {
+    const binding = (await agentStore.list()).find(state => state.workdir === workdir && state.taskId);
+    const bound = binding?.taskId ? await taskStore.get(binding.taskId) : null;
+    return bound?.branch ? `refs/heads/${bound.branch}` : null;
+  });
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -202,6 +270,15 @@ function asReturned(
   result: { kind: string } | { kind: string; task: TaskState },
 ): TaskState | null {
   return 'task' in result && result.kind === 'returned' ? result.task : null;
+}
+
+// dev/qa 的实况绑定:continueSession 需要 agent 记录里已有 workdir
+async function seedDevAgent(over: Partial<AgentBindingFacts> = {}): Promise<void> {
+  await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir: '/tmp/repo', updatedAt: TS, ...over });
+}
+
+async function seedQaAgent(over: Partial<AgentBindingFacts> = {}): Promise<void> {
+  await agentStore.set({ id: 'qa-1', projectId: 'proj', workdir: '/tmp/qa-repo', updatedAt: TS, ...over });
 }
 
 async function seed(over: Partial<TaskState> = {}): Promise<TaskState> {
@@ -441,116 +518,99 @@ describe('git spec approval gate verdicts', () => {
   }
 
   it('approves directly into the code handoff', async () => {
-    const gate = await seedSpecGate();
-    const codeTask = gitTask({
-      ...gate,
-      status: 'in_progress',
-      phase: 'code',
-      deliveryConfirmation: undefined,
-      signalToken: 'code-delivery-gate',
-    });
-    const transition = vi.spyOn(manager, 'transitionToCodePhase').mockResolvedValue(codeTask);
+    await seedSpecGate();
+    await seedDevAgent();
 
     const result = await manager.submitSpecVerdict('task-1', 'approve');
 
-    expect(transition).toHaveBeenCalledWith(
-      'task-1',
-      expect.objectContaining({
-        status: 'spec-ready',
-        phase: 'spec',
-        signalToken: 'spec-verdict-gate',
-        reviewRound: 1,
-        specReviewRound: 2,
-      }),
-      expect.objectContaining({
-        specReviewRound: 2,
-        expectedSignalToken: 'spec-verdict-gate',
-        prNumber: 42,
-        headSha: SHA1,
-        passProvenance: expect.objectContaining({ anchorSha: SHA1 }),
-      }),
-    );
-    expect(result).toBe(codeTask);
+    expect(result).toMatchObject({
+      status: 'in_progress',
+      phase: 'code',
+      specReviewRound: 2,
+      reviewRound: 1,
+      latestHeadSha: SHA1,
+      passProvenance: expect.objectContaining({ anchorSha: SHA1 }),
+    });
+    expect(result.signalToken).not.toBe('spec-verdict-gate');
+    expect(result.deliveryConfirmation).toBeUndefined();
+    expect(await taskStore.get('task-1')).toEqual(result);
+    expect(pastedPanes()).toEqual(['%0']);
+    expect(runner.pastedPrompts[0]?.body).toContain(result.signalToken!);
     expect(driver.ops.map(op => op.op)).toEqual(['prView']);
   });
 
   it('uses the live head as an explicit human override at the git spec max-rounds gate', async () => {
     const liveHead = 'b'.repeat(40);
-    const gate = await seedSpecGate({
+    await seedSpecGate({
       status: 'max_rounds',
       passProvenance: undefined,
       reviewHeadAnchorSha: SHA1,
     });
+    await seedDevAgent();
     driver.prViewResult = prRow({ headSha: liveHead });
-    const codeTask = gitTask({
-      ...gate,
-      status: 'in_progress',
-      phase: 'code',
-      deliveryConfirmation: undefined,
-      latestHeadSha: liveHead,
-      reviewHeadAnchorSha: liveHead,
-      passProvenance: undefined,
-    });
-    const transition = vi.spyOn(manager, 'transitionToCodePhase').mockResolvedValue(codeTask);
 
     const result = await manager.submitSpecVerdict('task-1', 'approve');
 
-    const approval = transition.mock.calls[0]?.[2];
-    expect(approval).toMatchObject({
+    expect(result).toMatchObject({
+      status: 'in_progress',
+      phase: 'code',
       specReviewRound: 2,
-      expectedSignalToken: 'spec-verdict-gate',
       prNumber: 42,
-      headSha: liveHead,
-      humanOverride: true,
+      latestHeadSha: liveHead,
+      reviewHeadAnchorSha: liveHead,
     });
-    expect(approval).not.toHaveProperty('passProvenance');
-    expect(result).toBe(codeTask);
+    expect(result.passProvenance).toBeUndefined();
+    expect(result.signalToken).not.toBe('spec-verdict-gate');
+    expect(await taskStore.get('task-1')).toEqual(result);
+    expect(pastedPanes()).toEqual(['%0']);
     expect(driver.ops.map(op => op.op)).toEqual(['prView']);
   });
 
   it('still requires QA pass provenance at the ordinary git spec-ready gate', async () => {
     await seedSpecGate({ passProvenance: undefined });
-    const transition = vi.spyOn(manager, 'transitionToCodePhase');
 
     await expect(manager.submitSpecVerdict('task-1', 'approve'))
       .rejects.toMatchObject({ status: 409 });
 
-    expect(transition).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-1')).toMatchObject({ status: 'spec-ready', phase: 'spec' });
+    expect(pastedPanes()).toEqual([]);
     expect(driver.ops).toEqual([]);
   });
 
-  it('rechecks a newer live head instead of approving the stale spec pass', async () => {
+  it('rechecks a newer live head with QA instead of approving the stale spec pass', async () => {
     await seedSpecGate();
     const changedHead = 'b'.repeat(40);
     driver.prViewResult = prRow({ headSha: changedHead });
-    const transition = vi.spyOn(manager, 'transitionToCodePhase');
-    const dispatch = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue(
-      gitTask({ status: 'review', phase: 'spec', latestHeadSha: changedHead }),
-    );
 
     await expect(manager.submitSpecVerdict('task-1', 'approve'))
       .rejects.toMatchObject({ status: 409 });
 
-    expect(transition).not.toHaveBeenCalled();
-    expect(dispatch).toHaveBeenCalledWith('task-1', expect.objectContaining({
-      fromStatus: ['spec-ready'],
-      bumpRound: true,
-      qaPhase: 'recheck',
-      expectPhase: 'spec',
-    }));
-    expect(await taskStore.get('task-1')).toMatchObject({ latestHeadSha: changedHead });
+    const rechecked = await taskStore.get('task-1');
+    expect(rechecked).toMatchObject({
+      status: 'review',
+      phase: 'spec',
+      specReviewRound: 3,
+      latestHeadSha: changedHead,
+      reviewHeadAnchorSha: changedHead,
+    });
+    expect(rechecked?.reviewDispatch).toBeUndefined();
+    expect(rechecked?.reviewRoundPending).toBeUndefined();
+    expect(pastedPanes()).toEqual(['%1']);
+    expect(await agentStore.get('qa-1')).toMatchObject({ taskId: 'task-1', paneId: '%1' });
+    expect(runner.pastedPrompts[0]?.body).toContain('phase: recheck');
+    expect(runner.pastedPrompts[0]?.body).toContain('stage: spec');
+    expect(runner.pastedPrompts[0]?.body).toContain(`anchor-sha: ${changedHead}`);
   });
 
   it('keeps the spec gate closed when the live head probe fails', async () => {
     await seedSpecGate();
     driver.prViewResult = new Error('HTTP 503');
-    const transition = vi.spyOn(manager, 'transitionToCodePhase');
 
     await expect(manager.submitSpecVerdict('task-1', 'approve'))
       .rejects.toMatchObject({ status: 503 });
 
-    expect(transition).not.toHaveBeenCalled();
-    expect((await taskStore.get('task-1'))?.status).toBe('spec-ready');
+    expect(await taskStore.get('task-1')).toMatchObject({ status: 'spec-ready', phase: 'spec' });
+    expect(pastedPanes()).toEqual([]);
   });
 
   it('does not overwrite a newer persisted head observation with an older live-probe result', async () => {
@@ -564,22 +624,23 @@ describe('git spec approval gate verdicts', () => {
       });
       return {
         ok: true,
+        prUrl: 'https://github.com/owner/repo/pull/42',
         headSha: SHA1,
         branch: 'bx/task-1',
         targetBranch: 'main',
       };
     });
-    const transition = vi.spyOn(manager, 'transitionToCodePhase');
 
     await expect(manager.submitSpecVerdict('task-1', 'approve'))
       .rejects.toMatchObject({ status: 409 });
 
-    expect(transition).not.toHaveBeenCalled();
     expect(await taskStore.get('task-1')).toMatchObject({
       status: 'spec-ready',
+      phase: 'spec',
       latestHeadSha: 'b'.repeat(40),
       reviewHeadAnchorSha: SHA1,
     });
+    expect(pastedPanes()).toEqual([]);
   });
 
   it('writes one durable PR comment, expands a capped spec budget, and dispatches spec fix', async () => {
@@ -587,7 +648,7 @@ describe('git spec approval gate verdicts', () => {
       key: 'existing-notice', type: 'human.intervention', data: { phase: 'existing' },
     };
     await seedSpecGate({ outbox: [notice] });
-    const dispatch = vi.spyOn(manager, 'dispatchGitFixToDev').mockResolvedValue(true);
+    await seedDevAgent();
 
     const result = await submitChanges(' 补充失败回滚方案 ');
 
@@ -600,7 +661,7 @@ describe('git spec approval gate verdicts', () => {
     });
     expect(pendingSpecVerdict(result)).toBeUndefined();
     expect(result.outbox).toEqual([notice]);
-    expect(dispatch).toHaveBeenCalledOnce();
+    expect(pastedPanes()).toEqual(['%0']);
     const writes = driver.ops.filter(op => op.op === 'comment');
     expect(writes).toHaveLength(1);
     expect(writes[0]?.vars).toMatchObject({
@@ -619,7 +680,7 @@ describe('git spec approval gate verdicts', () => {
       exitCode: 255,
       stderrTail: 'ssh: connect: connection timed out',
     });
-    vi.spyOn(manager, 'dispatchGitFixToDev').mockResolvedValue(true);
+    await seedDevAgent();
 
     const result = await submitChanges();
 
@@ -633,12 +694,12 @@ describe('git spec approval gate verdicts', () => {
     const entry = specVerdictOutbox({ writeAttemptedAt: TS });
     await seedSpecGate({ outbox: [entry] });
     driver.comments['issue-comments'] = [comment('human-spec-1', specVerdictBody(entry))];
-    const dispatch = vi.spyOn(manager, 'dispatchGitFixToDev').mockResolvedValue(true);
+    await seedDevAgent();
 
     await manager.flushTaskOutboxes();
 
     expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(0);
-    expect(dispatch).toHaveBeenCalledOnce();
+    expect(pastedPanes()).toEqual(['%0']);
     const recovered = await taskStore.get('task-1');
     expect(recovered).toMatchObject({
       status: 'fixing',
@@ -651,7 +712,7 @@ describe('git spec approval gate verdicts', () => {
   it('waits for a posted verdict comment to become scan-visible before dispatching the fix', async () => {
     await seedSpecGate({ specReviewRound: 1 });
     driver.commentVisibleAfterWrite = false;
-    const dispatch = vi.spyOn(manager, 'dispatchGitFixToDev').mockResolvedValue(true);
+    await seedDevAgent();
 
     await expect(submitChanges()).rejects.toMatchObject({ status: 503 });
 
@@ -668,14 +729,14 @@ describe('git spec approval gate verdicts', () => {
         writeAttemptedAt: expect.any(String),
       },
     });
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
     expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
 
     driver.comments['issue-comments'] = [comment('human-spec-1', specVerdictBody(pending))];
     await manager.flushTaskOutboxes();
 
     expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
-    expect(dispatch).toHaveBeenCalledOnce();
+    expect(pastedPanes()).toEqual(['%0']);
     expect(await taskStore.get('task-1')).toMatchObject({
       status: 'fixing',
       specReviewRound: 2,
@@ -688,7 +749,7 @@ describe('git spec approval gate verdicts', () => {
     await seedSpecGate({ specReviewRound: 1 });
     driver.commentError = new Error('transport result unavailable');
     driver.comments.reviews = new Error('review source unavailable');
-    const dispatch = vi.spyOn(manager, 'dispatchGitFixToDev').mockResolvedValue(true);
+    await seedDevAgent();
 
     await expect(submitChanges()).rejects.toMatchObject({ status: 503 });
 
@@ -704,7 +765,7 @@ describe('git spec approval gate verdicts', () => {
         writeAttemptedAt: expect.any(String),
       },
     });
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
     expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
 
     const pending = pendingSpecVerdict(uncertain)!;
@@ -723,7 +784,7 @@ describe('git spec approval gate verdicts', () => {
     await manager.flushTaskOutboxes();
 
     expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(2);
-    expect(dispatch).toHaveBeenCalledOnce();
+    expect(pastedPanes()).toEqual(['%0']);
     const recovered = await taskStore.get('task-1');
     expect(recovered).toMatchObject({
       status: 'fixing',
@@ -740,7 +801,7 @@ describe('git spec approval gate verdicts', () => {
       exitCode: 1,
       stderrTail: 'validation failed',
     });
-    const dispatch = vi.spyOn(manager, 'dispatchGitFixToDev');
+    await seedDevAgent();
 
     await expect(submitChanges()).rejects.toMatchObject({ status: 502 });
 
@@ -751,20 +812,20 @@ describe('git spec approval gate verdicts', () => {
       reviewRound: 1,
     });
     expect(pendingSpecVerdict(rejected!)).toBeUndefined();
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
     expect(driver.ops.filter(op => op.op === 'comment')).toHaveLength(1);
   });
 
   it('rejects an oversized spec verdict before persisting an outbox operation or invoking the driver', async () => {
     await seedSpecGate({ specReviewRound: 1 });
-    const dispatch = vi.spyOn(manager, 'dispatchGitFixToDev');
+    await seedDevAgent();
 
     await expect(submitChanges('x'.repeat(COMMENT_BODY_MAX_BYTES)))
       .rejects.toMatchObject({ status: 400 });
 
     expect(pendingSpecVerdict((await taskStore.get('task-1'))!)).toBeUndefined();
     expect(driver.ops).toEqual([]);
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
   });
 });
 
@@ -1436,26 +1497,24 @@ describe('processGitRemoteCleanup', () => {
       if (taskId === 'task-1') throw new Error('first task failed');
       return realProcess(taskId, generation);
     });
-    const intervention = vi.spyOn(
-      manager as unknown as {
-        emitIntervention: (...args: unknown[]) => Promise<void>;
-      },
-      'emitIntervention',
-    );
+    const interventions = () => events.filter(e => e.type === 'human.intervention');
 
     await manager.retryGitRemoteCleanupIntents();
 
     expect(process.mock.calls.map(call => call[0])).toEqual(['task-1', 'task-2']);
-    expect(intervention).toHaveBeenCalledWith('proj', 'dev-1', 'task-1', expect.objectContaining({
-      phase: 'remote-cleanup-failed', stage: 'delete-pending', kind: 'probe',
-      message: expect.stringContaining('first task failed'),
-    }));
+    expect(interventions()).toEqual([expect.objectContaining({
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: expect.objectContaining({
+        phase: 'remote-cleanup-failed', stage: 'delete-pending', kind: 'probe',
+        message: expect.stringContaining('first task failed'),
+      }),
+    })]);
     expect((await taskStore.get('task-2'))?.remoteCleanup).toBeUndefined();
     expect((await taskStore.get('task-3'))?.remoteCleanup?.stage).toBe('manual');
 
-    const interventionCount = intervention.mock.calls.length;
+    const interventionCount = interventions().length;
     await manager.retryGitRemoteCleanupIntents();
-    expect(intervention).toHaveBeenCalledTimes(interventionCount);
+    expect(interventions()).toHaveLength(interventionCount);
   });
 });
 
@@ -1739,12 +1798,14 @@ describe('git QA dispatch anchoring', () => {
     await seed({
       status: 'review', signalToken: 'ffff00001111', reviewRound: 1,
     });
-    const acquire = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    await seedQaAgent();
     driver.prViewResult = new Error('HTTP 502');
-    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toThrow('HTTP 502');
-    expect(acquire).not.toHaveBeenCalled();
-    expect(release).not.toHaveBeenCalled();
+    expect(await agentStore.get('qa-1')).toMatchObject({ id: 'qa-1' });
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
+    expect(pastedPanes()).toEqual([]);
     expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
   });
 });
@@ -1760,7 +1821,6 @@ describe('git review lease outcomes', () => {
       deliveryConfirmation: { phase: 'spec', source: 'signal', at: TS },
       reviewDispatch: undefined,
     });
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockResolvedValue({} as TaskState);
 
     await manager.retryPendingGitReviewDispatches();
 
@@ -1768,17 +1828,14 @@ describe('git review lease outcomes', () => {
     expect(recovered).toMatchObject({
       status: 'review',
       phase: 'spec',
-      reviewRoundPending: true,
-      reviewDispatch: {
-        phase: 'pending',
-        qaPhase: 'review',
-        headSha: SHA1,
-        effectiveRound: 1,
-      },
+      latestHeadSha: SHA1,
+      specReviewRound: 1,
+      reviewDispatchedAt: expect.any(String),
     });
-    expect(dispatch).toHaveBeenCalledWith('task-1', {
-      expectedGeneration: recovered!.reviewDispatch!.generation,
-    });
+    expect(recovered?.reviewRoundPending).toBeUndefined();
+    expect(recovered?.reviewDispatch).toBeUndefined();
+    expect(pastedPanes()).toEqual(['%1']);
+    expect(await agentStore.get('qa-1')).toMatchObject({ taskId: 'task-1', paneId: '%1' });
   });
 
   it('reports an invalid binding once while preserving a confirmed delivery for recovery', async () => {
@@ -1792,17 +1849,12 @@ describe('git review lease outcomes', () => {
       reviewDispatch: undefined,
     });
     driver.prViewResult = prRow({ draft: true });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    const emit = vi.spyOn(bus, 'emit');
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
     await manager.retryPendingGitReviewDispatches();
 
-    const alerts = emit.mock.calls
-      .map(([event]) => event)
-      .filter(event => event.type === 'human.intervention'
-        && event.data.phase === 'git-review-delivery-binding-invalid');
+    const alerts = events.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-delivery-binding-invalid');
     expect(alerts).toHaveLength(1);
     expect(alerts[0]?.data).toMatchObject({
       reason: 'draft',
@@ -1815,7 +1867,7 @@ describe('git review lease outcomes', () => {
       signalToken: 'confirmed-spec-token',
     });
     expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
   });
 
   it('does not report an obsolete binding failure after the delivery generation changes', async () => {
@@ -1837,15 +1889,11 @@ describe('git review lease outcomes', () => {
       });
       return { ok: false, reason: 'draft' };
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    const emit = vi.spyOn(bus, 'emit');
 
     await manager.retryPendingGitReviewDispatches();
 
-    expect(emit.mock.calls
-      .map(([event]) => event)
-      .filter(event => event.type === 'human.intervention'
-        && event.data.phase === 'git-review-delivery-binding-invalid')).toHaveLength(0);
+    expect(events.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-delivery-binding-invalid')).toHaveLength(0);
     expect(await taskStore.get('task-1')).toMatchObject({
       status: 'in_progress',
       signalToken: 'successor-spec-token',
@@ -1862,7 +1910,6 @@ describe('git review lease outcomes', () => {
       deliveryConfirmation: undefined,
       reviewDispatch: undefined,
     });
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
 
@@ -1871,7 +1918,7 @@ describe('git review lease outcomes', () => {
       phase: 'spec',
     });
     expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
   });
 
   it('allows only one dispatcher to claim and start the same generation', async () => {
@@ -1879,8 +1926,6 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    const acquire = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const start = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
     const generation = begun!.task.reviewDispatch!.generation;
 
     const outcomes = await Promise.allSettled([
@@ -1890,8 +1935,8 @@ describe('git review lease outcomes', () => {
 
     expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
     expect(outcomes.filter(outcome => outcome.status === 'rejected')).toHaveLength(1);
-    expect(acquire).toHaveBeenCalledTimes(1);
-    expect(start).toHaveBeenCalledTimes(1);
+    expect(pastedPanes()).toEqual(['%1']);
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
   });
 
   it('does not release a successor QA binding after the claimed pass is superseded', async () => {
@@ -1945,7 +1990,6 @@ describe('git review lease outcomes', () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: 'task-1', lockToken: devLock!, updatedAt: TS,
     });
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
 
     const realGet = agentStore.get.bind(agentStore);
     let successorGeneration: string | undefined;
@@ -1999,11 +2043,10 @@ describe('git review lease outcomes', () => {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
     driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
 
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
     expect((await taskStore.get('task-1'))?.reviewDispatch).toMatchObject({
       generation: begun!.task.reviewDispatch!.generation,
       phase: 'pending',
@@ -2017,18 +2060,13 @@ describe('git review lease outcomes', () => {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
     driver.prViewResult = prRow({ draft: true });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    const emit = vi.spyOn(bus, 'emit');
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
     driver.prViewResult = prRow({ state: 'closed' });
     await manager.retryPendingGitReviewDispatches();
 
-    const alerts = emit.mock.calls
-      .map(([event]) => event)
-      .filter(event => event.type === 'human.intervention'
-        && event.data.phase === 'git-review-lease-binding-invalid');
+    const alerts = events.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-lease-binding-invalid');
     expect(alerts).toHaveLength(1);
     expect(alerts[0]?.data).toMatchObject({
       reason: 'draft',
@@ -2038,7 +2076,7 @@ describe('git review lease outcomes', () => {
       qaPhase: begun!.task.reviewDispatch!.qaPhase,
     });
     expect((await taskStore.get('task-1'))?.reviewDispatch).toEqual(begun!.task.reviewDispatch);
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
   });
 
   it('does not report an obsolete pending-lease binding failure after its generation changes', async () => {
@@ -2057,30 +2095,28 @@ describe('git review lease outcomes', () => {
       successorGeneration = successor!.task.reviewDispatch!.generation;
       return { ok: false, reason: 'draft' };
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    const emit = vi.spyOn(bus, 'emit');
 
     await manager.retryPendingGitReviewDispatches();
 
-    expect(emit.mock.calls
-      .map(([event]) => event)
-      .filter(event => event.type === 'human.intervention'
-        && event.data.phase === 'git-review-lease-binding-invalid')).toHaveLength(0);
+    expect(events.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-lease-binding-invalid')).toHaveLength(0);
     expect((await taskStore.get('task-1'))?.reviewDispatch?.generation).toBe(successorGeneration);
   });
 
   it('fails a pending lease when its retry hits a terminal dispatch error', async () => {
-    await seed({ status: 'review', reviewRound: 1, signalToken: 'ffff00001111' });
+    // 提示词超过 MAX_PROMPT_BYTES:真实 dispatch 在 runner 之前就抛 prompt_too_large
+    await seed({
+      status: 'review', reviewRound: 1, signalToken: 'ffff00001111',
+      description: 'x'.repeat(90 * 1024),
+    });
     await manager.beginGitReviewPass('task-1', {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
-    vi.spyOn(manager, 'dispatchGitReviewLease').mockRejectedValue(
-      new DispatchTerminalError('prompt_too_large', 'QA prompt too large'),
-    );
 
     await manager.retryPendingGitReviewDispatches();
 
     expect((await taskStore.get('task-1'))?.status).toBe('failed');
+    expect(pastedPanes()).toEqual([]);
   });
 
   it('marks an ack_unknown claim uncertain so the sweep cannot double-dispatch it', async () => {
@@ -2088,39 +2124,29 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    const start = vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
 
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
 
+    // 故障确实落在「已投递、提交未确认」这一阶段:轨迹里 paste-buffer 先于被拒的 Enter
+    expect(traceOrder('paste-buffer', /send-keys -t %1 .*Enter/)).toBe(true);
     expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('uncertain');
     expect(await agentStore.get('qa-1')).toMatchObject({
       taskId: 'task-1',
       status: 'awaiting_human',
       awaitingPhase: 'dispatch-failed:ack_unknown',
     });
-    const retry = vi.spyOn(manager, 'dispatchGitReviewLease');
     await manager.retryPendingGitReviewDispatches();
-    expect(retry).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual(['%1']);
 
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toMatchObject({
       status: 409, code: 'dispatch-uncertain',
     });
-    const intervention = vi.spyOn(
-      manager as unknown as {
-        emitIntervention: (
-          projectId: string,
-          agentId: string | undefined,
-          taskId: string | undefined,
-          data: Record<string, unknown> & { phase: string },
-        ) => Promise<boolean>;
-      },
-      'emitIntervention',
-    );
-    start.mockResolvedValue(true);
+    const seenBefore = events.length;
+    deliverNormally();
     driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
     const manual = await manager.dispatchReviewToQa('task-1', {
       confirmUncertainNotDelivered: true,
@@ -2130,14 +2156,17 @@ describe('git review lease outcomes', () => {
     expect(manual.reviewRound).toBe(1);
     expect(manual.latestHeadSha).toBe('b'.repeat(40));
     expect(manual.reviewHeadAnchorSha).toBe('b'.repeat(40));
-    expect(start).toHaveBeenCalledTimes(2);
+    expect(pastedPanes()).toEqual(['%1', '%1']);
     expect(await agentStore.get('qa-1')).toMatchObject({ taskId: 'task-1' });
     expect((await agentStore.get('qa-1'))?.awaitingPhase).toBeUndefined();
-    expect(intervention).toHaveBeenCalledWith('proj', 'qa-1', 'task-1', {
-      phase: 'git-review-dispatch-hold-cleared',
-      previousPhase: 'dispatch-failed:ack_unknown',
-      generation: begun!.task.reviewDispatch!.generation,
-    });
+    expect(events.slice(seenBefore)).toContainEqual(expect.objectContaining({
+      type: 'human.intervention', projectId: 'proj', agentId: 'qa-1', taskId: 'task-1',
+      data: {
+        phase: 'git-review-dispatch-hold-cleared',
+        previousPhase: 'dispatch-failed:ack_unknown',
+        generation: begun!.task.reviewDispatch!.generation,
+      },
+    }));
   });
 
   it('retires an old-head code verdict before confirming an uncertain dispatch on a new head', async () => {
@@ -2145,9 +2174,8 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    const start = vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
@@ -2167,7 +2195,7 @@ describe('git review lease outcomes', () => {
       }],
     });
     driver.prViewResult = prRow({ headSha: 'b'.repeat(40) });
-    start.mockResolvedValue(true);
+    deliverNormally();
 
     const confirmed = await manager.dispatchReviewToQa('task-1', {
       confirmUncertainNotDelivered: true,
@@ -2183,20 +2211,17 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
-    const clear = vi.spyOn(manager, 'clearAwaitingHuman');
     vi.spyOn(taskStore, 'set').mockRejectedValueOnce(new Error('task store unavailable'));
 
     await expect(manager.dispatchReviewToQa('task-1', {
       confirmUncertainNotDelivered: true,
     })).rejects.toThrow('task store unavailable');
 
-    expect(clear).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('uncertain');
     expect(await agentStore.get('qa-1')).toMatchObject({
       status: 'awaiting_human',
@@ -2209,9 +2234,8 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    const start = vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
@@ -2221,7 +2245,7 @@ describe('git review lease outcomes', () => {
       confirmUncertainNotDelivered: true,
     })).rejects.toMatchObject({ status: 409 });
 
-    expect(start).toHaveBeenCalledTimes(1);
+    expect(pastedPanes()).toEqual(['%1']);
     expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('uncertain');
     expect(await agentStore.get('qa-1')).toMatchObject({
       status: 'awaiting_human',
@@ -2234,30 +2258,17 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
     const uncertain = (await taskStore.get('task-1'))!;
-    const internal = manager as unknown as {
-      confirmUncertainGitReviewDispatch: (
-        taskId: string,
-        expectedGeneration: string,
-        verifiedHeadSha: string,
-      ) => Promise<TaskState | null>;
-    };
-    const confirm = internal.confirmUncertainGitReviewDispatch.bind(internal);
-    vi.spyOn(internal, 'confirmUncertainGitReviewDispatch').mockImplementationOnce(async (...args) => {
-      const confirmed = await confirm(...args);
-      const drifted = {
-        ...confirmed!,
-        specReviewRound: 1,
-        updatedAt: new Date().toISOString(),
-      };
-      await taskStore.set(drifted);
-      return drifted;
+    // 绑定复核(平台边界)与确认写之间任务代际漂移:确认照样落盘,随后的 route 护栏才拒绝
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockImplementationOnce(async () => {
+      const current = (await taskStore.get('task-1'))!;
+      await taskStore.set({ ...current, specReviewRound: 1, updatedAt: new Date().toISOString() });
+      return { ok: true, prUrl: 'https://github.com/owner/repo/pull/42', headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main' };
     });
     const onSideEffect = vi.fn();
 
@@ -2290,14 +2301,22 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    const start = vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
-    vi.spyOn(manager, 'clearAwaitingHuman').mockResolvedValueOnce(false);
-    const writes = vi.spyOn(taskStore, 'set');
+    // 确认写落盘后、清 hold 之前 QA hold 被换掉 → clearAwaitingHuman 失败,确认整体回滚
+    const realSet = taskStore.set.bind(taskStore);
+    let holdRaced = false;
+    const writes = vi.spyOn(taskStore, 'set').mockImplementation(async (next) => {
+      await realSet(next);
+      if (!holdRaced && next.reviewDispatch?.phase === 'pending') {
+        holdRaced = true;
+        const held = (await agentStore.get('qa-1'))!;
+        await agentStore.set({ ...held, awaitingNonce: 'raced-hold', updatedAt: new Date().toISOString() });
+      }
+    });
 
     await expect(manager.dispatchReviewToQa('task-1', {
       confirmUncertainNotDelivered: true,
@@ -2308,7 +2327,7 @@ describe('git review lease outcomes', () => {
       phase: 'uncertain',
       generation: begun!.task.reviewDispatch!.generation,
     });
-    expect(start).toHaveBeenCalledTimes(1);
+    expect(pastedPanes()).toEqual(['%1']);
   });
 
   it('recovers a persisted pending lease when its ack-unknown QA hold survived a crash', async () => {
@@ -2316,9 +2335,8 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
@@ -2333,11 +2351,10 @@ describe('git review lease outcomes', () => {
       reviewDispatch: { ...pendingLease, phase: 'pending', updatedAt: new Date().toISOString() },
       updatedAt: new Date().toISOString(),
     });
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
 
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual(['%1']);
     expect((await taskStore.get('task-1'))?.reviewDispatch).toMatchObject({
       phase: 'uncertain',
       generation: begun!.task.reviewDispatch!.generation,
@@ -2352,8 +2369,6 @@ describe('git review lease outcomes', () => {
     });
     const staleDispatchTime = '2020-01-01T00:00:00.000Z';
     await taskStore.set({ ...begun!.task, reviewDispatchedAt: staleDispatchTime });
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
     await manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
@@ -2362,6 +2377,10 @@ describe('git review lease outcomes', () => {
     const delivered = await taskStore.get('task-1');
     expect(delivered?.reviewDispatch).toBeUndefined();
     expect(Date.parse(delivered!.reviewDispatchedAt!)).toBeGreaterThan(Date.parse(staleDispatchTime));
+    expect(pastedPanes()).toEqual(['%1']);
+    // adopt 路径的真实轨迹:找到会话 → 暂存 → 守卫通过的 paste → 守卫通过的 Enter
+    expect(runner.execWithStdin.mock.calls[0]?.[0]).toContain('load-buffer');
+    expect(traceOrder('list-sessions', 'paste-buffer', /send-keys -t %1 .*Enter/)).toBe(true);
   });
 
   it('does not replace an uncertain lease while QA still holds its unknown-delivery prompt', async () => {
@@ -2369,9 +2388,8 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
@@ -2399,9 +2417,8 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
-    const start = vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
-      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
-    );
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown
+    failAckAfterPaste();
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
@@ -2420,7 +2437,7 @@ describe('git review lease outcomes', () => {
 
     expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('uncertain');
     expect((await agentStore.get('qa-1'))?.awaitingPhase).toBe('branch-cleanup-pending');
-    expect(start).toHaveBeenCalledTimes(1);
+    expect(pastedPanes()).toEqual(['%1']);
   });
 
   it('does not place an ack-unknown hold after the claimed lease was superseded', async () => {
@@ -2429,24 +2446,22 @@ describe('git review lease outcomes', () => {
       fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
     });
     const oldLease = begun!.task.reviewDispatch!;
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+    // 投递途中新一轮 review pass 取代了这张 lease,随后的 ack_unknown 不得再落 QA hold
+    execHook = async (command) => {
+      if (refuseSendKeys || !command.includes('paste-buffer')) return;
+      refuseSendKeys = true;
       await manager.beginGitReviewPass('task-1', {
         fromStatus: ['review'], headSha: SHA1, bumpRound: true,
         expectSignalToken: oldLease.signalToken,
       });
-      throw new DispatchTerminalError('ack_unknown', 'late delivery outcome');
-    });
-    const hold = vi.spyOn(
-      manager as unknown as { markAwaitingIfAckUnknown: () => Promise<void> },
-      'markAwaitingIfAckUnknown',
-    ).mockResolvedValue();
+    };
 
     await expect(manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: oldLease.generation,
     })).rejects.toMatchObject({ reason: 'ack_unknown' });
 
-    expect(hold).not.toHaveBeenCalled();
+    expect((await agentStore.get('qa-1'))?.status).not.toBe('awaiting_human');
+    expect((await agentStore.get('qa-1'))?.awaitingPhase).toBeUndefined();
     expect((await taskStore.get('task-1'))?.reviewDispatch?.generation).not.toBe(oldLease.generation);
     expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
   });
@@ -2456,28 +2471,33 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['review'], headSha: SHA1, bumpRound: true,
     });
-    const claimed = await manager.claimGitReviewDispatch(
-      'task-1', begun!.task.reviewDispatch!.generation,
-    );
-    const approved = await manager.approveGitReviewPass('task-1', {
-      expectedSignalToken: claimed!.lease.signalToken,
-      headSha: SHA1,
-      reviewRound: claimed!.lease.effectiveRound,
-      provenance: {
-        sourceKey: 'reviews', id: 'r1',
-        token: claimed!.lease.passToken, failToken: claimed!.lease.failToken, anchorSha: SHA1,
-      },
-    });
-    const lateCleanup = manager as unknown as {
-      completeGitReviewDispatch: (
-        taskId: string, lease: NonNullable<TaskState['reviewDispatch']>,
-      ) => Promise<boolean>;
+    const lease = begun!.task.reviewDispatch!;
+    let approved: TaskState | null = null;
+    // 提交回车已发出、投递收尾之前,裁决先把这张 claimed lease 吃掉
+    execHook = async (command) => {
+      if (approved !== null || !/send-keys -t %1 .*Enter/.test(command)) return;
+      approved = await manager.approveGitReviewPass('task-1', {
+        expectedSignalToken: lease.signalToken,
+        headSha: SHA1,
+        reviewRound: lease.effectiveRound,
+        provenance: {
+          sourceKey: 'reviews', id: 'r1',
+          token: lease.passToken, failToken: lease.failToken, anchorSha: SHA1,
+        },
+      });
     };
 
-    expect(await lateCleanup.completeGitReviewDispatch('task-1', claimed!.lease)).toBe(false);
+    await manager.dispatchGitReviewLease('task-1', { expectedGeneration: lease.generation });
+
     expect(approved).toMatchObject({ status: 'approved', reviewRound: 2 });
-    expect(approved?.reviewDispatch).toBeUndefined();
-    expect((await taskStore.get('task-1'))?.postApproveGeneration).toMatch(/^[0-9a-f]{12}$/);
+    expect(pastedPanes()).toEqual(['%1']);
+    const stored = await taskStore.get('task-1');
+    expect(stored).toMatchObject({ status: 'approved', reviewRound: 2 });
+    expect(stored?.reviewDispatch).toBeUndefined();
+    // 迟到的收尾不得再改这条记录:轮次不二次递增、投递时刻不被重盖
+    expect(stored?.reviewDispatchedAt).toBe(approved!.reviewDispatchedAt);
+    expect(stored?.reviewRoundPending).toBeUndefined();
+    expect(stored?.postApproveGeneration).toMatch(/^[0-9a-f]{12}$/);
   });
 
   it('clears an uncertain-recovery attention after the matching review dispatch completes', async () => {
@@ -2485,10 +2505,6 @@ describe('git review lease outcomes', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
-    const claimed = await manager.claimGitReviewDispatch(
-      'task-1',
-      begun!.task.reviewDispatch!.generation,
-    );
     const current = (await taskStore.get('task-1'))!;
     await taskStore.set({
       ...current,
@@ -2500,41 +2516,54 @@ describe('git review lease outcomes', () => {
         generation: taskAttentionGeneration(current),
       },
     });
-    const internal = manager as unknown as {
-      completeGitReviewDispatch: (
-        taskId: string,
-        lease: NonNullable<TaskState['reviewDispatch']>,
-      ) => Promise<boolean>;
-    };
 
-    await expect(internal.completeGitReviewDispatch('task-1', claimed!.lease)).resolves.toBe(true);
+    await manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    });
 
-    expect((await taskStore.get('task-1'))?.attention).toBeUndefined();
+    const delivered = await taskStore.get('task-1');
+    expect(delivered?.attention).toBeUndefined();
+    expect(delivered?.reviewDispatch).toBeUndefined();
+    expect(delivered?.reviewDispatchedAt).toEqual(expect.any(String));
+    expect(pastedPanes()).toEqual(['%1']);
   });
 });
 
 describe('confirm merge recovery routing', () => {
-  const execute = (task: TaskState, error: PlatformMergeRecheckError) => (
-    manager as unknown as {
-      executeConfirmMerge: (current: TaskState, merge: () => Promise<void>) => Promise<void>;
-    }
-  ).executeConfirmMerge(task, async () => { throw error; });
+  // merge=auto 下 confirmHumanGate 是确认合并及其回退路由的公共入口
+  function autoMergeManager(): AgentManager {
+    const m = createManager({
+      config: makeConfig({ ...config, project: [{ ...config.project[0], merge: 'auto' }] }),
+    });
+    vi.spyOn(m, 'platformDriverFor').mockReturnValue(driver as unknown as PlatformDriver);
+    return m;
+  }
 
   it('routes pending feedback back to a generated dev post-approve episode', async () => {
-    const task = await seed({ status: 'merge-ready', latestHeadSha: SHA1 });
-    await expect(execute(task, new PlatformMergeRecheckError('pending-feedback', 'one reply is unacked')))
-      .rejects.toMatchObject({ status: 409 });
+    await seed({ status: 'merge-ready', latestHeadSha: SHA1, passProvenance: provenanceFor() });
+    seedAcceptedPass();
+    driver.comments['issue-comments'] = [comment('c1', 'one reply is unacked', { authorId: '5' })];
+
+    await expect(autoMergeManager().confirmHumanGate('task-1')).rejects.toMatchObject({ status: 409 });
 
     expect(await taskStore.get('task-1')).toMatchObject({
       status: 'approved', postApproveHeadSha: SHA1, postApprovePhase: 'installed',
       pendingRedispatch: true, redispatchCount: 0,
     });
+    expect(driver.ops.some(op => op.op === 'merge')).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'human.intervention',
+      taskId: 'task-1',
+      data: expect.objectContaining({
+        phase: 'confirm-merge-recheck-failed', kind: 'pending-feedback', retreated: true,
+      }),
+    }));
   });
 
   it('routes invalid provenance back to a generated QA review lease', async () => {
-    const task = await seed({ status: 'merge-ready', latestHeadSha: SHA1 });
-    await expect(execute(task, new PlatformMergeRecheckError('provenance-invalid', 'pass body changed')))
-      .rejects.toMatchObject({ status: 409 });
+    await seed({ status: 'merge-ready', latestHeadSha: SHA1, passProvenance: undefined });
+
+    await expect(autoMergeManager().confirmHumanGate('task-1')).rejects.toMatchObject({ status: 409 });
 
     const recovered = await taskStore.get('task-1');
     expect(recovered).toMatchObject({
@@ -2542,34 +2571,56 @@ describe('confirm merge recovery routing', () => {
       reviewDispatch: { phase: 'pending', headSha: SHA1, effectiveRound: 2 },
     });
     expect(recovered?.postApproveGeneration).toBeUndefined();
+    expect(driver.ops.some(op => op.op === 'merge')).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'human.intervention',
+      taskId: 'task-1',
+      data: expect.objectContaining({
+        phase: 'confirm-merge-recheck-failed', kind: 'provenance-invalid', retreated: true,
+      }),
+    }));
   });
 
   it('does not retreat a successor merge gate for a stale recheck failure', async () => {
-    const entry = await seed({
+    await seed({
       status: 'merge-ready', latestHeadSha: SHA1, signalToken: 'aaaa11112222',
+      passProvenance: provenanceFor(),
     });
-    await taskStore.set({
-      ...entry,
-      signalToken: 'bbbb11112222',
-      updatedAt: new Date().toISOString(),
-    });
+    seedAcceptedPass();
+    driver.comments['issue-comments'] = [comment('c1', 'wait, one more thing', { authorId: '5' })];
+    // 复核期间任务代际前进:回退必须认出自己手里是旧快照
+    driver.onPrView = async () => {
+      const current = (await taskStore.get('task-1'))!;
+      if (current.signalToken === 'bbbb11112222') return;
+      await taskStore.set({
+        ...current, signalToken: 'bbbb11112222', updatedAt: new Date().toISOString(),
+      });
+    };
 
-    await expect(execute(entry, new PlatformMergeRecheckError('pending-feedback', 'stale scan result')))
-      .rejects.toMatchObject({ status: 409 });
+    await expect(autoMergeManager().confirmHumanGate('task-1')).rejects.toMatchObject({ status: 409 });
 
     const successor = await taskStore.get('task-1');
     expect(successor).toMatchObject({ status: 'merge-ready', signalToken: 'bbbb11112222' });
     expect(successor?.postApproveGeneration).toBeUndefined();
     expect(successor?.reviewDispatch).toBeUndefined();
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'human.intervention',
+      taskId: 'task-1',
+      data: expect.objectContaining({ phase: 'confirm-merge-recheck-failed', retreated: false }),
+    }));
   });
 
   it('provenance recovery treats missing phase and token as an exact merge-gate tuple', async () => {
-    const entry = await seed({
+    await seed({
       status: 'merge-ready', latestHeadSha: SHA1, phase: undefined, signalToken: undefined,
+      passProvenance: undefined,
     });
-    const realBegin = manager.beginGitReviewPass.bind(manager);
+    const m = autoMergeManager();
+    const realBegin = m.beginGitReviewPass.bind(m);
     let capturedOptions: Record<string, unknown> | undefined;
-    vi.spyOn(manager, 'beginGitReviewPass').mockImplementation(async (taskId, options) => {
+    // E2: 「读到 fresh 与 beginGitReviewPass 取锁之间任务漂移」在 runner/平台层没有任何可挂钩的命令,
+    // 只能在该调用处注入交错
+    vi.spyOn(m, 'beginGitReviewPass').mockImplementation(async (taskId, options) => {
       capturedOptions = options;
       const current = await taskStore.get(taskId);
       await taskStore.set({
@@ -2578,8 +2629,7 @@ describe('confirm merge recovery routing', () => {
       return realBegin(taskId, options);
     });
 
-    await expect(execute(entry, new PlatformMergeRecheckError('provenance-invalid', 'pass body changed')))
-      .rejects.toMatchObject({ status: 409 });
+    await expect(m.confirmHumanGate('task-1')).rejects.toMatchObject({ status: 409 });
 
     expect(Object.hasOwn(capturedOptions ?? {}, 'expectPhase')).toBe(true);
     expect(Object.hasOwn(capturedOptions ?? {}, 'expectSignalToken')).toBe(true);
@@ -2622,12 +2672,11 @@ describe('manual dispatch binding recheck', () => {
     });
     const verify = vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true,
+      prUrl: 'https://github.com/owner/repo/pull/42',
       headSha: SHA1,
       branch: 'bx/task-1',
       targetBranch: 'main',
     });
-    vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
-      (await taskStore.get('task-1'))!);
 
     const result = await manager.dispatchReviewToQa('task-1', {
       stage: 'spec',
@@ -2638,12 +2687,12 @@ describe('manual dispatch binding recheck', () => {
       phase: 'spec',
       deliveryConfirmation: { phase: 'spec', source: 'human' },
       reviewRound: 0,
-      reviewDispatch: {
-        phase: 'pending',
-        effectiveRound: 1,
-      },
+      // effectiveRound 1 的 spec lease 交付后落在 specReviewRound 上
+      specReviewRound: 1,
     });
-    expect(result.specReviewRound ?? 0).toBe(0);
+    expect(result.reviewDispatch).toBeUndefined();
+    expect(await taskStore.get('task-1')).toEqual(result);
+    expect(pastedPanes()).toEqual(['%1']);
     expect(verify).toHaveBeenCalledTimes(2);
   });
 
@@ -2657,12 +2706,11 @@ describe('manual dispatch binding recheck', () => {
     });
     const verify = vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true,
+      prUrl: 'https://github.com/owner/repo/pull/42',
       headSha: SHA1,
       branch: 'bx/task-1',
       targetBranch: 'main',
     });
-    vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
-      (await taskStore.get('task-1'))!);
 
     const result = await manager.dispatchReviewToQa('task-1', {
       stage: 'code',
@@ -2672,8 +2720,10 @@ describe('manual dispatch binding recheck', () => {
       status: 'review',
       phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'human' },
-      reviewDispatch: { phase: 'pending', effectiveRound: 2 },
+      reviewRound: 2,
     });
+    expect(result.reviewDispatch).toBeUndefined();
+    expect(pastedPanes()).toEqual(['%1']);
     expect(verify).toHaveBeenCalledTimes(2);
   });
 
@@ -2689,6 +2739,7 @@ describe('manual dispatch binding recheck', () => {
       await manager.updateTask('task-1', { signalToken: 'eeee99990000' });
       return {
         ok: true,
+        prUrl: 'https://github.com/owner/repo/pull/42',
         headSha: SHA1,
         branch: 'bx/task-1',
         targetBranch: 'main',
@@ -2724,8 +2775,6 @@ describe('manual dispatch binding recheck', () => {
       prUrl: 'https://github.com/owner/repo/pull/73',
       branch: 'feature/manual-review',
     });
-    vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
-      (await taskStore.get('task-1'))!);
 
     const result = await manager.dispatchReviewToQa('task-1', {
       prNumber: 73,
@@ -2739,8 +2788,10 @@ describe('manual dispatch binding recheck', () => {
       branch: 'feature/manual-review',
       phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'human' },
-      reviewDispatch: { phase: 'pending', effectiveRound: 1 },
+      reviewRound: 1,
     });
+    expect(result.reviewDispatch).toBeUndefined();
+    expect(pastedPanes()).toEqual(['%1']);
     expect(driver.ops.filter(op => op.op === 'prView').map(op => op.vars))
       .toEqual([{ prNumber: 73 }, { prNumber: 73 }]);
   });
@@ -2817,17 +2868,14 @@ describe('manual dispatch binding recheck', () => {
       signalToken: 'ffff00001111',
       reviewDispatch: undefined,
     });
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () => {
-      return (await taskStore.get('task-1'))!;
-    });
 
     const result = await manager.dispatchReviewToQa('task-1', { bumpRound: false });
 
     expect(result.reviewRound).toBe(2);
-    expect(result.reviewDispatch).toMatchObject({ effectiveRound: 2 });
-    expect(dispatch).toHaveBeenCalledWith('task-1', expect.objectContaining({
-      expectedGeneration: result.reviewDispatch?.generation,
-    }));
+    expect(result.reviewDispatch).toBeUndefined();
+    expect(result.reviewRoundPending).toBeUndefined();
+    expect(pastedPanes()).toEqual(['%1']);
+    expect(await taskStore.get('task-1')).toEqual(result);
   });
 
   it('rejects a stale route guard before verifying the PR binding', async () => {
@@ -2865,7 +2913,6 @@ describe('manual dispatch binding recheck', () => {
     const begun = await manager.beginGitReviewPass('task-1', {
       fromStatus: ['review'], headSha: SHA1, bumpRound: true,
     });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
     const result = await manager.dispatchReviewToQa('task-1', {
       expectedTask: {
@@ -2887,6 +2934,7 @@ describe('manual dispatch binding recheck', () => {
     expect(result.reviewRoundPending).toBeUndefined();
     expect(result.reviewDispatch).toBeUndefined();
     expect(await taskStore.get('task-1')).toEqual(result);
+    expect(pastedPanes()).toEqual(['%1']);
   });
 
   it('restores a claimed git lease and reports unsupported if the QA hold races the route precheck', async () => {
@@ -2932,10 +2980,12 @@ describe('manual dispatch binding recheck', () => {
       status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
       awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    vi.spyOn(bus, 'emit').mockImplementation(event => manager.recordTaskAttention(event).then(() => true));
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    const bus = eventBus;
+    const passThroughEmit = bus.emit.bind(bus);
+    vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
+      if (event.type !== 'human.intervention') return passThroughEmit(event);
+      await manager.recordTaskAttention(event);
+    });
 
     await manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
@@ -2969,11 +3019,13 @@ describe('manual dispatch binding recheck', () => {
       status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
       awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
+    const bus = eventBus;
+    const passThroughEmit = bus.emit.bind(bus);
+    vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
+      if (event.type !== 'human.intervention') return passThroughEmit(event);
+      throw new Error('event log write failed');
+    });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
     await manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
@@ -3007,16 +3059,17 @@ describe('manual dispatch binding recheck', () => {
       status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
       awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
+    const bus = eventBus;
+    const passThroughEmit = bus.emit.bind(bus);
+    vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
+      if (event.type !== 'human.intervention') return passThroughEmit(event);
+      throw new Error('event log write failed');
+    });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    // 提示词落盘之后参与方状态读不出来:收尾照常完成,陈旧告警只能留着
     let promptDelivered = false;
-    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
-      promptDelivered = true;
-      return true;
-    });
+    execHook = (command) => { if (command.includes('paste-buffer')) promptDelivered = true; };
     const realGet = agentStore.get.bind(agentStore);
     vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
       if (promptDelivered) throw new Error('agent state unreadable');
@@ -3057,8 +3110,6 @@ describe('manual dispatch binding recheck', () => {
       status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
       awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
     });
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
     const realSet = taskStore.set.bind(taskStore);
     vi.spyOn(taskStore, 'set').mockImplementation(async (next) => {
       if (next.reviewDispatch === undefined && next.reviewDispatchedAt !== undefined) {
@@ -3099,11 +3150,16 @@ describe('manual dispatch binding recheck', () => {
       awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
     });
     let laterAlert = '';
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
+    const bus = eventBus;
+    const passThroughEmit = bus.emit.bind(bus);
     vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
-      if (event.data.phase !== 'git-review-dispatch-hold-cleared') {
-        throw new Error('event log write failed');
-      }
+      if (event.type !== 'human.intervention') return passThroughEmit(event);
+      throw new Error('event log write failed');
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // 提示词投递途中同一相位的 hold 与告警又被举起
+    execHook = async (command) => {
+      if (laterAlert !== '' || !command.includes('paste-buffer')) return;
       laterAlert = new Date().toISOString();
       const liveQa = (await agentStore.get('qa-1'))!;
       await agentStore.set({
@@ -3120,11 +3176,7 @@ describe('manual dispatch binding recheck', () => {
         ...live,
         attention: { ...live.attention!, runbook: 'raised again mid-delivery', occurredAt: laterAlert },
       });
-      throw new Error('event log write failed');
-    });
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    };
 
     await manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
@@ -3156,17 +3208,25 @@ describe('manual dispatch binding recheck', () => {
       status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
       awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
+    const bus = eventBus;
+    const passThroughEmit = bus.emit.bind(bus);
+    vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
+      if (event.type !== 'human.intervention') return passThroughEmit(event);
+      throw new Error('event log write failed');
+    });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    // E2: startSession 「不抛错但返回 false」只来自状态机内部的护栏短路(绑定在提交瞬间消失),
+    // runner 层造不出这一类结果
     vi.spyOn(manager, 'startSession').mockResolvedValueOnce(false).mockResolvedValue(true);
 
     const generation = begun!.task.reviewDispatch!.generation;
     await expect(manager.dispatchGitReviewLease('task-1', { expectedGeneration: generation }))
       .rejects.toThrow(/Failed to start git QA review session/);
     expect((await agentStore.get('qa-1'))?.status).not.toBe('awaiting_human');
+    // 派单失败必须把本次取得的 QA 绑定与锁交还
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
     expect((await taskStore.get('task-1'))?.attention?.reason).toBe('branch-cleanup-pending');
 
     await manager.dispatchGitReviewLease('task-1', { expectedGeneration: generation });
@@ -3184,16 +3244,10 @@ describe('manual dispatch binding recheck', () => {
       fromStatus: ['review'], headSha: SHA1, bumpRound: false,
     });
     const generation = begun!.task.reviewDispatch!.generation;
-    const claimed = await manager.claimGitReviewDispatch('task-1', generation);
-    const internal = manager as unknown as {
-      markGitReviewDispatchUncertain: (
-        taskId: string, lease: NonNullable<TaskState['reviewDispatch']>,
-      ) => Promise<boolean>;
-      confirmUncertainGitReviewDispatch: (
-        taskId: string, expectedGeneration: string, verifiedHeadSha: string,
-      ) => Promise<TaskState | null>;
-    };
-    expect(await internal.markGitReviewDispatchUncertain('task-1', claimed!.lease)).toBe(true);
+    // 投递后 Enter 与清稿都被守卫拒绝 → 生产侧 ack_unknown,lease 转 uncertain 并把 QA 停驻
+    failAckAfterPaste();
+    await expect(manager.dispatchGitReviewLease('task-1', { expectedGeneration: generation }))
+      .rejects.toMatchObject({ reason: 'ack_unknown' });
     const held = (await taskStore.get('task-1'))!;
     await taskStore.set({
       ...held,
@@ -3205,20 +3259,23 @@ describe('manual dispatch binding recheck', () => {
         generation: taskAttentionGeneration(held),
       },
     });
-    const qaLock = await lockManager.acquire('qa-1', 'task-1');
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj', taskId: 'task-1', lockToken: qaLock!,
-      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
-      awaitingSince: TS, awaitingNonce: 'ack-hold', updatedAt: TS,
+    const bus = eventBus;
+    const passThroughEmit = bus.emit.bind(bus);
+    vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
+      if (event.type !== 'human.intervention') return passThroughEmit(event);
+      throw new Error('event log write failed');
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    vi.spyOn(bus, 'emit').mockRejectedValue(new Error('event log write failed'));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    deliverNormally();
 
-    const confirmed = await internal.confirmUncertainGitReviewDispatch('task-1', generation, SHA1);
-    expect(confirmed?.reviewDispatch?.phase).toBe('pending');
+    // 在确认写落盘、hold 已清、hold-cleared 事件发不出去的那一刻停住
+    const stopAfterConfirm = new Error('stop after uncertain-delivery confirmation');
+    await expect(manager.dispatchReviewToQa('task-1', {
+      confirmUncertainNotDelivered: true,
+      onSideEffect: () => { throw stopAfterConfirm; },
+    })).rejects.toBe(stopAfterConfirm);
+
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
     expect((await agentStore.get('qa-1'))?.status).not.toBe('awaiting_human');
     expect((await taskStore.get('task-1'))?.attention?.reason).toBe('dispatch-failed:ack_unknown');
 
@@ -3227,6 +3284,7 @@ describe('manual dispatch binding recheck', () => {
     const delivered = await taskStore.get('task-1');
     expect(delivered?.reviewDispatch).toBeUndefined();
     expect(delivered?.attention).toBeUndefined();
+    expect(pastedPanes()).toEqual(['%1', '%1']);
     warn.mockRestore();
   });
 
@@ -3252,10 +3310,12 @@ describe('manual dispatch binding recheck', () => {
       status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
       awaitingSince: TS, awaitingNonce: 'cleanup-hold', updatedAt: TS,
     });
-    const bus = (manager as unknown as { eventBus: EventBus }).eventBus;
-    vi.spyOn(bus, 'emit').mockImplementation(event => manager.recordTaskAttention(event).then(() => true));
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    const bus = eventBus;
+    const passThroughEmit = bus.emit.bind(bus);
+    vi.spyOn(bus, 'emit').mockImplementation(async (event) => {
+      if (event.type !== 'human.intervention') return passThroughEmit(event);
+      await manager.recordTaskAttention(event);
+    });
 
     await manager.dispatchGitReviewLease('task-1', {
       expectedGeneration: begun!.task.reviewDispatch!.generation,
@@ -3273,9 +3333,8 @@ describe('manual dispatch binding recheck', () => {
       await taskStore.set({
         ...current!, phase: 'code', signalToken: 'manual-git-successor', updatedAt: new Date().toISOString(),
       });
-      return { ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main' };
+      return { ok: true, prUrl: 'https://github.com/owner/repo/pull/42', headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main' };
     });
-    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await expect(manager.dispatchReviewToQa('task-1', { stage: 'code' })).rejects.toMatchObject({
       status: 409, code: 'dispatch-superseded',
@@ -3285,7 +3344,7 @@ describe('manual dispatch binding recheck', () => {
       status: 'review', phase: 'code', signalToken: 'manual-git-successor',
     });
     expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
-    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(pastedPanes()).toEqual([]);
   });
 
   it('checks the full task generation while claiming an existing git lease', async () => {
@@ -3304,7 +3363,7 @@ describe('manual dispatch binding recheck', () => {
       specReviewRound: 2,
       updatedAt: new Date().toISOString(),
     });
-    const acquire = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
+    await seedQaAgent();
     const onSideEffect = vi.fn();
 
     await expect(manager.dispatchGitReviewLease('task-1', {
@@ -3321,20 +3380,23 @@ describe('manual dispatch binding recheck', () => {
     })).rejects.toMatchObject({ status: 409, code: 'dispatch-superseded' });
 
     expect(onSideEffect).not.toHaveBeenCalled();
-    expect(acquire).not.toHaveBeenCalled();
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+    expect(pastedPanes()).toEqual([]);
     expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
   });
 
   it('refuses to dispatch a git review onto a PR that fails the binding predicate', async () => {
     await seed({ status: 'review', signalToken: 'ffff00001111', reviewRound: 1 });
-    const acquire = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    await seedQaAgent();
     driver.prViewResult = prRow({ draft: true });
-    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toMatchObject({
       status: 409, message: expect.stringContaining('binding draft'),
     });
-    expect(acquire).not.toHaveBeenCalled();
-    expect(release).not.toHaveBeenCalled();
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
+    expect(pastedPanes()).toEqual([]);
   });
 });
 
@@ -3381,8 +3443,7 @@ describe('merge gate and post-review recovery integrity', () => {
       outbox: [{ key: 'task-1:42:mr-closed-unmerged:1', type: 'human.intervention', data: { phase: 'mr-closed-unmerged' } }],
     });
     const emitted: Array<{ id: string }> = [];
-    const bus = (manager as unknown as { eventBus: { emit: (e: { id: string }) => Promise<void> } }).eventBus;
-    vi.spyOn(bus, 'emit').mockImplementation(async (e: { id: string }) => { emitted.push(e); });
+    vi.spyOn(eventBus, 'emit').mockImplementation(async (e) => { emitted.push(e); });
     await manager.deliverTaskOutbox('task-1');
     expect(emitted[0]?.id).toBe('outbox:task-1:42:mr-closed-unmerged:1');
   });
@@ -3467,7 +3528,7 @@ describe('ensureGitBaseSnapshot binding guard', () => {
       ...task,
       platformBinding: { repoKey: 'github.com/owner/other-repo' },
     });
-    const bus = (m as unknown as { eventBus: EventBus }).eventBus;
+    const bus = eventBus;
     vi.spyOn(bus, 'emit').mockImplementation(event => m.recordTaskAttention(event));
     const realSet = taskStore.set.bind(taskStore);
     let releaseAttention!: () => void;
@@ -3510,11 +3571,13 @@ describe('ensureGitBaseSnapshot binding guard', () => {
 });
 
 describe('noteReviewConversationRevision', () => {
-  const injectCache = (): PrConversationCache => {
-    const cache = new PrConversationCache();
-    (manager as unknown as { prConversationCache?: PrConversationCache }).prConversationCache = cache;
-    return cache;
-  };
+  let cache: PrConversationCache;
+  // prConversationCache 是 AgentManagerDeps 的公共注入点,不再改私有字段
+  function withCache(): void {
+    cache = new PrConversationCache();
+    manager = createManager({ prConversationCache: cache });
+    vi.spyOn(manager, 'platformDriverFor').mockReturnValue(driver as unknown as PlatformDriver);
+  }
   const payloadOf = (body: string) => ({ items: [{ kind: 'issue-comment' as const, id: 'c1', body }] });
 
   it('stamps the display revision on a live task', async () => {
@@ -3532,7 +3595,7 @@ describe('noteReviewConversationRevision', () => {
 
   it('warms the conversation cache under the post-bump revision before persisting the task', async () => {
     await seed({ status: 'review' });
-    const cache = injectCache();
+    withCache();
     let entriesWhenTaskPersisted = -1;
     const originalSet = taskStore.set.bind(taskStore);
     const setSpy = vi.spyOn(taskStore, 'set').mockImplementation(async (task) => {
@@ -3551,7 +3614,7 @@ describe('noteReviewConversationRevision', () => {
 
   it('a force that read the pre-bump snapshot and lands after the warm write cannot evict it', async () => {
     const before = await seed({ status: 'review' });
-    const cache = injectCache();
+    withCache();
     await manager.noteReviewConversationRevision('task-1', { prNumber: 42, payload: payloadOf('warm body') });
 
     const after = await taskStore.get('task-1');
@@ -3576,7 +3639,7 @@ describe('noteReviewConversationRevision', () => {
 
   it('bumps the revision but skips the cache write when the scanned PR no longer matches', async () => {
     await seed({ status: 'review', prNumber: 43 });
-    const cache = injectCache();
+    withCache();
     await manager.noteReviewConversationRevision('task-1', { prNumber: 42, payload: payloadOf('stale pr') });
     expect((await taskStore.get('task-1'))?.reviewConversationUpdatedAt).toMatch(/^\d{4}-/);
     expect(cache.stats().entries).toBe(0);
@@ -3584,7 +3647,7 @@ describe('noteReviewConversationRevision', () => {
 
   it('does not warm the cache for a terminal task', async () => {
     await seed({ status: 'merged' });
-    const cache = injectCache();
+    withCache();
     await manager.noteReviewConversationRevision('task-1', { prNumber: 42, payload: payloadOf('late') });
     expect(cache.stats().entries).toBe(0);
   });

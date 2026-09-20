@@ -108,7 +108,6 @@ describe('TaskStatusBadge', () => {
   it('shows a readable contextual pill while preserving the machine status as data', () => {
     render(<TaskStatusBadge task={{ status: 'review', phase: 'spec' }} />);
     const badge = screen.getByText(getMessages().statusContext.reviewSpec);
-    expect(badge.className).toContain('pill-review');
     expect(badge.getAttribute('data-status')).toBe('review');
     expect(badge.getAttribute('title')).toBe(getMessages().statusContext.reviewSpec);
   });

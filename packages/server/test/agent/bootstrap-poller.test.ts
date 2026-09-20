@@ -17,7 +17,7 @@ const devAgent: AgentConfig = {
   id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local',
 };
 const config: BaxianConfig = {
-  github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
+  review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG, host: [],
   project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[devAgent]] }],
 };
 const noopRunner = {
@@ -70,7 +70,7 @@ afterEach(async () => { await rm(tempDir, { recursive: true }); });
 describe('BootstrapPoller', () => {
   it('start/stop schedules and halts periodic ticks', async () => {
     vi.useFakeTimers();
-    vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
+    vi.spyOn(agentStore, 'update').mockResolvedValue('noop');
     const ensure = vi.fn().mockResolvedValue('/repo/path');
     const poller = makePoller({ ensure });
     poller.start();
@@ -169,7 +169,7 @@ describe('BootstrapPoller', () => {
 
   describe('pollProject (user-triggered retry)', () => {
     const cfgTwoProjects: BaxianConfig = {
-      github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
+      review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG, host: [],
       project: [
         { id: 'p-yes', repo: 'https://github.com/u/r1.git', merge: null, agent: [[{ ...devAgent, id: 'dev-yes' }]] },
         { id: 'p-no', repo: 'https://github.com/u/r2.git', merge: null, agent: [[{ ...devAgent, id: 'dev-no' }]] },
@@ -223,7 +223,7 @@ describe('BootstrapPoller', () => {
   describe('replaceConfig reschedule', () => {
     it('clearing bootstrapRetryIntervalMs reverts to DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS (60s), not the stale runtime value', async () => {
       vi.useFakeTimers();
-      vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
+      vi.spyOn(agentStore, 'update').mockResolvedValue('noop');
       const ensure = vi.fn().mockResolvedValue('/repo/path');
       const customConfig: BaxianConfig = {
         ...config,
@@ -259,7 +259,7 @@ describe('BootstrapPoller', () => {
 
     it('reschedules timer when bootstrapRetryIntervalMs changes', async () => {
       vi.useFakeTimers();
-      vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
+      vi.spyOn(agentStore, 'update').mockResolvedValue('noop');
       const ensure = vi.fn().mockResolvedValue('/repo/path');
       const baseConfig: BaxianConfig = {
         ...config,

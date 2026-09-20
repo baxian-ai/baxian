@@ -1,16 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
+import type { MockInstance } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
 import type { BaxianConfig } from '../../src/shared/index.js';
 import { buildApp } from '../../src/app.js';
+import type { AgentManager, EnsureSessionResult } from '../../src/agent/manager.js';
 import * as loaderModule from '../../src/config/loader.js';
 import { ConfigValidationError } from '../../src/config/loader.js';
 import * as preflight from '../../src/agent/preflight.js';
 import * as tmuxInstall from '../../src/agent/tmux-install.js';
 import { CleanupFailedError, EnsureSessionError } from '../../src/agent/manager.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
+import { PlatformPoller } from '../../src/platform/platform-poller.js';
+import { ErrorRecordStore } from '../../src/state/error-record-store.js';
+import { ApiError } from '../../src/errors.js';
 import { createTestContext } from '../helpers/context.js';
 import { requesters } from './helpers.js';
 
@@ -54,6 +59,20 @@ async function projectWithDev(projectId: string, devId: string): Promise<void> {
   await addAgent(projectId, devAgent(devId));
 }
 
+const TEST_SESSION_REF = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
+
+function ensuredSession(agentId: string): EnsureSessionResult {
+  return {
+    ok: true,
+    createdSession: true,
+    freshRuntime: true,
+    paneId: '%0',
+    pane: { session: TEST_SESSION_REF, paneId: '%0', claim: agentId },
+    workdir: '/tmp/test',
+    sessionRef: TEST_SESSION_REF,
+  };
+}
+
 type AgentFacts = Parameters<FastifyInstance['ctx']['agentStore']['set']>[0];
 type TaskFacts = Parameters<FastifyInstance['ctx']['taskStore']['set']>[0];
 
@@ -85,26 +104,16 @@ beforeEach(async () => {
   await writeFile(configPath, JSON.stringify(ctx.config, null, 2));
   ctx.configPath = configPath;
   app = await buildApp(ctx);
-  vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(async (agentId) => ({
-    ok: true,
-    createdSession: true,
-    paneId: '%0',
-    pane: {
-      session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' },
-      paneId: '%0',
-      claim: agentId,
-    },
-    workdir: '/tmp/test',
-  }));
+  // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
+  vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(async agentId => ensuredSession(agentId));
   vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockResolvedValue();
 
-  const originalInject = app.inject.bind(app);
-  app.inject = (async (...args: Parameters<typeof originalInject>) => {
-    const response = await originalInject(...args);
-    const opts = args[0] as { method?: string; url?: string } | undefined;
+  const originalInject = app.inject.bind(app) as (opts: InjectOptions) => Promise<LightMyRequestResponse>;
+  app.inject = (async (opts: InjectOptions) => {
+    const response = await originalInject(opts);
     if (
       response.statusCode === 201 &&
-      opts?.method === 'POST' &&
+      opts.method === 'POST' &&
       typeof opts.url === 'string' &&
       /\/api\/projects\/[^/]+\/agents$/.test(opts.url)
     ) {
@@ -137,42 +146,68 @@ describe('POST /api/projects', () => {
     expect(app.ctx.config.project.some(p => p.id === 'newproj')).toBe(true);
   });
 
-  it('hot-reloads agentManager / tmuxProbePoller / bootstrapPoller / poller with the new config', async () => {
-    const agentReplace = vi.spyOn(app.ctx.agentManager, 'replaceConfig');
+  it('hot-reloads the manager and the platform poller with the new project', async () => {
+    // 探针/引导 poller 的配置替换没有其他可观察面，保留 stub
     const tmuxReplace = vi.fn();
     const bootstrapReplace = vi.fn();
-    const reconcile = vi.fn();
     app.ctx.tmuxProbePoller = { replaceConfig: tmuxReplace, stop: vi.fn() } as never;
     app.ctx.bootstrapPoller = { replaceConfig: bootstrapReplace, stop: vi.fn() } as never;
-    app.ctx.poller = { reconcile, reschedule: vi.fn(), stop: vi.fn() } as never;
-    app.ctx.platformEntryDeps = {
-      driverFor: () => ({ visibilityLagMs: 0, commentSources: [] }),
-      statePathFor: (repoUrl: string) => `${tempDir}/poller-${encodeURIComponent(repoUrl)}.json`,
-    } as never;
+    const poller = new PlatformPoller({ onEvent: () => undefined, tasks: async () => [], task: async () => null });
+    app.ctx.poller = poller;
+    const prRow = (repo: string) => ({
+      prNumber: 1, prUrl: `https://github.com/${repo}/pull/1`, branch: 'bx/task-x', headSha: 'a'.repeat(40),
+      state: 'open', draft: false, mergedAt: null, updatedAt: '2026-01-01T00:00:00Z',
+      sourceProjectId: '1', targetProjectId: '1', targetBranch: 'main',
+    });
+    const driverFor = vi.fn((project: { repo: string }) => ({
+      visibilityLagMs: 0,
+      commentSources: [],
+      runPreflightSteps: async () => [],
+      projectView: async () => ({ defaultBranch: 'main', pushPermitted: true }),
+      prView: async () => ({}),
+      branchView: async () => ({}),
+      listPrs: async () => [prRow(project.repo.replace('https://github.com/', '').replace(/\.git$/, ''))],
+      listComments: async () => [],
+      postComment: async () => undefined,
+      mergePr: async () => undefined,
+      closePr: async () => undefined,
+      deleteBranch: async () => undefined,
+    }));
+    const statePathFor = vi.fn((repoUrl: string) => `${tempDir}/poller-${encodeURIComponent(repoUrl)}.json`);
+    app.ctx.platformEntryDeps = { driverFor, statePathFor } as never;
     app.ctx.stateDir = tempDir;
 
     const response = await post('/api/projects', { id: 'hot', repo: 'https://github.com/a/b.git' });
     expect(response.statusCode).toBe(201);
 
-    expect(agentReplace).toHaveBeenCalledTimes(1);
-    expect(agentReplace.mock.calls[0][0].project.some((p: { id: string }) => p.id === 'hot')).toBe(true);
+    expect(app.ctx.agentManager.getProjectConfig('hot')?.repo).toBe('https://github.com/a/b.git');
     expect(tmuxReplace).toHaveBeenCalledTimes(1);
     expect(bootstrapReplace).toHaveBeenCalledTimes(1);
-    expect(reconcile).toHaveBeenCalledTimes(1);
-    const entries = reconcile.mock.calls[0][0] as Array<{ projectId: string; repoUrl: string; statePath: string }>;
-    const added = entries.find(e => e.projectId === 'hot');
-    expect(added).toBeDefined();
-    expect(added!.repoUrl).toBe('https://github.com/a/b.git');
-    expect(added!.statePath).toContain('poller-https%3A%2F%2Fgithub.com%2Fa%2Fb.git.json');
+    expect(poller.snapshots()).toContainEqual(expect.objectContaining({ projectId: 'hot', repo: 'github.com/a/b' }));
+    expect(driverFor).toHaveBeenCalledWith(expect.objectContaining({ id: 'hot', repo: 'https://github.com/a/b.git' }));
+
+    // a real poll must persist each repo's cursor into its own file, carrying that repo's identity
+    await poller.poll();
+    const cursorOf = async (repoUrl: string) =>
+      JSON.parse(await readFile(statePathFor(repoUrl), 'utf-8')) as { repoUrl: string };
+    expect((await cursorOf('https://github.com/a/b.git')).repoUrl).toBe('https://github.com/a/b.git');
+    expect((await cursorOf('https://github.com/user/repo.git')).repoUrl).toBe('https://github.com/user/repo.git');
   });
 
-  it('skips poller reconciliation when the platform deps are unavailable', async () => {
-    const reconcile = vi.fn();
-    app.ctx.poller = { reconcile, reschedule: vi.fn(), stop: vi.fn() } as never;
+  it('leaves the existing poller entries untouched when the platform deps are unavailable', async () => {
+    const poller = new PlatformPoller({ onEvent: () => undefined, tasks: async () => [], task: async () => null });
+    poller.reconcile([{
+      projectId: 'proj', repoUrl: 'https://github.com/user/repo.git',
+      driver: { visibilityLagMs: 0, commentSources: [] } as never, statePath: `${tempDir}/poller-existing.json`,
+    }]);
+    expect(poller.snapshots().map(s => s.projectId)).toEqual(['proj']);
+    app.ctx.poller = poller;
     app.ctx.platformEntryDeps = undefined;
     const res = await post('/api/projects', { id: 'nopath', repo: 'https://github.com/c/d.git' });
     expect(res.statusCode).toBe(201);
-    expect(reconcile).not.toHaveBeenCalled();
+    expect(app.ctx.agentManager.getProjectConfig('nopath')).toBeDefined();
+    // no reconcile at all: the pre-existing repo keeps polling, the new one is not added either
+    expect(poller.snapshots().map(s => s.projectId)).toEqual(['proj']);
   });
 
   it('defaults merge to null when omitted', async () => {
@@ -237,7 +272,7 @@ describe('POST /api/projects', () => {
     const written = JSON.parse(await readFile(configPath, 'utf-8')) as BaxianConfig;
     const project = written.project.find(p => p.id === 'persisted');
     expect(project).toBeDefined();
-    expect(project?.review).toBeUndefined();
+    expect(Object.keys(project!)).not.toContain('review');
     const backups = await readdir(tempDir);
     expect(backups.some(f => /^baxian\.json\.\d{4}(?:-\d{2}){5}-\d{3}$/.test(f))).toBe(true);
   });
@@ -460,10 +495,10 @@ describe('POST /api/projects/:projectId/agents', () => {
 
   it('commits the complete team and reports restartRequired when the in-memory switch fails', async () => {
     await createProject('add-switch-fail');
+    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync');
     vi.spyOn(app.ctx.agentManager, 'replaceConfig').mockImplementationOnce(() => {
       throw new Error('switch exploded');
     });
-    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync');
 
     const response = await addAgent(
       'add-switch-fail',
@@ -494,6 +529,7 @@ describe('POST /api/projects/:projectId/agents', () => {
       creationToken: expect.any(String),
     });
     expect(bootstrap).not.toHaveBeenCalled();
+    expect(app.ctx.agentManager.ensureSession).not.toHaveBeenCalled();
   });
 
   it('initializes both member states before exposing the team to task dispatch', async () => {
@@ -526,12 +562,12 @@ describe('POST /api/projects/:projectId/agents', () => {
 
   it('rolls back both member states and leaves the team uncommitted when state initialization fails', async () => {
     await createProject('add-state-fail');
+    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync');
     const originalSet = app.ctx.agentStore.set.bind(app.ctx.agentStore);
     vi.spyOn(app.ctx.agentStore, 'set').mockImplementation(async facts => {
       if (facts.id === 'add-state-fail-qa') throw new Error('state disk full');
       await originalSet(facts);
     });
-    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
 
     const response = await addAgent(
       'add-state-fail',
@@ -547,6 +583,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(await app.ctx.agentStore.get('add-state-fail-dev')).toBeNull();
     expect(await app.ctx.agentStore.get('add-state-fail-qa')).toBeNull();
     expect(bootstrap).not.toHaveBeenCalled();
+    expect(app.ctx.agentManager.ensureSession).not.toHaveBeenCalled();
   });
 
   it('restores staged member states when config persistence fails', async () => {
@@ -605,11 +642,13 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(response.statusCode).toBe(404);
   });
 
-  it('returns 409 when agent.id is taken globally', async () => {
+  it('returns 409 when agent.id is taken globally, without starting a session', async () => {
     await createProject('pp');
     const response = await addAgent('pp', { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', yolo: true });
     expect(response.statusCode).toBe(409);
-    expect(vi.mocked(app.ctx.agentManager.ensureSession)).not.toHaveBeenCalled();
+    expect(findProject('pp').agent).toEqual([]);
+    expect(await app.ctx.agentStore.get('dev-1')).toBeNull();
+    expect(app.ctx.agentManager.ensureSession).not.toHaveBeenCalled();
   });
 
   it('returns 409 when the agent id is tombstoned by an in-flight deletion (same-id rebuild blocked)', async () => {
@@ -843,9 +882,8 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     });
   });
 
-  it('replaces one Dev member without changing its QA partner', async () => {
+  it('replaces one Dev member without changing its QA partner and bootstraps the newcomer', async () => {
     await projectWithDev('replace-dev', 'replace-dev-old');
-    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
 
     const response = await put(
       '/api/projects/replace-dev/agents/replace-dev-old',
@@ -855,7 +893,8 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(200);
     expect(findProject('replace-dev').agent[0].map(agent => agent.id))
       .toEqual(['replace-dev-next', 'replace-dev-old-qa']);
-    expect(bootstrap).toHaveBeenCalledWith('replace-dev-next', expect.any(String));
+    await app.ctx.agentManager.waitForBootstrapSettled('replace-dev-next', 2_000);
+    expect(await app.ctx.agentStore.get('replace-dev-next')).toMatchObject({ paneId: '%0' });
   });
 
   it.each([
@@ -863,7 +902,6 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     ['role change', devAgent('replace-invalid-next'), /role must remain "qa"/],
   ] as const)('rejects %s before runtime cleanup', async (_label, replacement, error) => {
     await projectWithDev('replace-invalid', 'replace-invalid-dev');
-    const cleanup = vi.mocked(app.ctx.agentManager.cleanupRemovedAgentRuntime);
 
     const response = await put(
       '/api/projects/replace-invalid/agents/replace-invalid-qa',
@@ -872,9 +910,10 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
 
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toMatch(error);
-    expect(cleanup).not.toHaveBeenCalled();
     expect(findProject('replace-invalid').agent[0].map(agent => agent.id))
       .toEqual(['replace-invalid-dev', 'replace-invalid-qa']);
+    expect(await app.ctx.agentStore.get('replace-invalid-qa')).not.toBeNull();
+    expect(app.ctx.agentManager.cleanupRemovedAgentRuntime).not.toHaveBeenCalled();
   });
 
   it('rejects a globally used replacement id', async () => {
@@ -933,7 +972,6 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
       qaAgentId: 'replace-pending-qa',
       status: 'pending',
     });
-    const cleanup = vi.mocked(app.ctx.agentManager.cleanupRemovedAgentRuntime);
 
     const response = await put(
       '/api/projects/replace-pending/agents/replace-pending-qa',
@@ -942,9 +980,9 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/referenced by open task replace-pending-task/);
-    expect(cleanup).not.toHaveBeenCalled();
     expect(findProject('replace-pending').agent[0].map(agent => agent.id))
       .toEqual(['replace-pending-dev', 'replace-pending-qa']);
+    expect(await app.ctx.agentStore.get('replace-pending-qa')).not.toBeNull();
   });
 
   it('restores the original state and lock when runtime cleanup fails', async () => {
@@ -1001,7 +1039,6 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
   it('commits the replacement and reports an orphan-state warning when old state deletion fails', async () => {
     await projectWithDev('replace-state-delete', 'replace-state-delete-dev');
     vi.spyOn(app.ctx.agentStore, 'delete').mockRejectedValueOnce(new Error('state disk read-only'));
-    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
 
     const response = await put(
       '/api/projects/replace-state-delete/agents/replace-state-delete-qa',
@@ -1021,13 +1058,13 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     expect(await app.ctx.agentStore.get('replace-state-delete-qa')).not.toBeNull();
     expect(await app.ctx.agentStore.get('replace-state-delete-next')).not.toBeNull();
     expect(await app.ctx.lockManager.claimOf('replace-state-delete-qa')).toBeNull();
-    expect(bootstrap).toHaveBeenCalledWith('replace-state-delete-next', expect.any(String));
+    await app.ctx.agentManager.waitForBootstrapSettled('replace-state-delete-next', 2_000);
+    expect(await app.ctx.agentStore.get('replace-state-delete-next')).toMatchObject({ paneId: '%0' });
   });
 
   it('surfaces a failed post-commit lock release as a warning', async () => {
     await projectWithDev('replace-lock', 'replace-lock-dev');
     vi.spyOn(app.ctx.lockManager, 'releaseIfOwner').mockResolvedValue(false);
-    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
 
     const response = await put(
       '/api/projects/replace-lock/agents/replace-lock-qa',
@@ -1038,7 +1075,8 @@ describe('PUT /api/projects/:projectId/agents/:agentId', () => {
     expect(JSON.parse(response.body).warnings).toEqual([
       expect.stringMatching(/replacement lock release.*owner claim changed/),
     ]);
-    expect(bootstrap).toHaveBeenCalledWith('replace-lock-next', expect.any(String));
+    await app.ctx.agentManager.waitForBootstrapSettled('replace-lock-next', 2_000);
+    expect(await app.ctx.agentStore.get('replace-lock-next')).toMatchObject({ paneId: '%0' });
   });
 
   it('requires a restart when the post-commit in-memory switch fails', async () => {
@@ -1083,13 +1121,18 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(app.ctx.agentManager.getAgentConfig('rrd-qa')).toBeUndefined();
   });
 
-  it('purges errorRecordStore entries for deleted agent (so a recreate with same id starts clean)', async () => {
-    const purgeAgent = vi.fn().mockResolvedValue({ removed: 1 });
-    app.ctx.errorRecordStore = { purgeAgent } as never;
+  it('purges errorRecordStore entries for deleted agents (so a recreate with same id starts clean)', async () => {
+    const errorRecordStore = new ErrorRecordStore(join(tempDir, 'errors'));
+    await mkdir(join(tempDir, 'errors'), { recursive: true });
+    app.ctx.errorRecordStore = errorRecordStore;
     await projectWithDev('purge1', 'purge1-dev');
+    for (const agentId of ['purge1-dev', 'purge1-qa', 'dev-1']) {
+      await errorRecordStore.append({ agentId, projectId: 'purge1', operation: 'bootstrap', reason: 'x', message: 'boom' });
+    }
     await del('/api/projects/purge1/agents/purge1-dev');
-    expect(purgeAgent).toHaveBeenCalledWith('purge1-dev');
-    expect(purgeAgent).toHaveBeenCalledWith('purge1-qa');
+    expect(await errorRecordStore.latestForAgent('purge1-dev')).toBeUndefined();
+    expect(await errorRecordStore.latestForAgent('purge1-qa')).toBeUndefined();
+    expect(await errorRecordStore.latestForAgent('dev-1')).toMatchObject({ agentId: 'dev-1' });
   });
 
   it('clears the deleted agent\'s pet assignment (so a recreate with same id starts clean)', async () => {
@@ -1263,7 +1306,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
       status: 'max_rounds', prNumber: 7, branch: 'bx/task-mr-reserved',
     });
     await seedAgent('da-mr-active-dev', 'da-mr-active', {
-      taskId: 'task-mr-reserved', paneId: '%0', status: 'waiting', workdir: '/tmp/wt',
+      taskId: 'task-mr-reserved', paneId: '%0', status: 'ok', workdir: '/tmp/wt',
     });
 
     const response = await del('/api/projects/da-mr-active/agents/da-mr-active-dev');
@@ -1277,7 +1320,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
       preferredAgentId: 'da-mr-ref-dev', agentId: '', reviewRound: 5,
       status: 'max_rounds', phase: 'spec', prNumber: 8, branch: 'bx/task-spec-mr-ref',
     });
-    await seedAgent('da-mr-ref-dev', 'da-mr-ref', { status: 'idle', paneId: '%0' });
+    await seedAgent('da-mr-ref-dev', 'da-mr-ref', { status: 'ok', paneId: '%0' });
 
     const response = await del('/api/projects/da-mr-ref/agents/da-mr-ref-dev');
     expect(response.statusCode).toBe(409);
@@ -1386,7 +1429,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('refuses when an active task references the agent via agentId only (agent itself unbound)', async () => {
     await projectWithDev('ref-a', 'ref-a-dev');
-    await seedAgent('ref-a-dev', 'ref-a', { status: 'idle' });
+    await seedAgent('ref-a-dev', 'ref-a', { status: 'ok' });
     await seedTask('task-ref-a', 'ref-a', { preferredAgentId: '', agentId: 'ref-a-dev', status: 'in_progress' });
 
     const response = await del('/api/projects/ref-a/agents/ref-a-dev');
@@ -1412,7 +1455,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('refuses deleting an unbound Dev referenced only via devAgentId by an active task', async () => {
     await projectWithDev('ref-d', 'ref-d-dev');
-    await seedAgent('ref-d-dev', 'ref-d', { status: 'idle' });
+    await seedAgent('ref-d-dev', 'ref-d', { status: 'ok' });
     await seedTask('task-ref-d', 'ref-d', {
       preferredAgentId: '',
       agentId: '',
@@ -1428,7 +1471,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('409 when a non-awaiting agent is locked by another op', async () => {
     await projectWithDev('lk1', 'lk1-dev');
-    await seedAgent('lk1-dev', 'lk1', { status: 'idle' });
+    await seedAgent('lk1-dev', 'lk1', { status: 'ok' });
     const token = await app.ctx.lockManager.acquire('lk1-dev', 'test:foreign');
 
     const response = await del('/api/projects/lk1/agents/lk1-dev');
@@ -1440,7 +1483,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('releases locks it already acquired when a later team member is locked', async () => {
     await projectWithDev('lk2', 'lk2-dev');
-    await seedAgent('lk2-qa', 'lk2', { status: 'idle' });
+    await seedAgent('lk2-qa', 'lk2', { status: 'ok' });
     const token = await app.ctx.lockManager.acquire('lk2-qa', 'test:foreign');
 
     const response = await del('/api/projects/lk2/agents/lk2-dev');
@@ -1848,36 +1891,32 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
       }
       return realSave(path, config);
     });
-    const deleteSpy = vi.spyOn(app.ctx.agentStore, 'delete');
 
     const response = await del('/api/projects/rb2/agents/rb2-dev');
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
-    expect(deleteSpy).not.toHaveBeenCalled();
     expect(await app.ctx.agentStore.get('rb2-dev')).toMatchObject({ id: 'rb2-dev', paneId: '%1' });
+    expect(await app.ctx.agentStore.get('rb2-qa')).not.toBeNull();
   });
 });
 
 describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
-  it('awaiting_human agent: resumeAgent invoked + 200', async () => {
+  it('awaiting_human agent: the hold is cleared + 200', async () => {
     await seedAgent('dev-1', 'proj', { status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
-    const resumeSpy = vi.spyOn(app.ctx.agentManager, 'resumeAgent')
-      .mockResolvedValue({ resumed: true, releasedBinding: true });
 
     const response = await post('/api/projects/proj/agents/dev-1/resume');
 
     expect(response.statusCode).toBe(200);
-    expect(resumeSpy).toHaveBeenCalledWith('dev-1');
-    const body = JSON.parse(response.body);
-    expect(body).toMatchObject({ agentId: 'dev-1', resumed: true, releasedBinding: true });
+    expect(JSON.parse(response.body)).toMatchObject({ agentId: 'dev-1', resumed: true });
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
   });
 
-  it('resume returns 409 when manager reports resumed=false (e.g. creationToken still set)', async () => {
+  it('resume returns 409 while the bootstrap dialog is still unresolved (creationToken set)', async () => {
     await seedAgent('dev-1', 'proj', {
       status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending', creationToken: 'tok-pending',
     });
-    vi.spyOn(app.ctx.agentManager, 'resumeAgent')
-      .mockResolvedValue({ resumed: false, releasedBinding: false });
 
     const response = await post('/api/projects/proj/agents/dev-1/resume');
 
@@ -1885,15 +1924,11 @@ describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
     const body = JSON.parse(response.body);
     expect(body.error).toMatch(/Bootstrap dialog still unresolved/);
     expect(body.resumed).toBe(false);
+    expect((await app.ctx.agentStore.get('dev-1'))?.awaitingPhase).toBe('agent_dialog_pending');
   });
 
   it('resume surfaces the manager reason instead of the generic fallback (e.g. greeting_failed)', async () => {
     await seedAgent('dev-1', 'proj', { status: 'awaiting_human', awaitingPhase: 'greeting_failed' });
-    vi.spyOn(app.ctx.agentManager, 'resumeAgent').mockResolvedValue({
-      resumed: false,
-      releasedBinding: false,
-      reason: 'Greeting capability check failed; use Restart REPL to re-run the greeting check.',
-    });
 
     const response = await post('/api/projects/proj/agents/dev-1/resume');
 
@@ -1921,37 +1956,90 @@ describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
   it('resume during DELETE cleanup (deletionInFlight): 409 (no resumeAgent invocation, prevents race with phase2 cleanup)', async () => {
     await seedAgent('dev-1', 'proj', { status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
     app.ctx.agentManager.tryClaimDeletion(['dev-1']);
-    const resumeSpy = vi.spyOn(app.ctx.agentManager, 'resumeAgent');
 
     const response = await post('/api/projects/proj/agents/dev-1/resume');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/being deleted/);
-    expect(resumeSpy).not.toHaveBeenCalled();
+    expect((await app.ctx.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-interrupt-failed');
 
     app.ctx.agentManager.releaseDeletionClaim(['dev-1']);
   });
 });
 
 describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
-  it('happy path: restartReplOnly invoked + 200', async () => {
-    const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+  it('happy path: restarts the REPL of the addressed agent, answers 200 and leaves it unlocked', async () => {
+    // tmux boundary: the restart itself is stubbed, so the call is the only observable effect of this endpoint
+    const restart = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
 
     const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
 
     expect(response.statusCode).toBe(200);
-    expect(restartSpy).toHaveBeenCalledWith('dev-1', { expectedGeneration: 0 });
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(restart.mock.calls[0][0]).toBe('dev-1');
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('a successful restart hands the confirmed-ready REPL to the probe poller (stale conclusion replaced, immediate re-probe) before the binding cleanup', async () => {
+    const order: string[] = [];
+    const confirmReplReady = vi.fn(async () => { order.push('confirm'); });
+    app.ctx.tmuxProbePoller = { confirmReplReady, stop: vi.fn() } as never;
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    vi.spyOn(app.ctx.agentManager, 'clearAwaitingHuman').mockImplementation(async () => { order.push('cleanup'); return true; });
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    expect(confirmReplReady).toHaveBeenCalledWith('dev-1');
+    expect(order).toEqual(['confirm', 'cleanup']);
+  });
+
+  it('a post-restart probe failure is logged and does not fail the request', async () => {
+    app.ctx.tmuxProbePoller = {
+      confirmReplReady: vi.fn().mockRejectedValue(new Error('ssh timeout')),
+      stop: vi.fn(),
+    } as never;
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    const warn = vi.spyOn(app.log, 'warn');
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'dev-1' }), expect.stringContaining('post-restart probe failed'));
+  });
+
+  it('a failed restart leaves the probe poller\'s conclusion in place', async () => {
+    const confirmReplReady = vi.fn();
+    app.ctx.tmuxProbePoller = { confirmReplReady, stop: vi.fn() } as never;
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockRejectedValue(new Error('restart-repl: codex did not exit'));
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(500);
+    expect(confirmReplReady).not.toHaveBeenCalled();
+  });
+
+  it('a busy pane reported by restartReplOnly surfaces as 409 and releases the maintenance lock', async () => {
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockRejectedValue(
+      new ApiError(409, 'Agent dev-1 pane is busy (compact, upload, dispatch or another restart in progress); retry shortly'),
+    );
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/pane is busy/);
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('restart-repl during DELETE (deletionInFlight): 409, restartReplOnly not invoked', async () => {
     app.ctx.agentManager.tryClaimDeletion(['dev-1']);
-    const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    const restart = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
 
     const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/being deleted/);
-    expect(restartSpy).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
 
     app.ctx.agentManager.releaseDeletionClaim(['dev-1']);
   });
@@ -2326,25 +2414,27 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
       preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1', status: 'review',
     });
     await seedAgent('qa-1', 'proj', { taskId: 'task-qa-live' });
-    const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    const restart = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
 
     const response = await post('/api/projects/proj/agents/qa-1/restart-repl');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/bound to active task task-qa-live/);
-    expect(restartSpy).not.toHaveBeenCalled();
+    expect((await app.ctx.agentStore.get('qa-1'))?.taskId).toBe('task-qa-live');
+    expect(restart).not.toHaveBeenCalled();
   });
 
-  it('idle agent locked by another op → 409', async () => {
+  it('idle agent locked by another op → 409, restart not attempted', async () => {
     await seedAgent('dev-1', 'proj');
     await app.ctx.lockManager.acquire('dev-1', 'test:foreign');
-    const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    const restart = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
 
     const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
-    expect(restartSpy).not.toHaveBeenCalled();
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(true);
+    expect(restart).not.toHaveBeenCalled();
   });
 
   it('greeting_failed without a task → regreetHeldAgent instead of clearAwaitingHuman', async () => {
@@ -2353,14 +2443,78 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
     });
     vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
     const regreetSpy = vi.spyOn(app.ctx.agentManager, 'regreetHeldAgent').mockResolvedValue(true);
-    const clearSpy = vi.spyOn(app.ctx.agentManager, 'clearAwaitingHuman');
 
     const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
 
     expect(response.statusCode).toBe(200);
     expect(regreetSpy).toHaveBeenCalledWith('dev-1');
-    expect(clearSpy).not.toHaveBeenCalled();
+    expect(await app.ctx.agentStore.get('dev-1')).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'greeting_failed' });
     expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+  });
+});
+
+describe('restart-repl / retry share one per-agent maintenance boundary that spans the post-ready task replay', () => {
+  async function seedOwnedActiveTask(): Promise<void> {
+    await seedTask('task-replay-once', 'proj', {
+      preferredAgentId: 'dev-1', agentId: 'dev-1', status: 'in_progress', branch: 'bx/task-replay-once', signalToken: 'tok-1',
+    });
+    const token = await app.ctx.lockManager.acquire('dev-1', 'task-replay-once');
+    await seedAgent('dev-1', 'proj', { taskId: 'task-replay-once', lockToken: token!, paneId: '%old' });
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+  }
+
+  function gatedReplay(): { redispatch: MockInstance<AgentManager['redispatchTaskPromptAfterReplRestart']>; release: () => void } {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const redispatch = vi.spyOn(app.ctx.agentManager, 'redispatchTaskPromptAfterReplRestart')
+      .mockImplementation(async () => { await gate; return true; });
+    return { redispatch, release };
+  }
+
+  it.each([
+    ['retry', 'restart-repl'],
+    ['retry', 'retry'],
+    ['restart-repl', 'retry'],
+    ['restart-repl', 'restart-repl'],
+  ])('a %s still replaying the task prompt makes a concurrent %s 409: the prompt is replayed once, and the boundary reopens afterwards', async (first, second) => {
+    await seedOwnedActiveTask();
+    const { redispatch, release } = gatedReplay();
+
+    const inFlight = post(`/api/projects/proj/agents/dev-1/${first}`).then(r => r);
+    await vi.waitFor(() => expect(redispatch).toHaveBeenCalledTimes(1));
+    const blocked = await post(`/api/projects/proj/agents/dev-1/${second}`);
+    expect(blocked.statusCode).toBe(409);
+    expect(JSON.parse(blocked.body).error).toMatch(/restart-repl or retry already in progress/);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+
+    release();
+    expect((await inFlight).statusCode).toBe(200);
+    expect(redispatch).toHaveBeenCalledTimes(1);
+    const after = await post('/api/projects/proj/agents/dev-1/restart-repl');
+    expect(after.statusCode).toBe(200);
+    expect(redispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('a failed restart releases the boundary: the next maintenance request is not rejected as in progress', async () => {
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly')
+      .mockRejectedValueOnce(new Error('restart-repl: codex did not exit'))
+      .mockResolvedValueOnce();
+
+    expect((await post('/api/projects/proj/agents/dev-1/restart-repl')).statusCode).toBe(500);
+    expect((await post('/api/projects/proj/agents/dev-1/restart-repl')).statusCode).toBe(200);
+  });
+
+  it('the boundary is per agent: qa-1 restarts while dev-1 is still replaying', async () => {
+    await seedOwnedActiveTask();
+    const { redispatch, release } = gatedReplay();
+
+    const inFlight = post('/api/projects/proj/agents/dev-1/retry').then(r => r);
+    await vi.waitFor(() => expect(redispatch).toHaveBeenCalledTimes(1));
+    expect((await post('/api/projects/proj/agents/qa-1/restart-repl')).statusCode).toBe(200);
+
+    release();
+    expect((await inFlight).statusCode).toBe(200);
   });
 });
 
@@ -2374,6 +2528,18 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(response.statusCode).toBe(200);
     const stateAfter = await app.ctx.agentStore.get('dev-1');
     expect(stateAfter?.paneId).toBe('%0');
+  });
+
+  it('a successful retry hands the confirmed-ready REPL to the probe poller once ensureSession confirmed it', async () => {
+    const confirmReplReady = vi.fn(async () => {});
+    app.ctx.tmuxProbePoller = { confirmReplReady, stop: vi.fn() } as never;
+    await seedAgent('dev-1', 'proj');
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(200);
+    expect(confirmReplReady).toHaveBeenCalledWith('dev-1');
   });
 
   it('releases a stale QA binding with the same generation token used for recovery', async () => {
@@ -2439,13 +2605,10 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
       awaitingSince: now(),
     });
     app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
-    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(async (agentId) => {
+    // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
+    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(async agentId => {
       app.ctx.agentManager.bumpDeletionGeneration(agentId);
-      return {
-        ok: true, createdSession: true, paneId: '%0',
-        pane: { session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' }, paneId: '%0', claim: agentId },
-        workdir: '/tmp/test',
-      };
+      return ensuredSession(agentId);
     });
 
     const response = await post('/api/projects/proj/agents/dev-1/retry');
@@ -2456,6 +2619,31 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(stateAfter?.status).toBe('awaiting_human');
     expect(stateAfter?.awaitingPhase).toBe('agent_dialog_pending');
     expect(stateAfter?.paneId).toBe('%old');
+  });
+
+  it('a stale dialogPending failure after a DELETE→recreate during ensureSession does not park the successor binding → 500', async () => {
+    await seedAgent('dev-1', 'proj', { paneId: '%old' });
+    const { EnsureSessionError } = await import('../../src/agent/manager.js');
+    // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
+    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(async (agentId) => {
+      // the old retry is still inside ensureSession while DELETE→recreate replaces the binding under it
+      app.ctx.agentManager.bumpDeletionGeneration(agentId);
+      await seedAgent(agentId, 'proj', { paneId: '%replacement' });
+      throw new EnsureSessionError(
+        { createdSession: true, agentId, dialogPending: true, lastScreen: 'Press enter to continue' },
+        'buildFreshSession failed: repl not ready',
+      );
+    });
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/repl not ready/);
+    const successor = await app.ctx.agentStore.get('dev-1');
+    expect(successor?.paneId).toBe('%replacement');
+    expect(successor?.awaitingPhase).toBeUndefined();
+    expect(successor?.status).not.toBe('awaiting_human');
+    expect(await app.ctx.lockManager.claimOf('dev-1')).toBeNull();
   });
 
   it('unknown tmux probe status still lets retry attempt recovery', async () => {
@@ -2475,9 +2663,10 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(body.error).toMatch(/already ready/);
   });
 
-  it('retry hitting NEW dialog during ensureSession → 202 + dialog_pending state, NOT 500 + kill', async () => {
-    await seedAgent('dev-1', 'proj');
+  it('retry hitting NEW dialog during ensureSession → 202 + dialog_pending persisted, NOT 500 + kill', async () => {
+    await seedAgent('dev-1', 'proj', { paneId: '%0' });
     const { EnsureSessionError } = await import('../../src/agent/manager.js');
+    // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
     vi.spyOn(app.ctx.agentManager, 'ensureSession').mockRejectedValueOnce(
       new EnsureSessionError(
         {
@@ -2489,8 +2678,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
         'buildFreshSession failed: repl not ready',
       ),
     );
-    const handleSpy = vi.spyOn(app.ctx.agentManager, 'handleDialogPendingFromRuntime')
-      .mockResolvedValue(true);
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef');
 
     const response = await post('/api/projects/proj/agents/dev-1/retry');
 
@@ -2498,11 +2686,11 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     const body = JSON.parse(response.body);
     expect(body.runtimeStatus).toBe('pending');
     expect(body.message).toMatch(/web terminal/);
-    expect(handleSpy).toHaveBeenCalledWith(
-      'dev-1',
-      expect.any(EnsureSessionError),
-      expect.objectContaining({ expectedGeneration: expect.any(Number) }),
-    );
+    expect(await app.ctx.agentStore.get('dev-1')).toMatchObject({
+      status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending', paneId: '%0',
+    });
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(await app.ctx.lockManager.claimOf('dev-1')).toBeNull();
   });
 
   it('creationToken pending → 409 (operator-action hint, not 500)', async () => {
@@ -2513,14 +2701,16 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(body.error).toMatch(/being created/);
   });
 
-  it('retry during DELETE (deletionInFlight): 409, ensureSession not invoked', async () => {
+  it('retry during DELETE (deletionInFlight): 409, no session created', async () => {
+    await seedAgent('dev-1', 'proj');
     app.ctx.agentManager.tryClaimDeletion(['dev-1']);
 
     const response = await post('/api/projects/proj/agents/dev-1/retry');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/being deleted/);
-    expect(vi.mocked(app.ctx.agentManager.ensureSession)).not.toHaveBeenCalled();
+    expect((await app.ctx.agentStore.get('dev-1'))?.paneId).toBeUndefined();
+    expect(app.ctx.agentManager.ensureSession).not.toHaveBeenCalled();
 
     app.ctx.agentManager.releaseDeletionClaim(['dev-1']);
   });
@@ -2544,6 +2734,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     await seedAgent('dev-1', 'proj');
     app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
     const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+    // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
     vi.spyOn(app.ctx.agentManager, 'ensureSession').mockRejectedValueOnce(
       new EnsureSessionError(
         { createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 },
@@ -2566,7 +2757,9 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
   it('retry rollback stands down when the session was adopted after create', async () => {
     await seedAgent('dev-1', 'proj');
     app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    // E1: 「create 与 rollback 之间发生了一次 adopt」没有确定性公共触发点;仅用于触发,断言走 HTTP 码、kill 未调用与告警
     const mgr = app.ctx.agentManager as unknown as { adoptGeneration: Map<string, number> };
+    // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
     vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementationOnce(async () => {
       mgr.adoptGeneration.set('dev-1', (mgr.adoptGeneration.get('dev-1') ?? 0) + 1);
       throw new EnsureSessionError(
@@ -2595,6 +2788,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     await seedAgent('dev-1', 'proj');
     app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
     const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+    // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
     vi.spyOn(app.ctx.agentManager, 'ensureSession').mockRejectedValueOnce(
       new EnsureSessionError(
         { createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 },
@@ -2658,7 +2852,6 @@ describe('POST /api/projects/:id/bootstrap', () => {
 describe('DELETE /api/projects/:id', () => {
   it('removes an empty project and hot-reloads config', async () => {
     await createProject('gone');
-    const agentReplace = vi.spyOn(app.ctx.agentManager, 'replaceConfig');
     const tmuxReplace = vi.fn();
     const bootstrapReplace = vi.fn();
     app.ctx.tmuxProbePoller = { replaceConfig: tmuxReplace, stop: vi.fn() } as never;
@@ -2669,7 +2862,7 @@ describe('DELETE /api/projects/:id', () => {
     const body = JSON.parse(response.body);
     expect(body).toEqual({ removed: 'gone', restartRequired: false });
     expect(app.ctx.config.project.some(p => p.id === 'gone')).toBe(false);
-    expect(agentReplace).toHaveBeenCalledTimes(1);
+    expect(app.ctx.agentManager.getProjectConfig('gone')).toBeUndefined();
     expect(tmuxReplace).toHaveBeenCalledTimes(1);
     expect(bootstrapReplace).toHaveBeenCalledTimes(1);
   });

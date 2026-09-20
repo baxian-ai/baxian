@@ -175,16 +175,30 @@ describe('hasRuntimeReadyView', () => {
     expect(hasRuntimeReadyView(lines.join('\n'), 'claude-code')).toBe(false);
   });
 
-  it('does not apply the claude small-pane fallback to codex', () => {
-    expect(hasRuntimeReadyView('❯ \n', 'codex')).toBe(false);
-  });
-
-  it('accepts codex idle prompt with → arrow', () => {
-    expect(hasRuntimeReadyView('→ baxian git:(main)\n', 'codex')).toBe(true);
-  });
-
-  it('accepts a bare › as codex idle (a cleared empty composer; busy/menu gating still applies)', () => {
-    expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
+  it.each<[string, string, AgentRuntimeKind, boolean]>([
+    ['does not apply the claude small-pane fallback to codex', '❯ \n', 'codex', false],
+    ['accepts codex idle prompt with → arrow', '→ baxian git:(main)\n', 'codex', true],
+    ['accepts a bare › as codex idle (a cleared empty composer; busy/menu gating still applies)', '› \n', 'codex', true],
+    ['treats a claude-styled spinner above the codex prompt as stale (codex working detection rides the OSC title)', '· Thinking… (5s)\n→ baxian git:(main)\n', 'codex', true],
+    ['accepts codex → prompt when stale esc-to-interrupt is ABOVE the prompt', 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n', 'codex', true],
+    ['rejects codex → prompt when esc-to-interrupt is BELOW the prompt (active busy)', '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n', 'codex', false],
+    ['rejects codex → prompt when Working(...) is active in tail', '→ baxian git:(main)\n• Working (8s)\n', 'codex', false],
+    ['does not accept → output line (e.g. → run tests) as codex idle prompt', '→ run tests\n', 'codex', false],
+    ['does not accept indented → line as codex idle prompt', '  → baxian git:(main)\n', 'codex', false],
+    ['rejects codex → prompt when output follows it', '→ baxian git:(main)\nStill working on the request...\n', 'codex', false],
+    ['accepts codex backtrack hint footer (Esc on empty composer) as idle/ready',
+      '─ Worked for 1m 14s ─────────────────\n\n› Use /skills to list available skills\n\n  esc again to edit previous message\n', 'codex', true],
+    ['only treats the backtrack hint as ready when it is the bottom footer (busy marker below → not ready)',
+      '› Use /skills to list available skills\n\n  esc again to edit previous message\n· Working (8s)\n', 'codex', false],
+    ['does not treat the backtrack hint as ready for claude-code', '  esc again to edit previous message\n', 'claude-code', false],
+    ['opencode: idle composer footer without busy signals is ready', '┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode', true],
+    ['opencode: a working screen (progress bar + esc interrupt) is not ready', '   ■■■⬝⬝⬝  esc interrupt          ctrl+p commands\n', 'opencode', false],
+    ['qodercli: idle composer placeholder is ready', '*   Type your message or @path/to/file\n', 'qodercli', true],
+    ['qodercli: a thinking spinner screen is not ready', '⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli', false],
+    ['opencode: a permission prompt that keeps the idle footer is not ready', '△ Permission required\n  Allow once   Reject\n  ctrl+p commands\n', 'opencode', false],
+    ['qodercli: a shortcuts/help overlay is not ready (footer alone is not an idle cue)', '  keyboard shortcuts\n  ? for shortcuts\n', 'qodercli', false],
+  ])('%s', (_label, screen, runtime, expected) => {
+    expect(hasRuntimeReadyView(screen, runtime)).toBe(expected);
   });
 
   it('codex: a completion popup is not ready even with the YOLO banner anchor on screen (Enter would insert, not submit)', () => {
@@ -201,77 +215,6 @@ describe('hasRuntimeReadyView', () => {
     expect.soft(hasRuntimeReadyView(screen, 'codex')).toBe(true);
   });
 
-  it('treats a claude-styled spinner above the codex prompt as stale (codex working detection rides the OSC title)', () => {
-    const screen = '· Thinking… (5s)\n→ baxian git:(main)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
-  });
-
-  it('accepts codex → prompt when stale esc-to-interrupt is ABOVE the prompt', () => {
-    const screen = 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
-  });
-
-  it('rejects codex → prompt when esc-to-interrupt is BELOW the prompt (active busy)', () => {
-    const screen = '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
-  });
-
-  it('rejects codex → prompt when Working(...) is active in tail', () => {
-    const screen = '→ baxian git:(main)\n• Working (8s)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
-  });
-
-  it('does not accept → output line (e.g. → run tests) as codex idle prompt', () => {
-    expect(hasRuntimeReadyView('→ run tests\n', 'codex')).toBe(false);
-  });
-
-  it('does not accept indented → line as codex idle prompt', () => {
-    expect(hasRuntimeReadyView('  → baxian git:(main)\n', 'codex')).toBe(false);
-  });
-
-  it('rejects codex → prompt when output follows it', () => {
-    expect(hasRuntimeReadyView('→ baxian git:(main)\nStill working on the request...\n', 'codex')).toBe(false);
-  });
-
-  it('accepts codex backtrack hint footer (Esc on empty composer) as idle/ready', () => {
-    const screen =
-      '─ Worked for 1m 14s ─────────────────\n\n' +
-      '› Use /skills to list available skills\n\n' +
-      '  esc again to edit previous message\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
-  });
-
-  it('only treats the backtrack hint as ready when it is the bottom footer (busy marker below → not ready)', () => {
-    const screen =
-      '› Use /skills to list available skills\n\n' +
-      '  esc again to edit previous message\n' +
-      '· Working (8s)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
-  });
-
-  it('does not treat the backtrack hint as ready for claude-code', () => {
-    expect(hasRuntimeReadyView('  esc again to edit previous message\n', 'claude-code')).toBe(false);
-  });
-
-  it('opencode: idle composer footer without busy signals is ready', () => {
-    expect(hasRuntimeReadyView('┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode')).toBe(true);
-  });
-
-  it('opencode: a working screen (progress bar + esc interrupt) is not ready', () => {
-    expect(hasRuntimeReadyView('   ■■■⬝⬝⬝  esc interrupt          ctrl+p commands\n', 'opencode')).toBe(false);
-  });
-
-  it('qodercli: idle composer placeholder is ready', () => {
-    expect(hasRuntimeReadyView('*   Type your message or @path/to/file\n', 'qodercli')).toBe(true);
-  });
-
-  it('qodercli: a thinking spinner screen is not ready', () => {
-    expect(hasRuntimeReadyView('⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli')).toBe(false);
-  });
-
-  it('opencode: a permission prompt that keeps the idle footer is not ready', () => {
-    expect(hasRuntimeReadyView('△ Permission required\n  Allow once   Reject\n  ctrl+p commands\n', 'opencode')).toBe(false);
-  });
 
   it.each([
     'Permission Required',
@@ -294,38 +237,19 @@ describe('hasRuntimeReadyView', () => {
     expect(hasRuntimeReadyView(`${prompt}\n  Type your message or @path\n`, 'qodercli')).toBe(true);
   });
 
-  it('qodercli: a shortcuts/help overlay is not ready (footer alone is not an idle cue)', () => {
-    expect(hasRuntimeReadyView('  keyboard shortcuts\n  ? for shortcuts\n', 'qodercli')).toBe(false);
-  });
 });
 
 describe('working-state gating (was runtimeBusyCheck, opencode/qodercli screen-only busy)', () => {
-  it('opencode: esc interrupt hint is busy', () => {
-    expect(busy('   ■■■⬝⬝⬝  esc interrupt\n', 'opencode')).toBe(true);
-  });
-
-  it('opencode: idle composer is not busy', () => {
-    expect(busy('┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode')).toBe(false);
-  });
-
-  it('qodercli: "(esc to cancel," spinner is busy', () => {
-    expect(busy('⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli')).toBe(true);
-  });
-
-  it('qodercli: idle composer is not busy', () => {
-    expect(busy('*   Type your message or @path/to/file\n', 'qodercli')).toBe(false);
-  });
-
-  it('opencode: ctrl+c interrupt hint alone (progress bar wrapped out of tail) is busy', () => {
-    expect(busy('running a long tool call\n  ctrl+c to interrupt          ctrl+p commands\n', 'opencode')).toBe(true);
-  });
-
-  it('opencode: uppercase "ESC to interrupt" is busy (case-insensitive contains)', () => {
-    expect(busy('long tool output\n  ESC to interrupt\n', 'opencode')).toBe(true);
-  });
-
-  it('qodercli: braille spinner with non-ASCII activity text is busy', () => {
-    expect(busy('⠼ 正在思考中...\n', 'qodercli')).toBe(true);
+  it.each<[string, string, AgentRuntimeKind, boolean]>([
+    ['opencode: esc interrupt hint is busy', '   ■■■⬝⬝⬝  esc interrupt\n', 'opencode', true],
+    ['opencode: idle composer is not busy', '┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode', false],
+    ['qodercli: "(esc to cancel," spinner is busy', '⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli', true],
+    ['qodercli: idle composer is not busy', '*   Type your message or @path/to/file\n', 'qodercli', false],
+    ['opencode: ctrl+c interrupt hint alone (progress bar wrapped out of tail) is busy', 'running a long tool call\n  ctrl+c to interrupt          ctrl+p commands\n', 'opencode', true],
+    ['opencode: uppercase "ESC to interrupt" is busy (case-insensitive contains)', 'long tool output\n  ESC to interrupt\n', 'opencode', true],
+    ['qodercli: braille spinner with non-ASCII activity text is busy', '⠼ 正在思考中...\n', 'qodercli', true],
+  ])('%s', (_label, screen, runtime, expected) => {
+    expect(busy(screen, runtime)).toBe(expected);
   });
 });
 
@@ -352,34 +276,14 @@ describe('working-state gating (herdr whole_recent = 整屏,陈旧 hint 不再�
 });
 
 describe('working-state gating (position-aware)', () => {
-  it('codex: stale esc-to-interrupt above → prompt is NOT busy (position-aware)', () => {
-    const screen = 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n';
-    expect(busy(screen, 'codex')).toBe(false);
-  });
-
-  it('codex: a plain esc-to-interrupt line is not a herdr codex working signal (working rides the OSC title / • Working shape)', () => {
-    const screen = '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n';
-    expect(busy(screen, 'codex')).toBe(false);
-  });
-
-  it('claude-code: spinner above a blank sea IS busy (non-empty window, blanks cannot push the spinner out)', () => {
-    const lines = [
-      '✽ Grooving… (5m 21s · thinking)',
-      ...blank(18),
-      '❯ ',
-      '',
-    ];
-    expect(busy(lines.join('\n'), 'claude-code')).toBe(true);
-  });
-
-  it('codex: same tall-pane spinner is NOT busy (position-aware only checks tail)', () => {
-    const lines = [
-      '✽ Grooving… (5m 21s · thinking)',
-      ...blank(18),
-      '→ baxian git:(main)',
-      '',
-    ];
-    expect(busy(lines.join('\n'), 'codex')).toBe(false);
+  const tallSpinner = (prompt: string): string => ['✽ Grooving… (5m 21s · thinking)', ...blank(18), prompt, ''].join('\n');
+  it.each<[string, string, AgentRuntimeKind, boolean]>([
+    ['codex: stale esc-to-interrupt above → prompt is NOT busy (position-aware)', 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n', 'codex', false],
+    ['codex: a plain esc-to-interrupt line is not a herdr codex working signal (working rides the OSC title / • Working shape)', '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n', 'codex', false],
+    ['claude-code: spinner above a blank sea IS busy (non-empty window, blanks cannot push the spinner out)', tallSpinner('❯ '), 'claude-code', true],
+    ['codex: same tall-pane spinner is NOT busy (position-aware only checks tail)', tallSpinner('→ baxian git:(main)'), 'codex', false],
+  ])('%s', (_label, screen, runtime, expected) => {
+    expect(busy(screen, runtime)).toBe(expected);
   });
 });
 
@@ -550,13 +454,15 @@ describe('overlay gating (was detectRuntimeOverlay, now skipStateUpdate; herdr t
 });
 
 describe('launch composer cues (was hasRuntimeIdleComposerPrompt; herdr manifest 无 composer idle 规则,生命周期就绪走 native 线索)', () => {
-  it('detects codex → prompt in tail', () => {
-    const screen = 'some output\n→ baxian git:(main)\n';
-    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
-  });
-
-  it('detects codex → prompt without git info', () => {
-    expect(hasRuntimeReadyView('→ myproject\n', 'codex')).toBe(true);
+  it.each<[string, string, AgentRuntimeKind, boolean]>([
+    ['detects codex → prompt in tail', 'some output\n→ baxian git:(main)\n', 'codex', true],
+    ['detects codex → prompt without git info', '→ myproject\n', 'codex', true],
+    ['does not match → followed by multi-word content (output, not prompt)', '→ run tests now\n', 'codex', false],
+    ['does not match → prompt when output follows it', '→ baxian git:(main)\nStill working on the request...\n', 'codex', false],
+    ['rejects codex when prompt is not in tail', ['→ baxian git:(main)', ...Array.from({ length: 9 }, (_, i) => `line ${i + 1}`)].join('\n'), 'codex', false],
+    ['still works for claude-code', '❯ \n', 'claude-code', true],
+  ])('%s', (_label, screen, runtime, expected) => {
+    expect(hasRuntimeReadyView(screen, runtime)).toBe(expected);
   });
 
   it('matches a bare › empty composer — only blank lines may follow (col-0 OR indented marker)', () => {
@@ -573,23 +479,6 @@ describe('launch composer cues (was hasRuntimeIdleComposerPrompt; herdr manifest
     expect(hasRuntimeReadyView('› old typing\n  wrapped\n  ›\n', 'codex')).toBe(true);
   });
 
-  it('does not match → followed by multi-word content (output, not prompt)', () => {
-    expect(hasRuntimeReadyView('→ run tests now\n', 'codex')).toBe(false);
-  });
-
-  it('does not match → prompt when output follows it', () => {
-    expect(hasRuntimeReadyView('→ baxian git:(main)\nStill working on the request...\n', 'codex')).toBe(false);
-  });
-
-  it('rejects codex when prompt is not in tail', () => {
-    const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`);
-    lines[0] = '→ baxian git:(main)';
-    expect(hasRuntimeReadyView(lines.join('\n'), 'codex')).toBe(false);
-  });
-
-  it('still works for claude-code', () => {
-    expect(hasRuntimeReadyView('❯ \n', 'claude-code')).toBe(true);
-  });
 });
 
 describe('active-busy gating for claude (was detectReplActiveBusy / hasActiveSpinner*)', () => {

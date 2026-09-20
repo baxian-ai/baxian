@@ -513,9 +513,7 @@ describe('PaneStreamer', () => {
         await tick();
 
         expect(calls()).toBe(1);
-        expect(warnSpy).toHaveBeenCalledWith(
-          '[pane-streamer] dev-1 attach failing; backing off retries: probe timeout',
-        );
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/dev-1 attach failing.*probe timeout/));
         await expectAfter(1000, 1);
         await expectAfter(2000, 1);
       }, { ptyFactory: factory, runner, reattachDelayMs: 1000, sessionProbeTimeoutMs: 1234 });
@@ -773,7 +771,7 @@ describe('PaneStreamer', () => {
       const { factory, expectAfter } = countingFactory(ptys, [1]);
       await withTimerHarness(async ({ warnSpy, logSpy }) => {
         const recoveredLines = () =>
-          logSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('attach recovered'));
+          logSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('dev-1 attach recovered'));
         ptys[0].emitExit(0);
         await tick();
 
@@ -784,7 +782,7 @@ describe('PaneStreamer', () => {
         await vi.advanceTimersByTimeAsync(4999);
         expect(recoveredLines()).toEqual([]);
         await vi.advanceTimersByTimeAsync(1);
-        expect(recoveredLines()).toEqual(['[pane-streamer] dev-1 attach recovered']);
+        expect(recoveredLines()).toHaveLength(1);
 
         ptys[2].emitExit(0);
         await tick();
@@ -1274,7 +1272,8 @@ describe('spawn geometry baseline', () => {
     sizeMode: mode,
     ownerGen: null,
     ref: { serverPid: '1', serverStart: '2', sessionId: '$3' },
-    fencedCapable: true,
+    claim: 'dev-1',
+    ownerWriteCapability: 'full',
   });
 
   it('flagged + holds==0: headless AND pty spawn at desiredTty (W + status lines)', async () => {
@@ -1529,7 +1528,8 @@ describe('viewport follow tick', () => {
     sizeMode: mode,
     ownerGen: null,
     ref: { serverPid: '1', serverStart: '2', sessionId: '$3' },
-    fencedCapable: true,
+    claim: 'dev-1',
+    ownerWriteCapability: 'full',
   });
 
   function flaggedFactory(attachPty: FakePty): PtyFactory {

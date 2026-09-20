@@ -237,7 +237,7 @@ async function createTmuxFixture(tmuxFile = 'tmux'): Promise<TmuxFixture> {
   const sessionName = `baxian-attach-${nonce}`;
   const releaseChannel = `baxian-attach-release-${nonce}`;
   const socketRoot = await mkdtemp(join(await realpath(tmpdir()), 'baxian-attach-test-'));
-  const env = { ...process.env, TMUX_TMPDIR: socketRoot };
+  const env: NodeJS.ProcessEnv = { ...process.env, TMUX_TMPDIR: socketRoot };
   delete env.TMUX;
   delete env.TMUX_PANE;
   const cleanupRef: TmuxFixtureCleanup = {

@@ -2,8 +2,12 @@ import { describe, it, expect, vi } from 'vitest';
 import type { TaskState } from '../../src/shared/index.js';
 import { taskAttentionGeneration } from '../../src/shared/index.js';
 import { AgentManager, DispatchTerminalError, EnsureSessionError } from '../../src/agent/manager.js';
-import { ReplNotReadyError } from '../../src/agent/tmux.js';
-import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
+import { buildPhaseSignal } from '../../src/agent/phase-signal.js';
+import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
+import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import { RUNTIME_PROFILES, type FakeRunner, type FakeRunnerOptions } from '../helpers/fake-runner.js';
 import { makeTask } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
@@ -17,6 +21,50 @@ async function waitUntilAsync(predicate: () => Promise<boolean>, timeoutMs = 100
   throw new Error('waitUntilAsync: predicate never became true');
 }
 const harness = useManagerSuiteHarness();
+
+// 换一台带不同布置的 live runner,manager 经公共依赖重建
+function useRunner(options: FakeRunnerOptions): FakeRunner {
+  const runner = createManagerSuiteRunner(options);
+  harness.manager = harness.createManager({ runnerFactory: () => runner });
+  return runner;
+}
+
+// 真实 PhaseSignalWatcher + 假 streamer:成功武装的证据是投帧后真的产出事件
+function armedWatcher(): { watcher: PhaseSignalWatcher; feed: (frame: string) => void } {
+  const subscribers: Array<SubscriberCallbacks['onVisible']> = [];
+  const streamer = {
+    subscribeAtomic: async (cbs: SubscriberCallbacks) => {
+      subscribers.push(cbs.onVisible);
+      return {
+        snapshot: { data: '', cols: 80, rows: 24 },
+        snapshotSeq: 0,
+        unsubscribe: () => { subscribers.length = 0; },
+      };
+    },
+  };
+  const watcher = new PhaseSignalWatcher({
+    paneStreamerManager: { ensure: () => streamer } as unknown as PaneStreamerManager,
+    eventBus: harness.eventBus,
+    resolveAgent: id => {
+      const agent = harness.config.project.flatMap(p => p.agent.flat()).find(a => a.id === id);
+      return agent ? { ...agent, projectId: 'proj' } : undefined;
+    },
+  });
+  return {
+    watcher,
+    feed: frame => { for (const onVisible of [...subscribers]) onVisible?.(frame, 1); },
+  };
+}
+
+// 武装失败:公共依赖注入一个 start() 恒为 false 的 watcher 替身
+function unarmedWatcher(): PhaseSignalWatcher {
+  return {
+    start: async () => false,
+    stop: () => {},
+    stopAgentIfToken: () => {},
+    has: () => false,
+  } as unknown as PhaseSignalWatcher;
+}
 
 describe('AgentManager transitionTaskStatus', () => {
   it('persists a valid non-terminal transition and returns the previous status', async () => {
@@ -155,6 +203,7 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     return harness.createManager({
       config: harness.config,
       phaseSignalWatcher: watcherStub() as never,
+      cleanComposerWaitMs: 20,
     });
   }
 
@@ -176,33 +225,20 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     await seedSpecTask({ status: 'review', specReviewRound: 1 });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     await harness.seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    const waitingSpy = vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
 
     const result = await m.parkTaskAtSpecReady('task-spec-1');
+
     expect(result?.status).toBe('spec-ready');
     expect(result?.phase).toBe('spec');
     expect(result?.qaAgentId).toBe('qa-1');
     expect((await harness.taskStore.get('task-spec-1'))?.qaAgentId).toBe('qa-1');
-    const parkedGeneration = {
-      status: 'spec-ready',
-      phase: 'spec',
-      signalToken: undefined,
-      agentId: 'dev-1',
-      reviewRound: 0,
-      specReviewRound: 1,
-    };
-    expect(waitingSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'task-spec-1',
-      { expectedTask: parkedGeneration },
-    );
-    expect(releaseSpy).toHaveBeenCalledWith(
-      'qa-1',
-      'task-spec-1',
-      'idle',
-      { expectedTask: parkedGeneration, deferWhenBusy: true },
-    );
+    // Dev 停在原地等裁决:绑定与锁都保留
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBe('task-spec-1');
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
+    // QA 交还:绑定清空、锁释放
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await harness.lockManager.isLocked('qa-1')).toBe(false);
+    expect(harness.events.filter(e => e.type === 'human.intervention')).toEqual([]);
   });
 
   it('QA REPL 仍忙（APPROVE 已发、仍在收尾）→ 延后释放：QA 保持绑定、不落 hold、不告警', async () => {
@@ -210,15 +246,8 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     await seedSpecTask({ status: 'review', specReviewRound: 1 });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     await harness.seedAgent({ id: 'qa-1', taskId: 'task-spec-1', paneId: '%1' });
-    vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(
-      m as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
-      'inspectReleaseRuntime',
-    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
-    vi.spyOn(
-      m as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
-      'waitForReplPromptReady',
-    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+    // QA 的 REPL 还在收尾:静态忙碌帧不随抓屏回落,释放前的 ready 等待只能超时
+    harness.runner.sessions.markWorking('qa-1', RUNTIME_PROFILES.codex.workingFrame);
 
     const result = await m.parkTaskAtSpecReady('task-spec-1');
 
@@ -234,8 +263,9 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     await seedSpecTask({ status: 'review', specReviewRound: 1 });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     await harness.seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(false);
+    // QA 早已不是这把锁的持有者:释放被拒,且不是「忙」
+    const qaLock = await harness.lockManager.claimOf('qa-1');
+    await harness.lockManager.releaseIfOwner('qa-1', 'task-spec-1', qaLock!.token);
 
     await m.parkTaskAtSpecReady('task-spec-1');
 
@@ -268,8 +298,6 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     await harness.seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask');
-    const waitingSpy = vi.spyOn(m, 'markAgentWaiting');
     await seedSpecTask({
       status: 'review',
       specReviewRound: 2,
@@ -288,8 +316,10 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     });
 
     expect(result).toBeNull();
-    expect(releaseSpy).not.toHaveBeenCalled();
-    expect(waitingSpy).not.toHaveBeenCalled();
+    // 既没停驻 Dev 也没交还 QA:两边的绑定与锁都原封不动
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBe('task-spec-1');
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBe('task-spec-1');
+    expect(await harness.lockManager.isLocked('qa-1')).toBe(true);
     expect(await harness.taskStore.get('task-spec-1')).toMatchObject({
       status: 'review',
       specReviewRound: 2,
@@ -409,7 +439,7 @@ describe('AgentManager max_rounds manual actions', () => {
     it('rejects with 409 (no merge) when the QA is awaiting_human and bound to the task', async () => {
       await harness.taskStore.set(maxRoundsTask({ qaAgentId: 'qa-1' }));
       await harness.seedAgent({
-        id: 'dev-1', status: 'waiting',
+        id: 'dev-1', status: 'ok',
         taskId: 'task-mr', workdir: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1',
       });
       await harness.seedAgent({
@@ -447,7 +477,7 @@ describe('AgentManager max_rounds manual actions', () => {
     async function completeInFlight(): Promise<{ release: () => void; done: Promise<TaskState> }> {
       await harness.taskStore.set(maxRoundsTask());
       await harness.seedAgent({
-        id: 'dev-1', status: 'waiting',
+        id: 'dev-1', status: 'ok',
         taskId: 'task-mr', workdir: '/tmp/repo/.baxian-worktrees/task-mr_abc',
         paneId: '%1',
       });
@@ -487,36 +517,38 @@ describe('AgentManager max_rounds manual actions', () => {
   describe('continueDevRound', () => {
     async function bindReservedDev(): Promise<void> {
       await harness.seedAgent({
-        id: 'dev-1', status: 'waiting',
-        taskId: 'task-mr', workdir: '/tmp/repo/.baxian-worktrees/task-mr_abc',
-        paneId: '%1',
+        id: 'dev-1', status: 'ok',
+        taskId: 'task-mr', paneId: '%0',
       });
     }
 
-    async function setupContinueDev(armed: boolean): Promise<void> {
+    async function setupContinueDev(watcher?: PhaseSignalWatcher): Promise<void> {
       await harness.taskStore.set(maxRoundsTask());
       await bindReservedDev();
-      vi.spyOn(harness.manager, 'acquireAgentForTask').mockResolvedValue(true);
-      vi.spyOn(harness.manager as unknown as {
-        rotateAndSetupPhaseSignal: () => Promise<{ token: string; armed: boolean }>;
-      },
-        'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'fix-token', armed });
+      if (watcher) harness.manager = harness.createManager({ phaseSignalWatcher: watcher });
     }
 
     it('transitions max_rounds → fixing, bumps the round, and dispatches the fix', async () => {
-      await setupContinueDev(true);
-      const continueSpy = vi.spyOn(harness.manager, 'continueSession').mockResolvedValue(true);
+      const signals = armedWatcher();
+      await setupContinueDev(signals.watcher);
 
       const result = await harness.manager.continueDevRound('task-mr');
 
       expect(result.status).toBe('fixing');
       expect(result.reviewRound).toBe(3);
-      expect(continueSpy).toHaveBeenCalledWith(
-        'task-mr',
-        'dev-1',
-        'fix',
-        expect.objectContaining({ signalToken: 'fix-token' }),
-      );
+      const token = (await harness.taskStore.get('task-mr'))!.signalToken!;
+      expect(token).not.toBe('111111111111');
+      expect(harness.runner.pastedPrompts).toEqual([
+        { pane: '%0', body: expect.stringContaining(`token: ${token}`) },
+      ]);
+      expect(harness.runner.pastedPrompts[0]!.body).toContain('phase: fix');
+      // 武装成功的证据:这一轮的新 token 投进来才产出事件,旧 token 不被消费
+      signals.feed(`${buildPhaseSignal('pr-fixed', 'stale-token12')}\n`);
+      expect(harness.events.some(e => e.type === 'pr.fix.submitted')).toBe(false);
+      signals.feed(`${buildPhaseSignal('pr-fixed', token)}\n`);
+      await vi.waitFor(() => {
+        expect(harness.events.some(e => e.type === 'pr.fix.submitted' && e.taskId === 'task-mr')).toBe(true);
+      });
     });
 
     it.each([
@@ -539,35 +571,54 @@ describe('AgentManager max_rounds manual actions', () => {
     });
 
     it('rolls back to max_rounds and Holds the dev when the pr-fixed watcher fails to arm', async () => {
-      await setupContinueDev(false);
-      const holdSpy = vi.spyOn(harness.manager, 'markAwaitingHuman').mockResolvedValue(true);
-      const continueSpy = vi.spyOn(harness.manager, 'continueSession').mockResolvedValue(true);
+      await setupContinueDev(unarmedWatcher());
 
       await expect(harness.manager.continueDevRound('task-mr')).rejects.toMatchObject({ status: 500 });
-      expect(continueSpy).not.toHaveBeenCalled();
-      expect(holdSpy).toHaveBeenCalled();
+
+      // 没武装就不投递
+      expect(harness.runner.pastedPrompts).toEqual([]);
+      expect(await harness.agentStore.get('dev-1')).toMatchObject({
+        taskId: 'task-mr',
+        status: 'awaiting_human',
+        awaitingPhase: 'signal-arm-failed:pr-fixed',
+      });
       const t = await harness.taskStore.get('task-mr');
       expect(t?.status).toBe('max_rounds');
       expect(t?.reviewRound).toBe(2);
     });
 
-    it('rolls back to max_rounds and re-parks the dev when continueSession returns false', async () => {
-      await setupContinueDev(true);
-      vi.spyOn(harness.manager, 'continueSession').mockResolvedValue(false);
-      const waitSpy = vi.spyOn(harness.manager, 'markAgentWaiting').mockResolvedValue(true);
+    it('rolls back to max_rounds and re-parks the dev when the fix prompt is not delivered', async () => {
+      await harness.taskStore.set(maxRoundsTask());
+      await bindReservedDev();
+      // 派单途中这一轮的 pass 被换掉:投递前的守卫拒绝粘贴
+      let flipped = false;
+      const runner = useRunner({
+        onExec: async command => {
+          if (flipped || !command.includes('capture-pane')) return;
+          flipped = true;
+          const fresh = (await harness.taskStore.get('task-mr'))!;
+          await harness.taskStore.set({ ...fresh, signalToken: 'successor12x', updatedAt: new Date().toISOString() });
+        },
+      });
 
       await expect(harness.manager.continueDevRound('task-mr')).rejects.toMatchObject({ status: 500 });
+
+      expect(flipped).toBe(true);
       const t = await harness.taskStore.get('task-mr');
       expect(t?.status).toBe('max_rounds');
       expect(t?.reviewRound).toBe(2);
-      expect(waitSpy).toHaveBeenCalledWith('dev-1', 'task-mr');
+      // Dev 原地停驻:绑定与锁都还在,没有被停驻成 awaiting_human
+      expect(await harness.agentStore.get('dev-1')).toMatchObject({ taskId: 'task-mr' });
+      expect((await harness.agentStore.get('dev-1'))?.status).not.toBe('awaiting_human');
+      expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
+      expect(runner.pastedPrompts).toEqual([]);
     });
   });
 
   it('markAgentWaiting succeeds for a dev bound to a max_rounds task (active set unification)', async () => {
     await harness.taskStore.set(maxRoundsTask());
     await harness.seedAgent({
-      id: 'dev-1', status: 'running',
+      id: 'dev-1', status: 'ok',
       taskId: 'task-mr', paneId: '%1',
     });
     await expect(harness.manager.markAgentWaiting('dev-1', 'task-mr')).resolves.toBe(true);
@@ -576,7 +627,7 @@ describe('AgentManager max_rounds manual actions', () => {
   it('failTasksForAgent fails a max_rounds task when its reserved dev dies', async () => {
     await harness.taskStore.set(maxRoundsTask());
     await harness.seedAgent({
-      id: 'dev-1', status: 'waiting', taskId: 'task-mr',
+      id: 'dev-1', status: 'ok', taskId: 'task-mr',
     });
     const { failedTaskIds } = await harness.manager.failTasksForAgent('dev-1', 'tmux-absent');
     expect(failedTaskIds).toContain('task-mr');
@@ -587,7 +638,7 @@ describe('AgentManager max_rounds manual actions', () => {
     await harness.taskStore.set(makeTask({
       id: 'task-sr', status: 'spec-ready', phase: 'spec', agentId: 'dev-1',
     }));
-    await harness.seedAgent({ id: 'dev-1', status: 'waiting', taskId: 'task-sr' });
+    await harness.seedAgent({ id: 'dev-1', status: 'ok', taskId: 'task-sr' });
     const { failedTaskIds } = await harness.manager.failTasksForAgent('dev-1', 'tmux-absent');
     expect(failedTaskIds).toContain('task-sr');
     expect((await harness.taskStore.get('task-sr'))?.status).toBe('failed');
@@ -723,16 +774,17 @@ describe('AgentManager max_rounds manual actions', () => {
   it('cancelTask cancels a max_rounds task (non-terminal) and releases the reserved dev', async () => {
     await harness.taskStore.set(maxRoundsTask({ prNumber: undefined, prUrl: undefined }));
     await harness.seedAgent({
-      id: 'dev-1', status: 'waiting',
-      taskId: 'task-mr', paneId: '%1',
+      id: 'dev-1', status: 'ok',
+      taskId: 'task-mr', paneId: '%0',
     });
-    harness.mockInterruptPane(harness.manager, true);
-    const releaseSpy = vi.spyOn(harness.manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await harness.manager.cancelTask('task-mr');
 
     expect(cancelled.status).toBe('cancelled');
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-mr', 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
+    const dev = await harness.agentStore.get('dev-1');
+    expect(dev?.taskId).toBeUndefined();
+    expect(dev?.status).toBeUndefined();
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 });
 
@@ -837,7 +889,6 @@ describe('AgentManager.failTaskForDispatchError edge paths', () => {
     );
 
     expect((await harness.taskStore.get('task-1'))?.status).toBe('done');
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('skipping task transition'))).toBe(true);
     expect(harness.events.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'dispatch-failed:gate_failed')).toBe(true);
     warnSpy.mockRestore();
@@ -846,6 +897,7 @@ describe('AgentManager.failTaskForDispatchError edge paths', () => {
   it('warns when the post-failure release itself throws', async () => {
     await harness.seedTask({ status: 'in_progress' });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-1' });
+    // E2: 收尾释放自身抛错是状态机内部的吞掉分支,runner/git 边界的失败都会被释放路径自己转成 hold
     vi.spyOn(harness.manager, 'releaseAgentForTask').mockRejectedValue(new Error('release blip'));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -854,7 +906,9 @@ describe('AgentManager.failTaskForDispatchError edge paths', () => {
     );
 
     expect((await harness.taskStore.get('task-1'))?.status).toBe('failed');
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('releaseAgentForTask'))).toBe(true);
+    // the swallowed release failure has no other outlet: the warning must name the agent and carry the error
+    const releaseWarning = warnSpy.mock.calls.find(call => /releaseAgentForTask\(dev-1\)/.test(String(call[0])));
+    expect(releaseWarning?.[1]).toMatchObject({ message: 'release blip' });
     warnSpy.mockRestore();
   });
 });
@@ -909,7 +963,7 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
   it('propagates a marker rollback write failure from the handled dispatch rollback too', async () => {
     const m = harness.createManager();
     await seedSpecApproved({ status: 'spec-ready' });
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    // E2: handled=true 的 EnsureSessionError(派单已自行收尾)由状态机内部设置,runner 层的失败都带着自己的收尾
     vi.spyOn(m, 'continueSession').mockRejectedValue(
       new EnsureSessionError({ createdSession: false, agentId: 'dev-1', handled: true }, 'workdir busy'),
     );
@@ -929,7 +983,7 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
   it('clears the reentry marker when a handled ensure failure rolls the task back to spec-ready', async () => {
     const m = harness.createManager();
     await seedSpecApproved({ status: 'spec-ready' });
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    // E2: 同上,handled 语义只能从派单内部构造
     vi.spyOn(m, 'continueSession').mockRejectedValue(
       new EnsureSessionError({ createdSession: false, agentId: 'dev-1', handled: true }, 'workdir busy'),
     );
@@ -945,100 +999,109 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
   });
 
   it('marks the parked dev as bootstrapping through the code dispatch and clears it on delivery', async () => {
-    const m = harness.createManager();
     await seedSpecApproved({ status: 'spec-ready' });
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    // 在真实投递那一刻取样绑定:标记必须已经立起来
     let markerDuringDispatch: string | undefined;
-    vi.spyOn(m, 'continueSession').mockImplementation(async () => {
-      markerDuringDispatch = (await harness.agentStore.get('dev-1'))?.bootstrappingTaskId;
-      return true;
+    const runner = useRunner({
+      onExec: async command => {
+        if (markerDuringDispatch !== undefined || !command.includes('paste-buffer')) return;
+        markerDuringDispatch = (await harness.agentStore.get('dev-1'))?.bootstrappingTaskId;
+      },
     });
 
-    const result = await m.transitionToCodePhase('task-code-1');
+    const result = await harness.manager.transitionToCodePhase('task-code-1');
 
     expect(result).not.toBeNull();
     expect(markerDuringDispatch).toBe('task-code-1');
+    expect(runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining('phase: code') }]);
     expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
   });
 
   it('holds the dev when the pr-created watcher prevents code-phase delivery', async () => {
     const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };
-    const m2 = harness.createManager({ phaseSignalWatcher: watcher as never,
-    });
+    const m2 = harness.createManager({ phaseSignalWatcher: watcher as never });
     await seedSpecApproved();
-    vi.spyOn(m2, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m2, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m2, 'continueSession').mockImplementation(async (_taskId, _agentId, _phase, opts) => {
-      await opts.armBeforeInject?.({});
-      return false;
-    });
-    const holdSpy = vi.spyOn(m2, 'markAwaitingHuman').mockResolvedValue(true);
 
     const result = await m2.transitionToCodePhase('task-code-1');
 
     expect(result).toBeNull();
     expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({ expectedKinds: 'pr-created' }));
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1', 'code-dispatch-failed', expect.any(String), { expectedTaskId: 'task-code-1' },
-    );
+    // 武装失败 → 不投递、停驻 Dev
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect(await harness.agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-code-1',
+      status: 'awaiting_human',
+      awaitingPhase: 'code-dispatch-failed',
+    });
   });
 
   it('stays at the spec gate and emits code-dev-acquire-failed when the dev is unavailable', async () => {
-    const m = harness.createManager();
     await seedSpecApproved();
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(false);
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
+    // Dev 还停在别的 hold 上:绑定闸门拒绝把它取走
+    await harness.seedAgent({
+      id: 'dev-1', taskId: 'task-code-1', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
+    });
 
-    const result = await m.transitionToCodePhase('task-code-1');
+    const result = await harness.manager.transitionToCodePhase('task-code-1');
 
     expect(result).toBeNull();
-    expect(holdSpy).not.toHaveBeenCalled();
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-interrupt-failed');
     expect((await harness.taskStore.get('task-code-1'))?.status).toBe('review');
     expect(harness.events.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'code-dev-acquire-failed')).toBe(true);
   });
 
   it('fails the task on a DispatchTerminalError from the code dispatch', async () => {
-    const m = harness.createManager();
-    await seedSpecApproved();
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockRejectedValue(new DispatchTerminalError('prompt_too_large', 'too big'));
-    const failSpy = vi.spyOn(m, 'failTaskForDispatchError').mockResolvedValue();
+    // 暂存目录里没有这张图:组装 code 提示词时抛 DispatchTerminalError
+    await seedSpecApproved({ images: ['gone.png'] });
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    await expect(m.transitionToCodePhase('task-code-1')).rejects.toMatchObject({ reason: 'prompt_too_large' });
-    expect(failSpy).toHaveBeenCalledWith('task-code-1', 'code', 'dev-1', expect.anything());
+    await expect(harness.manager.transitionToCodePhase('task-code-1'))
+      .rejects.toMatchObject({ reason: 'task_image_missing' });
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect((await harness.taskStore.get('task-code-1'))?.status).toBe('failed');
+    expect(harness.events.some(e => e.type === 'human.intervention'
+      && (e.data as { phase?: string }).phase === 'dispatch-failed:task_image_missing')).toBe(true);
     errSpy.mockRestore();
   });
 
   it('holds the dev on a generic code dispatch error', async () => {
-    const m = harness.createManager();
     await seedSpecApproved();
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockRejectedValue(new Error('pane vanished'));
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
+    useRunner({ rules: [{ match: 'capture-pane', reply: { stderr: 'pane vanished', exitCode: 1 } }] });
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    await expect(m.transitionToCodePhase('task-code-1')).rejects.toThrow('pane vanished');
-    expect(holdSpy).toHaveBeenCalledWith('dev-1', 'code-dispatch-failed', expect.any(String), { expectedTaskId: 'task-code-1' });
+    await expect(harness.manager.transitionToCodePhase('task-code-1')).rejects.toThrow(/pane vanished/);
+
+    expect(await harness.agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-code-1',
+      status: 'awaiting_human',
+      awaitingPhase: 'code-dispatch-failed',
+    });
     errSpy.mockRestore();
   });
 
   it('holds the dev and emits code-resume-failed when the code prompt is not delivered', async () => {
-    const m = harness.createManager();
     await seedSpecApproved();
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockResolvedValue(false);
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
+    // 派单途中任务离开 in_progress:code 提示词的状态闸门关上,提示词不投递
+    let flipped = false;
+    const runner = useRunner({
+      onExec: async command => {
+        if (flipped || !command.includes('capture-pane')) return;
+        flipped = true;
+        const fresh = (await harness.taskStore.get('task-code-1'))!;
+        await harness.taskStore.set({ ...fresh, status: 'review', updatedAt: new Date().toISOString() });
+      },
+    });
 
-    const result = await m.transitionToCodePhase('task-code-1');
+    const result = await harness.manager.transitionToCodePhase('task-code-1');
 
     expect(result).toBeNull();
-    expect(holdSpy).toHaveBeenCalled();
+    expect(flipped).toBe(true);
+    expect(runner.pastedPrompts).toEqual([]);
+    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('code-dispatch-failed');
     expect(harness.events.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'code-resume-failed')).toBe(true);
   });

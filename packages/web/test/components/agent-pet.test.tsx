@@ -1,13 +1,26 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, render, screen } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, render, renderHook, screen, waitFor } from '@testing-library/react';
 import type { AgentRuntimeStatus } from '../../src/shared/index.js';
 
-const sprite = vi.hoisted(() => ({ url: 'blob:mock' as string | null }));
-vi.mock('../../src/hooks/use-pets.ts', () => ({
-  usePetSpritesheet: () => sprite.url,
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
+import { api } from '../../src/api.ts';
+import { usePetSpritesheet } from '../../src/hooks/use-pets.ts';
 import { AgentPet, PET_ANIMATION_ROWS, petRowForStatus } from '../../src/components/agent-pet.tsx';
+
+const fetchSpritesheetMock = vi.mocked(api.pets.fetchSpritesheet);
+
+class StubURL extends URL {
+  static createObjectURL = vi.fn(() => 'blob:mock');
+  static revokeObjectURL = vi.fn();
+}
+
+// The spritesheet cache is module-level, so p1 is warmed once and the fake-timer cases mount it synchronously.
+async function loadSprite(petId: string): Promise<void> {
+  const { result, unmount } = renderHook(() => usePetSpritesheet(petId));
+  await waitFor(() => expect(result.current).toBe('blob:mock'));
+  unmount();
+}
 
 let reducedMotion = false;
 function setMatchMedia(reduced: boolean): void {
@@ -24,9 +37,15 @@ function setMatchMedia(reduced: boolean): void {
   })) as unknown as typeof window.matchMedia;
 }
 
-beforeEach(() => {
-  sprite.url = 'blob:mock';
+beforeEach(async () => {
+  vi.stubGlobal('URL', StubURL);
+  fetchSpritesheetMock.mockReset().mockResolvedValue(new Blob(['sprite']));
   setMatchMedia(true);
+  await loadSprite('p1');
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe('petRowForStatus', () => {
@@ -74,12 +93,27 @@ describe('AgentPet rendering', () => {
     expect(el.style.backgroundPositionY).toBe('-504px');
   });
 
-  it('falls back to the status pill while the spritesheet is unavailable', () => {
-    sprite.url = null;
-    render(<AgentPet petId="p1" status="working" label="Working" />);
+  it.each([
+    ['fails to load', 'p-missing', () => Promise.reject(new Error('404'))],
+    ['is still loading', 'p-slow', () => new Promise<Blob>(() => {})],
+  ])('falls back to the status label while the spritesheet %s', async (_case, petId, fetchImpl) => {
+    fetchSpritesheetMock.mockImplementation(fetchImpl);
+    render(<AgentPet petId={petId} status="working" label="Working" />);
+    await waitFor(() => expect(fetchSpritesheetMock).toHaveBeenCalledWith(petId));
     expect(screen.queryByRole('img', { name: 'Working' })).toBeNull();
-    const pill = screen.getByText('Working');
-    expect(pill.className).toContain('pill');
+    expect(screen.getByText('Working')).toBeTruthy();
+  });
+
+  it('fetches a spritesheet once and serves later mounts of the same pet from the shared cache', async () => {
+    render(<AgentPet petId="p-shared" status="idle" label="First" />);
+    await screen.findByRole('img', { name: 'First' });
+
+    render(<AgentPet petId="p-shared" status="idle" label="Second" />);
+
+    expect(screen.getByRole('img', { name: 'Second' })).toBeTruthy();
+    // 只数这个 pet 的请求:beforeEach 预热过 p1,按总次数断言会随执行顺序和模块缓存残留而变
+    const sharedCalls = fetchSpritesheetMock.mock.calls.filter(([id]) => id === 'p-shared');
+    expect(sharedCalls).toHaveLength(1);
   });
 
   it('stays on frame 0 when prefers-reduced-motion is set', () => {

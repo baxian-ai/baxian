@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { TaskSchemaError, TaskStore } from '../../src/state/task-store.js';
 import { initStateDir } from '../../src/state/init.js';
-import type { TaskState } from '../../src/shared/index.js';
+import type { CodeVerdictOutboxEntry, TaskState } from '../../src/shared/index.js';
 import { taskAttentionGeneration } from '../../src/shared/index.js';
 import { makeTask } from '../helpers/fixtures.js';
 
@@ -200,20 +200,15 @@ describe('TaskStore', () => {
     await store.set(task);
     expect((await store.get(task.id))?.outbox).toEqual(task.outbox);
 
+    const verdict = task.outbox![0] as CodeVerdictOutboxEntry;
     await expect(store.set({
       ...task,
-      outbox: [{
-        ...task.outbox![0]!,
-        data: { ...task.outbox![0]!.data, anchorSha: 'b'.repeat(40) },
-      }],
+      outbox: [{ ...verdict, data: { ...verdict.data, anchorSha: 'b'.repeat(40) } }],
     })).rejects.toThrow('code-phase git verdict');
 
     await expect(store.set({
       ...task,
-      outbox: [{
-        ...task.outbox![0]!,
-        data: { ...task.outbox![0]!.data, writeAttemptedAt: 'not-a-timestamp' },
-      }],
+      outbox: [{ ...verdict, data: { ...verdict.data, writeAttemptedAt: 'not-a-timestamp' } }],
     })).rejects.toThrow('code-phase git verdict');
   });
 
@@ -550,7 +545,7 @@ describe('TaskStore git review fields', () => {
     baseBranch: 'main',
     closedUnmergedAnchor: { prNumber: 42, generation: 1 },
     passProvenance: {
-      sourceKey: 'reviews', id: '900', bodyDigest: 'a'.repeat(64),
+      sourceKey: 'reviews', id: '900',
       token: 'abcdef123456', failToken: '123456abcdef', anchorSha: 'a'.repeat(40),
     },
     consumedFeedback: { 'issue-comments:100:aa': 1700000000000 },

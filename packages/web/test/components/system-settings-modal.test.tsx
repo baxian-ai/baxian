@@ -2,17 +2,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
 import type { ReactElement } from 'react';
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 import { api } from '../../src/api.ts';
-import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { expectToast } from '../helpers/toast.tsx';
 import { SystemSettingsModal } from '../../src/components/system-settings-modal.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { TaskNotificationsProvider } from '../../src/hooks/use-task-notifications.tsx';
 import { I18nProvider, __resetI18nForTests } from '../../src/i18n/index.tsx';
 
 const configPatchMock = vi.mocked(api.config.patch);
-const showMock = toastShowMock;
 
 const originalNotification = window.Notification;
 
@@ -36,13 +35,12 @@ function renderModal(withI18n = false) {
       <SystemSettingsModal open onClose={() => {}} />
     </TaskNotificationsProvider>
   );
-  return render(withI18n ? <I18nProvider>{body}</I18nProvider> : body);
+  return render(withI18n ? <I18nProvider>{body}</I18nProvider> : body, { wrapper: ToastProvider });
 }
 
 beforeEach(() => {
   cleanup();
   configPatchMock.mockReset();
-  showMock.mockReset();
   restoreNotification();
   localStorage.clear();
 });
@@ -82,7 +80,7 @@ describe('SystemSettingsModal', () => {
 
     fireEvent.click(screen.getByRole('radio', { name: '简体中文' }));
 
-    await waitFor(() => expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to save language: boom' }));
+    await expectToast({ title: 'Failed to save language: boom' });
     expect((screen.getByRole('radio', { name: 'English' }) as HTMLInputElement).checked).toBe(true);
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeTruthy();
   });

@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import type { TaskState } from '../../src/shared/index.js';
-import { ApiError } from '../../src/errors.js';
 import {
   TASK_IMAGE_MAX_COUNT,
   IMAGE_UPLOAD_MAX_BYTES,
@@ -29,25 +30,36 @@ function createPayload(overrides: Record<string, unknown> = {}): Record<string, 
   return { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1', ...overrides };
 }
 
+// Unassigned tasks are queued without starting an agent session, so the stored task is the whole outcome.
+function unassignedPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return createPayload({ preferredAgentId: '', ...overrides });
+}
+
+async function markDevBusy(): Promise<void> {
+  await app.ctx.agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-busy', updatedAt: new Date().toISOString() });
+}
+
+async function storedTasks(): Promise<TaskState[]> {
+  return app.ctx.taskStore.list();
+}
+
 describe('POST /api/tasks with images', () => {
-  it('decodes images and passes {bytes, ext} to createAndStartTask', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockResolvedValue(makeTask({ id: 'task-001', phase: 'code', images: ['x.png'] }));
-    const res = await post('/api/tasks', createPayload({ images: [{ dataBase64: PNG_B64 }] }));
+  it('stores the decoded image bytes under the new task', async () => {
+    const res = await post('/api/tasks', unassignedPayload({ images: [{ dataBase64: PNG_B64 }] }));
     expect(res.statusCode).toBe(201);
-    const arg = spy.mock.calls[0][1] as { images?: { bytes: Buffer; ext: string }[] };
-    expect(arg.images).toHaveLength(1);
-    expect(arg.images![0].ext).toBe('png');
-    expect(arg.images![0].bytes.equals(Buffer.from(PNG_B64, 'base64'))).toBe(true);
+    const body = JSON.parse(res.body) as TaskState;
+    expect(body.images).toHaveLength(1);
+    expect(body.images![0]).toMatch(/\.png$/);
+    const staged = await readFile(join(harness.tempDir, 'state', 'task-images', body.id, body.images![0]));
+    expect(staged.equals(Buffer.from(PNG_B64, 'base64'))).toBe(true);
+    expect((await app.ctx.taskStore.get(body.id))?.images).toEqual(body.images);
   });
 
   it('accepts exactly the max legal image count', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockResolvedValue(makeTask({ id: 'task-001', phase: 'code' }));
     const images = Array.from({ length: TASK_IMAGE_MAX_COUNT }, () => ({ dataBase64: PNG_B64 }));
-    const res = await post('/api/tasks', createPayload({ images }));
+    const res = await post('/api/tasks', unassignedPayload({ images }));
     expect(res.statusCode).toBe(201);
-    expect((spy.mock.calls[0][1] as { images?: unknown[] }).images).toHaveLength(TASK_IMAGE_MAX_COUNT);
+    expect((JSON.parse(res.body) as TaskState).images).toHaveLength(TASK_IMAGE_MAX_COUNT);
   });
 
   it.each([
@@ -58,11 +70,10 @@ describe('POST /api/tasks with images', () => {
       Buffer.from([0x89, 0x50, 0x4e, 0x47]).copy(big);
       return [{ dataBase64: big.toString('base64') }];
     }],
-  ] as const)('rejects %s with 400 and does not dispatch', async (_label, buildImages) => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask');
+  ] as const)('rejects %s with 400 and creates nothing', async (_label, buildImages) => {
     const res = await post('/api/tasks', createPayload({ images: buildImages() }));
     expect(res.statusCode).toBe(400);
-    expect(spy).not.toHaveBeenCalled();
+    expect(await storedTasks()).toEqual([]);
   });
 
   it('route bodyLimits cover the max legal base64 payload', () => {
@@ -278,92 +289,63 @@ describe('GET /api/tasks/:id', () => {
 });
 
 describe('POST /api/tasks', () => {
-  it('happy: title + description + preferredAgentId → 201 + manager called with trimmed fields', async () => {
-    const created = makeTask({
-      id: 'task-100',
-      title: 'New manual task',
-      description: 'do the thing',
-      status: 'in_progress',
-    });
-    const spy = vi
-      .spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockResolvedValue(created);
-
-    const response = await post('/api/tasks', createPayload({
-      title: 'New manual task',
-      description: 'do the thing',
+  it('creates the task with trimmed title and description and returns the stored record', async () => {
+    const response = await post('/api/tasks', unassignedPayload({
+      title: '  New manual task  ',
+      description: '  do the thing  ',
     }));
 
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body) as TaskState;
-    expect(body.id).toBe('task-100');
-    expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith('proj', {
-      title: 'New manual task',
-      description: 'do the thing',
-      preferredAgentId: 'dev-1',
-    }, { background: true });
+    expect(body).toMatchObject({
+      projectId: 'proj', title: 'New manual task', description: 'do the thing', preferredAgentId: '', status: 'pending',
+    });
+    expect(await app.ctx.taskStore.get(body.id)).toEqual(body);
   });
 
-  it('passes branch to createAndStartTask when provided', async () => {
-    const spy = vi
-      .spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockResolvedValue(makeTask({ id: 'task-branch', branch: 'feat/custom' }));
+  it('answers 201 while the assigned agent is still bootstrapping, then finishes the start in the background', async () => {
+    let releaseStart!: () => void;
+    let reached!: () => void;
+    const reachedGate = new Promise<void>(resolve => { reached = resolve; });
+    const gate = new Promise<never>((_, reject) => { releaseStart = () => reject(new Error('bootstrap aborted by test')); });
+    // E2: API harness(createTestContext)不暴露 fake runner,tmux 会话边界只能在 manager 方法上替换
+    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(() => { reached(); return gate; });
 
-    const response = await post('/api/tasks', createPayload({
-      title: 'custom branch task',
-      description: 'details',
-      branch: 'feat/custom',
-    }));
-
+    const response = await post('/api/tasks', createPayload({ preferredAgentId: 'dev-1' }));
     expect(response.statusCode).toBe(201);
-    expect(spy).toHaveBeenCalledWith('proj', expect.objectContaining({
-      branch: 'feat/custom',
-    }), { background: true });
+    const created = JSON.parse(response.body) as TaskState;
+    expect(created.status).toBe('in_progress');
+    expect(created.agentId).toBe('dev-1');
+
+    await reachedGate;
+    expect((await app.ctx.taskStore.get(created.id))?.status).toBe('in_progress');
+    releaseStart();
+    // rollback writes the task first and unbinds the agent last: wait for that terminal state, not the first write
+    await vi.waitFor(async () => {
+      expect((await app.ctx.taskStore.get(created.id))?.status).toBe('pending');
+      expect((await app.ctx.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    }, { timeout: 5000, interval: 25 });
   });
 
-  it('opts into background bootstrap so the response does not block on agent startup', async () => {
-    const spy = vi
-      .spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockResolvedValue(makeTask({ id: 'task-bg', status: 'in_progress' }));
-
-    const response = await post('/api/tasks', createPayload());
+  it('binds the task to a custom branch when one is provided', async () => {
+    const response = await post('/api/tasks', unassignedPayload({ branch: 'feat/custom' }));
 
     expect(response.statusCode).toBe(201);
-    expect(spy).toHaveBeenLastCalledWith('proj', expect.any(Object), { background: true });
-  });
-
-  it('服务端归一化：title/description 带前后空白 → 落盘 trim 后值', async () => {
-    const spy = vi
-      .spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockResolvedValue(makeTask({ id: 'task-101', title: 'hello' }));
-
-    const response = await post('/api/tasks', createPayload({ title: '  hello  ', description: '  body  ' }));
-
-    expect(response.statusCode).toBe(201);
-    expect(spy).toHaveBeenCalledWith('proj', {
-      title: 'hello',
-      description: 'body',
-      preferredAgentId: 'dev-1',
-    }, { background: true });
+    const body = JSON.parse(response.body) as TaskState;
+    expect(body.branch).toBe('feat/custom');
+    expect(body.branchCreatedByBaxian).toBe(false);
   });
 
   it.each([
-    ['omitted', { description: undefined }, 'task-no-desc'],
-    ['all-whitespace', { description: '   ' }, 'task-ws-desc'],
-  ] as const)('description %s → 201 + manager 收到空描述', async (_label, overrides, id) => {
-    const spy = vi
-      .spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockResolvedValue(makeTask({ id }));
-
-    const response = await post('/api/tasks', createPayload(overrides));
+    ['omitted', { description: undefined }],
+    ['all-whitespace', { description: '   ' }],
+  ] as const)('description %s → 201 with an empty stored description', async (_label, overrides) => {
+    const response = await post('/api/tasks', unassignedPayload(overrides));
 
     expect(response.statusCode).toBe(201);
-    expect(spy).toHaveBeenCalledWith(
-      'proj',
-      expect.objectContaining({ description: '' }),
-      { background: true },
-    );
+    const body = JSON.parse(response.body) as TaskState;
+    expect(body.description).toBe('');
+    expect((await app.ctx.taskStore.get(body.id))?.description).toBe('');
   });
 
   it.each([
@@ -378,58 +360,37 @@ describe('POST /api/tasks', () => {
     ['title with newline → 400 single line', createPayload({ title: 'line1\nline2' }), 400, /single line/],
     ['preferredAgentId null → 400', createPayload({ preferredAgentId: null }), 400, undefined],
     ['preferredAgentId object → 400', createPayload({ preferredAgentId: { id: 'x' } }), 400, undefined],
+    ['preferredAgentId number → 400 (not coerced to unassigned)', createPayload({ preferredAgentId: 42 }), 400, /preferredAgentId must be a string/],
+    ['preferredAgentId unknown agent → 400', createPayload({ preferredAgentId: 'nope' }), 400, /Unknown agent/],
   ] as const)('validation %s', async (_label, body, status, errorMatch) => {
     const response = await post('/api/tasks', body);
     expectStatus(response, status, errorMatch);
-  });
-
-  it('preferredAgentId provided but number → 400 (do not silently coerce to unassigned)', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask');
-    const response = await post('/api/tasks', createPayload({ preferredAgentId: 42 }));
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/preferredAgentId must be a string/);
-    expect(spy).not.toHaveBeenCalled();
+    expect(await storedTasks()).toEqual([]);
   });
 
   it.each([
-    ['missing preferredAgentId → 201', { projectId: 'proj', title: 't', description: 'd' }, 'task-unassigned'],
-    ['empty preferredAgentId → 201', createPayload({ preferredAgentId: '' }), 'task-empty'],
-    ['whitespace preferredAgentId → 201', createPayload({ preferredAgentId: '   ' }), 'task-ws'],
-  ] as const)('unassigned create %s', async (_label, body, id) => {
-    vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
-      makeTask({ id, preferredAgentId: '', agentId: '', status: 'pending', branch: '' }),
-    );
+    ['missing preferredAgentId', { projectId: 'proj', title: 't', description: 'd' }],
+    ['empty preferredAgentId', createPayload({ preferredAgentId: '' })],
+    ['whitespace preferredAgentId', createPayload({ preferredAgentId: '   ' })],
+  ] as const)('%s → 201 queued without an agent', async (_label, body) => {
     const response = await post('/api/tasks', body);
     expect(response.statusCode).toBe(201);
+    const created = JSON.parse(response.body) as TaskState;
+    expect(created).toMatchObject({ status: 'pending', preferredAgentId: '', agentId: '' });
+    expect((await app.ctx.taskStore.get(created.id))?.status).toBe('pending');
   });
 
   it('projectId 前后 whitespace → trim 后 lookup', async () => {
-    const createSpy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
-      makeTask({ id: 'task-y', projectId: 'proj', status: 'pending', branch: '' }),
-    );
-    const response = await post('/api/tasks', createPayload({ projectId: '  proj  ' }));
+    const response = await post('/api/tasks', unassignedPayload({ projectId: '  proj  ' }));
     expect(response.statusCode).toBe(201);
-    expect(createSpy).toHaveBeenCalledWith('proj', expect.anything(), { background: true });
+    expect((JSON.parse(response.body) as TaskState).projectId).toBe('proj');
   });
 
-  it('preferredAgentId 前后 whitespace → trim 后传给 manager', async () => {
-    const createSpy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
-      makeTask({ id: 'task-x', preferredAgentId: 'dev-1', status: 'pending', branch: '' }),
-    );
+  it('preferredAgentId 前后 whitespace → trim 后记为首选 agent', async () => {
+    await markDevBusy();
     const response = await post('/api/tasks', createPayload({ preferredAgentId: '  dev-1  ' }));
     expect(response.statusCode).toBe(201);
-    expect(createSpy).toHaveBeenCalledWith('proj', expect.objectContaining({
-      preferredAgentId: 'dev-1',
-    }), { background: true });
-  });
-
-  it('preferredAgentId 不存在的 agent → 400（manager 抛 ApiError 透传）', async () => {
-    vi.spyOn(app.ctx.agentManager, 'createAndStartTask')
-      .mockRejectedValue(new ApiError(400, 'Unknown agent: nope'));
-
-    const response = await post('/api/tasks', createPayload({ preferredAgentId: 'nope' }));
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/Unknown agent/);
+    expect(JSON.parse(response.body) as TaskState).toMatchObject({ preferredAgentId: 'dev-1', status: 'pending' });
   });
 });
 
@@ -479,69 +440,57 @@ describe('POST /api/tasks/:id/advance', () => {
     [{ prNumber: 0 }, 'prNumber must be'],
     [{ confirmRevoked: 'yes' }, 'confirmRevoked must be'],
     [{ note: 7 }, 'note must be'],
-  ])('rejects invalid selector %# before advancing', async (body, message) => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'advanceTask');
-    const response = await post('/api/tasks/task-001/advance', body);
+  ])('rejects invalid selector %# before looking the task up', async (body, message) => {
+    const response = await post('/api/tasks/task-missing/advance', body);
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toContain(message);
-    expect(spy).not.toHaveBeenCalled();
   });
 
   it('does not reset reconciler budgets when the advance is rejected', async () => {
-    vi.spyOn(app.ctx.agentManager, 'advanceTask')
-      .mockRejectedValue(new ApiError(409, 'Task cannot advance'));
+    await seedTask(app.ctx.taskStore, { id: 'task-001', status: 'merged' });
     const resetTask = vi.fn();
     app.ctx.dispatchReconciler = { resetTask, stop: vi.fn() } as never;
 
     const response = await post('/api/tasks/task-001/advance', { executor: 'dev' });
 
     expect(response.statusCode).toBe(409);
+    expect((await app.ctx.taskStore.get('task-001'))?.status).toBe('merged');
     expect(resetTask).not.toHaveBeenCalled();
   });
 });
 
 describe('POST /api/tasks/:id/retry', () => {
-  it('terminal task → 201 and audits the original task with the replacement id', async () => {
-    const source = makeTask({ id: 'task-001', status: 'failed' });
-    const fresh = makeTask({ id: 'task-fresh', status: 'in_progress' });
-    vi.spyOn(app.ctx.agentManager, 'getTask').mockResolvedValue(source);
-    const spy = vi.spyOn(app.ctx.agentManager, 'retryTask').mockResolvedValue(fresh);
-    const audit = vi.spyOn(app.ctx.agentManager, 'auditHumanTaskOperation').mockResolvedValue();
+  it('terminal task → 201 with a fresh queued task, the source linked and the retry audited', async () => {
+    await markDevBusy();
+    await seedTask(app.ctx.taskStore, { id: 'task-001', status: 'failed' });
 
     const response = await post('/api/tasks/task-001/retry');
 
     expect(response.statusCode).toBe(201);
-    const body = JSON.parse(response.body) as TaskState;
-    expect(body.id).toBe('task-fresh');
-    expect(spy).toHaveBeenCalledWith('task-001');
-    expect(audit).toHaveBeenCalledWith(
-      source,
-      'retry',
-      'retry',
-      undefined,
-      { replacementTaskId: 'task-fresh' },
-    );
+    const fresh = JSON.parse(response.body) as TaskState;
+    expect(fresh.id).not.toBe('task-001');
+    expect(fresh).toMatchObject({ status: 'pending', preferredAgentId: 'dev-1', title: 'T', description: 'D' });
+    expect((await app.ctx.taskStore.get('task-001'))?.replacementTaskId).toBe(fresh.id);
+    const today = new Date().toISOString().slice(0, 10);
+    const audit = (await app.ctx.eventLog.readDate(today))
+      .filter(e => e.type === 'task.updated' && e.taskId === 'task-001' && e.data.operation === 'retry');
+    expect(audit.map(e => e.data.replacementTaskId)).toEqual([fresh.id]);
   });
 
-  it('non-terminal task → 409 (ApiError pass-through from manager.retryTask)', async () => {
-    vi.spyOn(app.ctx.agentManager, 'getTask')
-      .mockResolvedValue(makeTask({ id: 'task-001', status: 'in_progress' }));
-    vi.spyOn(app.ctx.agentManager, 'retryTask')
-      .mockRejectedValue(new ApiError(409, 'Task task-001 cannot be retried in status "in_progress"'));
+  it('non-terminal task → 409 and no replacement is created', async () => {
+    await seedTask(app.ctx.taskStore, { id: 'task-001', status: 'in_progress' });
 
     const response = await post('/api/tasks/task-001/retry');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/cannot be retried/);
+    expect((await storedTasks()).map(t => t.id)).toEqual(['task-001']);
   });
 
   it('unknown task → 404', async () => {
-    const retry = vi.spyOn(app.ctx.agentManager, 'retryTask');
-
     const response = await post('/api/tasks/task-missing/retry');
-
     expect(response.statusCode).toBe(404);
-    expect(retry).not.toHaveBeenCalled();
+    expect(await storedTasks()).toEqual([]);
   });
 });
 
@@ -571,12 +520,10 @@ describe('POST /api/tasks/:id/verdict', () => {
     [{ action: 'reject' }, 'action'],
     [{ action: 'pass', comments: 123 }, 'comments'],
     [{ action: 'pass', note: 123 }, 'note'],
-  ])('rejects invalid payload %#', async (body, message) => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitTaskVerdict');
-    const response = await post('/api/tasks/task-001/verdict', body);
+  ])('rejects invalid payload %# before looking the task up', async (body, message) => {
+    const response = await post('/api/tasks/task-missing/verdict', body);
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toContain(message);
-    expect(spy).not.toHaveBeenCalled();
   });
 });
 
@@ -591,55 +538,39 @@ describe('removed task operation endpoints', () => {
 });
 
 describe('PATCH /api/tasks/:id', () => {
-  it('改 title → 200 + editTask 收到 trimmed patch', async () => {
-    const updated = makeTask({ id: 'task-001', phase: 'code', status: 'pending', title: 'new title' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(updated);
-
-    const response = await patch('/api/tasks/task-001', { title: '  new title  ' });
-
-    expect(response.statusCode).toBe(200);
-    const body = JSON.parse(response.body) as TaskState;
-    expect(body.title).toBe('new title');
-    expect(spy).toHaveBeenCalledWith('task-001', { title: 'new title' });
-  });
-
-  it('改 description → 200 + editTask 收到 trimmed', async () => {
-    const updated = makeTask({ id: 'task-001', phase: 'code', status: 'pending', description: 'new desc' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(updated);
-
-    const response = await patch('/api/tasks/task-001', { description: '  new desc  ' });
-
-    expect(response.statusCode).toBe(200);
-    expect(spy).toHaveBeenCalledWith('task-001', { description: 'new desc' });
-  });
-
-  it('清空 description → 200 + editTask 收到空串', async () => {
-    const updated = makeTask({ id: 'task-001', phase: 'code', status: 'pending', description: '' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(updated);
-
-    const response = await patch('/api/tasks/task-001', { description: '   ' });
-
-    expect(response.statusCode).toBe(200);
-    expect(spy).toHaveBeenCalledWith('task-001', { description: '' });
-  });
-
-  it('改 preferredAgentId 立即重派 → 响应反映 manager refresh 后 in_progress + 新 dev', async () => {
-    const refreshed = makeTask({
-      id: 'task-001',
-      phase: 'code',
-      status: 'in_progress',
-      preferredAgentId: 'dev-2',
-      agentId: 'dev-2',
+  async function seedPending(over: Partial<TaskState> = {}): Promise<TaskState> {
+    return seedTask(app.ctx.taskStore, {
+      id: 'task-001', status: 'pending', preferredAgentId: '', agentId: '', devAgentId: '', qaAgentId: undefined, ...over,
     });
-    const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(refreshed);
+  }
 
-    const response = await patch('/api/tasks/task-001', { preferredAgentId: 'dev-2' });
+  it.each([
+    ['title', { title: '  new title  ' }, { title: 'new title' }],
+    ['description', { description: '  new desc  ' }, { description: 'new desc' }],
+    ['description cleared', { description: '   ' }, { description: '' }],
+  ] as const)('edits %s with trimmed values and persists them', async (_label, body, expected) => {
+    await seedPending();
+
+    const response = await patch('/api/tasks/task-001', body);
 
     expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject(expected);
+    expect(await app.ctx.taskStore.get('task-001')).toMatchObject(expected);
+  });
+
+  it('改 preferredAgentId：trim 后经真实 manager 持久化，绑定 Agent Team 的 dev/qa 并清掉旧 phase', async () => {
+    await seedPending({ phase: 'code' });
+
+    const response = await patch('/api/tasks/task-001', { preferredAgentId: '  dev-1  ' });
+
+    expect(response.statusCode).toBe(200);
+    const expected = { preferredAgentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1', status: 'pending' };
     const body = JSON.parse(response.body) as TaskState;
-    expect(body.status).toBe('in_progress');
-    expect(body.agentId).toBe('dev-2');
-    expect(spy).toHaveBeenCalledWith('task-001', { preferredAgentId: 'dev-2' });
+    expect(body).toMatchObject(expected);
+    expect(body.phase).toBeUndefined();
+    const stored = await app.ctx.taskStore.get('task-001');
+    expect(stored).toMatchObject(expected);
+    expect(stored?.phase).toBeUndefined();
   });
 
   it.each([
@@ -648,84 +579,68 @@ describe('PATCH /api/tasks/:id', () => {
     ['description non-string → 400', { description: 42 }, /description must be a string/],
     ['description over 16000 → 400 at most', { description: 'x'.repeat(16001) }, /at most 16000/],
     ['preferredAgentId null → 400', { preferredAgentId: null }, undefined],
+    ['preferredAgentId number → 400 (not coerced to clear)', { preferredAgentId: 123 }, /preferredAgentId must be a string/],
     ["status 'failed' → 400 only cancelled accepted", { status: 'failed' }, /Only 'cancelled'/],
     ["title + status='cancelled' → 400 cannot combine", { title: 't', status: 'cancelled' }, /Cannot combine cancellation with edits/],
     ['empty body → 400 no fields to update', {}, /no fields to update/],
-  ] as const)('validation %s', async (_label, body, errorMatch) => {
+  ] as const)('validation %s leaves the task untouched', async (_label, body, errorMatch) => {
+    const seeded = await seedPending({ title: 'keep', description: 'keep' });
     const response = await patch('/api/tasks/task-001', body);
     expectStatus(response, 400, errorMatch);
+    expect(await app.ctx.taskStore.get('task-001')).toEqual(seeded);
   });
 
   it('preferredAgentId 空字符串 → 200（清空当前分配）', async () => {
-    const cleared = makeTask({
-      id: 'task-001',
-      preferredAgentId: '',
-      agentId: '',
-      devAgentId: '',
-      qaAgentId: undefined,
-    });
-    vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(cleared);
+    await markDevBusy();
+    await seedPending({ preferredAgentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1' });
     const response = await patch('/api/tasks/task-001', { preferredAgentId: '' });
     expect(response.statusCode).toBe(200);
+    expect((await app.ctx.taskStore.get('task-001'))?.preferredAgentId).toBe('');
   });
 
-  it('preferredAgentId provided but number → 400 (do not coerce to empty/clear)', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'editTask');
-    const response = await patch('/api/tasks/task-001', { preferredAgentId: 123 });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/preferredAgentId must be a string/);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('in_progress 改 title → 409（editTask 抛 ApiError 透传）', async () => {
-    vi.spyOn(app.ctx.agentManager, 'editTask')
-      .mockRejectedValue(new ApiError(409, 'Task not editable in status in_progress'));
+  it('in_progress 改 title → 409, task untouched', async () => {
+    const seeded = await seedTask(app.ctx.taskStore, { id: 'task-001', status: 'in_progress', title: 'keep' });
 
     const response = await patch('/api/tasks/task-001', { title: 'new' });
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/not editable/);
+    expect((await app.ctx.taskStore.get('task-001'))?.title).toBe(seeded.title);
   });
 
-  it("body { status: 'cancelled' } → 200 + cancelTask 被调", async () => {
-    const cancelled = makeTask({ id: 'task-001', phase: 'code', status: 'cancelled' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'cancelTask').mockResolvedValue(cancelled);
+  it("body { status: 'cancelled' } → 200 and the task is persisted as cancelled", async () => {
+    await seedPending();
 
     const response = await patch('/api/tasks/task-001', { status: 'cancelled' });
     expect(response.statusCode).toBe(200);
-    const body = JSON.parse(response.body) as TaskState;
-    expect(body.status).toBe('cancelled');
-    expect(spy).toHaveBeenCalledWith('task-001');
+    expect((JSON.parse(response.body) as TaskState).status).toBe('cancelled');
+    expect((await app.ctx.taskStore.get('task-001'))?.status).toBe('cancelled');
   });
 
-  it('cancelled 后 PR 字段保留不变（来自 manager 的响应）', async () => {
-    const cancelled = makeTask({
-      id: 'task-001',
-      phase: 'code',
-      status: 'cancelled',
-      prNumber: 42,
-      prUrl: 'https://example.com/pr/42',
+  it("body { status: 'cancelled' } keeps the published PR metadata on the cancelled task", async () => {
+    await seedTask(app.ctx.taskStore, {
+      id: 'task-001', status: 'pending', agentId: '', devAgentId: '', qaAgentId: undefined, preferredAgentId: '',
+      prNumber: 55, prUrl: 'https://github.com/user/repo/pull/55',
     });
-    vi.spyOn(app.ctx.agentManager, 'cancelTask').mockResolvedValue(cancelled);
 
     const response = await patch('/api/tasks/task-001', { status: 'cancelled' });
     expect(response.statusCode).toBe(200);
-    const body = JSON.parse(response.body) as TaskState;
-    expect(body.prNumber).toBe(42);
-    expect(body.prUrl).toBe('https://example.com/pr/42');
+    expect(JSON.parse(response.body) as TaskState).toMatchObject({
+      status: 'cancelled', prNumber: 55, prUrl: 'https://github.com/user/repo/pull/55',
+    });
+    expect(await app.ctx.taskStore.get('task-001')).toMatchObject({
+      status: 'cancelled', prNumber: 55, prUrl: 'https://github.com/user/repo/pull/55',
+    });
   });
 
-  it("body { status: 'cancelled' } 但 task 已 merged → 409（cancelTask 抛 ApiError）", async () => {
-    vi.spyOn(app.ctx.agentManager, 'cancelTask')
-      .mockRejectedValue(new ApiError(409, 'Cannot cancel task in status merged'));
+  it("body { status: 'cancelled' } on an already merged task → 200 without rewriting its status", async () => {
+    await seedTask(app.ctx.taskStore, { id: 'task-001', status: 'merged', platformBinding: undefined });
 
     const response = await patch('/api/tasks/task-001', { status: 'cancelled' });
-    expect(response.statusCode).toBe(409);
+    expect(response.statusCode).toBe(200);
+    expect((await app.ctx.taskStore.get('task-001'))?.status).toBe('merged');
   });
 
-  it('未知 task → 404（manager 抛 ApiError 透传）', async () => {
-    vi.spyOn(app.ctx.agentManager, 'editTask')
-      .mockRejectedValue(new ApiError(404, 'Task not found'));
-
+  it('未知 task → 404', async () => {
     const response = await patch('/api/tasks/no-such', { title: 't' });
     expect(response.statusCode).toBe(404);
   });
@@ -771,7 +686,8 @@ describe('POST /api/tasks - op-aware gates', () => {
     expect(body.agentId).toBe('');
   });
 
-  it('previewPromptBytesForTaskInput returns over-limit → 400', async () => {
+  it('prompt size preview over-limit → 400', async () => {
+    // 保留 stub：description 限 16000 字符，真实提示词到不了 80KB 上限
     vi.spyOn(app.ctx.agentManager, 'previewPromptBytesForTaskInput')
       .mockReturnValue(100 * 1024);
 
@@ -786,15 +702,6 @@ describe('POST /api/tasks - op-aware gates', () => {
     expect(body.error).toMatch(/task description or platform workflow instructions/);
   });
 
-  it('previewPromptBytesForTaskInput throws (unknown agent) → 400', async () => {
-    vi.spyOn(app.ctx.agentManager, 'previewPromptBytesForTaskInput')
-      .mockImplementation(() => { throw new Error('Unknown agent: ghost'); });
-
-    const response = await post('/api/tasks', createPayload({ preferredAgentId: 'ghost' }));
-
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/Unknown agent/);
-  });
 });
 
 describe('GET /api/tasks/:id/pr-review', () => {
@@ -821,52 +728,44 @@ describe('GET /api/tasks/:id/pr-review', () => {
     expect(res.statusCode).toBe(404);
   });
 
+  // The harness project is https://github.com/user/repo, so this binding matches the live one.
   const GIT_BINDING = { repoKey: 'github.com/user/repo' };
 
-  function spyLiveBinding(binding = GIT_BINDING) {
-    return vi.spyOn(app.ctx.agentManager, 'platformBindingFields')
-      .mockReturnValue({ platformBinding: binding });
+  function useDriver(driver: unknown): void {
+    vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
   }
 
   it('git tasks render the driver timeline instead of the gh hardcoded path', async () => {
     await seedTask(app.ctx.taskStore, { id: 'git-ok', prNumber: 7, platformBinding: GIT_BINDING });
-    const fakeDriver = {
+    useDriver({
       commentSources: [
         { key: 'issue-comments', category: 'top-level' },
       ],
       listComments: async () => [{ id: 'c1', body: 'from driver', createdAt: '2026-07-19T01:00:00Z' }],
-    };
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor')
-      .mockReturnValue(fakeDriver as never);
+    });
     const res = await get('/api/tasks/git-ok/pr-review');
     const body = JSON.parse(res.body);
     expect(body.available).toBe(true);
     expect(body.items).toHaveLength(1);
     expect(body.items[0]).toMatchObject({ kind: 'issue-comment', body: 'from driver', sourceKey: 'issue-comments' });
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('git tasks without a resolvable driver report driver-unavailable', async () => {
     await seedTask(app.ctx.taskStore, { id: 'git-nodrv', prNumber: 7, platformBinding: GIT_BINDING });
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(undefined);
+    useDriver(undefined);
     const res = await get('/api/tasks/git-nodrv/pr-review');
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'driver-unavailable' });
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('a drifted platform binding never queries the live repo for a historical task', async () => {
-    await seedTask(app.ctx.taskStore, { id: 'git-drift', prNumber: 7, status: 'merged', platformBinding: GIT_BINDING });
-    const bindingSpy = spyLiveBinding({ repoKey: 'github.com/user/other-repo' });
-    const driverSpy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor');
+    await seedTask(app.ctx.taskStore, {
+      id: 'git-drift', prNumber: 7, status: 'merged', platformBinding: { repoKey: 'github.com/user/other-repo' },
+    });
+    const { driver, calls } = countingDriver();
+    useDriver(driver);
     const res = await get('/api/tasks/git-drift/pr-review');
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'driver-unavailable' });
-    expect(driverSpy).not.toHaveBeenCalled();
-    driverSpy.mockRestore();
-    bindingSpy.mockRestore();
+    expect(calls).toEqual([]);
   });
 
   function countingDriver(): { driver: unknown; calls: number[] } {
@@ -883,21 +782,17 @@ describe('GET /api/tasks/:id/pr-review', () => {
 
   it('serves consecutive same-revision GETs from cache: the driver runs once', async () => {
     const { driver, calls } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, { id: 'git-cache', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-cache/pr-review');
     const res = await get('/api/tasks/git-cache/pr-review');
     expect(calls).toEqual([7]);
     expect(JSON.parse(res.body).available).toBe(true);
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('rebuilds when a revision field changes (reviewDispatchedAt)', async () => {
     const { driver, calls } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, { id: 'git-rev', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-rev/pr-review');
     await seedTask(app.ctx.taskStore, {
@@ -906,53 +801,41 @@ describe('GET /api/tasks/:id/pr-review', () => {
     });
     await get('/api/tasks/git-rev/pr-review');
     expect(calls).toEqual([7, 7]);
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('rebuilds against the new PR when only prNumber changes (PR rebind)', async () => {
     const { driver, calls } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, { id: 'git-rebind', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-rebind/pr-review');
     await seedTask(app.ctx.taskStore, { id: 'git-rebind', prNumber: 9, platformBinding: GIT_BINDING });
     const res = await get('/api/tasks/git-rebind/pr-review');
     expect(calls).toEqual([7, 9]);
     expect(JSON.parse(res.body).prNumber).toBe(9);
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('an active task reports fetchedAt, autoRefresh:true and the poll interval', async () => {
     const { driver } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, { id: 'git-fresh', prNumber: 7, platformBinding: GIT_BINDING });
     const body = JSON.parse((await get('/api/tasks/git-fresh/pr-review')).body);
     expect(body.fetchedAt).toMatch(/^\d{4}-/);
     expect(body.autoRefresh).toBe(true);
     expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.platformPollIntervalMs);
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('a terminal task reports autoRefresh:false without an interval', async () => {
     const { driver } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, { id: 'git-done', prNumber: 7, status: 'merged', platformBinding: GIT_BINDING });
     const body = JSON.parse((await get('/api/tasks/git-done/pr-review')).body);
     expect(body.autoRefresh).toBe(false);
     expect(body.autoRefreshIntervalMs).toBeUndefined();
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('a live task whose PR is closed-unmerged reports autoRefresh:false (poller skips it)', async () => {
     const { driver } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, {
       id: 'git-closed', prNumber: 7, status: 'review', platformBinding: GIT_BINDING,
       closedUnmergedAnchor: { prNumber: 7, generation: 1 },
@@ -960,14 +843,11 @@ describe('GET /api/tasks/:id/pr-review', () => {
     const body = JSON.parse((await get('/api/tasks/git-closed/pr-review')).body);
     expect(body.autoRefresh).toBe(false);
     expect(body.autoRefreshIntervalMs).toBeUndefined();
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('a reopened PR (cleared anchor) resumes autoRefresh:true', async () => {
     const { driver } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, {
       id: 'git-reopened', prNumber: 7, status: 'review', platformBinding: GIT_BINDING,
       closedUnmergedAnchor: { prNumber: 7, generation: 1, cleared: true },
@@ -975,17 +855,14 @@ describe('GET /api/tasks/:id/pr-review', () => {
     const body = JSON.parse((await get('/api/tasks/git-reopened/pr-review')).body);
     expect(body.autoRefresh).toBe(true);
     expect(body.autoRefreshIntervalMs).toBe(app.ctx.config.server.platformPollIntervalMs);
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 });
 
 describe('POST /api/tasks/:id/pr-review/refresh', () => {
   const GIT_BINDING = { repoKey: 'github.com/user/repo' };
 
-  function spyLiveBinding() {
-    return vi.spyOn(app.ctx.agentManager, 'platformBindingFields')
-      .mockReturnValue({ platformBinding: GIT_BINDING });
+  function useDriver(driver: unknown): void {
+    vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
   }
 
   function countingDriver(): { driver: unknown; calls: number[] } {
@@ -1007,8 +884,7 @@ describe('POST /api/tasks/:id/pr-review/refresh', () => {
 
   it('forces a rebuild past a warm same-revision cache entry', async () => {
     const { driver, calls } = countingDriver();
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, { id: 'git-force', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-force/pr-review');
     const res = await post('/api/tasks/git-force/pr-review/refresh');
@@ -1017,8 +893,6 @@ describe('POST /api/tasks/:id/pr-review/refresh', () => {
     expect(body.available).toBe(true);
     expect(body.items).toHaveLength(1);
     expect(body.fetchedAt).toMatch(/^\d{4}-/);
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('refreshes the entry the next GET is served from', async () => {
@@ -1031,8 +905,7 @@ describe('POST /api/tasks/:id/pr-review/refresh', () => {
         return [{ id: 'c1', body: label, createdAt: '2026-07-19T01:00:00Z' }];
       },
     };
-    const bindingSpy = spyLiveBinding();
-    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    useDriver(driver);
     await seedTask(app.ctx.taskStore, { id: 'git-swr', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-swr/pr-review');
     label = 'after';
@@ -1040,8 +913,6 @@ describe('POST /api/tasks/:id/pr-review/refresh', () => {
     const body = JSON.parse((await get('/api/tasks/git-swr/pr-review')).body);
     expect(calls).toEqual([7, 7]);
     expect(body.items[0].body).toBe('after');
-    spy.mockRestore();
-    bindingSpy.mockRestore();
   });
 
   it('available:false (no-pr) when the task has no PR', async () => {

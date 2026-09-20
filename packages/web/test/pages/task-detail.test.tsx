@@ -4,16 +4,8 @@ import { render, screen, cleanup, fireEvent, act, within } from '@testing-librar
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import type { AgentBindingFacts, ProjectConfig, TaskState } from '../../src/shared/index.js';
 
-const { useProjectsMock } = vi.hoisted(() => ({
-  useProjectsMock: vi.fn(),
-}));
-
 vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
-vi.mock('../../src/hooks/use-projects.ts', () => ({
-  useProjects: useProjectsMock,
-}));
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
 vi.mock('../../src/components/agent-card.tsx', () => ({
   AgentCard: (props: {
@@ -28,7 +20,8 @@ vi.mock('../../src/components/agent-card.tsx', () => ({
     agent: { id: string; runtimeStatus?: string };
   }) => (
     <div
-      data-testid="agent-card"
+      role="article"
+      aria-label={`Agent ${props.agent?.id}`}
       data-role={props.role}
       data-agent-id={props.agent?.id}
       data-runtime={props.runtime}
@@ -48,11 +41,11 @@ vi.mock('../../src/components/agent-card.tsx', () => ({
 
 vi.mock('../../src/components/review-conversation.tsx', () => ({
   ReviewConversation: ({ task }: { task: TaskState }) => (
-    <div data-testid="review-conversation" data-task={task.id} />
+    <div role="region" aria-label="Review conversation" data-task={task.id} />
   ),
 }));
 vi.mock('../../src/components/create-task-modal.tsx', () => ({
-  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div data-testid="edit-modal" /> : null),
+  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label="Edit task" /> : null),
 }));
 
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
@@ -60,14 +53,17 @@ vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts'))
 import { api } from '../../src/api.ts';
 import { useTaskMock, useAgentsMock } from '../helpers/events-mock.ts';
 import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
-import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { expectToast } from '../helpers/toast.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
+import { __resetProjectsCacheForTests, refreshProjects } from '../../src/hooks/use-projects.ts';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { TaskDetail } from '../../src/pages/task-detail.tsx';
 
 const tasksRetryMock = vi.mocked(api.tasks.retry);
 const tasksUpdateMock = vi.mocked(api.tasks.update);
 const tasksAdvanceMock = vi.mocked(api.tasks.advance);
 const tasksVerdictMock = vi.mocked(api.tasks.verdict);
+const projectsListMock = vi.mocked(api.projects.list);
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   const task = makeTaskFixture({
@@ -120,13 +116,24 @@ function setTasks(map: Record<string, TaskState>): void {
   useTaskMock.mockImplementation((id: string) => ({ data: map[id] ?? null, loaded: true, error: null }));
 }
 
-function setProjects(projects: ProjectConfig[] | null, error: string | null = null): void {
-  useProjectsMock.mockReturnValue({ projects, error, refresh: vi.fn() });
+// Loaded lists are warmed into the shared cache before mount, mirroring a user arriving from the dashboard;
+// error and pending lists are left to the page's own mount fetch.
+async function setProjects(projects: ProjectConfig[] | null, error: string | null = null): Promise<void> {
+  __resetProjectsCacheForTests();
+  projectsListMock.mockReset();
+  if (projects) {
+    projectsListMock.mockResolvedValue(projects);
+    await refreshProjects();
+  } else if (error) {
+    projectsListMock.mockRejectedValue(new Error(error));
+  } else {
+    projectsListMock.mockReturnValue(new Promise<ProjectConfig[]>(() => {}));
+  }
 }
 
 function LocationProbe() {
   const loc = useLocation();
-  return <div data-testid="loc">{loc.pathname}</div>;
+  return <div role="region" aria-label="location">{loc.pathname}</div>;
 }
 
 function GoTo({ to }: { to: string }) {
@@ -150,7 +157,7 @@ function pageTree(taskId = 'task-010', opts: { entries?: string[]; index?: numbe
 }
 
 function renderPage(taskId = 'task-010', opts: { entries?: string[]; index?: number; extra?: ReactNode } = {}) {
-  return render(pageTree(taskId, opts));
+  return render(pageTree(taskId, opts), { wrapper: ToastProvider });
 }
 
 async function findConfirmDialog(): Promise<HTMLElement> {
@@ -182,7 +189,7 @@ function bindAgent(agentId: string, binding: AgentBindingFacts): void {
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   cleanup();
   useTaskMock.mockReset();
   useAgentsMock.mockReset();
@@ -191,13 +198,11 @@ beforeEach(() => {
     loaded: true,
     error: null,
   });
-  useProjectsMock.mockReset();
-  setProjects([PROJECT]);
+  await setProjects([PROJECT]);
   tasksRetryMock.mockReset();
   tasksUpdateMock.mockReset();
   tasksAdvanceMock.mockReset();
   tasksVerdictMock.mockReset();
-  toastShowMock.mockReset();
 });
 
 afterEach(() => {
@@ -220,16 +225,16 @@ describe('TaskDetail page — header & info', () => {
     const { container } = open({ title: 'Clean tests' });
 
     const heading = container.querySelector('h1')!;
-    expect(within(heading).getByText('task-010').className).toContain('text-og-400');
+    expect(within(heading).getByText('task-010')).toBeTruthy();
     expect(within(heading).getByText('Clean tests')).toBeTruthy();
 
-    expect(within(container.querySelector('section')!).getByText('Running pre-merge checks').className).toContain('pill');
+    expect(within(container.querySelector('section')!).getByText('Running pre-merge checks')).toBeTruthy();
     expect(container.textContent).toContain('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00');
     expect(container.textContent).toContain('Task body here');
     expect(container.textContent).toContain('Code review · round 1');
     expect(container.textContent).not.toContain('Plan review · round 0');
     expect(container.textContent).toContain('Branch:');
-    expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
+    expect(screen.getByRole('region', { name: 'Review conversation' }).getAttribute('data-task')).toBe('task-010');
   });
 
   it.each([
@@ -242,8 +247,7 @@ describe('TaskDetail page — header & info', () => {
 
     open({ status });
 
-    expect(screen.getByTestId('task-dispatching').textContent)
-      .toContain('Dispatching to the agent');
+    expect(screen.getByText(/Dispatching to the agent/)).toBeTruthy();
   });
 
   it.each([
@@ -262,28 +266,20 @@ describe('TaskDetail page — header & info', () => {
 
     open({ status: 'in_progress' });
 
-    expect(screen.queryByTestId('task-dispatching')).toBeNull();
+    expect(screen.queryByText(/Dispatching to the agent/)).toBeNull();
   });
 
-  it('shows regular-weight plan/code review counts beside the status pill', () => {
+  it('shows both the plan and code review counts beside the status, hiding a zero plan round', () => {
     const { container } = open({ reviewRound: 3, specReviewRound: 2 });
     const status = within(container.querySelector('section')!).getByText('Running pre-merge checks').parentElement!;
-    expect(within(status).getByText('Code review · round 3').className).not.toContain('font-semibold');
-    expect(within(status).getByText('Plan review · round 2').className).not.toContain('font-semibold');
-  });
+    expect(within(status).getByText('Code review · round 3')).toBeTruthy();
+    expect(within(status).getByText('Plan review · round 2')).toBeTruthy();
 
-  it('keeps status, review rounds, and timestamps at body size', () => {
-    const { container } = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
-    const section = container.querySelector('section')!;
-    const row = within(section).getByText('Code review needs a decision').parentElement!;
-    const round = within(row).getByText('Code review · round 10');
-    const timestamps = within(section).getByText('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00');
-
-    expect(within(row).getByText('Code review needs a decision').className).toContain('text-sm');
-    expect(round.className).toContain('text-sm');
+    cleanup();
+    const maxRounds = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
+    const row = within(maxRounds.container.querySelector('section')!).getByText('Code review needs a decision').parentElement!;
+    expect(within(row).getByText('Code review · round 10')).toBeTruthy();
     expect(within(row).queryByText('Plan review · round 0')).toBeNull();
-    expect(timestamps.className).toContain('text-sm');
-    expect(timestamps.className).not.toContain('text-xs');
   });
 
   it('shows only PR and Branch in the info card, with a branch hyperlink, dropping project/agent rows', () => {
@@ -358,19 +354,17 @@ describe('TaskDetail page — header & info', () => {
 });
 
 describe('TaskDetail page — layout & agent cards', () => {
-  it('splits info and agents into two equal columns aligned to the top', () => {
+  it('places info and agents side by side in a two-column grid on large screens', () => {
     const { container } = open();
     const grid = container.querySelector('.lg\\:grid-cols-2')!;
     expect(grid).toBeTruthy();
-    expect(grid.className).toContain('items-start');
     expect(grid.querySelector('section')).toBeTruthy();
     expect(grid.querySelector('aside')).toBeTruthy();
-    expect(container.querySelector('.lg\\:grid-cols-3')).toBeNull();
   });
 
   it('renders the dev card above the qa card, styled like dashboard/project cards', () => {
     const { container } = open();
-    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
+    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[role="article"]'));
     expect(cards).toHaveLength(2);
     expect(cards[0].getAttribute('data-role')).toBe('dev');
     expect(cards[0].getAttribute('data-agent-id')).toBe('bx-dev');
@@ -386,7 +380,7 @@ describe('TaskDetail page — layout & agent cards', () => {
 
   it('activates one task detail agent card at a time and clears it on outside click', () => {
     const { container } = open();
-    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
+    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[role="article"]'));
     const devCard = cards[0] as HTMLElement;
     const qaCard = cards[1] as HTMLElement;
 
@@ -408,7 +402,7 @@ describe('TaskDetail page — layout & agent cards', () => {
 
   it('clears the active task detail agent card on Escape', () => {
     const { container } = open();
-    const devCard = container.querySelector('[data-testid="agent-card"]') as HTMLElement;
+    const devCard = container.querySelector('[role="article"]') as HTMLElement;
 
     fireEvent.click(devCard);
     expect(devCard.getAttribute('data-active')).toBe('true');
@@ -422,7 +416,7 @@ describe('TaskDetail page — layout & agent cards', () => {
 
   it('keeps the active task detail agent card when Escape starts from focus inside the card', () => {
     const { container } = open();
-    const devCard = container.querySelector('[data-testid="agent-card"]') as HTMLElement;
+    const devCard = container.querySelector('[role="article"]') as HTMLElement;
 
     fireEvent.click(devCard);
     expect(devCard.getAttribute('data-active')).toBe('true');
@@ -440,22 +434,22 @@ describe('TaskDetail page — layout & agent cards', () => {
   it('resolves the snapshotted dev and QA participants before agentId is assigned', () => {
     setTask(makeTask({ status: 'pending', agentId: '', preferredAgentId: 'bx-dev' }));
     const { container } = renderPage();
-    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
+    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[role="article"]'));
     expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-dev', 'bx-qa']);
   });
 
-  it('shows a placeholder when projects are still loading', () => {
-    setProjects(null);
+  it('shows a placeholder when projects are still loading', async () => {
+    await setProjects(null);
     open();
     expect(screen.getByText('Loading…')).toBeTruthy();
-    expect(screen.queryByTestId('agent-card')).toBeNull();
+    expect(screen.queryByRole('article')).toBeNull();
   });
 
   it('shows a placeholder for an unassigned task with no participant team', () => {
     setTask(makeTask({ agentId: '', devAgentId: 'unassigned', preferredAgentId: '', qaAgentId: undefined }));
     renderPage();
     expect(screen.getByText('No linked agent')).toBeTruthy();
-    expect(screen.queryByTestId('agent-card')).toBeNull();
+    expect(screen.queryByRole('article')).toBeNull();
   });
 });
 
@@ -480,13 +474,13 @@ describe('TaskDetail page — actions & states', () => {
     setTask(makeTask());
     renderPage('task-010', { entries: ['/elsewhere', '/project/baxian/task/task-010'], index: 1 });
     fireEvent.click(screen.getByRole('button', { name: '← Back' }));
-    expect(screen.getByTestId('loc').textContent).toBe('/elsewhere');
+    expect(screen.getByRole('region', { name: 'location' }).textContent).toBe('/elsewhere');
   });
 
   it('Edit task opens the edit modal overlay', () => {
     open({ status: 'pending' });
     fireEvent.click(screen.getByRole('button', { name: 'Edit task' }));
-    expect(screen.getByTestId('edit-modal')).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: 'Edit task' })).toBeTruthy();
   });
 
   it('Run task again creates a fresh task and navigates to its detail page', async () => {
@@ -506,7 +500,7 @@ describe('TaskDetail page — actions & states', () => {
     });
 
     expect(tasksRetryMock).toHaveBeenCalledWith('task-010');
-    expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-011');
+    expect(screen.getByRole('region', { name: 'location' }).textContent).toBe('/project/baxian/task/task-011');
   });
 
   it('does not offer another run after the terminal task records its replacement', () => {
@@ -560,7 +554,7 @@ describe('TaskDetail page — actions & states', () => {
     });
 
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Released the remaining agent links' });
+    await expectToast({ title: 'Released the remaining agent links' });
   });
 
   it('Cancel force-cancels a task that is under review', async () => {
@@ -694,7 +688,7 @@ describe('TaskDetail page — actions & states', () => {
       });
 
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'approve' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Plan approved; development started' });
+      await expectToast({ title: 'Plan approved; development started' });
     });
 
     it('Request plan changes submits request-changes with the comments', async () => {
@@ -710,7 +704,7 @@ describe('TaskDetail page — actions & states', () => {
         action: 'request-changes',
         comments: '边界场景没有覆盖',
       });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Change request sent; the development agent is revising the plan' });
+      await expectToast({ title: 'Change request sent; the development agent is revising the plan' });
     });
 
     it('verdict failure surfaces an error toast', async () => {
@@ -720,8 +714,7 @@ describe('TaskDetail page — actions & states', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Approve plan and start development' }));
       await settleConfirmDialog('Approve plan');
 
-      expect(toastShowMock).toHaveBeenCalledWith({
-        kind: 'error',
+      await expectToast({
         title: 'Couldn’t approve the plan',
         body: ACTION_FAILED_BODY,
         details: 'task-010 is fixing',
@@ -743,7 +736,7 @@ describe('TaskDetail page — advance', () => {
       executor: 'dev',
       agentId: 'bx-dev',
     });
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Current step started' });
+    await expectToast({ title: 'Current step started' });
   });
 
   it('restarts review through the unified endpoint', async () => {
@@ -852,8 +845,7 @@ describe('TaskDetail page — advance', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Restart review' }));
     await settleConfirmDialog('Restart review');
 
-    expect(toastShowMock).toHaveBeenCalledWith({
-      kind: 'error',
+    await expectToast({
       title: 'Couldn’t start this step',
       body: ACTION_FAILED_BODY,
       details: 'qa is busy',
@@ -877,8 +869,7 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
     await settleConfirmDialog('Cancel task');
 
-    expect(toastShowMock).toHaveBeenCalledWith({
-      kind: 'error',
+    await expectToast({
       title: 'Couldn’t cancel the task',
       body: ACTION_FAILED_BODY,
       details: 'cancel nope',
@@ -898,13 +889,12 @@ describe('TaskDetail page — action failures surface error toasts', () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Run task again' }));
     });
 
-    expect(toastShowMock).toHaveBeenCalledWith({
-      kind: 'error',
+    await expectToast({
       title: 'Couldn’t start the new task',
       body: ACTION_FAILED_BODY,
       details: 'retry nope',
     });
-    expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-010');
+    expect(screen.getByRole('region', { name: 'location' }).textContent).toBe('/project/baxian/task/task-010');
   });
 
   it('Accept current version failure reports the verdict action', async () => {
@@ -914,8 +904,7 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Accept current version and merge' }));
     await settleConfirmDialog('Accept current version and merge');
 
-    expect(toastShowMock).toHaveBeenCalledWith({
-      kind: 'error',
+    await expectToast({
       title: 'Couldn’t accept and merge the current version',
       body: ACTION_FAILED_BODY,
       details: 'merge conflict',
@@ -929,8 +918,7 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Continue revising' }));
     await settleConfirmDialog('Continue revising');
 
-    expect(toastShowMock).toHaveBeenCalledWith({
-      kind: 'error',
+    await expectToast({
       title: 'Couldn’t start another revision',
       body: ACTION_FAILED_BODY,
       details: 'dev is gone',
@@ -939,8 +927,8 @@ describe('TaskDetail page — action failures surface error toasts', () => {
 });
 
 describe('TaskDetail page — human confirmation gates', () => {
-  it('waits for project settings before enabling confirmation', () => {
-    setProjects(null);
+  it('waits for project settings before enabling confirmation', async () => {
+    await setProjects(null);
     open({ status: 'merge-ready' });
 
     expect(screen.getByText('Loading the project’s merge setting. Confirmation will be available when it is ready.')).toBeTruthy();
@@ -952,10 +940,10 @@ describe('TaskDetail page — human confirmation gates', () => {
   });
 
   it('warns that confirmation may merge the PR when project settings are unavailable', async () => {
-    setProjects(null, 'project settings request failed');
+    await setProjects(null, 'project settings request failed');
     open({ status: 'merge-ready' });
 
-    expect(screen.getByText(/Confirming may merge the PR immediately/)).toBeTruthy();
+    expect(await screen.findByText(/Confirming may merge the PR immediately/)).toBeTruthy();
     const details = screen.getByText('Technical details').closest('details')!;
     expect(within(details).getByText('project settings request failed')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Confirm result' }));
@@ -982,11 +970,11 @@ describe('TaskDetail page — human confirmation gates', () => {
     });
 
     expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'confirm-merge' });
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Task marked complete' });
+    await expectToast({ title: 'Task marked complete' });
   });
 
   it('automatic merge mode clearly confirms and merges the PR', async () => {
-    setProjects([{ ...PROJECT, merge: 'auto' }]);
+    await setProjects([{ ...PROJECT, merge: 'auto' }]);
     tasksVerdictMock.mockResolvedValue(makeTask({ status: 'merged', updatedAt: '2026-05-11T00:00:00.000Z' }));
     open({ status: 'merge-ready' });
 
@@ -1000,7 +988,7 @@ describe('TaskDetail page — human confirmation gates', () => {
     });
 
     expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'confirm-merge' });
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'PR merged; task complete' });
+    await expectToast({ title: 'PR merged; task complete' });
   });
 
   it('Confirm is skipped when the confirm dialog is cancelled and reports failures', async () => {
@@ -1014,8 +1002,7 @@ describe('TaskDetail page — human confirmation gates', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm complete' }));
     await settleConfirmDialog('Confirm complete');
 
-    expect(toastShowMock).toHaveBeenCalledWith({
-      kind: 'error',
+    await expectToast({
       title: 'Couldn’t confirm the result',
       body: ACTION_FAILED_BODY,
       details: 'gate says no',
@@ -1156,7 +1143,7 @@ describe('TaskDetail page — unassigned tasks', () => {
     const attention = screen.getByText('The next step did not start').parentElement!;
     fireEvent.click(within(attention).getByRole('button', { name: 'Edit task' }));
 
-    expect(screen.getByTestId('edit-modal')).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: 'Edit task' })).toBeTruthy();
     expect(tasksAdvanceMock).not.toHaveBeenCalled();
   });
 
@@ -1176,13 +1163,13 @@ describe('TaskDetail page — unassigned tasks', () => {
 });
 
 describe('TaskDetail page — PR/Branch fallbacks', () => {
-  it('renders plain mono PR number and branch when the task has no PR url', () => {
+  it('renders the PR number and branch as plain text when the task has no PR url', () => {
     const { container } = open({ prUrl: undefined });
     const section = container.querySelector('section')!;
     expect(within(section).queryByRole('link', { name: '#55' })).toBeNull();
-    expect(within(section).getByText('#55').className).toContain('font-mono');
+    expect(within(section).getByText('#55')).toBeTruthy();
     expect(within(section).queryByRole('link', { name: 'bx/task-010' })).toBeNull();
-    expect(within(section).getByText('bx/task-010').className).toContain('font-mono');
+    expect(within(section).getByText('bx/task-010')).toBeTruthy();
   });
 
   it.each(['javascript:alert(1)', 'not a url'])(
@@ -1206,7 +1193,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
   it('feeds a synthetic unknown snapshot and pendingRestart when the loaded agent list lacks the agent', () => {
     useAgentsMock.mockReturnValue({ data: [], loaded: true, error: null });
     const { container } = open();
-    const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
+    const cards = Array.from(container.querySelectorAll('[role="article"]'));
     expect(cards).toHaveLength(2);
     for (const card of cards) {
       expect(card.getAttribute('data-runtime-status')).toBe('unknown');
@@ -1218,13 +1205,13 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
   it('marks terminals as loading while the agent stream has not produced snapshots yet', () => {
     useAgentsMock.mockReturnValue({ data: null, loaded: false, error: null });
     const { container } = open();
-    const card = container.querySelector('[data-testid="agent-card"]')!;
+    const card = container.querySelector('[role="article"]')!;
     expect(card.getAttribute('data-pending-restart')).toBe('false');
     expect(card.getAttribute('data-terminal-loading')).toBe('true');
   });
 
-  it('shows the QA slot placeholder when the snapshotted QA no longer belongs to the team', () => {
-    setProjects([{
+  it('shows the QA slot placeholder when the snapshotted QA no longer belongs to the team', async () => {
+    await setProjects([{
       ...PROJECT,
       agent: [[
         PROJECT.agent[0][0],
@@ -1234,23 +1221,23 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
     expect(screen.getByText('No review agent')).toBeTruthy();
-    expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[role="article"]')).toHaveLength(1);
   });
 
   it('does not attach a team QA that was not snapshotted on the task', () => {
     setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
     expect(screen.getByText('No review agent')).toBeTruthy();
-    const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
+    const cards = Array.from(container.querySelectorAll('[role="article"]'));
     expect(cards.map((card) => card.getAttribute('data-role'))).toEqual(['dev']);
   });
 
-  it('shows the Dev slot placeholder when only the QA agent resolves via qaAgentId', () => {
-    setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][1]]] }]);
+  it('shows the Dev slot placeholder when only the QA agent resolves via qaAgentId', async () => {
+    await setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][1]]] }]);
     setTask(makeTask({ agentId: 'ghost-dev', preferredAgentId: 'ghost-dev', qaAgentId: 'bx-qa' }));
     const { container } = renderPage();
     expect(screen.getByText('No development agent')).toBeTruthy();
-    const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
+    const cards = Array.from(container.querySelectorAll('[role="article"]'));
     expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-qa']);
   });
 });

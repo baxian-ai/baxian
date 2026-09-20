@@ -1,6 +1,6 @@
 {
   "name": "baxian",
-  "version": "2.0.28",
+  "version": "2.0.29",
   "description": "AI agent orchestration",
   "license": "Apache-2.0",
   "repository": {
@@ -26,6 +26,7 @@
     "test:coverage": "pnpm -r --if-present test:coverage",
     "test:browser": "pnpm -r --if-present test:browser",
     "lint": "eslint .",
+    "typecheck": "pnpm -r --if-present typecheck",
     "clean": "pnpm -r clean && rm -rf dist",
     "prepack": "node ./scripts/prepack.mjs"
   },

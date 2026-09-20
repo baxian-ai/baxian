@@ -97,7 +97,7 @@ function startWatch(
 function makeWatcher() {
   const streamer = createFakeStreamer();
   const paneStreamerManager = { ensure: vi.fn(() => streamer) } as unknown as PaneStreamerManager;
-  const emit = vi.fn(async () => undefined);
+  const emit = vi.fn(async (_event: BaxianEvent): Promise<void> => undefined);
   const eventBus = { emit } as unknown as EventBus;
   const commits: NeedInputCommitIntent[] = [];
   let commitResult: NeedInputCommitResult | Error = 'ok';
@@ -1857,6 +1857,7 @@ describe('task-create side channel', () => {
     const flood = REJECTED_FRAME_CAP * 4;
     for (let i = 0; i < flood; i++) streamer.triggerLive(`${frame(`${i}+${'z'.repeat(4096)}`)}\n`);
     expect(rejections()).toHaveLength(flood);
+    // the memory bound itself is the contract here (review-required); no public surface exposes it deterministically
     const entry = watcher['entries'].get('t1:dev-1') as { rejectedFrames: Set<string> };
     expect(entry.rejectedFrames.size).toBe(REJECTED_FRAME_CAP);
     for (const id of entry.rejectedFrames) expect(id.length).toBeLessThanOrEqual(32);

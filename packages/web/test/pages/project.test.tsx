@@ -6,8 +6,6 @@ import { __resetProjectsCacheForTests, useProjects } from '../../src/hooks/use-p
 
 vi.mock('../../src/components/pane-terminal.tsx', async () => (await import('../helpers/pane-terminal-mock.tsx')).createPaneTerminalMock());
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
-
 vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
 
 let projectPayload: ProjectConfig;
@@ -29,18 +27,18 @@ const projectTasksState = {
 vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 
 vi.mock('../../src/components/create-task-modal.tsx', () => ({
-  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div data-testid="create-task-modal" /> : null),
+  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label="New task" /> : null),
 }));
 
 vi.mock('../../src/components/create-agent-modal.tsx', () => ({
-  CreateAgentModal: ({ open }: { open: boolean }) => (open ? <div data-testid="create-agent-modal" /> : null),
+  CreateAgentModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label="Add Agent Team" /> : null),
 }));
 
 import { api } from '../../src/api.ts';
-import { toastShowMock as toastShow } from '../helpers/toast-mock.tsx';
 import { useAgentsMock, useProjectTasksMock, useTaskMock } from '../helpers/events-mock.ts';
 import { makeProject } from '../helpers/fixtures.ts';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { Project } from '../../src/pages/project.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
@@ -50,19 +48,25 @@ const projectsDelete = vi.mocked(api.projects.delete);
 
 function LocationProbe() {
   const loc = useLocation();
-  return <div data-testid="location">{loc.pathname}</div>;
+  return <div role="region" aria-label="location">{loc.pathname}</div>;
+}
+
+function topbarActions(): HTMLElement {
+  return document.getElementById(TOPBAR_ACTIONS_ID)!;
 }
 
 function renderProjectPage() {
   return render(
     <MemoryRouter initialEntries={['/project/demo']}>
-      <ConfirmProvider>
-        <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
-        <Routes>
-          <Route path="/project/:id" element={<Project />} />
-          <Route path="/" element={<LocationProbe />} />
-        </Routes>
-      </ConfirmProvider>
+      <ToastProvider>
+        <ConfirmProvider>
+          <div id={TOPBAR_ACTIONS_ID} />
+          <Routes>
+            <Route path="/project/:id" element={<Project />} />
+            <Route path="/" element={<LocationProbe />} />
+          </Routes>
+        </ConfirmProvider>
+      </ToastProvider>
     </MemoryRouter>,
   );
 }
@@ -81,7 +85,6 @@ beforeEach(() => {
   cleanup();
   localStorage.clear();
   __resetProjectsCacheForTests();
-  toastShow.mockClear();
   projectsGet.mockClear();
   projectsList.mockClear();
   projectsDelete.mockClear();
@@ -102,24 +105,16 @@ beforeEach(() => {
 });
 
 describe('Project page header', () => {
-  it('lists the project id and repo with compact header styling', async () => {
+  it('lists the project id and repo, each exposing its full text as hover title', async () => {
     renderProjectPage();
 
     const heading = await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
-    expect(heading.className).toContain('text-sm');
-    expect(heading.className).toContain('font-display');
-    expect(heading.className).toContain('font-semibold');
+    expect(heading.getAttribute('title')).toBe('demo');
 
     const repo = screen.getByText('/tmp/demo-repo');
-    expect(repo.className).toContain('font-mono');
-    expect(repo.className).toContain('text-xs');
-    expect(repo.className).toContain('text-og-500');
-    expect(repo.className).toContain('truncate');
-    expect(repo.className).not.toContain('break-words');
     expect(repo.getAttribute('title')).toBe('/tmp/demo-repo');
-
-    expect(heading.className).toContain('truncate');
-    expect(heading.getAttribute('title')).toBe('demo');
+    // jsdom does no text layout: the truncate token is the only guard that long values keep the header one line
+    for (const el of [heading, repo]) expect(el.className.split(/\s+/)).toContain('truncate');
   });
 
   it('hides the repo path below sm so the header stays compact on mobile', async () => {
@@ -136,13 +131,11 @@ describe('Project header actions', () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
-    const topbarActions = screen.getByTestId('topbar-actions');
-    const taskBtn = within(topbarActions).getByRole('button', { name: '+ New task' });
-    expect(taskBtn.className).toContain('btn-ghost');
+    const taskBtn = within(topbarActions()).getByRole('button', { name: '+ New task' });
     expect(screen.getAllByRole('button', { name: '+ New task' })).toHaveLength(1);
-    expect(screen.queryByTestId('create-task-modal')).toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'New task' })).toBeNull();
     fireEvent.click(taskBtn);
-    expect(await screen.findByTestId('create-task-modal')).toBeTruthy();
+    expect(await screen.findByRole('dialog', { name: 'New task' })).toBeTruthy();
   });
 
   it('only sets aria-controls on the project three-dot menu while it is open', async () => {
@@ -165,16 +158,14 @@ describe('Project header actions', () => {
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
     expect(screen.queryByRole('button', { name: /Add Agent Team/ })).toBeNull();
-    const topbarActions = screen.getByTestId('topbar-actions');
-    expect(within(topbarActions).getByRole('button', { name: /Project demo actions menu/ })).toBeTruthy();
+    expect(within(topbarActions()).getByRole('button', { name: /Project demo actions menu/ })).toBeTruthy();
 
     await openProjectMenu();
     const item = await screen.findByRole('menuitem', { name: 'Add Agent Team' });
-    expect(item.className).not.toContain('text-danger');
 
-    expect(screen.queryByTestId('create-agent-modal')).toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'Add Agent Team' })).toBeNull();
     fireEvent.click(item);
-    expect(await screen.findByTestId('create-agent-modal')).toBeTruthy();
+    expect(await screen.findByRole('dialog', { name: 'Add Agent Team' })).toBeTruthy();
   });
 });
 
@@ -183,11 +174,10 @@ describe('Project Task panel', () => {
     renderProjectPage();
     const panel = await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }));
     const heading = screen.getByRole('heading', { name: 'Tasks' });
-    const agentsHeading = screen.getByRole('heading', { name: 'Agents' });
+    expect(screen.getByRole('heading', { name: 'Agents' })).toBeTruthy();
     const closeBtn = screen.getByRole('button', { name: 'Close task panel' });
     expect(panel.contains(heading)).toBe(false);
     expect(panel.contains(closeBtn)).toBe(false);
-    expect(heading.className).toBe(agentsHeading.className);
     expect(screen.queryByRole('menuitem', { name: 'Show task panel' })).toBeNull();
   });
 
@@ -228,7 +218,7 @@ describe('Project Task panel', () => {
 });
 
 describe('Project delete entry', () => {
-  it('keeps delete inside the project menu and marks it destructive', async () => {
+  it('keeps delete inside the project menu, enabled when the project has no agents', async () => {
     renderProjectPage();
     const menuButton = await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ }));
 
@@ -237,7 +227,6 @@ describe('Project delete entry', () => {
     fireEvent.click(menuButton);
 
     const item = await waitFor(() => screen.getByRole('menuitem', { name: 'Delete project…' }));
-    expect(item.className).toContain('text-og-1000');
     expect(item.hasAttribute('disabled')).toBe(false);
   });
 
@@ -281,17 +270,19 @@ describe('Project delete entry', () => {
     projectsListPayload = [makeProject({ id: 'demo', repo: '/tmp/demo-repo' })];
     function ProjectIdsProbe() {
       const { projects } = useProjects();
-      return <div data-testid="cached-ids">{(projects ?? []).map(p => p.id).join(',')}</div>;
+      return <div role="region" aria-label="cached project ids">{(projects ?? []).map(p => p.id).join(',')}</div>;
     }
     render(
       <MemoryRouter initialEntries={['/project/demo']}>
-        <ConfirmProvider>
-          <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
-          <Routes>
-            <Route path="/project/:id" element={<Project />} />
-            <Route path="/" element={<><LocationProbe /><ProjectIdsProbe /></>} />
-          </Routes>
-        </ConfirmProvider>
+        <ToastProvider>
+          <ConfirmProvider>
+            <div id={TOPBAR_ACTIONS_ID} />
+            <Routes>
+              <Route path="/project/:id" element={<Project />} />
+              <Route path="/" element={<><LocationProbe /><ProjectIdsProbe /></>} />
+            </Routes>
+          </ConfirmProvider>
+        </ToastProvider>
       </MemoryRouter>,
     );
 
@@ -304,11 +295,9 @@ describe('Project delete entry', () => {
 
     await waitFor(() => expect(projectsDelete).toHaveBeenCalledWith('demo'));
     await waitFor(() => expect(projectsList).toHaveBeenCalled());
-    await waitFor(() => expect(toastShow).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'success', title: expect.stringContaining('deleted') }),
-    ));
-    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/'));
-    expect(screen.getByTestId('cached-ids').textContent).toBe('');
+    expect((await screen.findByRole('status')).textContent).toMatch(/deleted/);
+    await waitFor(() => expect(screen.getByRole('region', { name: 'location' }).textContent).toBe('/'));
+    expect(screen.getByRole('region', { name: 'cached project ids' }).textContent).toBe('');
   });
 
   it('surfaces server error in the modal and keeps the user on the project page', async () => {
@@ -321,7 +310,7 @@ describe('Project delete entry', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm delete' }));
 
     await waitFor(() => expect(within(dialog).getByText(/boom — config locked/)).toBeTruthy());
-    expect(screen.queryByTestId('location')).toBeNull();
-    expect(toastShow).not.toHaveBeenCalled();
+    expect(screen.queryByRole('region', { name: 'location' })).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
   });
 });

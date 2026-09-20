@@ -126,7 +126,7 @@ describe('startServer', () => {
 
       const sigintHandler = process.listeners('SIGINT').find((l) => !sigintBefore.has(l));
       expect(sigintHandler).toBeDefined();
-      sigintHandler!();
+      sigintHandler!('SIGINT');
       await vi.waitFor(() => {
         expect(exitSpy).toHaveBeenCalledWith(130);
       }, { timeout: 15_000 });
@@ -187,7 +187,7 @@ describe('startServer', () => {
 
       const sigintHandler = process.listeners('SIGINT').find(listener => !sigintBefore.has(listener));
       expect(sigintHandler).toBeDefined();
-      sigintHandler!();
+      sigintHandler!('SIGINT');
       await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130), { timeout: 15_000 });
     } finally {
       for (const listener of process.listeners('SIGINT')) {

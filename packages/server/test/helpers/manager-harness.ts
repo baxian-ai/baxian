@@ -10,14 +10,15 @@ import type {
 } from '../../src/shared/index.js';
 import { AgentManager, type AgentManagerDeps } from '../../src/agent/manager.js';
 import { BranchManager } from '../../src/agent/branch.js';
-import { TmuxManager, type AgentRuntimeKind, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
+import type { PaneRef, TmuxSessionRef } from '../../src/agent/tmux.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { initStateDir } from '../../src/state/init.js';
-import { fakeRunner } from './fake-runner.js';
+import type { RepoStore } from '../../src/agent/repo-store.js';
+import { fakeRunner, type FakeRunnerAgent, type FakeRunnerOptions } from './fake-runner.js';
 import { makeConfig, makeTask } from './fixtures.js';
 
 export const TEST_SESSION_REF: TmuxSessionRef = {
@@ -26,27 +27,15 @@ export const TEST_SESSION_REF: TmuxSessionRef = {
   serverStart: '1700000000',
 };
 
-export function paneRefOf(paneId: string, claim: string): PaneRef {
-  return { session: TEST_SESSION_REF, paneId, claim };
+// fake runner 给每个 agent 一个唯一 session id(dev-1 $1、qa-1 $2…),pane ref 必须跟着走,否则身份守卫会真实拒绝
+const SEEDED_SESSION_IDS: Record<string, string> = { 'dev-1': '$1', 'qa-1': '$2' };
+
+export function sessionRefOf(agentId: string): TmuxSessionRef {
+  return { ...TEST_SESSION_REF, sessionId: SEEDED_SESSION_IDS[agentId] ?? TEST_SESSION_REF.sessionId };
 }
 
-export type AckResult = { acked: boolean; composerDelivered?: boolean; aborted?: boolean };
-
-export function callInjectAndAwaitAck(
-  manager: AgentManager,
-  tmux: TmuxManager,
-  paneId: string,
-  prompt: string,
-  agentId: string,
-  runtime: AgentRuntimeKind,
-  guardBeforePaste?: () => Promise<boolean>,
-): Promise<AckResult> {
-  return (manager as unknown as {
-    injectAndAwaitAck: (
-      tmux: TmuxManager, pane: PaneRef, prompt: string, agentId: string, runtime: AgentRuntimeKind,
-      guardBeforePaste?: () => Promise<boolean>,
-    ) => Promise<AckResult>;
-  }).injectAndAwaitAck(tmux, paneRefOf(paneId, agentId), prompt, agentId, runtime, guardBeforePaste);
+export function paneRefOf(paneId: string, claim: string): PaneRef {
+  return { session: sessionRefOf(claim), paneId, claim };
 }
 
 export interface ManagerHarnessOverrides {
@@ -117,9 +106,9 @@ export async function createManagerHarness(
     if (!overrides.lockSeededAgents || !agent.taskId || await lockManager.isLocked(agent.id)) return;
     const token = await lockManager.acquire(agent.id, agent.taskId);
     if (!token) return;
-    await agentStore.update(agent.id, latest => latest?.taskId === agent.taskId
+    await agentStore.update(agent.id, latest => (latest && latest.taskId === agent.taskId
       ? { ...latest, lockToken: token, updatedAt: new Date().toISOString() }
-      : latest);
+      : latest));
   }
 
   const seedHarnessTask = (taskOverrides: Partial<TaskState> = {}) =>
@@ -152,20 +141,53 @@ export async function createManagerHarness(
   };
 }
 
-export function createManagerSuiteRunner() {
+export function workdirsOf(config: BaxianConfig): Record<string, string> {
+  const agents = config.project.flatMap(project => project.agent.flat());
+  return Object.fromEntries(agents.flatMap(agent => (agent.workdir ? [[agent.id, agent.workdir]] : [])));
+}
+
+// live runtime:两个 agent 的 tmux 会话都在、pane 处于 idle,workdir 与配置一致,提示投递按守卫协议真实推进
+export function createManagerSuiteRunner(options: FakeRunnerOptions & { workdirs?: Record<string, string> } = {}) {
+  const { workdirs = {}, agents = {}, ...rest } = options;
+  const agentSpec = (id: string, runtime: FakeRunnerAgent['runtime']): FakeRunnerAgent => ({
+    runtime,
+    ...(workdirs[id] ? { workdir: workdirs[id] } : {}),
+    ...agents[id],
+  });
   return fakeRunner({
-    session: 'absent',
+    session: 'present',
+    ...rest,
     agents: {
-      'qa-1': { screen: 'permissions: YOLO mode\n\n>' },
+      ...agents,
+      'dev-1': agentSpec('dev-1', 'claude-code'),
+      'qa-1': agentSpec('qa-1', 'codex'),
     },
   });
 }
 
+// git 仓库边界替身(spec E4):manager 对 RepoStore 的契约只是 ensure() → workdir
+export function repoStoreStandIn(tempDir: string): NonNullable<AgentManagerDeps['repoStoreFactory']> {
+  return (_runner, _repo, _mode, _host, _cache, agentId, workdir) => ({
+    ensure: async () => workdir ?? join(tempDir, agentId),
+    refresh: async () => undefined,
+  }) as unknown as RepoStore;
+}
+
 async function createManagerSuiteHarness(tempDir: string) {
-  const runner = createManagerSuiteRunner();
+  const suiteConfig = makeConfig({ review: { rounds: 2 } });
+  const workdirs = workdirsOf(suiteConfig);
+  const runner = createManagerSuiteRunner({ workdirs });
   const harness = await createManagerHarness(tempDir, {
-    config: makeConfig({ review: { rounds: 2 } }),
-    deps: { runnerFactory: () => runner },
+    config: suiteConfig,
+    deps: {
+      runnerFactory: () => runner,
+      repoStoreFactory: repoStoreStandIn(tempDir),
+      // live runtime 每次派单都真实等待 idle/ack,节拍压到毫秒级,单测不再按生产秒级轮询
+      compactIdlePollMs: 1,
+      readyStableSpacingMs: 1,
+      runtimeLivenessProbeMs: 1,
+      bootstrapTimeoutsMs: { trustDialog: 300, waitReplReady: 1_000 },
+    },
     lockSeededAgents: true,
     useDefaultPlatformRunner: false,
   });
@@ -174,6 +196,7 @@ async function createManagerSuiteHarness(tempDir: string) {
     .map(agent => [agent.id, agent.workdir] as const));
   vi.spyOn(harness.manager, 'platformVerifyPrBinding').mockResolvedValue({
     ok: true,
+    prUrl: 'https://github.com/user/repo/pull/42',
     headSha: 'a'.repeat(40),
     branch: 'bx/task-review',
     targetBranch: 'main',
@@ -189,52 +212,6 @@ async function createManagerSuiteHarness(tempDir: string) {
     const boundTask = binding?.taskId ? await harness.taskStore.get(binding.taskId) : null;
     return boundTask?.branch ? `refs/heads/${boundTask.branch}` : null;
   });
-  function stubEnsureSession(
-    target: AgentManager,
-    resultOverrides: Record<string, unknown> = {},
-  ): void {
-    vi.spyOn(target, 'ensureSession').mockImplementation(async agentId => ({
-      ok: true,
-      createdSession: false,
-      freshRuntime: false,
-      sessionRef: TEST_SESSION_REF,
-      paneId: '%0',
-      workdir: (await harness.agentStore.get(agentId))?.workdir ?? '/tmp/repo',
-      ...resultOverrides,
-    }));
-    vi.spyOn(TmuxManager.prototype, 'getSessionOptionByRef').mockResolvedValue(null);
-    vi.spyOn(
-      target as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
-      'waitForReplPromptReady',
-    ).mockResolvedValue(undefined);
-    vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
-    vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue(undefined);
-    vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);
-    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
-  }
-  function stubInject(
-    target: AgentManager,
-    implementation: (
-      tmux: TmuxManager,
-      paneId: string,
-      prompt: string,
-      agentId: string,
-      runtime: AgentRuntimeKind,
-    ) => Promise<{ acked: boolean; composerDelivered: boolean }>,
-  ): void {
-    vi.spyOn(
-      target as unknown as { injectAndAwaitAck: typeof implementation },
-      'injectAndAwaitAck',
-    ).mockImplementation(implementation);
-  }
-  const setCompactTiming = (target: AgentManager, waitMs = 100, pollMs = 10) => {
-    Object.assign(target, { compactIdleWaitMs: waitMs, compactIdlePollMs: pollMs });
-  };
-  const mockInterruptPane = (target: AgentManager, ok: boolean) =>
-    vi.spyOn(
-      target as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> },
-      'interruptPaneAndWaitReady',
-    ).mockResolvedValue(ok);
   return {
     ...harness,
     runner,
@@ -242,10 +219,6 @@ async function createManagerSuiteHarness(tempDir: string) {
       workdir: workdirByAgent.get(agent.id ?? 'dev-1'),
       ...agent,
     }),
-    stubEnsureSession,
-    stubInject,
-    setCompactTiming,
-    mockInterruptPane,
   };
 }
 

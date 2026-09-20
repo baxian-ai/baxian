@@ -1,31 +1,144 @@
-import { describe, it, expect, vi } from 'vitest';
-import type { AgentBindingFacts, AgentConfig } from '../../src/shared/index.js';
-import { AgentManager } from '../../src/agent/manager.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import type { TaskState } from '../../src/shared/index.js';
+import type { AgentManagerDeps } from '../../src/agent/manager.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
-import {
-  callInjectAndAwaitAck,
-  createManagerSuiteRunner,
-  TEST_SESSION_REF,
-  useManagerSuiteHarness,
-} from '../helpers/manager-harness.js';
-import { clearAwareRunner, fakeRunner } from '../helpers/fake-runner.js';
+import { AGENT_STORE_NOOP } from '../../src/state/agent-store.js';
+import { createManagerSuiteRunner, paneRefOf, useManagerSuiteHarness, workdirsOf } from '../helpers/manager-harness.js';
+import { fakeRunner, type FakeRunner, type FakeRunnerOptions, type FakeRunnerRule } from '../helpers/fake-runner.js';
 import { makeTask } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
-
-const CLAUDE_PANE = { proc: 'claude', idle: '⏵⏵ bypass permissions on /tmp/repo\n\n>' };
-
-const CODEX_PANE = { proc: 'codex', idle: 'permissions: YOLO mode\n\n>' };
-
-function stubClaimedPaneResolution(paneForAgent: (agentId: string) => string): void {
-  vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot')
-    .mockImplementation(async (name) => ({ ref: TEST_SESSION_REF, claim: name }));
-  vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef')
-    .mockImplementation(async (ref, claim) => ({ session: ref, paneId: paneForAgent(claim), claim }));
-}
+const PANE = { 'dev-1': '%0', 'qa-1': '%1' } as const;
+type AgentId = keyof typeof PANE;
+const RUNTIME = { 'dev-1': 'claude-code', 'qa-1': 'codex' } as const;
 
 const harness = useManagerSuiteHarness();
+// 假时钟用例一旦超时,finally 不会执行;这里兜底还原,避免拖垮后续用例
+afterEach(() => { vi.useRealTimers(); });
+
+const holdEvents = () => harness.events.filter(
+  e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'cancel-interrupt-failed',
+);
+
+// if-shell 内层的 'Escape' 被 shell 转义成 '\''Escape'\'';只取非字面按键
+const keyOf = (cmd: string): string | undefined => /send-keys -t %\d+ (?:-- )?'(?:\\'')?([^'\\]+)/.exec(cmd)?.[1];
+const isKey = (cmd: string, paneId: string, key: string): boolean =>
+  cmd.includes(`send-keys -t ${paneId} `) && keyOf(cmd) === key;
+const interruptKeys = (runner: FakeRunner, paneId: string): string[] => runner.sentKeys
+  .filter(cmd => cmd.includes(`send-keys -t ${paneId} `))
+  .map(keyOf)
+  .filter((key): key is 'Escape' | 'C-c' => key === 'Escape' || key === 'C-c');
+// liveness 采样不带 -e(ansi:false);waitReplReady 与诊断抓屏都带 -e
+const isLivenessCapture = (cmd: string): boolean => cmd.includes('capture-pane') && !cmd.includes(' -e ');
+// 释放阶段的就绪探针与 liveness 采样同形;只有 C-c 之前的那些才可能是 liveness 采样
+const livenessCapturesBeforeClear = (runner: FakeRunner, paneId: string): string[] => {
+  const trace = runner.exec.mock.calls.map(c => String(c[0]));
+  const at = trace.findIndex(cmd => isKey(cmd, paneId, 'C-c'));
+  return trace.slice(0, at === -1 ? trace.length : at).filter(isLivenessCapture);
+};
+
+// live runtime:working 只能由 Escape 结束(ackHoldCaptures: Infinity),清稿确认窗口压到毫秒级
+function liveManager(runnerOptions: FakeRunnerOptions = {}, deps: Partial<AgentManagerDeps> = {}): FakeRunner {
+  const workdirs = workdirsOf(harness.config);
+  const runner = createManagerSuiteRunner({ workdirs, ackHoldCaptures: Infinity, ...runnerOptions });
+  harness.manager = harness.createManager({ runnerFactory: () => runner, cleanComposerWaitMs: 300, ...deps });
+  return runner;
+}
+
+async function bindTask(agentId: AgentId, overrides: Partial<TaskState> = {}): Promise<string> {
+  const t = await harness.seedTask(overrides);
+  await harness.seedAgent({ id: agentId, taskId: t.id, paneId: PANE[agentId] });
+  return t.id;
+}
+
+type CancelOutcome = 'released' | 'held';
+async function outcomeFor(agentId: AgentId, taskId: string): Promise<CancelOutcome> {
+  expect((await harness.taskStore.get(taskId))?.status).toBe('cancelled');
+  const state = await harness.agentStore.get(agentId);
+  if (state?.awaitingPhase === 'cancel-interrupt-failed') {
+    expect(state.taskId).toBe(taskId);
+    expect(await harness.lockManager.isLocked(agentId)).toBe(true);
+    return 'held';
+  }
+  expect(state?.taskId).toBeUndefined();
+  expect(await harness.lockManager.isLocked(agentId)).toBe(false);
+  return 'released';
+}
+
+// ESC 后生产硬等 10 s 的 ready 窗口才做 liveness 判定:假时钟推进等待,setImmediate 保持真实让 store I/O 落定
+function fakeClock() {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+  const step = async (totalMs: number, until: () => boolean = () => false): Promise<void> => {
+    for (let elapsed = 0; elapsed < totalMs && !until(); elapsed += 100) {
+      await vi.advanceTimersByTimeAsync(100);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  };
+  // 虚拟预算不能按"每 100 ms 只让一拍真实事件循环"折算:coverage 插桩下 store/fs I/O 需要更多拍,
+  // 两者耦合会在真实工作还没跑完时就烧光预算。改成先把真实 I/O 排空,再推进虚拟时钟,并用真实时间兜底。
+  const settle = async <T>(pending: Promise<T>, maxMs = 120_000): Promise<T> => {
+    let done = false;
+    pending.then(() => { done = true; }, () => { done = true; });
+    const realDeadline = performance.now() + 60_000;
+    for (let elapsed = 0; !done && elapsed < maxMs && performance.now() < realDeadline; elapsed += 100) {
+      for (let turn = 0; turn < 20 && !done; turn++) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      if (done) break;
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(done).toBe(true);
+    return pending;
+  };
+  return { step, settle };
+}
+async function onFakeClock<T>(run: (clock: ReturnType<typeof fakeClock>) => Promise<T>): Promise<T> {
+  const clock = fakeClock();
+  try {
+    return await run(clock);
+  } finally {
+    vi.useRealTimers();
+  }
+}
+const cancelOnFakeClock = (taskId: string): Promise<TaskState> =>
+  onFakeClock(clock => clock.settle(harness.manager.cancelTask(taskId)));
+
+// 在指定命令处把 fake runner 卡住直到 release():让一个公共操作持有 pane mutex
+function execGate(match: (cmd: string) => boolean) {
+  let release!: () => void;
+  let arrive!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const reached = new Promise<void>(resolve => { arrive = resolve; });
+  let armed = true;
+  const onExec = async (cmd: string): Promise<void> => {
+    if (!armed || !match(cmd)) return;
+    armed = false;
+    arrive();
+    await released;
+  };
+  return { onExec, reached, release };
+}
+
+// 往 idle composer 里放一段未提交的草稿:单行按人手敲入,多行只能经 tmux buffer 粘贴(send-keys -l 不接受换行)
+const typeDraft = async (runner: FakeRunner, agentId: AgentId, text: string): Promise<void> => {
+  const tmux = new TmuxManager(runner);
+  const pane = paneRefOf(PANE[agentId], agentId);
+  if (!text.includes('\n')) {
+    await tmux.sendKeysLiteral(pane, text, RUNTIME[agentId]);
+    return;
+  }
+  const { buf } = await tmux.stagePromptBuffer(pane.paneId, text, agentId);
+  await tmux.pasteStagedBuffer(pane, buf, RUNTIME[agentId]);
+  runner.pastedPrompts.length = 0;
+};
+
+const paneTitleRule = (title: () => string): FakeRunnerRule =>
+  ({ match: 'pane_title', reply: () => ({ stdout: `BX_PANE_OK${title()}\n` }) });
+
+const markCancelClearing = (agentId: AgentId) => harness.agentStore.update(
+  agentId,
+  s => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP),
+);
 
 describe('AgentManager runtime menu marker', () => {
   it('emits one pending intervention and one matching resolution when the menu closes', async () => {
@@ -42,8 +155,7 @@ describe('AgentManager runtime menu marker', () => {
         },
       }],
     });
-    harness.manager = harness.createManager({ runnerFactory: () => runner });
-    harness.manager['runtimeMenuPollIntervalMs'] = 5;
+    harness.manager = harness.createManager({ runnerFactory: () => runner, runtimeMenuPollIntervalMs: 5 });
     await harness.seedTask();
     await harness.seedAgent({
       id: 'dev-1',
@@ -86,8 +198,7 @@ describe('AgentManager runtime menu marker', () => {
         },
       }],
     });
-    harness.manager = harness.createManager({ runnerFactory: () => runner });
-    harness.manager['runtimeMenuPollIntervalMs'] = 5;
+    harness.manager = harness.createManager({ runnerFactory: () => runner, runtimeMenuPollIntervalMs: 5 });
     await harness.seedTask();
     await harness.seedAgent({
       id: 'dev-1',
@@ -116,73 +227,36 @@ describe('AgentManager runtime menu marker', () => {
 });
 
 describe('cancelTask interrupts (ESC) then releases dev and qa panes without clearing', () => {
-  it('sends ESC to both dev and qa, never /clear, then clears both bindings', async () => {
-    const sentKeys: string[] = [];
-    const localManager = harness.createManager({
-      runnerFactory: () => clearAwareRunner(sentKeys, pane => (pane === '%1' ? CODEX_PANE : CLAUDE_PANE)),
-    });
-    harness.setCompactTiming(localManager);
+  it('sends ESC to both working panes, never /clear, clears the interrupted prompts and both bindings', async () => {
+    const runner = liveManager();
+    const t = await harness.seedTask();
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    await harness.manager.injectTextToAgent('dev-1', 'dev prompt', { expectedTaskId: t.id });
+    await harness.manager.injectTextToAgent('qa-1', 'qa prompt', { expectedTaskId: t.id });
+    expect(runner.sessions.pane('dev-1')!.phase).toBe('working');
+    expect(runner.sessions.pane('qa-1')!.phase).toBe('working');
 
-    const t = await harness.seedTask({ qaAgentId: 'qa-1' });
-    await harness.seedAgent({
-      id: 'dev-1',
-      taskId: t.id,
-      paneId: '%0',
-    });
-    await harness.seedAgent({
-      id: 'qa-1',
-      taskId: t.id,
-      paneId: '%1',
-    });
-    await harness.acquireAgentLock('dev-1');
-    await harness.acquireAgentLock('qa-1');
-
-    const cancelled = await localManager.cancelTask(t.id);
+    const cancelled = await cancelOnFakeClock(t.id);
 
     expect(cancelled.status).toBe('cancelled');
-    const escKeys = sentKeys.filter(k => k.includes("'Escape'"));
-    expect(escKeys.length).toBeGreaterThanOrEqual(2);
-    expect(sentKeys.some(k => k.includes('send-keys -l') && k.includes('/clear'))).toBe(false);
-    expect(sentKeys.some(k => k.includes('%0') && k.includes('C-c'))).toBe(true);
-    expect(sentKeys.some(k => k.includes('%1') && k.includes('C-c'))).toBe(true);
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
-    expect(await harness.lockManager.isLocked('qa-1')).toBe(false);
+    expect(interruptKeys(runner, '%0')).toEqual(['Escape', 'C-c']);
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
+    expect(runner.sentKeys.some(k => k.includes('/clear'))).toBe(false);
+    for (const id of ['dev-1', 'qa-1'] as const) {
+      expect(runner.sessions.pane(id)).toMatchObject({ phase: 'idle', composer: '' });
+      expect((await harness.agentStore.get(id))?.taskId).toBeUndefined();
+      expect(await harness.lockManager.isLocked(id)).toBe(false);
+    }
   });
 
-  it('skips interrupt/clear and release when agent has been rebound to a new task (race protection)', async () => {
-    const sentKeys: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys')) {
-          sentKeys.push(cmd);
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const localManager = harness.createManager({ runnerFactory: () => runner });
+  it('skips interrupt and release when the agent has been rebound to a new task (race protection)', async () => {
+    const runner = liveManager();
+    const oldTask = await harness.seedTask({ id: 'task-old' });
+    const newTask = await harness.seedTask({ id: 'task-new' });
+    await harness.seedAgent({ id: 'dev-1', taskId: oldTask.id, paneId: '%0' });
 
-    const oldTask = makeTask({ id: 'task-old' });
-    const newTask = makeTask({ id: 'task-new' });
-    await harness.taskStore.set(oldTask);
-    await harness.taskStore.set(newTask);
-    await harness.seedAgent({
-      id: 'dev-1',
-      taskId: oldTask.id,
-      paneId: '%0',
-    });
-    await harness.acquireAgentLock('dev-1');
-
+    // 绑定在 cancel 标记之后、逐 agent 检查之前被换掉:两次读之间没有外部命令,只能在 store 读上交错
     const realAgentGet = harness.agentStore.get.bind(harness.agentStore);
     let devGets = 0;
     let switched = false;
@@ -193,112 +267,97 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
         if (cur) {
           await harness.agentStore.set({ ...cur, taskId: newTask.id, updatedAt: new Date().toISOString() });
         }
-        return realAgentGet(id);
       }
       return realAgentGet(id);
     });
 
-    const cancelled = await localManager.cancelTask(oldTask.id);
+    const cancelled = await harness.manager.cancelTask(oldTask.id);
 
     expect(cancelled.status).toBe('cancelled');
-    expect(sentKeys.filter(k => k.includes("'Escape'"))).toHaveLength(0);
-    expect(sentKeys.filter(k => k.includes('/clear'))).toHaveLength(0);
+    expect(runner.sentKeys).toEqual([]);
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBe(newTask.id);
   });
 
-  it('preserves binding and emits intervention when interrupt fails (no /clear)', async () => {
-    const sentKeys: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys')) sentKeys.push(cmd);
-        if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: 'Tool use: Bash\nstill streaming...\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const localManager = harness.createManager({ runnerFactory: () => runner });
-
-    harness.mockInterruptPane(localManager, false);
-
-    const t = await harness.seedTask();
-    await harness.seedAgent({
-      id: 'dev-1',
-      taskId: t.id,
-      paneId: '%0',
-    });
-    await harness.acquireAgentLock('dev-1');
-
-    const cancelled = await localManager.cancelTask(t.id);
-
-    expect(cancelled.status).toBe('cancelled');
-    expect(sentKeys.filter(k => k.includes('/clear'))).toHaveLength(0);
-    const stateAfter = await harness.agentStore.get('dev-1');
-    expect(stateAfter?.taskId).toBe(t.id);
-    expect(stateAfter?.status).toBe('awaiting_human');
-    expect(stateAfter?.awaitingPhase).toBe('cancel-interrupt-failed');
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
-    const failedEvents = harness.events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'cancel-interrupt-failed',
-    );
-    expect(failedEvents).toHaveLength(1);
-    expect(failedEvents[0]).toMatchObject({
-      type: 'human.intervention',
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: t.id,
-    });
-  });
-
-  it('keeps the mutex-busy hold reason and emits a single intervention when the pane mutex stays busy', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
-    Object.assign(localManager, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
-    stubClaimedPaneResolution(() => '%0');
-    (localManager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('dev-1');
-
+  it('preserves the binding and emits one intervention when ESC does not stop the turn (no /clear, no C-c)', async () => {
+    const runner = liveManager({ agents: { 'dev-1': { interrupt: 'ignored-live' } } });
     const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
+    runner.sessions.markWorking('dev-1');
 
-    const cancelled = await localManager.cancelTask(t.id);
+    const cancelled = await cancelOnFakeClock(t.id);
+
+    expect(cancelled.status).toBe('cancelled');
+    expect(interruptKeys(runner, '%0')).toEqual(['Escape']);
+    expect(runner.sentKeys.some(k => k.includes('/clear'))).toBe(false);
+    expect(runner.sessions.pane('dev-1')!.phase).toBe('working');
+    const stateAfter = await harness.agentStore.get('dev-1');
+    expect(stateAfter).toMatchObject({ taskId: t.id, status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
+    expect(holdEvents()).toEqual([expect.objectContaining({ projectId: 'proj', agentId: 'dev-1', taskId: t.id })]);
+  });
+
+  it('keeps the mutex-busy hold reason and emits a single intervention when an in-flight upload keeps the pane mutex past the wait window', async () => {
+    const gate = execGate(cmd => cmd.includes('paste-buffer'));
+    const runner = liveManager({ onExec: gate.onExec }, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
+    const t = await harness.seedTask();
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const upload = harness.manager.injectTextToAgent('dev-1', 'in flight', { expectedTaskId: t.id });
+    await gate.reached;
+
+    const cancelled = await harness.manager.cancelTask(t.id);
 
     expect(cancelled.status).toBe('cancelled');
     const dev = await harness.agentStore.get('dev-1');
-    expect(dev?.taskId).toBe(t.id);
-    expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
+    expect(dev).toMatchObject({ taskId: t.id, awaitingPhase: 'cancel-interrupt-failed' });
     expect(dev?.awaitingReason).toContain('pane mutex');
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
-    const holdEvents = harness.events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'cancel-interrupt-failed',
-    );
-    expect(holdEvents).toHaveLength(1);
+    expect(runner.sentKeys).toEqual([]);
+    expect(holdEvents()).toHaveLength(1);
+    gate.release();
+    await upload.catch(() => undefined);
+  });
+
+  it('keeps waiting for a busy pane mutex across a custom dispatch ack window instead of giving up at the default wait', async () => {
+    const gate = execGate(cmd => cmd.includes('paste-buffer'));
+    const runner = liveManager({ onExec: gate.onExec }, { dispatchAckTimeoutMs: 60_000, compactIdlePollMs: 50 });
+    const t = await harness.seedTask();
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const upload = harness.manager.injectTextToAgent('dev-1', 'in flight', { expectedTaskId: t.id });
+    await gate.reached;
+
+    await onFakeClock(async clock => {
+      const cancel = harness.manager.cancelTask(t.id);
+      await vi.waitFor(async () => {
+        expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
+      });
+      await clock.step(40_000);
+      expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
+      expect(interruptKeys(runner, '%0')).toEqual([]);
+
+      gate.release();
+      await clock.settle(upload);
+      expect((await clock.settle(cancel)).status).toBe('cancelled');
+    });
+
+    expect(interruptKeys(runner, '%0')).toEqual(['Escape', 'C-c']);
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(runner.sessions.pane('dev-1')).toMatchObject({ phase: 'idle', composer: '' });
   });
 
   it('releases neither agent until both panes are interrupted, so a slow qa interrupt cannot expose a freed dev', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
-
-    const t = await harness.seedTask({ qaAgentId: 'qa-1' });
+    const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await harness.acquireAgentLock('dev-1');
-    await harness.acquireAgentLock('qa-1');
-
     let devStillHeldDuringQaInterrupt: boolean | undefined;
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockImplementation(async (state) => {
-        if (state.id === 'qa-1') {
-          devStillHeldDuringQaInterrupt =
-            (await harness.agentStore.get('dev-1'))?.taskId === t.id && (await harness.lockManager.isLocked('dev-1'));
-        }
-        return true;
-      });
+    liveManager({
+      onExec: async cmd => {
+        if (!isKey(cmd, '%1', 'Escape')) return;
+        devStillHeldDuringQaInterrupt =
+          (await harness.agentStore.get('dev-1'))?.taskId === t.id && (await harness.lockManager.isLocked('dev-1'));
+      },
+    });
 
-    await localManager.cancelTask(t.id);
+    await cancelOnFakeClock(t.id);
 
     expect(devStillHeldDuringQaInterrupt).toBe(true);
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
@@ -308,24 +367,17 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('refuses Resume while cancel cleanup is in flight, and the worker still completes both releases', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
-
-    const t = await harness.seedTask({ qaAgentId: 'qa-1' });
+    const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await harness.acquireAgentLock('dev-1');
-    await harness.acquireAgentLock('qa-1');
-
     let resumeDuringCancel: { resumed: boolean; reason?: string } | undefined;
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockImplementation(async (state) => {
-        if (state.id === 'qa-1') {
-          resumeDuringCancel = await localManager.resumeAgent('dev-1');
-        }
-        return true;
-      });
+    liveManager({
+      onExec: async cmd => {
+        if (isKey(cmd, '%1', 'Escape')) resumeDuringCancel = await harness.manager.resumeAgent('dev-1');
+      },
+    });
 
-    await localManager.cancelTask(t.id);
+    await cancelOnFakeClock(t.id);
 
     expect(resumeDuringCancel?.resumed).toBe(false);
     expect(resumeDuringCancel?.reason).toContain('in progress');
@@ -336,25 +388,19 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('a duplicate cancel of an already-cancelling task does not clear the in-flight guard early', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
-
-    const t = await harness.seedTask({ qaAgentId: 'qa-1' });
+    const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await harness.acquireAgentLock('dev-1');
-    await harness.acquireAgentLock('qa-1');
-
     let resumeAfterDuplicateCancel: { resumed: boolean; reason?: string } | undefined;
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockImplementation(async (state) => {
-        if (state.id === 'qa-1') {
-          await localManager.cancelTask(t.id);
-          resumeAfterDuplicateCancel = await localManager.resumeAgent('dev-1');
-        }
-        return true;
-      });
+    liveManager({
+      onExec: async cmd => {
+        if (!isKey(cmd, '%1', 'Escape')) return;
+        await harness.manager.cancelTask(t.id);
+        resumeAfterDuplicateCancel = await harness.manager.resumeAgent('dev-1');
+      },
+    });
 
-    await localManager.cancelTask(t.id);
+    await cancelOnFakeClock(t.id);
 
     expect(resumeAfterDuplicateCancel?.resumed).toBe(false);
     expect(resumeAfterDuplicateCancel?.reason).toContain('in progress');
@@ -365,43 +411,34 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('a dev whose interrupt fails does not strand qa — qa is still interrupted and released', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
-
-    const t = await harness.seedTask({ qaAgentId: 'qa-1' });
+    const runner = liveManager({ agents: { 'dev-1': { interrupt: 'ignored-live' } } });
+    const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await harness.acquireAgentLock('dev-1');
-    await harness.acquireAgentLock('qa-1');
+    runner.sessions.markWorking('dev-1');
 
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockImplementation(async (state) => state.id !== 'dev-1');
-
-    await localManager.cancelTask(t.id);
+    await cancelOnFakeClock(t.id);
 
     const dev = await harness.agentStore.get('dev-1');
-    expect(dev?.status).toBe('awaiting_human');
-    expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
-    expect(dev?.taskId).toBe(t.id);
-    const qa = await harness.agentStore.get('qa-1');
-    expect(qa?.taskId).toBeUndefined();
+    expect(dev).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed', taskId: t.id });
+    expect(interruptKeys(runner, '%0')).toEqual(['Escape']);
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
     expect(await harness.lockManager.isLocked('qa-1')).toBe(false);
   });
 
   it('does not stale-mark a rebound agent when it is reassigned mid-cleanup (release+reassign race)', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
-
     const t = await harness.seedTask();
     await harness.taskStore.set(makeTask({ id: 'task-new' }));
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockImplementation(async () => {
+    liveManager({
+      onExec: async cmd => {
+        if (!isKey(cmd, '%0', 'Escape')) return;
         await harness.agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-new', paneId: '%0', updatedAt: new Date().toISOString() });
-        return true;
-      });
+      },
+    });
 
-    await localManager.cancelTask(t.id);
+    await cancelOnFakeClock(t.id);
 
     const dev = await harness.agentStore.get('dev-1');
     expect(dev?.taskId).toBe('task-new');
@@ -412,7 +449,6 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('refuses release of a cancel-clearing pane unless it is cancel\'s own (fromCancelCleanup)', async () => {
     const t = await harness.seedTask({ status: 'cancelled' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await harness.acquireAgentLock('dev-1');
 
     expect(await harness.manager.releaseAgentForTask('dev-1', t.id, 'idle')).toBe(false);
     expect(await harness.manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true })).toBe(false);
@@ -424,23 +460,18 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('blocks a concurrent terminal-task escape release while cancel is mid-cleanup', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
-    const t = await harness.seedTask({ qaAgentId: 'qa-1' });
+    const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await harness.acquireAgentLock('dev-1');
-    await harness.acquireAgentLock('qa-1');
-
     let escapeReleaseResult: boolean | undefined;
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockImplementation(async () => {
-        if (escapeReleaseResult === undefined) {
-          escapeReleaseResult = await localManager.releaseAgentForTask('qa-1', t.id, 'idle');
-        }
-        return true;
-      });
+    liveManager({
+      onExec: async cmd => {
+        if (escapeReleaseResult !== undefined || keyOf(cmd) !== 'Escape') return;
+        escapeReleaseResult = await harness.manager.releaseAgentForTask('qa-1', t.id, 'idle');
+      },
+    });
 
-    const cancelled = await localManager.cancelTask(t.id);
+    const cancelled = await cancelOnFakeClock(t.id);
 
     expect(cancelled.status).toBe('cancelled');
     expect(escapeReleaseResult).toBe(false);
@@ -449,24 +480,19 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 
   it('cancel of one task does not block a rebound agent release by its new task', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => createManagerSuiteRunner() });
     await harness.taskStore.set(makeTask({ id: 'task-old', agentId: 'dev-1', qaAgentId: 'qa-1' }));
     await harness.taskStore.set(makeTask({ id: 'task-new', agentId: 'dev-1' }));
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-new', paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: 'task-old', paneId: '%1' });
-    await harness.acquireAgentLock('dev-1');
-    await harness.acquireAgentLock('qa-1');
-
     let devReleaseByNewTask: boolean | undefined;
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockImplementation(async () => {
-        if (devReleaseByNewTask === undefined) {
-          devReleaseByNewTask = await localManager.releaseAgentForTask('dev-1', 'task-new', 'idle');
-        }
-        return true;
-      });
+    liveManager({
+      onExec: async cmd => {
+        if (devReleaseByNewTask !== undefined || keyOf(cmd) !== 'Escape') return;
+        devReleaseByNewTask = await harness.manager.releaseAgentForTask('dev-1', 'task-new', 'idle');
+      },
+    });
 
-    await localManager.cancelTask('task-old');
+    await cancelOnFakeClock('task-old');
 
     expect(devReleaseByNewTask).toBe(true);
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
@@ -490,7 +516,6 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('Resume releases a stale cancel-clearing hold whose task already reached a terminal status', async () => {
     const t = await harness.seedTask({ status: 'cancelled' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await harness.acquireAgentLock('dev-1');
 
     const res = await harness.manager.resumeAgent('dev-1');
     expect(res.resumed).toBe(true);
@@ -502,9 +527,6 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('recover() holds a cancel-clearing agent bound to a cancelled task (restart mid-cleanup)', async () => {
     await harness.taskStore.set(makeTask({ id: 'task-x', status: 'cancelled', agentId: 'dev-1' }));
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-x', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await harness.acquireAgentLock('dev-1');
-    vi.spyOn(harness.manager as unknown as { ensureSession: () => Promise<{ paneId: string }> }, 'ensureSession')
-      .mockResolvedValue({ paneId: '%0' });
 
     await harness.manager.recover();
 
@@ -518,7 +540,6 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('does not auto-release a cancel-interrupt-failed pane (escape/handler), but Resume can', async () => {
     const t = await harness.seedTask({ status: 'cancelled' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
-    await harness.acquireAgentLock('dev-1');
 
     expect(await harness.manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true })).toBe(false);
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBe(t.id);
@@ -533,9 +554,6 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('recover() holds a cancel-interrupt-failed agent (restart) instead of auto-releasing it', async () => {
     await harness.taskStore.set(makeTask({ id: 'task-y', status: 'cancelled', agentId: 'dev-1' }));
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-y', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
-    await harness.acquireAgentLock('dev-1');
-    vi.spyOn(harness.manager as unknown as { ensureSession: () => Promise<{ paneId: string }> }, 'ensureSession')
-      .mockResolvedValue({ paneId: '%0' });
 
     await harness.manager.recover();
 
@@ -546,516 +564,379 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   });
 });
 
-describe('interruptPaneAndWaitReady composer recovery', () => {
-  function callInterrupt(
-    mgr: AgentManager,
-    state: AgentBindingFacts,
-    cfg: AgentConfig & { projectId: string },
-  ): Promise<boolean> {
-    return (mgr as unknown as {
-      interruptPaneAndWaitReady: (s: AgentBindingFacts, c: AgentConfig & { projectId: string }) => Promise<boolean>;
-    }).interruptPaneAndWaitReady(state, cfg);
-  }
-  function cfgOf(mgr: AgentManager, id: string): AgentConfig & { projectId: string } {
-    return (mgr as unknown as {
-      getAgentConfig: (id: string) => AgentConfig & { projectId: string };
-    }).getAgentConfig(id);
-  }
-  const INTERRUPT_PANES: Record<string, string> = { 'qa-1': '%7', 'dev-1': '%3' };
-  function stubInterruptPanes(): void {
-    stubClaimedPaneResolution(id => INTERRUPT_PANES[id] ?? '%0');
-  }
-  function spyKeys(proc = 'node'): string[] {
-    stubInterruptPanes();
-    const keys: string[] = [];
-    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
-    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue(proc);
-    return keys;
-  }
-  function spyClearFlow(dirty: string, afterCtrlC: string, opts: { proc?: string; cleanAfterCtrlC?: boolean } = {}): string[] {
-    stubInterruptPanes();
-    const proc = opts.proc ?? 'node';
-    const cleanAfterCtrlC = opts.cleanAfterCtrlC ?? true;
-    const keys: string[] = [];
-    let cleared = false;
-    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => {
-      keys.push(k);
-      if (k === 'C-c') cleared = true;
-    });
-    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue(proc);
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockImplementation(async () => {
-      if (cleared && cleanAfterCtrlC) return;
-      throw new Error('repl not ready');
-    });
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockImplementation(async () => (cleared ? afterCtrlC : dirty));
-    return keys;
-  }
-
-  const STUCK_COMPOSER =
-    '› Title: 优化 Agent Pet 样式\n  1. Agent Pet 再放大一点点\n  2. ...\n  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
-  const BUSY_LOOKING_COMPOSER =
-    '› 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
-  const LONG_COMPOSER_NO_GLYPH =
-    'pasted diagnostics line\n'.repeat(14) + '  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
-  const CLEARED_BARE_PROMPT = '› \n  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
+describe('cancelTask: ESC, liveness probe and composer clearing', () => {
+  const STUCK_COMPOSER = 'Title: 优化 Agent Pet 样式\n  1. Agent Pet 再放大一点点\n  2. ...';
+  const BUSY_LOOKING_COMPOSER = '排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt';
+  const LONG_COMPOSER = 'pasted diagnostics line\n'.repeat(14);
   const NODE_HUMAN_SESSION = 'running diagnostics…\n> \n';
-  const CLAUDE_DIRTY = '❯ 修复 web terminal 乱码\n';
-  const CLAUDE_CLEARED = '❯ \n';
-  const CLAUDE_RESTORED_PROMPT =
-    ' ▐▛███▛█   Claude Code v2.1.267\n'
-    + '────────\n'
-    + '❯ hold. Skip it and the task stalls.\n'
-    + '  To pause for a human, emit `[bx:need-input:<token>:<n>]` for the nth question; once\n'
-    + '  it is answered, emit `[bx:input-received:<token>:<n>]` before resuming work.\n'
-    + '────────\n';
-  const RUNNING_TURN_A = '• Working (12s)\n  esc to interrupt\n';
-  const RUNNING_TURN_B = '• Working (13s)\n  esc to interrupt\n';
-  const CLAUDE_RUN_A = '✶ Grooving… (12s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
-  const CLAUDE_RUN_B = '✶ Grooving… (13s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
-  const CLAUDE_RUN_C = '✶ Grooving… (14s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
-  const CLAUDE_RUN_D = '✶ Grooving… (15s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
   const RUNTIME_MENU = 'Select a model\n  Enter to confirm · Esc to cancel\n';
-  const GROWING_OUTPUT_A = 'building project…\n  compiled module 1\n';
-  const GROWING_OUTPUT_B = 'building project…\n  compiled module 2\n';
   const BLOCKER_OVER_PROMPT = 'Allow command `rm -rf`?\n  Press Enter to confirm or Esc to cancel\n› \n';
+  const QUIET_OUTPUT = 'quiet build output\n  no spinner here\n';
+  const SPINNER = [...'⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'];
 
-  it('C-c clears an un-submitted composer and verifies it reached a clean composer (qa-1: codex)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(STUCK_COMPOSER, CLEARED_BARE_PROMPT);
+  async function cancelBound(agentId: AgentId, taskId: string): Promise<CancelOutcome> {
+    await cancelOnFakeClock(taskId);
+    return outcomeFor(agentId, taskId);
+  }
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
+  it.each([
+    ['an empty composer', ''],
+    ['an un-submitted draft', STUCK_COMPOSER],
+    ['a draft whose text looks like a running turn ("Working" / "esc to interrupt")', BUSY_LOOKING_COMPOSER],
+    ['a long multi-line draft', LONG_COMPOSER],
+  ])('codex: ESC then C-c clears %s and confirms the clean composer before releasing (qa-1)', async (_name, draft) => {
+    const runner = liveManager();
+    const taskId = await bindTask('qa-1');
+    if (draft) await typeDraft(runner, 'qa-1', draft);
 
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
+    expect(await cancelBound('qa-1', taskId)).toBe('released');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
+    expect(runner.sessions.pane('qa-1')).toMatchObject({ process: 'codex', phase: 'idle', composer: '' });
+    // ESC 后已 ready 的 pane 直接清稿:C-c 之前不做任何 liveness 采样
+    expect(livenessCapturesBeforeClear(runner, '%1')).toEqual([]);
   });
 
-  it('C-c clears a dirty composer whose text contains "Working"/"esc to interrupt"', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(BUSY_LOOKING_COMPOSER, CLEARED_BARE_PROMPT);
+  it('claude-code: C-c clears a dirty composer and confirms the empty prompt (dev-1)', async () => {
+    const runner = liveManager();
+    const taskId = await bindTask('dev-1');
+    await typeDraft(runner, 'dev-1', '修复 web terminal 乱码');
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
+    expect(await cancelBound('dev-1', taskId)).toBe('released');
+    expect(interruptKeys(runner, '%0')).toEqual(['Escape', 'C-c']);
+    expect(runner.sessions.pane('dev-1')).toMatchObject({ process: 'claude', phase: 'idle', composer: '' });
   });
 
-  it('C-c clears a LONG composer whose `›` scrolled off — verified by the OUTCOME, not a visible glyph', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(LONG_COMPOSER_NO_GLYPH, CLEARED_BARE_PROMPT);
-
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
-  });
-
-  it('C-c clears a Claude dirty composer and verifies the empty ❯ prompt (dev-1: claude-code)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(CLAUDE_DIRTY, CLAUDE_CLEARED, { proc: 'claude' });
-
-    await harness.seedAgent({ id: 'dev-1', paneId: '%3' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('dev-1'))!, cfgOf(harness.manager, 'dev-1'));
-
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
-  });
-
-  it('C-c clears the composer even though ESC leaves an idle-looking screen: claude-code restores the interrupted prompt into the composer (dev-1)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyKeys('claude');
-    let cleared = false;
-    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => {
-      keys.push(k);
-      if (k === 'C-c') cleared = true;
+  it('claude-code: ESC restores the interrupted prompt into an idle-looking composer, and cancel still clears it (dev-1)', async () => {
+    let composerBeforeClear: string | undefined;
+    const runner = liveManager({
+      onExec: cmd => {
+        if (composerBeforeClear === undefined && cmd.includes('send-keys -l -t %0')) {
+          composerBeforeClear = runner.sessions.pane('dev-1')!.composer;
+        }
+      },
     });
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
-      .mockImplementation(async () => (cleared ? CLAUDE_CLEARED : CLAUDE_RESTORED_PROMPT));
-    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('✳ Claude Code');
+    const taskId = await bindTask('dev-1');
+    await harness.manager.injectTextToAgent('dev-1', 'hold. Skip it and the task stalls.', { expectedTaskId: taskId });
+    expect(runner.sessions.pane('dev-1')!.phase).toBe('working');
 
-    await harness.seedAgent({ id: 'dev-1', paneId: '%3' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('dev-1'))!, cfgOf(harness.manager, 'dev-1'));
-
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
+    expect(await cancelBound('dev-1', taskId)).toBe('released');
+    expect(composerBeforeClear).toBe('hold. Skip it and the task stalls.');
+    expect(interruptKeys(runner, '%0')).toEqual(['Escape', 'C-c']);
+    expect(runner.sessions.pane('dev-1')).toMatchObject({ phase: 'idle', composer: '' });
   });
 
-  it('holds (no C-c) when a turn is genuinely still running after ESC (screen changes between grabs)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
-    const keys = spyKeys();
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
-      .mockResolvedValueOnce(RUNNING_TURN_A)
-      .mockResolvedValueOnce(RUNNING_TURN_B);
+  it.each(['qa-1', 'dev-1'] as const)('%s: holds (no C-c) when the turn is still running after ESC (frames keep changing)', async (agentId) => {
+    const runner = liveManager({ agents: { [agentId]: { interrupt: 'ignored-live' } } });
+    const taskId = await bindTask(agentId);
+    runner.sessions.markWorking(agentId);
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape']);
+    expect(await cancelBound(agentId, taskId)).toBe('held');
+    expect(interruptKeys(runner, PANE[agentId])).toEqual(['Escape']);
+    expect(runner.sessions.pane(agentId)!.phase).toBe('working');
+    expect(holdEvents()).toHaveLength(1);
   });
 
-  it('a turn that settles to a stable ready frame during the probe is NOT live (working→idle between grabs)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
-      .mockResolvedValueOnce('• Working (8s • esc to interrupt)\n')
-      .mockResolvedValueOnce('› \n')
-      .mockResolvedValueOnce('› \n');
-    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('');
-    const tmux = new TmuxManager(fakeRunner({ rules: [] }));
-    const pane = { session: { sessionId: '$1', serverPid: '1', serverStart: '2' }, paneId: '%3', claim: 'dev-1' };
-    const live = await (harness.manager as unknown as {
-      paneHasLiveTurn: (t: TmuxManager, p: unknown, r: string) => Promise<boolean>;
-    }).paneHasLiveTurn(tmux, pane, 'codex');
-    expect(live).toBe(false);
+  it('a turn that settles to a stable ready frame during the probe is NOT live: C-c proceeds (working→idle between grabs)', async () => {
+    let livenessCaptures = 0;
+    const runner = liveManager({
+      agents: { 'qa-1': { interrupt: 'ignored-static' } },
+      onExec: cmd => {
+        if (isLivenessCapture(cmd) && ++livenessCaptures === 2) runner.sessions.setProcess('qa-1', 'codex');
+      },
+    });
+    const taskId = await bindTask('qa-1');
+    runner.sessions.markWorking('qa-1');
+
+    expect(await cancelBound('qa-1', taskId)).toBe('released');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
+    expect(runner.sessions.pane('qa-1')).toMatchObject({ phase: 'idle', composer: '' });
   });
 
-  it('the final settling confirmation re-reads the OSC title: a new turn announced only by the title is live', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
-      .mockResolvedValueOnce('• Working (8s • esc to interrupt)\n')
-      .mockResolvedValueOnce('› \n')
-      .mockResolvedValueOnce('›  \n')
-      .mockResolvedValue('›  \n');
-    vi.spyOn(TmuxManager.prototype, 'readPaneTitle')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('')
-      .mockResolvedValue('⠙ Working');
-    const tmux = new TmuxManager(fakeRunner({ rules: [] }));
-    const pane = { session: { sessionId: '$1', serverPid: '1', serverStart: '2' }, paneId: '%3', claim: 'dev-1' };
-    const live = await (harness.manager as unknown as {
-      paneHasLiveTurn: (t: TmuxManager, p: unknown, r: string) => Promise<boolean>;
-    }).paneHasLiveTurn(tmux, pane, 'codex');
-    expect(live).toBe(true);
-  });
+  it('the final settling confirmation re-reads the OSC title: a new turn announced only by the title is live (holds, no C-c)', async () => {
+    let title = 'codex';
+    let livenessCaptures = 0;
+    const runner = liveManager({
+      agents: { 'qa-1': { interrupt: 'ignored-static' } },
+      rules: [paneTitleRule(() => title)],
+      onExec: cmd => {
+        if (!isLivenessCapture(cmd)) return;
+        livenessCaptures += 1;
+        // 第三拍屏幕回到 ready;确认拍屏幕不变,只有标题宣告了新 turn
+        if (livenessCaptures === 3) runner.sessions.setProcess('qa-1', 'codex');
+        if (livenessCaptures === 4) title = '⠙ codex';
+      },
+    });
+    const taskId = await bindTask('qa-1');
+    runner.sessions.markWorking('qa-1');
 
-  it('holds (no C-c) on a real running Claude turn whose high spinner advances between grabs (dev-1)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
-    const keys = spyKeys('claude');
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
-      .mockResolvedValueOnce(CLAUDE_RUN_A)
-      .mockResolvedValueOnce(CLAUDE_RUN_B)
-      .mockResolvedValueOnce(CLAUDE_RUN_C)
-      .mockResolvedValueOnce(CLAUDE_RUN_D);
-
-    await harness.seedAgent({ id: 'dev-1', paneId: '%3' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('dev-1'))!, cfgOf(harness.manager, 'dev-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape']);
+    expect(await cancelBound('qa-1', taskId)).toBe('held');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape']);
   });
 
   it('holds (no C-c) when the pane is no longer running the runtime (crashed to shell)', async () => {
-    const keys = spyKeys('zsh');
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
-    const captureSpy = vi.spyOn(TmuxManager.prototype, 'capturePaneById');
+    const runner = liveManager();
+    const taskId = await bindTask('qa-1');
+    runner.sessions.setProcess('qa-1', 'zsh');
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape']);
-    expect(captureSpy).not.toHaveBeenCalled();
+    expect(await cancelBound('qa-1', taskId)).toBe('held');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape']);
   });
 
-  it('re-checks proc title right before C-c: holds (no C-c) if the runtime crashed to a shell during the liveness window', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    stubInterruptPanes();
-    const keys: string[] = [];
-    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
-    vi.spyOn(TmuxManager.prototype, 'displayMessage')
-      .mockResolvedValueOnce('node')
-      .mockResolvedValue('zsh');
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
-    const captureSpy = vi.spyOn(TmuxManager.prototype, 'capturePaneById')
-      .mockResolvedValue('idle diagnostics output\n  gpt-5.5 xhigh · ~/repo\n');
+  it('re-checks the foreground right before C-c: holds (no C-c) if the runtime crashed to a shell during the liveness window', async () => {
+    let livenessCaptures = 0;
+    let crashed = false;
+    const runner = liveManager({
+      agents: { 'qa-1': { interrupt: 'ignored-static' } },
+      onExec: cmd => {
+        if (isLivenessCapture(cmd)) livenessCaptures += 1;
+        else if (!crashed && livenessCaptures >= 3 && cmd.includes('pane_current_command')) {
+          crashed = true;
+          runner.sessions.setProcess('qa-1', 'zsh');
+        }
+      },
+    });
+    const taskId = await bindTask('qa-1');
+    runner.sessions.markWorking('qa-1');
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape']);
-    expect(captureSpy).toHaveBeenCalled();
+    expect(await cancelBound('qa-1', taskId)).toBe('held');
+    expect(livenessCaptures).toBeGreaterThanOrEqual(3);
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape']);
+    expect(runner.sessions.pane('qa-1')!.process).toBe('zsh');
   });
 
   it('holds (no C-c) when the screen is static but the OSC braille title ADVANCES across samples (live turn)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
-    stubInterruptPanes();
-    const keys: string[] = [];
-    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
-    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
-    vi.spyOn(TmuxManager.prototype, 'readPaneTitle')
-      .mockResolvedValueOnce('⠋ Working')
-      .mockResolvedValue('⠙ Working');
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockResolvedValue('quiet build output\n  no spinner here\n');
+    let reads = 0;
+    const runner = liveManager({
+      agents: { 'qa-1': { interrupt: 'ignored-static' } },
+      rules: [paneTitleRule(() => `${SPINNER[reads++ % SPINNER.length]} codex`)],
+    });
+    const taskId = await bindTask('qa-1');
+    runner.sessions.markWorking('qa-1', QUIET_OUTPUT);
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape']);
+    expect(await cancelBound('qa-1', taskId)).toBe('held');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape']);
   });
 
-  it('does NOT treat a STALE static working-shaped OSC title as live — C-c proceeds (else cancel-interrupt-failed)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(STUCK_COMPOSER, CLEARED_BARE_PROMPT);
-    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('⠹ Working');
+  it('does NOT treat a STALE static working-shaped OSC title as live — C-c proceeds and the refreshed title confirms ready', async () => {
+    let title = '⠹ codex';
+    const runner = liveManager({
+      rules: [paneTitleRule(() => title)],
+      // C-c 让 runtime 重绘,陈旧的标题才刷新回 idle
+      onExec: cmd => { if (isKey(cmd, '%1', 'C-c')) title = 'codex'; },
+    });
+    const taskId = await bindTask('qa-1');
+    await typeDraft(runner, 'qa-1', STUCK_COMPOSER);
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
+    expect(await cancelBound('qa-1', taskId)).toBe('released');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
+    expect(runner.sessions.pane('qa-1')!.composer).toBe('');
   });
 
-  it('an ADVANCING OSC title is live even when the screen momentarily shows a ready-looking prompt', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
-    stubInterruptPanes();
-    const keys: string[] = [];
-    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
-    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
-    vi.spyOn(TmuxManager.prototype, 'readPaneTitle')
-      .mockResolvedValueOnce('⠋ Working')
-      .mockResolvedValue('⠙ Working');
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockResolvedValue('› \n');
+  it('an ADVANCING OSC title is live even when the screen shows a ready-looking prompt', async () => {
+    let reads = 0;
+    const runner = liveManager({ rules: [paneTitleRule(() => `${SPINNER[reads++ % SPINNER.length]} codex`)] });
+    const taskId = await bindTask('qa-1');
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape']);
+    expect(await cancelBound('qa-1', taskId)).toBe('held');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape']);
   });
 
-  it('holds AFTER one C-c when a human `node` session never becomes a Codex composer (`>` ≠ `›`)', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(NODE_HUMAN_SESSION, NODE_HUMAN_SESSION, { cleanAfterCtrlC: false });
+  it.each([
+    ['a human `node` session that never shows a codex composer (`>` ≠ `›`)', { process: 'node', screen: NODE_HUMAN_SESSION }],
+    ['a runtime menu that does not dismiss', { screen: RUNTIME_MENU }],
+    ['a bare `›` under a permission/confirm blocker', { screen: BLOCKER_OVER_PROMPT }],
+  ])('holds AFTER one C-c when the pane never returns to a clean composer: %s', async (_name, agent) => {
+    const runner = liveManager({ agents: { 'qa-1': agent } });
+    const taskId = await bindTask('qa-1');
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape', 'C-c']);
-  });
-
-  it('holds AFTER C-c when a runtime menu does not dismiss to a clean composer', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(RUNTIME_MENU, RUNTIME_MENU, { cleanAfterCtrlC: false });
-
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape', 'C-c']);
+    expect(await cancelBound('qa-1', taskId)).toBe('held');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
   });
 
   it('holds (no C-c) on a live turn with NO busy marker — sampled for change, not gated on busy markers', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1 });
-    const keys = spyKeys();
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
-    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
-      .mockResolvedValueOnce(GROWING_OUTPUT_A)
-      .mockResolvedValueOnce(GROWING_OUTPUT_B);
+    let lines = 0;
+    const runner = liveManager({
+      rules: [{ match: 'capture-pane', reply: () => ({ stdout: `BX_PANE_OK\nbuilding project…\n  compiled module ${++lines}\n` }) }],
+    });
+    const taskId = await bindTask('qa-1');
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape']);
+    expect(await cancelBound('qa-1', taskId)).toBe('held');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape']);
   });
 
-  it('holds AFTER C-c when a bare `›` still sits under a permission/confirm blocker', async () => {
-    Object.assign(harness.manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
-    const keys = spyClearFlow(BLOCKER_OVER_PROMPT, BLOCKER_OVER_PROMPT, { cleanAfterCtrlC: false });
+  it('waits for a busy pane mutex and proceeds once the in-flight upload releases it (no instant hold)', async () => {
+    const gate = execGate(cmd => cmd.includes('paste-buffer'));
+    const runner = liveManager({ onExec: gate.onExec }, { cancelInterruptGuardWaitMs: 2_000, compactIdlePollMs: 5 });
+    const taskId = await bindTask('qa-1');
+    const upload = harness.manager.injectTextToAgent('qa-1', 'in flight', { expectedTaskId: taskId });
+    await gate.reached;
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
+    await onFakeClock(async clock => {
+      const cancel = harness.manager.cancelTask(taskId);
+      await clock.step(200);
+      expect(interruptKeys(runner, '%1')).toEqual([]);
+      gate.release();
+      await clock.settle(upload);
+      await clock.settle(cancel);
+    });
 
-    expect(ok).toBe(false);
-    expect(keys).toEqual(['Escape', 'C-c']);
-  });
-
-  it('holds (cancel-interrupt-failed) without sending keys when the pane mutex stays busy past the wait window', async () => {
-    Object.assign(harness.manager, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
-    const keys = spyKeys();
-    (harness.manager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('qa-1');
-    await harness.seedAgent({ id: 'qa-1', taskId: 'tBusy', paneId: '%7', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(false);
-    expect(keys).toEqual([]);
-    expect((await harness.agentStore.get('qa-1'))?.awaitingPhase).toBe('cancel-interrupt-failed');
-  });
-
-  it('waits for a busy pane mutex and proceeds once the in-flight dispatch releases it (no instant hold)', async () => {
-    Object.assign(harness.manager, { cancelInterruptGuardWaitMs: 2_000, compactIdlePollMs: 5 });
-    const keys = spyKeys();
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    const inFlight = (harness.manager as unknown as { compactInFlight: Set<string> }).compactInFlight;
-    inFlight.add('qa-1');
-    setTimeout(() => inFlight.delete('qa-1'), 25);
-
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const ok = await callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
-  });
-
-  it('an already idle pane gets its composer cleared after ESC without liveness sampling (idle screen is no proof the composer is empty)', async () => {
-    const keys = spyKeys();
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    const captureSpy = vi.spyOn(TmuxManager.prototype, 'capturePaneById');
-
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const state = (await harness.agentStore.get('qa-1'))!;
-    const ok = await callInterrupt(harness.manager, state, cfgOf(harness.manager, 'qa-1'));
-
-    expect(ok).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
-    expect(captureSpy).not.toHaveBeenCalled();
+    expect(await outcomeFor('qa-1', taskId)).toBe('released');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
+    expect(runner.sessions.pane('qa-1')).toMatchObject({ phase: 'idle', composer: '' });
   });
 
   it('holds the pane mutex until the composer clear and ready confirmation finish, so a concurrent Compact is refused (409)', async () => {
-    const keys = spyKeys();
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    let releaseSpace!: () => void;
-    const spaceStarted = new Promise<void>(started => {
-      vi.spyOn(TmuxManager.prototype, 'sendKeysLiteral').mockImplementation(() => {
-        started();
-        return new Promise<void>(resolve => { releaseSpace = resolve; });
-      });
+    // 卡在清稿的弄脏键上:此时 ESC 已发、ready 已确认,cancel 仍持有 pane mutex
+    const gate = execGate(cmd => cmd.includes('send-keys -l -t %1'));
+    const runner = liveManager({ onExec: gate.onExec });
+    const taskId = await bindTask('qa-1');
+    let clearing = false;
+    void gate.reached.then(() => { clearing = true; });
+
+    await onFakeClock(async clock => {
+      const cancel = harness.manager.cancelTask(taskId);
+      await clock.step(60_000, () => clearing);
+      expect(clearing).toBe(true);
+      await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({ status: 409 });
+      gate.release();
+      await clock.settle(cancel);
     });
-    const inFlight = (harness.manager as unknown as { compactInFlight: Set<string> }).compactInFlight;
 
-    await harness.seedAgent({ id: 'qa-1', paneId: '%7' });
-    const interrupt = callInterrupt(harness.manager, (await harness.agentStore.get('qa-1'))!, cfgOf(harness.manager, 'qa-1'));
-    await spaceStarted;
-
-    expect(inFlight.has('qa-1')).toBe(true);
-    await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({ status: 409 });
-
-    releaseSpace();
-    expect(await interrupt).toBe(true);
-    expect(keys).toEqual(['Escape', 'C-c']);
-    expect(inFlight.has('qa-1')).toBe(false);
+    expect(await outcomeFor('qa-1', taskId)).toBe('released');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c']);
   });
 
-  it('injectAndAwaitAck aborts a dispatch whose bound task went terminal while waiting for the pane mutex', async () => {
-    const t = await harness.seedTask({ status: 'cancelled' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    const tmux = new TmuxManager(createManagerSuiteRunner());
-    await expect(
-      callInjectAndAwaitAck(harness.manager, tmux, '%0', 'prompt', 'dev-1', 'claude-code'),
-    ).rejects.toThrow(/went terminal/);
+  it('releases the pane mutex once cancel finishes, so a later cancel on the same agent can interrupt again', async () => {
+    const runner = liveManager({}, { cancelInterruptGuardWaitMs: 50, compactIdlePollMs: 5 });
+    const first = await bindTask('qa-1', { id: 'task-first' });
+    expect(await cancelBound('qa-1', first)).toBe('released');
+
+    const second = await bindTask('qa-1', { id: 'task-second' });
+    expect(await cancelBound('qa-1', second)).toBe('released');
+    expect(interruptKeys(runner, '%1')).toEqual(['Escape', 'C-c', 'Escape', 'C-c']);
   });
 
-  it('injectAndAwaitAck aborts when cancel marked the agent cancel-clearing before the task flips terminal', async () => {
-    const t = await harness.seedTask({ status: 'in_progress' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    const tmux = new TmuxManager(createManagerSuiteRunner());
-    await expect(
-      callInjectAndAwaitAck(harness.manager, tmux, '%0', 'prompt', 'dev-1', 'claude-code'),
-    ).rejects.toThrow(/taken over by cancel/);
+  async function seedDispatchableTask(id: string): Promise<string> {
+    await harness.seedTask({ id, signalToken: 'devtok123456' });
+    await harness.seedAgent({ id: 'dev-1', taskId: id, paneId: '%0' });
+    return id;
+  }
+  // 派单已写下 running 标记,接下来只剩等 pane mutex
+  const dispatchReachedPaneMutex = (taskId: string): Promise<void> => vi.waitFor(async () => {
+    expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBe(taskId);
+  }, { interval: 5 });
+
+  it('a dispatch whose bound task went terminal while waiting for the pane mutex is aborted before any paste', async () => {
+    const gate = execGate(cmd => cmd.includes('paste-buffer'));
+    const runner = liveManager({ onExec: gate.onExec });
+    const taskId = await seedDispatchableTask('task-terminal-wait');
+    const upload = harness.manager.injectTextToAgent('dev-1', 'in flight', { expectedTaskId: taskId });
+    await gate.reached;
+    const dispatch = harness.manager.startSession(taskId, 'dev-1', 'develop');
+    await dispatchReachedPaneMutex(taskId);
+    await harness.taskStore.set({ ...(await harness.taskStore.get(taskId))!, status: 'cancelled' });
+    gate.release();
+
+    await expect(dispatch).rejects.toThrow(/went terminal while waiting for pane mutex/);
+    await upload;
+    expect(runner.pastedPrompts.map(p => p.body)).toEqual(['in flight']);
   });
 
-  it('injectAndAwaitAck re-checks after the task read: aborts before paste if cancel lands during taskStore.get', async () => {
-    const t = await harness.seedTask({ status: 'in_progress' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
-    const realGet = harness.taskStore.get.bind(harness.taskStore);
-    vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id: string) => {
-      await harness.agentStore.update('dev-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
-      return realGet(id);
+  it('a dispatch taken over by a cancel hold while waiting for the pane mutex is aborted before any paste', async () => {
+    const gate = execGate(cmd => cmd.includes('paste-buffer'));
+    const runner = liveManager({ onExec: gate.onExec });
+    const taskId = await seedDispatchableTask('task-hold-wait');
+    const upload = harness.manager.injectTextToAgent('dev-1', 'in flight', { expectedTaskId: taskId });
+    await gate.reached;
+    const dispatch = harness.manager.startSession(taskId, 'dev-1', 'develop');
+    await dispatchReachedPaneMutex(taskId);
+    await markCancelClearing('dev-1');
+    gate.release();
+
+    await expect(dispatch).rejects.toThrow(/taken over by cancel \(cancel-clearing\) while waiting for pane mutex/);
+    await upload;
+    expect(runner.pastedPrompts.map(p => p.body)).toEqual(['in flight']);
+    expect((await harness.agentStore.get('dev-1'))).toMatchObject({ taskId, awaitingPhase: 'cancel-clearing' });
+  });
+
+  it('a dispatch re-checks the cancel hold after its pre-inject screen read: aborts before paste', async () => {
+    let held = false;
+    const runner = liveManager({
+      onExec: async cmd => {
+        if (held || !cmd.includes('capture-pane')) return;
+        if ((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId !== 'task-hold-before-paste') return;
+        held = true;
+        await markCancelClearing('dev-1');
+      },
     });
-    const tmux = new TmuxManager(createManagerSuiteRunner());
-    await expect(
-      callInjectAndAwaitAck(harness.manager, tmux, '%0', 'prompt', 'dev-1', 'claude-code'),
-    ).rejects.toThrow(/taken over by cancel before paste/);
-    expect(injectSpy).not.toHaveBeenCalled();
+    const taskId = await seedDispatchableTask('task-hold-before-paste');
+
+    await expect(harness.manager.startSession(taskId, 'dev-1', 'develop')).rejects.toThrow(/taken over by cancel before paste/);
+    expect(held).toBe(true);
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
   it('injectTextToAgent re-checks after the task read: aborts before paste if cancel lands during taskStore.get', async () => {
     const t = await harness.seedTask({ status: 'in_progress' });
-    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('qa-1', t.id);
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     const realGet = harness.taskStore.get.bind(harness.taskStore);
     vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id: string) => {
-      await harness.agentStore.update('qa-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
+      await markCancelClearing('qa-1');
       return realGet(id);
     });
     await expect(
       harness.manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: t.id }),
     ).rejects.toThrow(/taken over by cancel before paste/);
-    expect(injectSpy).not.toHaveBeenCalled();
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('injectTextToAgent aborts before paste when a DELETE→recreate bumps the generation during pane resolution', async () => {
+    const runner = liveManager({
+      onExec: cmd => { if (cmd.includes('list-panes')) harness.manager.bumpDeletionGeneration('qa-1'); },
+    });
     const t = await harness.seedTask({ id: 'task-rf-aba', status: 'in_progress' });
-    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('qa-1', t.id);
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
-    vi.spyOn(harness.manager as unknown as { resolveClaimedPane: (...a: unknown[]) => Promise<unknown> }, 'resolveClaimedPane')
-      .mockImplementation(async () => {
-        harness.manager.bumpDeletionGeneration('qa-1');
-        return { session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' }, paneId: '%0', claim: 'qa-1' };
-      });
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     await expect(
       harness.manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: t.id }),
     ).rejects.toThrow(/deleted or recreated before paste/);
-    expect(injectSpy).not.toHaveBeenCalled();
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
   it('cleanupRemovedAgentRuntime bounds every tmux probe/kill with a deadline (no unbounded hang holding the tombstone)', async () => {
-    await harness.seedAgent({ id: 'dev-1', paneId: '%5' });
-    const timeouts: Array<number | undefined> = [];
-    vi.spyOn(harness.manager as unknown as { createRunnerFor: (a: unknown) => CommandRunner }, 'createRunnerFor')
-      .mockReturnValue({
-        exec: vi.fn(async (cmd: string, o?: { timeout?: number }) => {
-          timeouts.push(o?.timeout);
-          if (cmd.includes('list-sessions')) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }),
-        writeFile: vi.fn(async () => {}),
-      } as unknown as CommandRunner);
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
 
     await harness.manager.cleanupRemovedAgentRuntime(['dev-1']);
 
-    expect(timeouts.filter(t => t !== undefined).length).toBeGreaterThanOrEqual(2);
-    expect(timeouts.filter(t => t !== undefined).every(t => t === 15_000)).toBe(true);
+    const tmuxCalls = harness.runner.exec.mock.calls.filter(([cmd]) => cmd.startsWith('tmux '));
+    expect(tmuxCalls.length).toBeGreaterThanOrEqual(2);
+    expect(tmuxCalls.every(([, opts]) => opts?.timeout === 15_000)).toBe(true);
+    expect(harness.runner.sessions.present('dev-1')).toBe(false);
   });
 
   it('injectTextToAgent refuses to inject into a pane held by cancel cleanup', async () => {
     await harness.seedTask({ id: 'task-rf-hold', status: 'in_progress' });
-    await harness.seedAgent({ id: 'qa-1', taskId: 'task-rf-hold', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await harness.seedAgent({ id: 'qa-1', taskId: 'task-rf-hold', paneId: '%1', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
     await expect(
       harness.manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 'task-rf-hold' }),
     ).rejects.toThrow(/taken over by cancel/);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('injectTextToAgent refuses to inject when the bound task is already terminal', async () => {
     const t = await harness.seedTask({ id: 'task-rf-terminal', status: 'cancelled' });
-    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('qa-1', t.id);
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     await expect(
       harness.manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: t.id }),
     ).rejects.toThrow(/terminal/);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('injectTextToAgent refuses a newer lock generation for the same task', async () => {
     const t = await harness.seedTask({ id: 'task-rf-rebound', status: 'in_progress' });
-    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     const oldToken = await harness.acquireAgentLock('qa-1', t.id);
     expect(oldToken).toBeTruthy();
     await harness.agentStore.update('qa-1', state => ({ ...state!, lockToken: oldToken!, updatedAt: NOW }));
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
     const realGet = harness.taskStore.get.bind(harness.taskStore);
     vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id: string) => {
       await harness.lockManager.releaseIfOwner('qa-1', t.id, oldToken!);
@@ -1068,72 +949,52 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     await expect(
       harness.manager.injectTextToAgent('qa-1', 'stale file body', { expectedTaskId: t.id }),
     ).rejects.toThrow(/exclusive lock changed/);
-    expect(injectSpy).not.toHaveBeenCalled();
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('attachImageToRunningAgent refuses to paste into a pane held by cancel cleanup', async () => {
     await harness.seedTask({ id: 'task-img-hold', status: 'in_progress' });
-    await harness.seedAgent({ id: 'qa-1', taskId: 'task-img-hold', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await harness.seedAgent({ id: 'qa-1', taskId: 'task-img-hold', paneId: '%1', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
     await expect(
       harness.manager.attachImageToRunningAgent('qa-1', Buffer.from('img'), 'png'),
     ).rejects.toThrow(/being cancelled/);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('attachImageToRunningAgent refuses when the bound task is already terminal', async () => {
     const t = await harness.seedTask({ id: 'task-img-terminal', status: 'cancelled' });
-    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     await expect(
       harness.manager.attachImageToRunningAgent('qa-1', Buffer.from('img'), 'png'),
     ).rejects.toThrow(/terminal/);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('attachImageToRunningAgent re-checks cancel state AFTER the slow host write — refuses the paste if cancel landed', async () => {
     await harness.seedTask({ id: 'task-img-toctou', status: 'in_progress' });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-img-toctou', paneId: '%0' });
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
-    const localManager = harness.createManager({
-      runnerFactory: () => ({
-        exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
-        writeFile: vi.fn(async () => {
-          await harness.agentStore.update('dev-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
-        }),
-      } as unknown as CommandRunner),
-    });
+    harness.runner.writeFile.mockImplementation(async () => { await markCancelClearing('dev-1'); });
 
     await expect(
-      localManager.attachImageToRunningAgent('dev-1', Buffer.from('img'), 'png'),
+      harness.manager.attachImageToRunningAgent('dev-1', Buffer.from('img'), 'png'),
     ).rejects.toThrow(/being cancelled/);
-    expect(injectSpy).not.toHaveBeenCalled();
+    expect(harness.runner.writeFile).toHaveBeenCalledTimes(1);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('attachImageToRunningAgent re-checks the cancel hold AFTER its task read (closes the assertUploadStillValid gap)', async () => {
     await harness.seedTask({ id: 'task-img-taskgap', status: 'in_progress' });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-img-taskgap', paneId: '%0' });
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
     const realGet = harness.taskStore.get.bind(harness.taskStore);
     vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id: string) => {
-      await harness.agentStore.update('dev-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
+      await markCancelClearing('dev-1');
       return realGet(id);
     });
-    const localManager = harness.createManager({
-      runnerFactory: () => ({
-        exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
-        writeFile: vi.fn(async () => undefined),
-        execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-      } as unknown as CommandRunner),
-    });
-    await expect(
-      localManager.attachImageToRunningAgent('dev-1', Buffer.from('img'), 'png'),
-    ).rejects.toThrow(/being cancelled/);
-    expect(injectSpy).not.toHaveBeenCalled();
-  });
 
-  it('cancel-interrupt guard wait is derived from the configured dispatch ack timeout (not the default)', () => {
-    const m = harness.createManager({ dispatchAckTimeoutMs: 60_000 }) as unknown as {
-      cancelInterruptGuardWaitMs: number; dispatchAckTimeoutMs: number;
-    };
-    expect(m.dispatchAckTimeoutMs).toBe(60_000);
-    expect(m.cancelInterruptGuardWaitMs).toBeGreaterThanOrEqual(60_000);
+    await expect(
+      harness.manager.attachImageToRunningAgent('dev-1', Buffer.from('img'), 'png'),
+    ).rejects.toThrow(/being cancelled/);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('markAwaitingHuman does not let a generic hold overwrite a cancel-cleanup hold', async () => {
@@ -1141,7 +1002,6 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
 
     await harness.manager.markAwaitingHuman('dev-1', 'code-dispatch-failed', 'generic dispatch failure');
     expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
-
   });
 
   it('markAwaitingHuman still allows the escalation cancel-clearing → cancel-interrupt-failed', async () => {
@@ -1149,31 +1009,21 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     await harness.manager.markAwaitingHuman('dev-1', 'cancel-interrupt-failed', 'interrupt failed');
     expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-interrupt-failed');
   });
-
-  it('markPaneCancelClearing still sets cancel-clearing from a non-hold binding (initial cancel)', async () => {
-    await harness.seedAgent({ id: 'dev-1', taskId: 'tX', paneId: '%0' });
-    await (harness.manager as unknown as { markPaneCancelClearing: (a: string, t: string) => Promise<void> })
-      .markPaneCancelClearing('dev-1', 'tX');
-    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
-  });
-
-  it('cancel-interrupt guard wait covers the dispatch ack window (so cancel-during-ack is not dropped to hold)', () => {
-    const m = harness.manager as unknown as { cancelInterruptGuardWaitMs: number; dispatchAckTimeoutMs: number };
-    expect(m.cancelInterruptGuardWaitMs).toBeGreaterThanOrEqual(m.dispatchAckTimeoutMs);
-  });
 });
 
 describe('AgentManager.cancelTask release failure tolerance', () => {
   it('logs but completes the cancel when releaseAgentForTask throws', async () => {
+    const runner = liveManager();
     const t = await harness.seedTask();
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    harness.mockInterruptPane(harness.manager, true);
+    // E2: 释放阶段的内部异常(store/lock 状态机错误)在 runner 层造不出来,只能替换公共方法注入
     vi.spyOn(harness.manager, 'releaseAgentForTask').mockRejectedValue(new Error('release exploded'));
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    const cancelled = await harness.manager.cancelTask(t.id);
+    const cancelled = await cancelOnFakeClock(t.id);
 
     expect(cancelled.status).toBe('cancelled');
+    expect(interruptKeys(runner, '%0')).toEqual(['Escape', 'C-c']);
     expect(errSpy.mock.calls.some(c => String(c[0]).includes('releaseAgentForTask'))).toBe(true);
     errSpy.mockRestore();
   });

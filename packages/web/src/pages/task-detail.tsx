@@ -554,7 +554,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         <div className="mb-3 flex flex-wrap items-center gap-3">
           <TaskStatusBadge task={task} className="text-sm" />
           {dispatching && (
-            <span data-testid="task-dispatching" className="text-sm text-og-500" title={t.taskDetail.dispatchingHint}>
+            <span className="text-sm text-og-500" title={t.taskDetail.dispatchingHint}>
               {t.taskDetail.dispatching}
             </span>
           )}

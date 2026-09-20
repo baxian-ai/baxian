@@ -1,37 +1,72 @@
 import { describe, it, expect, vi } from 'vitest';
-import { AgentManager } from '../../src/agent/manager.js';
-import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import { BranchManager } from '../../src/agent/branch.js';
+import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
+import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
+import { buildPhaseSignal, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
+import type { AgentBindingFacts, AgentConfig, TaskState } from '../../src/shared/index.js';
+import type { FakeRunnerOptions } from '../helpers/fake-runner.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness, workdirsOf } from '../helpers/manager-harness.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
 const SHA1 = 'a'.repeat(40);
+const SIGNAL_EVENT_TYPES = ['spec.ready', 'pr.created', 'pr.fix.submitted', 'pr.updated'];
 
 const harness = useManagerSuiteHarness();
 
+const binding = (): Promise<AgentBindingFacts | null> => harness.agentStore.get('dev-1');
+const signalEvents = () => harness.events.filter(e => SIGNAL_EVENT_TYPES.includes(e.type));
+const frame = (kind: PhaseSignalKind, token: string): string =>
+  kind === 'pr-created' || kind === 'spec-done' ? buildPhaseSignal(kind, token, 7) : buildPhaseSignal(kind as 'pr-fixed', token);
+
+function suiteRunner(options: FakeRunnerOptions = {}) {
+  const workdirs = workdirsOf(harness.config);
+  return createManagerSuiteRunner({ workdirs, ...options });
+}
+
+async function rotateTask(taskId: string, signalToken: string): Promise<void> {
+  const fresh = await harness.taskStore.get(taskId);
+  await harness.taskStore.set({ ...fresh!, phase: 'code', signalToken });
+}
+
+async function seedHolder(taskId: string, task: Partial<TaskState>, agent: Partial<AgentBindingFacts> = {}): Promise<void> {
+  await harness.seedTask({ id: taskId, status: 'in_progress', ...task });
+  await harness.seedAgent({ id: 'dev-1', taskId, paneId: '%0', ...agent });
+}
+
+// 真实 PhaseSignalWatcher 接在按 agent 分流的假 streamer 上:用例向 pane 投帧,事件经 harness.eventBus 流出
+function watchedManager(opts: {
+  snapshot?: () => Promise<string>;
+  onSubscribe?: () => Promise<void>;
+  runner?: ReturnType<typeof suiteRunner>;
+} = {}) {
+  const listeners = new Map<string, Array<SubscriberCallbacks['onVisible']>>();
+  const paneOf = (agentId: string) => listeners.get(agentId) ?? listeners.set(agentId, []).get(agentId)!;
+  let subscribes = 0;
+  const ensure = (agent: AgentConfig) => ({
+    subscribeAtomic: async (cbs: SubscriberCallbacks) => {
+      subscribes += 1;
+      await opts.onSubscribe?.();
+      paneOf(agent.id).push(cbs.onVisible);
+      return {
+        snapshot: { data: (await opts.snapshot?.()) ?? '', cols: 80, rows: 24 },
+        snapshotSeq: 0,
+        unsubscribe: () => { listeners.set(agent.id, paneOf(agent.id).filter(cb => cb !== cbs.onVisible)); },
+      };
+    },
+  });
+  const m = harness.createManager({
+    paneStreamerManager: { ensure } as unknown as PaneStreamerManager,
+    ...(opts.runner ? { runnerFactory: () => opts.runner! } : {}),
+  });
+  return {
+    m,
+    post: (agentId: string, signal: string) => { for (const cb of [...paneOf(agentId)]) cb?.(`${signal}\n`, 1); },
+    listening: (agentId: string) => paneOf(agentId).length,
+    subscribes: () => subscribes,
+  };
+}
+
 describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
-  function restartManager(): AgentManager {
-    return harness.createManager({ config: harness.config });
-  }
-
-  function spyDispatch(m: AgentManager): {
-    clearSpy: ReturnType<typeof vi.spyOn>;
-    continueSpy: ReturnType<typeof vi.spyOn>;
-    holdSpy: ReturnType<typeof vi.spyOn>;
-    armedWith: () => Promise<unknown[][]>;
-  } {
-    const clearSpy = vi.spyOn(m, 'clearAwaitingHuman').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(m, 'continueSession').mockImplementation(async (...args) => {
-      const opts = args[3] as { armBeforeInject?: (ctx: object) => Promise<boolean> };
-      return opts.armBeforeInject ? opts.armBeforeInject({}) : true;
-    });
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
-    const watcherSpy = vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockResolvedValue(true);
-    const armedWith = async (): Promise<unknown[][]> => watcherSpy.mock.calls;
-    return { clearSpy, continueSpy, holdSpy, armedWith };
-  }
-
   async function rotatedTaskToken(taskId: string, oldToken: string): Promise<string> {
     const token = (await harness.taskStore.get(taskId))?.signalToken;
     expect(token).toEqual(expect.any(String));
@@ -39,347 +74,196 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     return token!;
   }
 
-  function expectReplayArm(
-    calls: unknown[][],
-    taskId: string,
-    agentId: string,
-    expectedKinds: readonly string[],
-    oldToken: string,
-    newToken: string,
-  ): void {
-    expect(calls).toEqual([[
-      taskId,
-      agentId,
-      expectedKinds,
-      newToken,
-      expect.objectContaining({
-        skipSnapshot: true,
-        onlyReplaceOwnToken: true,
-        replaceFromToken: oldToken,
-        replaceScope: 'agent',
-        preparedReplay: expect.any(Object),
-      }),
-    ]]);
-  }
-
-  it('replays the initial develop prompt for a dev holder with in-flight-safe options', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-dev-restart',
-      status: 'in_progress',
-      signalToken: 'dev-token-1',
-    });
-    const { continueSpy, armedWith } = spyDispatch(m);
+  it.each([
+    ['spec-done', 'spec.ready'],
+    ['pr-created', 'pr.created'],
+  ] as const)('replays the initial develop prompt for a delivered dev holder and arms %s on the rotated token only', async (kind, eventType) => {
+    const { m, post } = watchedManager();
+    await seedHolder('task-dev-restart', { signalToken: 'dev-token-1' });
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-restart')).toBe(true);
+
     const newToken = await rotatedTaskToken('task-dev-restart', 'dev-token-1');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-dev-restart',
-      'dev-1',
-      'develop',
-      expect.objectContaining({
-        signalToken: newToken,
-        allowDirtyWorkdir: true,
-        armBeforeInject: expect.any(Function),
-      }),
-    );
-    expect((continueSpy.mock.calls[0]![3] as { bypassTaskStatusGate?: boolean }).bypassTaskStatusGate)
-      .toBeUndefined();
-    expectReplayArm(await armedWith(), 'task-dev-restart', 'dev-1', ['spec-done', 'pr-created'], 'dev-token-1', newToken);
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(`token: ${newToken}`) }]);
+    expect(harness.runner.pastedPrompts[0]!.body).not.toContain('token: dev-token-1');
+    // 已交付过的 holder 在脏 Workdir 上重放,不再要求 clean
+    expect(BranchManager.prototype.assertClean).not.toHaveBeenCalled();
+    expect((await binding())?.status).toBeUndefined();
+    post('dev-1', frame(kind, 'dev-token-1'));
+    expect(signalEvents()).toEqual([]);
+    post('dev-1', frame(kind, newToken));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: eventType, taskId: 'task-dev-restart', agentId: 'dev-1' }),
+    ]));
   });
 
-  it('replays a git code phase without server Spec documents', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-git-code-restart',
-      status: 'in_progress',
-      phase: 'code',
-      specReviewRound: 2,
-      signalToken: 'git-code-token',
-    });
-    await harness.seedAgent({ id: 'dev-1', taskId: 'task-git-code-restart' });
-    const { continueSpy, holdSpy, armedWith } = spyDispatch(m);
+  it('replays a git code phase and arms only pr-created on the rotated token', async () => {
+    const { m, post } = watchedManager();
+    await seedHolder('task-git-code-restart', { phase: 'code', specReviewRound: 2, signalToken: 'git-code-token' });
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-git-code-restart')).toBe(true);
+
     const newToken = await rotatedTaskToken('task-git-code-restart', 'git-code-token');
-    expect(holdSpy).not.toHaveBeenCalled();
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-git-code-restart',
-      'dev-1',
-      'code',
-      expect.objectContaining({
-        signalToken: newToken,
-        allowDirtyWorkdir: true,
-      }),
-    );
-    expect(continueSpy.mock.calls[0]?.[3]).not.toHaveProperty('specDocuments');
-    expectReplayArm(
-      await armedWith(),
-      'task-git-code-restart',
-      'dev-1',
-      ['pr-created'],
-      'git-code-token',
-      newToken,
-    );
+    expect((await binding())?.status).toBeUndefined();
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(`token: ${newToken}`) }]);
+    expect(BranchManager.prototype.assertClean).not.toHaveBeenCalled();
+    post('dev-1', frame('spec-done', newToken));
+    expect(signalEvents()).toEqual([]);
+    post('dev-1', frame('pr-created', newToken));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: 'pr.created', taskId: 'task-git-code-restart' }),
+    ]));
   });
 
   it('finalizes an interrupted git code bootstrap after replay', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-git-code-boot-restart',
-      status: 'in_progress',
-      phase: 'code',
-      specReviewRound: 1,
-      signalToken: 'git-code-boot-token',
-    });
-    await harness.seedAgent({
-      id: 'dev-1',
-      taskId: 'task-git-code-boot-restart',
-      bootstrappingTaskId: 'task-git-code-boot-restart',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart(
-      'dev-1',
+    const m = harness.manager;
+    await seedHolder(
       'task-git-code-boot-restart',
+      { phase: 'code', specReviewRound: 1, signalToken: 'git-code-boot-token' },
+      { bootstrappingTaskId: 'task-git-code-boot-restart' },
+    );
+
+    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-git-code-boot-restart')).toBe(true);
+
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
+    expect((await binding())?.status).toBeUndefined();
+    expect((await binding())?.bootstrappingTaskId).toBeUndefined();
+    expect(harness.events.some(e =>
+      e.type === 'session.started' && e.taskId === 'task-git-code-boot-restart' && e.data.phase === 'code',
     )).toBe(true);
-    expect(continueSpy).toHaveBeenCalledOnce();
-    expect(holdSpy).not.toHaveBeenCalled();
-    expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
   });
 
-  it('replays spec fixing from PR feedback', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-git-spec-fix-restart',
-      status: 'fixing',
-      phase: 'spec',
-      specReviewRound: 2,
-      signalToken: 'git-spec-fix-token',
-    });
-    await harness.seedAgent({ id: 'dev-1', taskId: 'task-git-spec-fix-restart' });
-    const { continueSpy, holdSpy } = spyDispatch(m);
+  it('replays spec fixing from PR feedback and arms pr-fixed', async () => {
+    const { m, post } = watchedManager();
+    await seedHolder('task-git-spec-fix-restart', { status: 'fixing', phase: 'spec', specReviewRound: 2, signalToken: 'git-spec-fix-token' });
 
-    expect(await m.redispatchTaskPromptAfterReplRestart(
-      'dev-1',
-      'task-git-spec-fix-restart',
-    )).toBe(true);
-    expect(holdSpy).not.toHaveBeenCalled();
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-git-spec-fix-restart',
-      'dev-1',
-      'fix',
-      expect.objectContaining({
-        allowDirtyWorkdir: true,
-      }),
-    );
-    expect(continueSpy.mock.calls[0]?.[3]).not.toHaveProperty('serverPriorFindings');
+    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-git-spec-fix-restart')).toBe(true);
+
+    const newToken = await rotatedTaskToken('task-git-spec-fix-restart', 'git-spec-fix-token');
+    expect((await binding())?.status).toBeUndefined();
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(`token: ${newToken}`) }]);
+    expect(BranchManager.prototype.assertClean).not.toHaveBeenCalled();
+    post('dev-1', frame('pr-fixed', newToken));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: 'pr.fix.submitted', taskId: 'task-git-spec-fix-restart' }),
+    ]));
   });
 
-  it('replays the PR-feedback fix prompt for a github fixing pass', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-dev-fix-restart',
-      status: 'fixing',
-      phase: 'code',
-      reviewRound: 1,
-      signalToken: 'dev-fix-token',
-    });
-    const { continueSpy, armedWith } = spyDispatch(m);
+  it.each([
+    ['code', 'task-dev-fix-restart', 'dev-fix-token'],
+    [undefined, 'task-dev-fix-nophase-restart', 'dev-fix-nophase-token'],
+  ] as const)('replays the PR-feedback fix prompt for a github fixing pass (phase=%s) and arms pr-fixed', async (phase, taskId, oldToken) => {
+    const { m, post } = watchedManager();
+    await seedHolder(taskId, { status: 'fixing', reviewRound: 1, signalToken: oldToken, ...(phase ? { phase } : {}) });
 
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-fix-restart')).toBe(true);
-    const newToken = await rotatedTaskToken('task-dev-fix-restart', 'dev-fix-token');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-dev-fix-restart',
-      'dev-1',
-      'fix',
-      expect.objectContaining({
-        signalToken: newToken,
-        allowDirtyWorkdir: true,
-      }),
-    );
-    expect((continueSpy.mock.calls[0]![3] as { serverPriorFindings?: string }).serverPriorFindings)
-      .toBeUndefined();
-    expectReplayArm(await armedWith(), 'task-dev-fix-restart', 'dev-1', ['pr-fixed'], 'dev-fix-token', newToken);
-  });
+    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', taskId)).toBe(true);
 
-  it('replays the PR-feedback fix prompt when the fixing pass never persisted a phase', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-dev-fix-nophase-restart',
-      status: 'fixing',
-      reviewRound: 1,
-      signalToken: 'dev-fix-nophase-token',
-    });
-    const { continueSpy, armedWith } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-fix-nophase-restart')).toBe(true);
-    const newToken = await rotatedTaskToken('task-dev-fix-nophase-restart', 'dev-fix-nophase-token');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-dev-fix-nophase-restart',
-      'dev-1',
-      'fix',
-      expect.objectContaining({
-        signalToken: newToken,
-        allowDirtyWorkdir: true,
-      }),
-    );
-    expectReplayArm(await armedWith(), 'task-dev-fix-nophase-restart', 'dev-1', ['pr-fixed'], 'dev-fix-nophase-token', newToken);
+    const newToken = await rotatedTaskToken(taskId, oldToken);
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(`token: ${newToken}`) }]);
+    expect(BranchManager.prototype.assertClean).not.toHaveBeenCalled();
+    post('dev-1', frame('pr-fixed', oldToken));
+    expect(signalEvents()).toEqual([]);
+    post('dev-1', frame('pr-fixed', newToken));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: 'pr.fix.submitted', taskId }),
+    ]));
   });
 
   it('arms replay watchers without consuming the stale pane snapshot', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-snap-restart',
-      status: 'in_progress',
-      signalToken: 'snap-token-1',
+    // 订阅时 pane 上已经留着一帧新 token 的完成信号:重派武装必须跳过它,只认之后的活帧
+    const { m, post } = watchedManager({
+      snapshot: async () => frame('spec-done', (await harness.taskStore.get('task-snap-restart'))!.signalToken!),
     });
-    const { armedWith } = spyDispatch(m);
+    await seedHolder('task-snap-restart', { signalToken: 'snap-token-1' });
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-snap-restart')).toBe(true);
+
     const newToken = await rotatedTaskToken('task-snap-restart', 'snap-token-1');
-    expectReplayArm(await armedWith(), 'task-snap-restart', 'dev-1', ['spec-done', 'pr-created'], 'snap-token-1', newToken);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(signalEvents()).toEqual([]);
+    post('dev-1', frame('spec-done', newToken));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: 'spec.ready', taskId: 'task-snap-restart' }),
+    ]));
   });
 
-  it('persists the same rotated token that is rendered into the replay prompt', async () => {
-    const m = harness.manager;
-    const oldToken = 'prompt-old-token';
-    await harness.seedTask({ id: 'task-prompt-token', status: 'in_progress', signalToken: oldToken });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-prompt-token', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
-    const injected: string[] = [];
-    harness.stubInject(m, async (_tmux, _paneId, prompt) => {
-      injected.push(prompt);
-      return { acked: true, composerDelivered: true };
-    });
+  it('a replay arm replaces only its own agent entry: another agent watching the same task keeps firing', async () => {
+    const { m, post } = watchedManager();
+    await seedHolder('task-scope-restart', { signalToken: 'scope-token-1' });
+    expect(await m.setupPhaseSignal('task-scope-restart', 'qa-1', ['pr-fixed'], { tokenOverride: 'qa-side-token' })).toBe(true);
 
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-prompt-token')).toBe(true);
+    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-scope-restart')).toBe(true);
 
-    const newToken = await rotatedTaskToken('task-prompt-token', oldToken);
-    expect(injected).toHaveLength(1);
-    expect(injected[0]).toContain(`token: ${newToken}`);
-    expect(injected[0]).not.toContain(`token: ${oldToken}`);
+    post('qa-1', frame('pr-fixed', 'qa-side-token'));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: 'pr.fix.submitted', taskId: 'task-scope-restart', agentId: 'qa-1' }),
+    ]));
   });
 
   it('tears down the replay arm and aborts the paste when the pass advances during arming', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-arm-drift',
-      status: 'in_progress',
-      signalToken: 'arm-stale-1',
-    });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-arm-drift', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
-    const watcherSpy = vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockImplementation(async () => {
-      const fresh = await harness.taskStore.get('task-arm-drift');
-      await harness.taskStore.set({ ...fresh!, phase: 'code', signalToken: 'arm-rotated-2' });
-      return true;
-    });
-    const injected: string[] = [];
-    harness.stubInject(m, async (_tmux, _paneId, prompt) => {
-      injected.push(prompt);
-      return { acked: true, composerDelivered: true };
-    });
+    const { m, listening } = watchedManager({ onSubscribe: () => rotateTask('task-arm-drift', 'arm-rotated-2') });
+    await seedHolder('task-arm-drift', { signalToken: 'arm-stale-1' });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-arm-drift'))
-      .resolves.toBe(false);
-    expect(watcherSpy).toHaveBeenCalledTimes(1);
-    expect(injected).toEqual([]);
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-arm-drift')).resolves.toBe(false);
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect(listening('dev-1')).toBe(0);
   });
 
   it('aborts the paste when the pass rotates after arming but before inject', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-paste-drift',
-      status: 'in_progress',
-      signalToken: 'paste-stale-1',
-    });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-paste-drift', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
     let armed = false;
-    const watcherSpy = vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockImplementation(async () => {
-      armed = true;
-      return true;
-    });
+    const { m, listening } = watchedManager({ onSubscribe: async () => { armed = true; } });
+    await seedHolder('task-paste-drift', { signalToken: 'paste-stale-1' });
     let drifted = false;
     const realUpdate = harness.agentStore.update.bind(harness.agentStore);
     vi.spyOn(harness.agentStore, 'update').mockImplementation(async (id, updater) => {
       if (armed && !drifted) {
         drifted = true;
-        const fresh = await harness.taskStore.get('task-paste-drift');
-        await harness.taskStore.set({ ...fresh!, phase: 'code', signalToken: 'paste-rotated-2' });
+        await rotateTask('task-paste-drift', 'paste-rotated-2');
       }
       return realUpdate(id, updater);
     });
-    const injected: string[] = [];
-    harness.stubInject(m, async (_tmux, _paneId, prompt) => {
-      injected.push(prompt);
-      return { acked: true, composerDelivered: true };
-    });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-paste-drift'))
-      .resolves.toBe(false);
-    expect(watcherSpy).toHaveBeenCalledTimes(1);
-    expect(injected).toEqual([]);
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-paste-drift')).resolves.toBe(false);
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect(listening('dev-1')).toBe(0);
   });
 
   it('finalizes the bootstrap marker and delivery evidence after replaying an interrupted initial develop', async () => {
     const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-boot-replay',
-      status: 'in_progress',
-      signalToken: 'boot-token-1',
-    });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-boot-replay', paneId: '%0',
-      workdir: '/tmp/repo', bootstrappingTaskId: 'task-boot-replay',
-    });
-    vi.spyOn(m, 'clearAwaitingHuman').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    await seedHolder('task-boot-replay', { signalToken: 'boot-token-1' }, { bootstrappingTaskId: 'task-boot-replay' });
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-boot-replay')).toBe(true);
-    expect(continueSpy).toHaveBeenCalled();
-    expect((continueSpy.mock.calls[0]![3] as { allowDirtyWorkdir?: boolean }).allowDirtyWorkdir)
-      .toBeUndefined();
-    expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
+    // 未交付过的初始 develop 仍要求 clean Workdir
+    expect(BranchManager.prototype.assertClean).toHaveBeenCalled();
+    expect((await binding())?.bootstrappingTaskId).toBeUndefined();
     expect(harness.events.some(e =>
       e.type === 'session.started' && e.taskId === 'task-boot-replay' && e.data.phase === 'develop',
     )).toBe(true);
   });
 
   it('keeps the bootstrap marker and holds the rotated pass when the replay is not delivered', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-boot-keep',
-      status: 'in_progress',
-      signalToken: 'boot-token-2',
+    let handedOff = false;
+    // 会话探测期间绑定换手(lockToken 被继任者改写):continueSession 在 ensure 之后放弃投递
+    const runner = suiteRunner({
+      onExec: async (command) => {
+        if (!command.includes('tmux list-sessions') || handedOff) return;
+        handedOff = true;
+        await harness.agentStore.update('dev-1', latest => (latest ? { ...latest, lockToken: 'successor-token' } : latest));
+      },
     });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-boot-keep', paneId: '%0',
-      workdir: '/tmp/repo', bootstrappingTaskId: 'task-boot-keep',
-    });
-    vi.spyOn(m, 'clearAwaitingHuman').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockResolvedValue(false);
+    const m = harness.createManager({ runnerFactory: () => runner });
+    await seedHolder('task-boot-keep', { signalToken: 'boot-token-2' }, { bootstrappingTaskId: 'task-boot-keep' });
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-boot-keep')).toBe(true);
+
     expect(await rotatedTaskToken('task-boot-keep', 'boot-token-2')).toEqual(expect.any(String));
-    expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBe('task-boot-keep');
-    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('restart-redispatch-failed');
+    expect(runner.pastedPrompts).toEqual([]);
+    expect((await binding())?.bootstrappingTaskId).toBe('task-boot-keep');
+    expect((await binding())?.awaitingPhase).toBe('restart-redispatch-failed');
     expect(harness.events.some(e => e.type === 'session.started' && e.taskId === 'task-boot-keep')).toBe(false);
   });
 
@@ -413,149 +297,97 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
 
   it('does not replay a delivered bootstrap held on a failed marker clear', async () => {
     const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-boot-delivered',
-      status: 'in_progress',
-      signalToken: 'boot-token-3',
-    });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-boot-delivered', paneId: '%0',
-      workdir: '/tmp/repo', bootstrappingTaskId: 'task-boot-delivered',
+    await seedHolder('task-boot-delivered', { signalToken: 'boot-token-3' }, {
+      bootstrappingTaskId: 'task-boot-delivered',
       status: 'awaiting_human',
       awaitingPhase: 'bootstrap-marker-clear-failed',
       awaitingReason: 'marker clear failed after delivery',
       awaitingSince: NOW,
     });
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-boot-delivered')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    const state = await harness.agentStore.get('dev-1');
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect(harness.runner.exec.mock.calls.some(c => (c[0] as string).includes('tmux'))).toBe(false);
+    const state = await binding();
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('restart-redispatch-failed');
     expect(state?.awaitingReason).toMatch(/already delivered/);
   });
 
   it('aborts the replay before arming when the pass moved on mid-dispatch', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-drift-restart',
-      status: 'in_progress',
-      signalToken: 'stale-token-1',
+    let drifted = false;
+    const runner = suiteRunner({
+      onExec: async (command) => {
+        if (!command.includes('tmux list-sessions') || drifted) return;
+        drifted = true;
+        await rotateTask('task-drift-restart', 'rotated-token-2');
+      },
     });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-drift-restart', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
-    vi.spyOn(m, 'ensureSession').mockImplementation(async (agentId) => {
-      const fresh = await harness.taskStore.get('task-drift-restart');
-      await harness.taskStore.set({ ...fresh!, phase: 'code', signalToken: 'rotated-token-2' });
-      return {
-        ok: true, createdSession: false, freshRuntime: false, paneId: '%0',
-        workdir: (await harness.agentStore.get(agentId))?.workdir ?? '/tmp/repo',
-      };
-    });
-    const watcherSpy = vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockResolvedValue(true);
-    const injected: string[] = [];
-    harness.stubInject(m, async (_tmux, _paneId, prompt) => {
-      injected.push(prompt);
-      return { acked: true, composerDelivered: true };
-    });
+    const { m, subscribes } = watchedManager({ runner });
+    await seedHolder('task-drift-restart', { signalToken: 'stale-token-1' });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-drift-restart'))
-      .resolves.toBe(false);
-    expect(watcherSpy).not.toHaveBeenCalled();
-    expect(injected).toEqual([]);
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-drift-restart')).resolves.toBe(false);
+
+    expect(subscribes()).toBe(0);
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
   it('rotates an embedded git post-approve token without losing episode metadata', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-postapprove-git-restart',
+    const { m, post } = watchedManager();
+    await seedHolder('task-postapprove-git-restart', {
       status: 'approved',
       signalToken: 'task-token-git',
       postApproveGeneration: 'feedfeedfeed',
-      postApproveHeadSha: 'a'.repeat(40),
+      postApproveHeadSha: SHA1,
       postApproveToken: 'git-pa-token-1',
       postApprovePhase: 'installed',
       redispatchCount: 4,
       pendingRedispatch: true,
       consumedFeedback: { review_1: 17 },
     });
-    const confirm = vi.spyOn(m, 'confirmPostApprovePromptDelivered').mockResolvedValue();
-    const { continueSpy } = spyDispatch(m);
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-postapprove-git-restart')).toBe(true);
 
     const task = await harness.taskStore.get('task-postapprove-git-restart');
     expect(task?.postApproveToken).not.toBe('git-pa-token-1');
+    expect(task?.signalToken).toBe('task-token-git');
     expect(task).toMatchObject({
       postApproveGeneration: 'feedfeedfeed',
-      postApproveHeadSha: 'a'.repeat(40),
-      postApprovePhase: 'installed',
+      postApproveHeadSha: SHA1,
+      postApprovePhase: 'delivered',
       redispatchCount: 4,
-      pendingRedispatch: true,
+      pendingRedispatch: false,
       consumedFeedback: { review_1: 17 },
     });
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-postapprove-git-restart',
-      'dev-1',
-      'post-approve',
-      expect.objectContaining({ signalToken: task!.postApproveToken }),
-    );
-    expect(confirm).toHaveBeenCalledWith('task-postapprove-git-restart', {
-      generation: 'feedfeedfeed',
-      headSha: 'a'.repeat(40),
-      token: task!.postApproveToken,
-    });
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(`token: ${task!.postApproveToken}`) }]);
+    post('dev-1', buildPhaseSignal('pr-merge-ready', 'git-pa-token-1'));
+    expect(signalEvents()).toEqual([]);
+    post('dev-1', buildPhaseSignal('pr-merge-ready', task!.postApproveToken!));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: 'pr.updated', taskId: 'task-postapprove-git-restart' }),
+    ]));
   });
 
-  it('holds the post-approve replay when neither completion nor approved head survive', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-postapprove-lost',
-      status: 'approved',
-      signalToken: 'tok-x',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
+  it.each([
+    ['neither completion nor approved head survive', { signalToken: 'tok-x' }],
+    ['only a drifted latestHeadSha is persisted', { latestHeadSha: 'unreviewed-sha-B' }],
+  ] as const)('holds the post-approve replay when %s', async (_label, task) => {
+    const m = harness.manager;
+    await seedHolder('task-postapprove-lost', { status: 'approved', ...task });
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-postapprove-lost')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
     expect(await m.getPostApproveCompletion('task-postapprove-lost')).toBeNull();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'restart-redispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-postapprove-lost' }),
-    );
-  });
-
-  it('holds the rebuild when only a drifted latestHeadSha is persisted', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-postapprove-drifted',
-      status: 'approved',
-      latestHeadSha: 'unreviewed-sha-B',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-postapprove-drifted')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(await m.getPostApproveCompletion('task-postapprove-drifted')).toBeNull();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'restart-redispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-postapprove-drifted' }),
-    );
+    const held = await binding();
+    expect(held?.status).toBe('awaiting_human');
+    expect(held?.awaitingPhase).toBe('restart-redispatch-failed');
+    expect(held?.awaitingReason).toMatch(/no complete post-approve episode/);
   });
 
   it('markAwaitingHuman reports whether the hold generation write landed', async () => {
-    const m = restartManager();
+    const m = harness.manager;
     await harness.seedTask({ id: 'task-mark-cas', status: 'in_progress', signalToken: 'mc-T1' });
     await harness.seedAgent({
       id: 'dev-1', taskId: 'task-mark-cas',
@@ -576,16 +408,13 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
   });
 
   it('aborts the replay when the entry hold vanished before the clear', async () => {
-    const m = restartManager();
-    await harness.seedTask({ id: 'task-entry-clear', status: 'in_progress', signalToken: 'ec-T1' });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-entry-clear', paneId: '%0',
+    const m = harness.manager;
+    await seedHolder('task-entry-clear', { signalToken: 'ec-T1' }, {
       status: 'awaiting_human',
       awaitingPhase: 'restart-redispatch-failed',
       awaitingReason: 'pre-restart hold',
       awaitingSince: NOW,
     });
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
     const realGet = harness.taskStore.get.bind(harness.taskStore);
     let reads = 0;
     vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id) => {
@@ -598,16 +427,12 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     });
 
     await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-entry-clear')).resolves.toBe(false);
-    expect(continueSpy).not.toHaveBeenCalled();
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
   it('a successor hold landing after the currentness read still survives the clear', async () => {
     const m = harness.manager;
-    await harness.seedTask({ id: 'task-hold-cas', status: 'in_progress', signalToken: 'hc-T1' });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-hold-cas', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
+    await seedHolder('task-hold-cas', { signalToken: 'hc-T1' });
     const realGet = harness.taskStore.get.bind(harness.taskStore);
     let reads = 0;
     vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id) => {
@@ -628,20 +453,15 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     });
 
     await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-hold-cas')).resolves.toBe(false);
-    const binding = await harness.agentStore.get('dev-1');
-    expect(binding?.status).toBe('awaiting_human');
-    expect(binding?.awaitingPhase).toBe('code-dispatch-failed');
-    expect(binding?.awaitingReason).toBe('successor hold after currentness read');
+    const state = await binding();
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('code-dispatch-failed');
+    expect(state?.awaitingReason).toBe('successor hold after currentness read');
   });
 
   it('a stale replay never clears a hold written by the successor pass', async () => {
     const m = harness.manager;
-    await harness.seedTask({ id: 'task-hold-race', status: 'in_progress', signalToken: 'hr-T1' });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-hold-race', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    const clearSpy = vi.spyOn(m, 'clearAwaitingHuman');
+    await seedHolder('task-hold-race', { signalToken: 'hr-T1' });
     const realGet = harness.taskStore.get.bind(harness.taskStore);
     let hooked = false;
     vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id) => {
@@ -660,185 +480,117 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     });
 
     await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-hold-race')).resolves.toBe(false);
-    expect(clearSpy).not.toHaveBeenCalled();
-    const binding = await harness.agentStore.get('dev-1');
-    expect(binding?.status).toBe('awaiting_human');
-    expect(binding?.awaitingPhase).toBe('code-dispatch-failed');
+    const state = await binding();
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('code-dispatch-failed');
+    expect(state?.awaitingReason).toBe('successor hold');
   });
 
   it('escalates an own-generation arm failure into the recoverable hold path', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-arm-fail',
-      status: 'in_progress',
-      signalToken: 'arm-fail-1',
-    });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-arm-fail', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
-    vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockResolvedValue(false);
-    const injected: string[] = [];
-    harness.stubInject(m, async (_tmux, _paneId, prompt) => {
-      injected.push(prompt);
-      return { acked: true, composerDelivered: true };
-    });
+    const { m } = watchedManager({ onSubscribe: async () => { throw new Error('subscribe transport down'); } });
+    await seedHolder('task-arm-fail', { signalToken: 'arm-fail-1' });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-arm-fail'))
-      .resolves.toBe(true);
-    expect(injected).toEqual([]);
-    const held = await harness.agentStore.get('dev-1');
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-arm-fail')).resolves.toBe(true);
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    const held = await binding();
     expect(held?.status).toBe('awaiting_human');
     expect(held?.awaitingPhase).toBe('restart-redispatch-failed');
     expect(held?.awaitingReason).toMatch(/failed to arm/);
   });
 
   it('a post-clear replay throw is held on the live generation, not the stale entry hold', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-throw-held',
-      status: 'in_progress',
-      signalToken: 'throw-held-1',
-    });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-throw-held', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
+    const runner = suiteRunner({ rules: [{ match: 'paste-buffer', reply: { outcome: 'refused' } }] });
+    const { m } = watchedManager({ runner });
+    await seedHolder('task-throw-held', { signalToken: 'throw-held-1' }, {
       status: 'awaiting_human', awaitingPhase: 'restart-redispatch-failed', awaitingSince: NOW,
     });
-    harness.stubEnsureSession(m);
-    vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockResolvedValue(true);
-    harness.stubInject(m, async () => {
-      throw new Error('enter scrub failed mid-delivery');
-    });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-throw-held'))
-      .resolves.toBe(true);
-    const held = await harness.agentStore.get('dev-1');
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-throw-held')).resolves.toBe(true);
+
+    expect(runner.pastedPrompts).toEqual([]);
+    const held = await binding();
     expect(held?.status).toBe('awaiting_human');
     expect(held?.awaitingPhase).toBe('restart-redispatch-failed');
-    expect(held?.awaitingReason).toMatch(/enter scrub failed mid-delivery/);
+    expect(held?.awaitingReason).toMatch(/replaying the task prompt failed/);
     expect(held?.awaitingSince).not.toBe(NOW);
   });
 
   it('a replay throw after a successor rotation exits without holding the successor', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-throw-rotated',
-      status: 'in_progress',
-      signalToken: 'throw-rot-1',
+    const runner = suiteRunner({
+      rules: [{ match: 'paste-buffer', reply: { outcome: 'refused' } }],
+      onExec: async (command) => {
+        if (command.includes('paste-buffer')) await rotateTask('task-throw-rotated', 'throw-rot-2');
+      },
     });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-throw-rotated', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
-    vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockResolvedValue(true);
-    harness.stubInject(m, async () => {
-      const fresh = await harness.taskStore.get('task-throw-rotated');
-      await harness.taskStore.set({ ...fresh!, signalToken: 'throw-rot-2' });
-      throw new Error('paste transport died');
-    });
+    const { m } = watchedManager({ runner });
+    await seedHolder('task-throw-rotated', { signalToken: 'throw-rot-1' });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-throw-rotated'))
-      .resolves.toBe(false);
-    const after = await harness.agentStore.get('dev-1');
-    expect(after?.status).not.toBe('awaiting_human');
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-throw-rotated')).resolves.toBe(false);
+
+    expect(runner.pastedPrompts).toEqual([]);
+    expect((await binding())?.status).not.toBe('awaiting_human');
   });
 
   it('exits quietly when the arm failed because the pass already moved on', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-arm-fail-drift',
-      status: 'in_progress',
-      signalToken: 'arm-fail-2',
+    const { m } = watchedManager({
+      onSubscribe: async () => {
+        await rotateTask('task-arm-fail-drift', 'arm-fail-rotated');
+        throw new Error('subscribe transport down');
+      },
     });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-arm-fail-drift', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
-    vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockImplementation(async () => {
-      const fresh = await harness.taskStore.get('task-arm-fail-drift');
-      await harness.taskStore.set({ ...fresh!, phase: 'code', signalToken: 'arm-fail-rotated' });
-      return false;
-    });
-    const injected: string[] = [];
-    harness.stubInject(m, async (_tmux, _paneId, prompt) => {
-      injected.push(prompt);
-      return { acked: true, composerDelivered: true };
-    });
+    await seedHolder('task-arm-fail-drift', { signalToken: 'arm-fail-2' });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-arm-fail-drift'))
-      .resolves.toBe(false);
-    expect(injected).toEqual([]);
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-arm-fail-drift')).resolves.toBe(false);
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect((await binding())?.status).toBeUndefined();
   });
 
   it('aborts the paste when the pass rotates while waiting for the pane mutex', async () => {
-    const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-mutex-drift',
-      status: 'in_progress',
-      signalToken: 'mutex-stale-1',
+    const { m, listening } = watchedManager();
+    await seedHolder('task-mutex-drift', { signalToken: 'mutex-stale-1' });
+    let releaseUpload!: () => void;
+    const uploadGate = new Promise<void>(resolve => { releaseUpload = resolve; });
+    harness.runner.writeFile.mockImplementationOnce(async () => { await uploadGate; });
+    // 图片上传持有 pane 互斥;重派在 injectAndAwaitAck 门口排队
+    const upload = m.attachImageToRunningAgent('dev-1', Buffer.from('png'), 'png');
+    await vi.waitFor(() => expect(harness.runner.writeFile).toHaveBeenCalled());
+    const realGet = harness.taskStore.get.bind(harness.taskStore);
+    let readsAfterArm = 0;
+    vi.spyOn(harness.taskStore, 'get').mockImplementation(async (id) => {
+      const value = await realGet(id);
+      // 武装后的第二次读是 pre-inject 守卫;它放行后、拿到互斥前换代
+      if (id === 'task-mutex-drift' && listening('dev-1') > 0 && ++readsAfterArm === 2) {
+        await rotateTask('task-mutex-drift', 'mutex-rotated-2');
+        releaseUpload();
+      }
+      return value;
     });
-    await harness.seedAgent({
-      id: 'dev-1', taskId: 'task-mutex-drift', paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-    });
-    harness.stubEnsureSession(m);
-    vi.spyOn(
-      m as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
-      'setupPhaseSignalWatcher',
-    ).mockResolvedValue(true);
-    vi.spyOn(
-      m as unknown as { acquireCompactGuard: (agentId: string) => Promise<void> },
-      'acquireCompactGuard',
-    ).mockImplementation(async () => {
-      const fresh = await harness.taskStore.get('task-mutex-drift');
-      await harness.taskStore.set({ ...fresh!, phase: 'code', signalToken: 'mutex-rotated-2' });
-    });
-    const stepsSpy = vi.spyOn(
-      m as unknown as { injectAndAwaitAckSteps: (...args: unknown[]) => Promise<unknown> },
-      'injectAndAwaitAckSteps',
-    ).mockResolvedValue({ acked: true, composerDelivered: true });
 
-    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-mutex-drift'))
-      .resolves.toBe(false);
-    expect(stepsSpy).not.toHaveBeenCalled();
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-mutex-drift')).resolves.toBe(false);
+    await upload;
+
+    expect(readsAfterArm).toBeGreaterThanOrEqual(2);
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringMatching(/\.png $/) }]);
+    expect(listening('dev-1')).toBe(0);
   });
 
   it('holds an in-flight holder whose signal token is missing', async () => {
-    const m = restartManager();
-    await harness.seedTask({
-      id: 'task-no-token',
-      status: 'in_progress',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
+    const m = harness.manager;
+    await seedHolder('task-no-token', {});
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-no-token')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'restart-redispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-no-token' }),
-    );
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    const held = await binding();
+    expect(held?.status).toBe('awaiting_human');
+    expect(held?.awaitingPhase).toBe('restart-redispatch-failed');
+    expect(held?.awaitingReason).toMatch(/no signal token/);
   });
 
   it('leaves non-working statuses to the waiting transition', async () => {
-    const m = restartManager();
+    const m = harness.manager;
     await harness.seedTask({
       id: 'task-in-review',
       status: 'review',
@@ -852,12 +604,12 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       phase: 'spec',
       signalToken: 'tok-c',
     });
-    const { continueSpy, holdSpy } = spyDispatch(m);
+    await harness.seedAgent({ id: 'dev-1', taskId: 'task-in-review', paneId: '%0' });
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-in-review')).toBe(false);
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-spec-ready')).toBe(false);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).not.toHaveBeenCalled();
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect((await binding())?.status).toBeUndefined();
   });
 });
 
@@ -872,7 +624,6 @@ describe('AgentManager.advanceTask', () => {
       passProvenance: {
         sourceKey: 'issue-comments',
         id: 'pass-1',
-        bodyDigest: 'digest',
         token: 'abcdef123456',
         failToken: '123456abcdef',
         anchorSha: SHA1,
@@ -887,18 +638,14 @@ describe('AgentManager.advanceTask', () => {
 
   it('replays the persisted Dev instruction for an in-progress task', async () => {
     const m = harness.manager;
-    await harness.seedTask({
-      id: 'task-advance-dev',
-      status: 'in_progress',
-      phase: 'code',
-      signalToken: 'advance-token',
-    });
-    const replay = vi.spyOn(m, 'redispatchTaskPromptAfterReplRestart').mockResolvedValue(true);
+    await seedHolder('task-advance-dev', { phase: 'code', signalToken: 'advance-token' });
 
     const result = await m.advanceTask('task-advance-dev', { executor: 'dev', note: 'manual replay' });
 
     expect(result.status).toBe('in_progress');
-    expect(replay).toHaveBeenCalledWith('dev-1', 'task-advance-dev');
+    const replayedToken = (await harness.taskStore.get('task-advance-dev'))?.signalToken;
+    expect(replayedToken).not.toBe('advance-token');
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(`token: ${replayedToken}`) }]);
     expect(harness.events.at(-1)).toMatchObject({
       type: 'task.updated',
       taskId: 'task-advance-dev',
@@ -920,23 +667,22 @@ describe('AgentManager.advanceTask', () => {
       phase: 'code',
       signalToken: 'advance-qa-token',
     });
-    const dispatch = vi.spyOn(m, 'dispatchReviewToQa').mockResolvedValue({
-      ...task,
-      status: 'review',
-    });
+    await harness.seedAgent({ id: 'dev-1', taskId: task.id, paneId: '%0' });
+    await harness.seedAgent({ id: 'qa-1', paneId: '%1' });
 
-    await m.advanceTask(task.id, {
+    const updated = await m.advanceTask(task.id, {
       executor: 'qa',
       stage: 'code',
       prNumber: 42,
     });
 
-    expect(dispatch).toHaveBeenCalledWith(task.id, {
-      fromStatus: ['fixing'],
-      confirmUncertainNotDelivered: true,
-      stage: 'code',
+    expect(updated).toMatchObject({
+      status: 'review',
       prNumber: 42,
+      deliveryConfirmation: { phase: 'code', source: 'human' },
     });
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%1', body: expect.stringContaining(`token: ${updated.signalToken}`) }]);
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBe(task.id);
     expect(harness.events.at(-1)).toMatchObject({
       type: 'task.updated',
       taskId: task.id,

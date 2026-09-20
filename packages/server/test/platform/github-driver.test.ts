@@ -98,7 +98,10 @@ describe('GitHubDriver', () => {
 
   it('classifies platform failures without exposing their diagnostic text through the safe formatter', async () => {
     const { driver } = harness([result('', 1, 'HTTP 403 secret-token')]);
-    const error = await driver.projectView().catch(value => value as DriverOpError);
+    const error = await driver.projectView().then(
+      () => { throw new Error('projectView should have failed'); },
+      (value: unknown) => value as DriverOpError,
+    );
     expect(error).toBeInstanceOf(DriverOpError);
     expect(error.info.errorClass).toBe('ACCESS_DENIED');
     expect(safeDriverErrorText(error)).toBe('op projectView failed (exit 1, class ACCESS_DENIED)');

@@ -13,21 +13,18 @@ function md(text: string): HTMLElement {
 }
 
 describe('MarkdownLite headings', () => {
-  it('renders all six levels, keeps the # prefix, and scales size/weight by level', () => {
+  it('renders all six levels as heading tags and keeps the # prefix', () => {
     const c = md('# h1 title\n\n## h2 title\n\n### h3 title\n\n#### h4 title\n\n##### h5 title\n\n###### h6 title');
-    const expectations: Array<[string, string, string, string]> = [
-      ['h1', '# h1 title', 'text-[18px]', 'font-bold'],
-      ['h2', '## h2 title', 'text-[17px]', 'font-bold'],
-      ['h3', '### h3 title', 'text-[16px]', 'font-semibold'],
-      ['h4', '#### h4 title', 'text-[15px]', 'font-semibold'],
-      ['h5', '##### h5 title', 'text-[15px]', 'font-semibold'],
-      ['h6', '###### h6 title', 'text-[15px]', 'font-semibold'],
+    const expectations: Array<[string, string]> = [
+      ['h1', '# h1 title'],
+      ['h2', '## h2 title'],
+      ['h3', '### h3 title'],
+      ['h4', '#### h4 title'],
+      ['h5', '##### h5 title'],
+      ['h6', '###### h6 title'],
     ];
-    for (const [tag, text, size, weight] of expectations) {
-      const el = c.querySelector(tag);
-      expect(el?.textContent).toBe(text);
-      expect(el?.className).toContain(size);
-      expect(el?.className).toContain(weight);
+    for (const [tag, text] of expectations) {
+      expect(c.querySelector(tag)?.textContent).toBe(text);
     }
   });
 

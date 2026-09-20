@@ -111,9 +111,9 @@ export async function runSingleTarget(
       try {
         let wasUpdated = false;
         await deps.agentStore.update(agent.id, (existing) => {
-          if (!existing) return AGENT_STORE_NOOP;
+          if (!existing || !workdir || existing.workdir === workdir) return AGENT_STORE_NOOP;
           wasUpdated = true;
-          return { ...existing, ...(workdir ? { workdir } : {}), updatedAt: now };
+          return { ...existing, workdir, updatedAt: now };
         });
         if (wasUpdated) updated++;
       } catch (writeErr) {

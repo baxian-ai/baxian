@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from 'vitest';
 import { render, cleanup, act, fireEvent, screen } from '@testing-library/react';
+import { ToastProvider } from '../../src/components/toast.tsx';
 
 const fakeTerminals: FakeTerminal[] = [];
 
@@ -100,7 +101,6 @@ vi.mock('../../src/components/terminal-renderer.ts', () => ({
 vi.mock('@xterm/xterm', () => ({ Terminal: FakeTerminal }));
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: FakeFitAddon }));
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
 class MockWebSocket {
   static OPEN = 1;
@@ -191,7 +191,7 @@ function importPane(): Promise<PaneModule> {
 
 async function renderPane(props: PaneProps): Promise<ReturnType<typeof render> & { term: FakeTerminal }> {
   const { PaneTerminal } = await importPane();
-  const result = render(<PaneTerminal agentId="dev-1" {...props} />);
+  const result = render(<PaneTerminal agentId="dev-1" {...props} />, { wrapper: ToastProvider });
   return Object.assign(result, { term: lastTerminal() });
 }
 
@@ -301,7 +301,7 @@ describe('PaneTerminal', () => {
 
   it('applies Zed light theme to the xterm instance', async () => {
     const { PaneTerminal, ZED_LIGHT_THEME, TERMINAL_BG } = await importPane();
-    const { container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
+    const { container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />, { wrapper: ToastProvider });
     const term = lastTerminal();
     expect(term.opts.theme).toBe(ZED_LIGHT_THEME);
     expect(ZED_LIGHT_THEME.background).toBe(TERMINAL_BG);
@@ -646,7 +646,7 @@ describe('PaneTerminal', () => {
 
     try {
       const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
+      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />, { wrapper: ToastProvider });
       const term = fakeTerminals[fakeTerminals.length - 1];
       term.buffer.active.cursorY = 42;
       await new Promise((r) => setTimeout(r, 0));
@@ -706,7 +706,7 @@ describe('PaneTerminal', () => {
 
     try {
       const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
+      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />, { wrapper: ToastProvider });
       const term = fakeTerminals[fakeTerminals.length - 1];
       term.buffer.active.cursorY = 10;
       await new Promise((r) => setTimeout(r, 0));
@@ -856,7 +856,7 @@ describe('PaneTerminal', () => {
   it('changing agentId clears stale error/session-gone banner', async () => {
     await installPaneStreamForTest();
     const { PaneTerminal } = await importPane();
-    const { rerender, container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
+    const { rerender, container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />, { wrapper: ToastProvider });
     await flushMacrotask();
     const ws = lastMockWs()!;
     await act(async () => {
@@ -1072,6 +1072,7 @@ async function mountWithHandshake(
       interactive={props.interactive}
       arrowKeys={props.arrowKeys}
     />,
+    { wrapper: ToastProvider },
   );
   const term = lastTerminal();
   await flushMacrotask();
@@ -1112,6 +1113,7 @@ async function renderDeferredPane(
       autoFocus={false}
       deferFullUntilFocus
     />,
+    { wrapper: ToastProvider },
   );
   await flushMacrotask();
   return { container, ws1: lastMockWs()! };

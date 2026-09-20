@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -31,7 +32,7 @@ describe('CLI task subcommands', () => {
   let exitCode: number | undefined;
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errSpy: ReturnType<typeof vi.spyOn>;
-  let exitSpy: ReturnType<typeof vi.spyOn>;
+  let exitSpy: MockInstance<typeof process.exit>;
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;

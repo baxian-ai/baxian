@@ -1,552 +1,540 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import type { AgentManager } from '../../src/agent/manager.js';
-import { TmuxManager, ReplNotReadyError, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
-import type { AgentStore } from '../../src/state/agent-store.js';
-import type { LockManager } from '../../src/state/lock.js';
-import type { CommandRunner } from '../../src/agent/runner.js';
-import { createManagerHarness } from '../helpers/manager-harness.js';
-import { fakeRunner } from '../helpers/fake-runner.js';
-import { makeAgent, makeConfig } from '../helpers/fixtures.js';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import type { AgentManagerDeps } from '../../src/agent/manager.js';
+import { ReplNotReadyError } from '../../src/agent/tmux.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness, workdirsOf } from '../helpers/manager-harness.js';
+import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
 
-const REF: TmuxSessionRef = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
-const paneRef = (agentId: string, paneId: string): PaneRef => ({ session: REF, paneId, claim: agentId });
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
 const SPACE_LITERAL = "'\\'' '\\''";
+const COMMA_LITERAL = "'\\'','\\''";
 
-let tempDir: string;
-let agentStore: AgentStore;
-let lockManager: LockManager;
-let manager: AgentManager;
-let mockRunner: CommandRunner;
-let waitReadySpy: ReturnType<typeof vi.spyOn>;
-let seedAgent: Awaited<ReturnType<typeof createManagerHarness>>['seedAgent'];
+const harness = useManagerSuiteHarness();
 
-function execCalls(): string[] {
-  return (mockRunner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => String(c[0]));
+let runner: FakeRunner;
+let onExec: ((cmd: string) => void | Promise<void>) | null;
+
+function useRunner(options: FakeRunnerOptions = {}, deps: Partial<AgentManagerDeps> = {}): FakeRunner {
+  runner = createManagerSuiteRunner({
+    workdirs: workdirsOf(harness.config),
+    ...options,
+    onExec: cmd => onExec?.(cmd),
+  });
+  harness.manager = harness.createManager({ runnerFactory: () => runner, ...deps });
+  return runner;
 }
 
-function guardSet(): Set<string> {
-  return (manager as never as { compactInFlight: Set<string> }).compactInFlight;
+beforeEach(() => {
+  onExec = null;
+  useRunner();
+});
+
+const cmds = (): string[] => runner.exec.mock.calls.map(c => String(c[0]));
+const idxOf = (calls: string[], match: (c: string) => boolean, from = 0): number =>
+  calls.findIndex((c, i) => i >= from && match(c));
+
+const isTitleRead = (c: string): boolean => c.includes('pane_title');
+const isCapture = (c: string): boolean => c.includes('capture-pane');
+const isLiteral = (c: string, body: string): boolean => c.includes('send-keys -l') && c.includes(body);
+
+// 暂存走 execWithStdin,粘贴走 exec:跨两个 mock 的先后只能按全局调用序号比较
+function orderOf(mock: FakeRunner['exec'] | FakeRunner['execWithStdin'], match: (c: string) => boolean): number {
+  const i = mock.mock.calls.findIndex(c => match(String(c[0])));
+  return i === -1 ? -1 : mock.mock.invocationCallOrder[i]!;
 }
 
-function installGates(): Array<() => void> {
-  const gates: Array<() => void> = [];
-  waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-  return gates;
-}
-
-function setPollMs(ms: number): void {
-  (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = ms;
-}
-
-function callPrivate<T>(name: string, ...args: unknown[]): T {
-  return (manager as never as Record<string, (...a: unknown[]) => T>)[name](...args);
-}
-
-function injectAndAwaitAck(...args: unknown[]): Promise<{ acked: boolean }> {
-  return callPrivate('injectAndAwaitAck', ...args);
-}
-
-function mockFn(): ReturnType<typeof vi.fn> {
-  return vi.fn().mockResolvedValue(undefined);
-}
-
-function fakeDispatchTmux(): Record<string, ReturnType<typeof vi.fn>> {
-  return {
-    injectPrompt: mockFn(), captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
-    readPaneTitle: vi.fn().mockResolvedValue(''),
-    sendEnter: mockFn(), waitSubmitAck: mockFn(),
-    clearComposerDraft: mockFn(),
-    capturePaneById: vi.fn().mockResolvedValue(''),
+// 真实并发闸门:持有者卡在自己发出的某条 tmux 命令上,竞争方在公共入口的守卫处直接被拒
+function gateOn(match: (cmd: string) => boolean): { release: () => void; hit: () => boolean } {
+  let release!: () => void;
+  let hit = false;
+  const gate = new Promise<void>(r => { release = r; });
+  onExec = async cmd => {
+    if (hit || !match(cmd)) return;
+    hit = true;
+    await gate;
   };
+  return { release, hit: () => hit };
 }
 
-function expectGuardReleased(id: string): Promise<void> {
-  return vi.waitFor(() => expect(guardSet().has(id)).toBe(false));
+// 守卫是否已释放只能从行为看:拿不到守卫的操作一律 409
+function waitGuardFree(agentId: string): Promise<void> {
+  return vi.waitFor(async () => {
+    await harness.manager.attachImageToRunningAgent(agentId, PNG, 'png');
+  }, { timeout: 5_000, interval: 5 });
 }
 
-function waitGates(gates: Array<() => void>, n: number): Promise<void> {
-  return vi.waitFor(() => expect(gates.length).toBe(n));
+async function seedLiveAgent(id = 'dev-1', paneId = '%0', extra = {}): Promise<void> {
+  await harness.seedAgent({ id, paneId, ...extra });
 }
-
-async function drainHolderGates(gates: Array<() => void>, holder: Promise<unknown>): Promise<void> {
-  gates[0]();
-  await waitGates(gates, 2);
-  gates[1]();
-  await holder;
-  await waitGates(gates, 3);
-  gates[2]();
-}
-
-async function drainHolderAndRelease(
-  gates: Array<() => void>,
-  holder: Promise<unknown>,
-  id: string,
-): Promise<void> {
-  await drainHolderGates(gates, holder);
-  await expectGuardReleased(id);
-}
-
-async function startGuarded(
-  start: () => Promise<unknown> = () => manager.compactAgent('dev-1'),
-): Promise<{ gates: Array<() => void>; holder: Promise<unknown> }> {
-  const gates = installGates();
-  const holder = start();
-  await waitGates(gates, 1);
-  return { gates, holder };
-}
-
-async function startBlockedUpload(id: string): Promise<{ upload: Promise<unknown>; releaseWrite: () => void }> {
-  let releaseWrite: () => void = () => {};
-  (mockRunner.writeFile as ReturnType<typeof vi.fn>).mockReturnValue(
-    new Promise<void>(r => { releaseWrite = r; }),
-  );
-  const upload = manager.attachImageToRunningAgent(id, Buffer.from([0x89, 0x50]), 'png');
-  await vi.waitFor(() => expect(mockRunner.writeFile).toHaveBeenCalled());
-  return { upload, releaseWrite };
-}
-
-beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-compact-test-'));
-  mockRunner = fakeRunner({ defaultResult: {} });
-  const config = makeConfig({
-    project: [{
-      id: 'proj',
-      repo: 'https://github.com/user/repo.git',
-      merge: null,
-      agent: [[
-        makeAgent({ workdir: join(tempDir, 'dev-1') }),
-        makeAgent({
-          id: 'qa-1',
-          runtime: 'codex',
-          role: 'qa',
-          workdir: join(tempDir, 'qa-1'),
-        }),
-      ]],
-    }],
-  });
-  const harness = await createManagerHarness(tempDir, {
-    config,
-    agentDefaults: { paneId: '%7' },
-    deps: {
-      runnerFactory: () => mockRunner,
-      platformRunner: mockRunner,
-    },
-  });
-  ({ manager, agentStore, lockManager, seedAgent } = harness);
-
-  waitReadySpy = vi.spyOn(
-    manager as never as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
-    'waitForReplPromptReady',
-  );
-
-  vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot')
-    .mockImplementation(async name => ({ ref: REF, claim: name }));
-  vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef')
-    .mockImplementation(async (_ref, claim) => {
-      const paneId = (await agentStore.get(claim))?.paneId;
-      if (!paneId) throw new Error(`tmux session ${claim} is gone (no panes match)`);
-      return { session: REF, paneId, claim };
-    });
-});
-
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await rm(tempDir, { recursive: true });
-});
 
 describe('compactAgent', () => {
   it('waits for an idle prompt, clears the composer draft (space then C-c), then sends /compact + Enter', async () => {
-    await seedAgent();
-    waitReadySpy.mockResolvedValue(undefined);
+    await seedLiveAgent();
 
-    await manager.compactAgent('dev-1');
+    await harness.manager.compactAgent('dev-1');
 
-    await vi.waitFor(() => expect(waitReadySpy).toHaveBeenCalledTimes(3));
-    await expectGuardReleased('dev-1');
-    const [, pane, runtime, timeoutMs] = waitReadySpy.mock.calls[0];
-    expect(pane).toMatchObject({ paneId: '%7' });
-    expect(runtime).toBe('claude-code');
-    expect(timeoutMs).toBe(5_000);
-
-    const calls = execCalls();
-    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes(SPACE_LITERAL));
-    const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
-    const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/compact'));
+    const calls = cmds();
+    const spaceIdx = idxOf(calls, c => isLiteral(c, SPACE_LITERAL));
+    const ccIdx = idxOf(calls, c => c.includes('send-keys') && c.includes('C-c'));
+    const literalIdx = idxOf(calls, c => isLiteral(c, '/compact'));
     expect(spaceIdx).toBeGreaterThanOrEqual(0);
     expect(ccIdx).toBeGreaterThan(spaceIdx);
     expect(literalIdx).toBeGreaterThan(ccIdx);
-    expect(calls[literalIdx]).toContain("'%7'");
-    const enterIdx = calls.findIndex((c, i) => i > literalIdx && c.includes('send-keys') && c.includes('Enter'));
-    expect(enterIdx).toBeGreaterThan(literalIdx);
+    expect(calls[literalIdx]).toContain("'%0'");
+    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBeGreaterThan(literalIdx);
+    // 提交确实落在 runtime 上:pane 进入 working,composer 已清空
+    expect(runner.sessions.pane('dev-1')).toMatchObject({ phase: 'working', composer: '' });
+
+    await waitGuardFree('dev-1');
   });
 
   it('rejects 409 when a compact for the same agent is already in flight, and releases the guard after', async () => {
-    await seedAgent();
-    const { gates, holder: first } = await startGuarded();
+    await seedLiveAgent();
+    const gate = gateOn(c => c.includes('list-sessions'));
+    const first = harness.manager.compactAgent('dev-1');
+    await vi.waitFor(() => expect(gate.hit()).toBe(true));
 
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
+    await expect(harness.manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
 
-    await drainHolderAndRelease(gates, first, 'dev-1');
-
-    waitReadySpy.mockResolvedValue(undefined);
-    await expect(manager.compactAgent('dev-1')).resolves.toBeUndefined();
+    gate.release();
+    await first;
+    await waitGuardFree('dev-1');
+    await expect(harness.manager.compactAgent('dev-1')).resolves.toBeUndefined();
   });
 
   it.each([
     {
       label: 're-dispatched (taskId changes)',
-      seed: () => seedAgent(),
-      reseed: () => seedAgent({ taskId: 'task-new' }),
+      reseed: () => harness.seedAgent({ id: 'dev-1', paneId: '%0', taskId: 'task-new' }),
     },
     {
       label: 'same-task re-dispatch bumps updatedAt',
-      seed: () => seedAgent({ taskId: 'task-1', updatedAt: '2026-06-12T08:00:00.000Z' }),
-      reseed: () => seedAgent({ taskId: 'task-1', updatedAt: '2026-06-12T08:00:01.000Z' }),
+      reseed: () => harness.seedAgent({ id: 'dev-1', paneId: '%0', taskId: 'task-1', updatedAt: '2026-06-12T08:00:01.000Z' }),
     },
     {
       label: 'pane is rebuilt',
-      seed: () => seedAgent(),
-      reseed: () => seedAgent({ paneId: '%9' }),
+      reseed: () => harness.seedAgent({ id: 'dev-1', paneId: '%9' }),
     },
-  ])('rejects 409 and sends nothing when the $label during the wait', async ({ seed, reseed }) => {
-    await seed();
-    waitReadySpy.mockImplementation(async () => { await reseed(); });
+  ])('rejects 409 and sends nothing when the $label during the wait', async ({ reseed }) => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0', taskId: 'task-1', updatedAt: '2026-06-12T08:00:00.000Z' });
+    // 重新派单落在就绪等待期间:用第一次抓屏做交错点
+    let done = false;
+    onExec = async c => {
+      if (done || !isCapture(c)) return;
+      done = true;
+      await reseed();
+    };
 
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
+    await expect(harness.manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('session changed'),
     });
-    expect(execCalls().some(c => c.includes('C-c') || c.includes('/compact'))).toBe(false);
+    expect(cmds().some(c => c.includes('C-c') || c.includes('/compact'))).toBe(false);
   });
 
-  it('passes the configured runtime through for a codex agent', async () => {
-    await seedAgent({ id: 'qa-1', paneId: '%3' });
-    waitReadySpy.mockResolvedValue(undefined);
+  it('rejects 409 without sending anything when the runtime is not at an idle prompt, and leaves a server-side trace', async () => {
+    await seedLiveAgent();
+    // REPL 在就绪判定之后、清稿之前退出前台:探针读回的前台不再是 runtime
+    let flipped = false;
+    onExec = c => {
+      if (flipped || !isTitleRead(c)) return;
+      flipped = true;
+      runner.sessions.setProcess('dev-1', 'vim');
+    };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    await manager.compactAgent('qa-1');
-
-    expect(waitReadySpy.mock.calls[0][2]).toBe('codex');
-  });
-
-  it('rejects 409 without sending anything when the runtime is not at an idle prompt', async () => {
-    await seedAgent();
-    waitReadySpy.mockRejectedValue(new Error('pane %7 stayed busy past 5000ms'));
-
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
+    await expect(harness.manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('not at an idle REPL prompt'),
     });
-    expect(execCalls().some(c => c.includes('/compact'))).toBe(false);
+    expect(cmds().some(c => c.includes('/compact'))).toBe(false);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('sendSlashCommand(dev-1, /compact) before composer clear: runtime not at an idle prompt'),
+      expect.any(Error),
+    );
   });
 
+  it('codex: dirties with a comma and sends C-c only after a cursor read shows the composer accepted it', async () => {
+    await seedLiveAgent('qa-1', '%1');
+
+    await harness.manager.compactAgent('qa-1');
+
+    const calls = cmds();
+    expect(calls.some(c => isLiteral(c, SPACE_LITERAL))).toBe(false);
+    const commaIdx = idxOf(calls, c => isLiteral(c, COMMA_LITERAL));
+    const ccIdx = idxOf(calls, c => c.includes('send-keys') && c.includes('C-c'));
+    expect(commaIdx).toBeGreaterThanOrEqual(0);
+    expect(calls[commaIdx]).toContain("'%1'");
+    expect(ccIdx).toBeGreaterThan(commaIdx);
+    expect(calls.slice(0, commaIdx).some(c => c.includes('cursor_x'))).toBe(true);
+    expect(calls.slice(commaIdx + 1, ccIdx).some(c => c.includes('cursor_x'))).toBe(true);
+    expect(idxOf(calls, c => isLiteral(c, '/compact'))).toBeGreaterThan(ccIdx);
+
+    await waitGuardFree('qa-1');
+  });
+
+  it('codex: rejects 409, withholds C-c and logs when the cursor never moves (keystroke not yet in the composer)', async () => {
+    await seedLiveAgent('qa-1', '%1');
+    // 光标停住=弄脏键还没进 composer,空 composer 上的 C-c 会直接退出 codex
+    useRunner({ rules: [{ match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|codex\n' } }] });
+    await seedLiveAgent('qa-1', '%1');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('composer could not be cleared'),
+    });
+
+    const calls = cmds();
+    expect(calls.some(c => c.includes('send-keys') && c.includes('C-c'))).toBe(false);
+    expect(calls.some(c => c.includes('/compact'))).toBe(false);
+    expect(runner.sessions.pane('qa-1')?.process).toBe('codex');
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('sendSlashCommand(qa-1, /compact) composer clear failed'),
+      expect.any(ReplNotReadyError),
+    );
+  }, 15_000);
+
   it('rejects 409 when the agent has no live session (no paneId)', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString() });
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({ status: 409 });
-    expect(waitReadySpy).not.toHaveBeenCalled();
+    await harness.seedAgent({ id: 'dev-1' });
+    await expect(harness.manager.compactAgent('dev-1')).rejects.toMatchObject({ status: 409 });
+    expect(cmds().some(c => c.includes('send-keys'))).toBe(false);
   });
 
   it('rejects 404 for an unknown agent', async () => {
-    await expect(manager.compactAgent('nope')).rejects.toMatchObject({ status: 404 });
+    await expect(harness.manager.compactAgent('nope')).rejects.toMatchObject({ status: 404 });
   });
 
   it('rejects image attach with 409 while a compact holds the guard', async () => {
-    await seedAgent();
-    const { gates, holder: manual } = await startGuarded();
+    await seedLiveAgent();
+    const gate = gateOn(c => c.includes('list-sessions'));
+    const compact = harness.manager.compactAgent('dev-1');
+    await vi.waitFor(() => expect(gate.hit()).toBe(true));
 
-    await expect(
-      manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50, 0x4e, 0x47]), 'png'),
-    ).rejects.toMatchObject({
+    await expect(harness.manager.attachImageToRunningAgent('dev-1', PNG, 'png')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('in progress'),
     });
 
-    await drainHolderAndRelease(gates, manual, 'dev-1');
+    gate.release();
+    await compact;
+    await waitGuardFree('dev-1');
   });
 
   it('keeps the guard until the runtime is idle again after /compact, blocking uploads meanwhile', async () => {
-    await seedAgent();
-    const { gates, holder: manual } = await startGuarded();
-    gates[0]();
-    await waitGates(gates, 2);
-    gates[1]();
-    await manual;
-
-    await expect(
-      manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png'),
-    ).rejects.toMatchObject({ status: 409, message: expect.stringContaining('in progress') });
-
-    await waitGates(gates, 3);
-    gates[2]();
-    await expectGuardReleased('dev-1');
-
-    await expect(
-      manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png'),
-    ).resolves.toMatchObject({ path: expect.stringContaining('dev-1') });
-  });
-
-  it('dispatch injection waits for an in-flight compact instead of pasting concurrently', async () => {
-    await seedAgent();
-    setPollMs(1);
-    const fakeTmux = fakeDispatchTmux();
-    const { gates, holder: manual } = await startGuarded();
-
-    const dispatch = injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'next prompt', 'dev-1', 'claude-code');
-    await new Promise(r => setTimeout(r, 20));
-    expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
-
-    await drainHolderGates(gates, manual);
-
-    await expect(dispatch).resolves.toMatchObject({ acked: true });
-    expect(fakeTmux.injectPrompt).toHaveBeenCalledWith(expect.objectContaining({ paneId: '%7' }), 'next prompt', 'dev-1');
-    expect(guardSet().has('dev-1')).toBe(false);
-  });
-
-  it('refuses to inject when the pre-inject frame shows a pending blocker (herdr: Blocked 是唯一拒发条件)', async () => {
-    await seedAgent();
-    setPollMs(1);
-    const fakeTmux = fakeDispatchTmux();
-    fakeTmux.readPaneTitle = vi.fn().mockResolvedValue('✳ 上一任务');
-    fakeTmux.capturePaneById = vi.fn().mockResolvedValue(
-      'Bash command\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend · ctrl+e to explain',
-    );
-    await expect(injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'p', 'dev-1', 'claude-code'))
-      .rejects.toThrow(/pre-inject/);
-    expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
-    expect(fakeTmux.clearComposerDraft).not.toHaveBeenCalled();
-  });
-
-  it('samples the OSC title BEFORE sendEnter and threads it into waitSubmitAck (a post-submit working title must not become the baseline)', async () => {
-    await seedAgent();
-    setPollMs(1);
-    const fakeTmux = fakeDispatchTmux();
-    fakeTmux.readPaneTitle.mockResolvedValue('~/repo');
-    const { gates, holder: manual } = await startGuarded();
-
-    const dispatch = injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'p', 'dev-1', 'claude-code');
-    await drainHolderGates(gates, manual);
-    await expect(dispatch).resolves.toMatchObject({ acked: true });
-
-    expect(fakeTmux.readPaneTitle.mock.invocationCallOrder[0])
-      .toBeLessThan(fakeTmux.sendEnter.mock.invocationCallOrder[0]);
-    expect(fakeTmux.waitSubmitAck).toHaveBeenCalledWith(
-      expect.objectContaining({ paneId: '%7' }),
-      'snapshot', 'claude-code', expect.objectContaining({ baselineTitle: '~/repo' }),
-    );
-  });
-
-  it('a guarded dispatch that goes stale after entry never touches the composer', async () => {
-    await seedAgent();
-    setPollMs(1);
-    const fakeTmux = fakeDispatchTmux();
-    fakeTmux.stagePromptBuffer = vi.fn().mockResolvedValue({ buf: 'baxian-dev-1-x' });
-    fakeTmux.pasteStagedBuffer = mockFn();
-    fakeTmux.dropStagedBuffer = mockFn();
-    let calls = 0;
-    const guard = vi.fn(async () => {
-      calls += 1;
-      return calls === 1;
+    await seedLiveAgent();
+    // /compact 提交后的空闲复核仍在跑:守卫必须继续挡住上传
+    let submitted = false;
+    const gate = gateOn(c => {
+      if (isLiteral(c, '/compact')) submitted = true;
+      return submitted && isCapture(c);
     });
 
-    const result = await injectAndAwaitAck(fakeTmux, '%7', 'stale prompt', 'dev-1', 'claude-code', guard);
+    await harness.manager.compactAgent('dev-1');
+    await vi.waitFor(() => expect(gate.hit()).toBe(true));
 
-    expect(result).toMatchObject({ aborted: true });
-    expect(fakeTmux.clearComposerDraft).not.toHaveBeenCalled();
-    expect(fakeTmux.stagePromptBuffer).not.toHaveBeenCalled();
-    expect(fakeTmux.pasteStagedBuffer).not.toHaveBeenCalled();
-  });
+    await expect(harness.manager.attachImageToRunningAgent('dev-1', PNG, 'png')).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('in progress'),
+    });
 
-  it('a guarded dispatch scrubs the composer inside the paste fence, after staging', async () => {
-    await seedAgent();
-    setPollMs(1);
-    const fakeTmux = fakeDispatchTmux();
-    fakeTmux.stagePromptBuffer = vi.fn().mockResolvedValue({ buf: 'baxian-dev-1-y' });
-    fakeTmux.pasteStagedBuffer = mockFn();
-    fakeTmux.dropStagedBuffer = mockFn();
-    const guard = vi.fn(async () => true);
-
-    const result = await injectAndAwaitAck(fakeTmux, '%7', 'live prompt', 'dev-1', 'claude-code', guard);
-
-    expect(result).toMatchObject({ acked: true });
-    expect(fakeTmux.clearComposerDraft.mock.invocationCallOrder[0])
-      .toBeGreaterThan(fakeTmux.stagePromptBuffer.mock.invocationCallOrder[0]!);
-    expect(fakeTmux.clearComposerDraft.mock.invocationCallOrder[0])
-      .toBeLessThan(fakeTmux.pasteStagedBuffer.mock.invocationCallOrder[0]!);
-  });
-
-  it('aborts a guarded dispatch when the binding is released while waiting (task cancelled)', async () => {
-    await seedAgent({ taskId: 't1' });
-    const lockToken = await lockManager.acquire('dev-1', 't1');
-    expect(lockToken).toBeTruthy();
-    await agentStore.update('dev-1', state => ({ ...state!, lockToken: lockToken!, updatedAt: state!.updatedAt }));
-    setPollMs(1);
-    const fakeTmux = fakeDispatchTmux();
-    const { gates, holder: manual } = await startGuarded();
-
-    const dispatch = injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'stale prompt', 'dev-1', 'claude-code');
-    await seedAgent();
-
-    gates[0]();
-    await expect(manual).rejects.toMatchObject({ status: 409 });
-
-    await expect(dispatch).rejects.toThrow('binding changed');
-    expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
-    expect(guardSet().has('dev-1')).toBe(false);
-  });
-
-  it('guarded text injection waits for the guard, then pastes once it is released', async () => {
-    await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
-    expect(await lockManager.acquire('qa-1', 't1')).toBeTruthy();
-    setPollMs(1);
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined);
-    const enterSpy = vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
-    const { gates, holder: manual } = await startGuarded(() => manager.compactAgent('qa-1'));
-
-    const inject = manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 't1' });
-    await new Promise(r => setTimeout(r, 20));
-    expect(injectSpy).not.toHaveBeenCalled();
-
-    await drainHolderGates(gates, manual);
-
-    await inject;
-    expect(injectSpy).toHaveBeenCalledWith(expect.objectContaining({ paneId: '%3' }), 'file body', 'qa-1');
-    expect(enterSpy).toHaveBeenCalled();
-    expect(guardSet().has('qa-1')).toBe(false);
-  });
-
-  it('drops stale text injection when the agent was rebound during the guard wait', async () => {
-    await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
-    expect(await lockManager.acquire('qa-1', 't1')).toBeTruthy();
-    setPollMs(1);
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined);
-    const { gates, holder: manual } = await startGuarded(() => manager.compactAgent('qa-1'));
-
-    const inject = manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 't1' });
-    await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't2' });
-
-    gates[0]();
-    await expect(manual).rejects.toMatchObject({ status: 409 });
-
-    await expect(inject).rejects.toThrow('no longer bound');
-    expect(injectSpy).not.toHaveBeenCalledWith(expect.objectContaining({ paneId: '%3' }), 'file body', 'qa-1');
-    expect(guardSet().has('qa-1')).toBe(false);
+    gate.release();
+    await waitGuardFree('dev-1');
   });
 
   it('rejects manual compact while an image upload holds the guard, then allows it after the upload completes', async () => {
-    await seedAgent();
-    const { upload, releaseWrite } = await startBlockedUpload('dev-1');
+    await seedLiveAgent();
+    let releaseWrite!: () => void;
+    runner.writeFile.mockReturnValueOnce(new Promise<void>(r => { releaseWrite = r; }));
+    const upload = harness.manager.attachImageToRunningAgent('dev-1', PNG, 'png');
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
 
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
+    await expect(harness.manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
-    expect(execCalls().some(c => c.includes('C-c') || c.includes('/compact'))).toBe(false);
+    expect(cmds().some(c => c.includes('C-c') || c.includes('/compact'))).toBe(false);
 
     releaseWrite();
     await upload;
-
-    waitReadySpy.mockResolvedValue(undefined);
-    await expect(manager.compactAgent('dev-1')).resolves.toBeUndefined();
+    await expect(harness.manager.compactAgent('dev-1')).resolves.toBeUndefined();
   });
 
   it('rejects a second image upload while the first still holds the guard', async () => {
-    await seedAgent();
-    const { upload: first, releaseWrite } = await startBlockedUpload('dev-1');
+    await seedLiveAgent();
+    let releaseWrite!: () => void;
+    runner.writeFile.mockReturnValueOnce(new Promise<void>(r => { releaseWrite = r; }));
+    const first = harness.manager.attachImageToRunningAgent('dev-1', PNG, 'png');
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
 
-    await expect(
-      manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png'),
-    ).rejects.toMatchObject({ status: 409, message: expect.stringContaining('in progress') });
+    await expect(harness.manager.attachImageToRunningAgent('dev-1', PNG, 'png')).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('in progress'),
+    });
 
     releaseWrite();
     await first;
+    expect(runner.pastedPrompts).toHaveLength(1);
   });
 
   it('releases the guard when an upload fails, so a later compact is not blocked', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    (mockRunner.writeFile as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('disk full'));
+    await seedLiveAgent();
+    runner.writeFile.mockRejectedValueOnce(new Error('disk full'));
 
-    await expect(
-      manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png'),
-    ).rejects.toThrow('disk full');
+    await expect(harness.manager.attachImageToRunningAgent('dev-1', PNG, 'png')).rejects.toThrow('disk full');
 
-    waitReadySpy.mockResolvedValue(undefined);
-    await expect(manager.compactAgent('dev-1')).resolves.toBeUndefined();
+    await expect(harness.manager.compactAgent('dev-1')).resolves.toBeUndefined();
   });
 
   it('rejects manual compact with 409 while a clear holds the guard', async () => {
-    await seedAgent();
-    const { gates, holder: clear } = await startGuarded(() => manager.clearAgent('dev-1'));
+    await seedLiveAgent();
+    const gate = gateOn(c => c.includes('list-sessions'));
+    const clear = harness.manager.clearAgent('dev-1');
+    await vi.waitFor(() => expect(gate.hit()).toBe(true));
 
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
+    await expect(harness.manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
 
-    await drainHolderAndRelease(gates, clear, 'dev-1');
+    gate.release();
+    await clear;
+    await waitGuardFree('dev-1');
   });
-
 });
 
 describe('clearAgent', () => {
   it('sends /clear instead of /compact', async () => {
-    await seedAgent();
-    waitReadySpy.mockResolvedValue(undefined);
+    await seedLiveAgent();
 
-    await manager.clearAgent('dev-1');
+    await harness.manager.clearAgent('dev-1');
 
-    await vi.waitFor(() => expect(waitReadySpy).toHaveBeenCalledTimes(3));
-    await expectGuardReleased('dev-1');
-
-    const calls = execCalls();
-    const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/clear'));
+    const calls = cmds();
+    const literalIdx = idxOf(calls, c => isLiteral(c, '/clear'));
     expect(literalIdx).toBeGreaterThanOrEqual(0);
     expect(calls.some(c => c.includes('/compact'))).toBe(false);
-    const enterIdx = calls.findIndex((c, i) => i > literalIdx && c.includes('send-keys') && c.includes('Enter'));
-    expect(enterIdx).toBeGreaterThan(literalIdx);
+    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBeGreaterThan(literalIdx);
+    // /clear 同时清掉会话上的任务上下文标记,下一次派单必须重发完整上下文
+    expect(runner.sessions.option('dev-1', '@baxian-context-task-id')).toBe('');
+
+    await waitGuardFree('dev-1');
   });
 
-  it('dirties the composer with a space before C-c for codex, so a leftover draft is cleared and an empty-composer C-c cannot kill the REPL', async () => {
-    await seedAgent({ id: 'qa-1', paneId: '%3' });
-    waitReadySpy.mockResolvedValue(undefined);
+  it('dirties the composer with a comma before C-c for codex, so a leftover draft is cleared and an empty-composer C-c cannot kill the REPL', async () => {
+    await seedLiveAgent('qa-1', '%1');
 
-    await manager.clearAgent('qa-1');
-    await expectGuardReleased('qa-1');
+    await harness.manager.clearAgent('qa-1');
 
-    expect(waitReadySpy.mock.calls[0][2]).toBe('codex');
-    const calls = execCalls();
+    const calls = cmds();
     expect(calls.some(c => c.includes('send-keys') && c.includes('Escape'))).toBe(false);
-    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes(SPACE_LITERAL));
-    const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
-    const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/clear'));
-    expect(spaceIdx).toBeGreaterThanOrEqual(0);
-    expect(ccIdx).toBeGreaterThan(spaceIdx);
+    const commaIdx = idxOf(calls, c => isLiteral(c, COMMA_LITERAL));
+    const ccIdx = idxOf(calls, c => c.includes('send-keys') && c.includes('C-c'));
+    const literalIdx = idxOf(calls, c => isLiteral(c, '/clear'));
+    expect(commaIdx).toBeGreaterThanOrEqual(0);
+    expect(ccIdx).toBeGreaterThan(commaIdx);
     expect(literalIdx).toBeGreaterThan(ccIdx);
-    expect(calls[spaceIdx]).toContain("'%3'");
+    expect(calls[commaIdx]).toContain("'%1'");
+    // codex 的 REPL 没有被空 composer 的 C-c 打死
+    expect(runner.sessions.pane('qa-1')?.process).toBe('codex');
+
+    await waitGuardFree('qa-1');
   });
 
   it('rejects 404 for an unknown agent', async () => {
-    await expect(manager.clearAgent('nope')).rejects.toMatchObject({ status: 404 });
+    await expect(harness.manager.clearAgent('nope')).rejects.toMatchObject({ status: 404 });
   });
 
   it('rejects 409 when a compact is already in flight', async () => {
-    await seedAgent();
-    const { gates, holder: compact } = await startGuarded();
+    await seedLiveAgent();
+    const gate = gateOn(c => c.includes('list-sessions'));
+    const compact = harness.manager.compactAgent('dev-1');
+    await vi.waitFor(() => expect(gate.hit()).toBe(true));
 
-    await expect(manager.clearAgent('dev-1')).rejects.toMatchObject({
+    await expect(harness.manager.clearAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
 
-    await drainHolderAndRelease(gates, compact, 'dev-1');
+    gate.release();
+    await compact;
+    await waitGuardFree('dev-1');
   });
 });
 
-describe('waitForReplPromptReady (narrow-pane width-independent idle detection)', () => {
+describe('prompt injection under the compact guard', () => {
+  const DEV_PROMPT_MARK = 'T';
+
+  async function seedDevDispatch(taskId = 'task-1'): Promise<string> {
+    const task = await harness.seedTask({ id: taskId, status: 'in_progress', signalToken: 'devtok123456' });
+    await harness.seedAgent({ id: 'dev-1', taskId: task.id, paneId: '%0' });
+    await harness.acquireAgentLock('dev-1', task.id);
+    return task.id;
+  }
+
+  // 用一次卡住的图片上传真实占住守卫:它不发任何 tmux 命令,派单只会停在守卫上
+  function holdGuardByUpload(agentId = 'dev-1'): { settle: (fail?: boolean) => void; done: Promise<unknown> } {
+    let settle!: (fail?: boolean) => void;
+    runner.writeFile.mockReturnValueOnce(new Promise<void>((resolve, reject) => {
+      settle = fail => (fail ? reject(new Error('upload dropped')) : resolve());
+    }));
+    const done = harness.manager.attachImageToRunningAgent(agentId, PNG, 'png').catch(() => undefined);
+    return { settle, done };
+  }
+
+  async function settleTrace(): Promise<void> {
+    let prev = -1;
+    while (prev !== runner.exec.mock.calls.length) {
+      prev = runner.exec.mock.calls.length;
+      await new Promise(r => setTimeout(r, 25));
+    }
+  }
+
+  it('dispatch injection waits for an in-flight compact instead of pasting concurrently', async () => {
+    const taskId = await seedDevDispatch();
+    const upload = holdGuardByUpload();
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
+
+    const dispatch = harness.manager.startSession(taskId, 'dev-1', 'develop');
+    await settleTrace();
+    expect(cmds().some(c => c.includes('paste-buffer'))).toBe(false);
+    expect(runner.pastedPrompts).toEqual([]);
+
+    upload.settle(true);
+    await upload.done;
+
+    await expect(dispatch).resolves.toBe(true);
+    expect(runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(DEV_PROMPT_MARK) }]);
+  });
+
+  it('refuses to inject when the pre-inject frame shows a pending blocker (herdr: Blocked 是唯一拒发条件)', async () => {
+    const BLOCKER =
+      'Bash command\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend · ctrl+e to explain';
+    let blocked = false;
+    useRunner({
+      rules: [{
+        match: c => blocked && c.includes('capture-pane'),
+        reply: c => ({ stdout: `${c.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK'}\n${BLOCKER}` }),
+      }],
+    });
+    const taskId = await seedDevDispatch();
+    const upload = holdGuardByUpload();
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
+
+    const dispatch = harness.manager.startSession(taskId, 'dev-1', 'develop');
+    await settleTrace();
+    // 阻塞帧在守卫等待期间出现:就绪判定已过,pre-inject 复核是最后一道闸
+    blocked = true;
+    upload.settle(true);
+    await upload.done;
+
+    await expect(dispatch).rejects.toThrow(/pre-inject/);
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(orderOf(runner.execWithStdin, c => c.includes('load-buffer'))).toBe(-1);
+  });
+
+  it('samples the OSC title before the submit Enter so a post-submit working title cannot become the ack baseline', async () => {
+    const taskId = await seedDevDispatch();
+
+    await expect(harness.manager.startSession(taskId, 'dev-1', 'develop')).resolves.toBe(true);
+
+    const calls = cmds();
+    const pasteIdx = idxOf(calls, c => c.includes('paste-buffer'));
+    const titleIdx = idxOf(calls, isTitleRead, pasteIdx + 1);
+    const enterIdx = idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), pasteIdx + 1);
+    expect(pasteIdx).toBeGreaterThanOrEqual(0);
+    expect(titleIdx).toBeGreaterThan(pasteIdx);
+    expect(titleIdx).toBeLessThan(enterIdx);
+    // 基线标题取自提交前,提交后标题转 working 才能被认作 ack
+    expect(runner.sessions.pane('dev-1')?.title).toBe('⠂ Claude Code');
+  });
+
+  it('a guarded dispatch that goes stale after entry never touches the composer', async () => {
+    const taskId = await seedDevDispatch();
+    let calls = 0;
+    const guardBeforeInject = async (): Promise<boolean> => { calls += 1; return calls === 1; };
+
+    await expect(harness.manager.continueSession(taskId, 'dev-1', 'develop', { guardBeforeInject }))
+      .resolves.toBe(false);
+
+    const trace = cmds();
+    expect(orderOf(runner.execWithStdin, c => c.includes('load-buffer'))).toBe(-1);
+    expect(trace.some(c => c.includes('paste-buffer'))).toBe(false);
+    expect(trace.some(c => isLiteral(c, SPACE_LITERAL))).toBe(false);
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(runner.sessions.pane('dev-1')).toMatchObject({ composer: '', phase: 'idle' });
+  });
+
+  it('a guarded dispatch scrubs the composer inside the paste fence, after staging', async () => {
+    const taskId = await seedDevDispatch();
+
+    await expect(harness.manager.continueSession(taskId, 'dev-1', 'develop', {
+      guardBeforeInject: async () => true,
+    })).resolves.toBe(true);
+
+    const stageAt = orderOf(runner.execWithStdin, c => c.includes('load-buffer'));
+    const scrubAt = orderOf(runner.exec, c => isLiteral(c, SPACE_LITERAL));
+    const pasteAt = orderOf(runner.exec, c => c.includes('paste-buffer'));
+    expect(stageAt).toBeGreaterThan(0);
+    expect(scrubAt).toBeGreaterThan(stageAt);
+    expect(pasteAt).toBeGreaterThan(scrubAt);
+    expect(runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(DEV_PROMPT_MARK) }]);
+  });
+
+  it('aborts a guarded dispatch when the binding is released while waiting (task cancelled)', async () => {
+    const taskId = await seedDevDispatch();
+    const upload = holdGuardByUpload();
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
+
+    const dispatch = harness.manager.continueSession(taskId, 'dev-1', 'develop', {
+      guardBeforeInject: async () => true,
+    });
+    await settleTrace();
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    upload.settle(true);
+    await upload.done;
+
+    await expect(dispatch).rejects.toThrow('binding changed');
+    expect(runner.pastedPrompts).toEqual([]);
+  });
+
+  it('guarded text injection waits for the guard, then pastes once it is released', async () => {
+    await harness.seedAgent({ id: 'qa-1', paneId: '%1', taskId: 't1' });
+    await harness.acquireAgentLock('qa-1', 't1');
+    const upload = holdGuardByUpload('qa-1');
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
+
+    const inject = harness.manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 't1' });
+    await settleTrace();
+    expect(runner.pastedPrompts).toEqual([]);
+
+    upload.settle(true);
+    await upload.done;
+
+    await inject;
+    expect(runner.pastedPrompts).toEqual([{ pane: '%1', body: 'file body' }]);
+    expect(runner.sessions.pane('qa-1')?.phase).toBe('working');
+  });
+
+  it('drops stale text injection when the agent was rebound during the guard wait', async () => {
+    await harness.seedAgent({ id: 'qa-1', paneId: '%1', taskId: 't1' });
+    await harness.acquireAgentLock('qa-1', 't1');
+    const upload = holdGuardByUpload('qa-1');
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
+
+    const inject = harness.manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 't1' });
+    await settleTrace();
+    await harness.seedAgent({ id: 'qa-1', paneId: '%1', taskId: 't2' });
+    upload.settle(true);
+    await upload.done;
+
+    await expect(inject).rejects.toThrow('no longer bound');
+    expect(runner.pastedPrompts).toEqual([]);
+  });
+});
+
+describe('idle detection (width-independent, title-corroborated)', () => {
   const NARROW_IDLE_SCREEN =
     '合并门），合并动作留给你。\n' +
     '你合并后我再做本地清理（删\n' +
@@ -556,61 +544,73 @@ describe('waitForReplPromptReady (narrow-pane width-independent idle detection)'
     'merge。\n' +
     '\n' +
     '✻ Churned for 56s\n';
+  const CODEX_POPUP =
+    'permissions: YOLO mode\n\n› $bax\n  $baxian-task  Dispatch\n\n  Press enter to insert or esc to close\n';
+  const CODEX_IDLE = 'permissions: YOLO mode\n\n› \n\n  gpt-5.5 xhigh · ~/repo\n';
 
-  function mockPaneState(procTitle: string, screen: string, title: string): void {
-    (mockRunner.exec as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => {
-      if (cmd.includes('pane_current_command')) return { stdout: `BX_PANE_OK${procTitle}\n`, stderr: '', exitCode: 0 };
-      if (cmd.includes('pane_title')) return { stdout: `BX_PANE_OK${title}\n`, stderr: '', exitCode: 0 };
-      return { stdout: `BX_PANE_OK\n${screen}`, stderr: '', exitCode: 0 };
+  async function seedReviewDispatch(): Promise<string> {
+    const task = await harness.seedTask({
+      id: 'task-review',
+      status: 'review',
+      signalToken: 'tok123456789',
+      latestHeadSha: 'a'.repeat(40),
+      reviewHeadAnchorSha: 'a'.repeat(40),
+      passToken: 'aaaaaaaaaaaa',
+      failToken: 'bbbbbbbbbbbb',
     });
+    await harness.seedAgent({ id: 'qa-1', taskId: task.id, paneId: '%1' });
+    await harness.acquireAgentLock('qa-1', task.id);
+    return task.id;
   }
 
-  it('claude-code: narrow-pane reflowed idle screen (no anchor, no ❯) + "✳ " title → ready', async () => {
-    setPollMs(5);
-    mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '✳ 分析 baxian 服务 DEV agent 不遵照指示问题');
-    const tmux = new TmuxManager(mockRunner);
-    await expect(
-      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('dev-1', '%6'), 'claude-code', 1000),
-    ).resolves.toBeUndefined();
+  it('claude-code: a narrow-pane reflowed idle screen (no anchor, no ❯) with a "✳ " title is accepted as idle', async () => {
+    useRunner({
+      agents: { 'dev-1': { process: '2.1.199', screen: NARROW_IDLE_SCREEN, title: '✳ 分析 baxian 服务 DEV agent 不遵照指示问题' } },
+    });
+    await seedLiveAgent();
+
+    await expect(harness.manager.compactAgent('dev-1')).resolves.toBeUndefined();
+    expect(cmds().some(c => isLiteral(c, '/compact'))).toBe(true);
   });
 
-  it('claude-code: same narrow screen without the ✳ idle title still fails closed', async () => {
-    setPollMs(5);
-    mockPaneState('2.1.199', NARROW_IDLE_SCREEN, 'baxian');
-    const tmux = new TmuxManager(mockRunner);
-    await expect(
-      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('dev-1', '%6'), 'claude-code', 200),
-    ).rejects.toThrow(/repl not ready/);
-  });
+  it('claude-code: the same narrow screen without the ✳ idle title still fails closed', async () => {
+    useRunner(
+      { agents: { 'dev-1': { process: '2.1.199', screen: NARROW_IDLE_SCREEN, title: 'baxian' } } },
+      { manualCompactWaitMs: 50 },
+    );
+    await seedLiveAgent();
 
-  function setStableSpacingMs(ms: number): void {
-    (manager as never as { readyStableSpacingMs: number }).readyStableSpacingMs = ms;
-  }
-
-  it('stableIdle: a trust dialog never joins the idle streak and times out as a retryable ReplNotReadyError', async () => {
-    setStableSpacingMs(5);
-    mockPaneState('2.1.199', 'Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit\n', 'baxian');
-    const tmux = new TmuxManager(mockRunner);
-    await expect(
-      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('dev-1', '%6'), 'claude-code', 100, { stableIdle: true }),
-    ).rejects.toBeInstanceOf(ReplNotReadyError);
+    await expect(harness.manager.compactAgent('dev-1')).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('not at an idle REPL prompt'),
+    });
+    expect(cmds().some(c => c.includes('/compact'))).toBe(false);
   });
 
   it('stableIdle: a codex completion popup never joins the idle streak even though the YOLO banner anchor reads as idle', async () => {
-    setStableSpacingMs(5);
-    mockPaneState('codex', 'permissions: YOLO mode\n\n› $bax\n  $baxian-task  Dispatch\n\n  Press enter to insert or esc to close\n', 'codex');
-    const tmux = new TmuxManager(mockRunner);
-    await expect(
-      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('qa-1', '%7'), 'codex', 100, { stableIdle: true }),
-    ).rejects.toBeInstanceOf(ReplNotReadyError);
+    useRunner({ agents: { 'qa-1': { screen: CODEX_POPUP } } }, { cleanComposerWaitMs: 50 });
+    const taskId = await seedReviewDispatch();
+
+    await expect(harness.manager.startSession(taskId, 'qa-1', 'review')).rejects.toBeInstanceOf(ReplNotReadyError);
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
   it('stableIdle: the same codex banner with an empty composer still passes (control)', async () => {
-    setStableSpacingMs(5);
-    mockPaneState('codex', 'permissions: YOLO mode\n\n› \n\n  gpt-5.5 xhigh · ~/repo\n', 'codex');
-    const tmux = new TmuxManager(mockRunner);
-    await expect(
-      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('qa-1', '%7'), 'codex', 1000, { stableIdle: true }),
-    ).resolves.toBeUndefined();
+    useRunner({ agents: { 'qa-1': { screen: CODEX_IDLE } } }, { cleanComposerWaitMs: 1_000 });
+    const taskId = await seedReviewDispatch();
+
+    await expect(harness.manager.startSession(taskId, 'qa-1', 'review')).resolves.toBe(true);
+    expect(runner.pastedPrompts).toEqual([{ pane: '%1', body: expect.any(String) }]);
+  });
+
+  it('a startup dialog on the adopted pane blocks the dispatch instead of being pasted over', async () => {
+    useRunner({ agents: { 'dev-1': { screen: ' Enter to confirm · Esc to cancel\n' } } });
+    const task = await harness.seedTask({ id: 'task-1', status: 'in_progress', signalToken: 'devtok123456' });
+    await harness.seedAgent({ id: 'dev-1', taskId: task.id, paneId: '%0' });
+    await harness.acquireAgentLock('dev-1', task.id);
+
+    await expect(harness.manager.startSession(task.id, 'dev-1', 'develop'))
+      .rejects.toMatchObject({ partial: { dialogPending: true } });
+    expect(runner.pastedPrompts).toEqual([]);
   });
 });

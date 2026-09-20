@@ -1,24 +1,75 @@
 import { describe, it, expect, vi } from 'vitest';
-import type { BaxianEvent } from '../../src/shared/index.js';
-import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { TmuxManager } from '../../src/agent/tmux.js';
-import {
-  callInjectAndAwaitAck,
-  createManagerSuiteRunner,
-  useManagerSuiteHarness,
-  type AckResult,
-} from '../helpers/manager-harness.js';
+import type { BaxianEvent, TaskState } from '../../src/shared/index.js';
+import { DispatchTerminalError, type AgentManagerDeps, type ContinueSessionOpts } from '../../src/agent/manager.js';
+import type { AgentRuntimeKind } from '../../src/agent/tmux.js';
+import { classifyScreen } from '../../src/agent/detect/classify.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import { RUNTIME_PROFILES, type FakeRunner, type FakeRunnerOptions } from '../helpers/fake-runner.js';
 
-function makeInjectManager(runner: CommandRunner, ackMs: number, settleMs: number, resendMs?: number): AgentManager {
-  const mgr = harness.createManager({
-    runnerFactory: () => runner,
-    dispatchAckTimeoutMs: ackMs,
-    dispatchSettleTimeoutMs: settleMs,
-  });
-  Object.assign(mgr, { runtimeLivenessProbeMs: 1, ...(resendMs === undefined ? {} : { dispatchAckResendIntervalMs: resendMs }) });
-  return mgr;
+const harness = useManagerSuiteHarness();
+
+const FAST = { dispatchAckTimeoutMs: 150, dispatchSettleTimeoutMs: 150, dispatchAckResendIntervalMs: 30 };
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+// claude-code 的 working 规则只看屏幕底部,真实派发提示词的尾部是固定协议文本,自匹配基线只能由屏幕帧给出
+const BUSY_BODY = '✻ Thinking… (3s · esc to interrupt)';
+const BUSY_BASELINE = `${RUNTIME_PROFILES['claude-code'].idleFrame('/tmp/repo')}note:\n${BUSY_BODY}\n`;
+const WORKING_FRAME = '✻ Working… (12s · esc to interrupt)\n';
+const WORKING_TITLE = '⠹ Grooving…';
+const IDLE_TITLE = 'dev-1';
+const BUSY_LOOKING_DRAFT = '❯ 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n';
+const PANE_LOST = { stderr: 'no such pane: %0', exitCode: 1 };
+const SSH_TIMEOUT = { stderr: 'ssh: connect: connection timed out', exitCode: 1 };
+// tmux 送达了 Enter(OK 标记),REPL 没有响应:模型里的 pane 保持 idle、composer 原样
+const SWALLOW_ENTER = { stdout: 'BX_RUNTIME_OK\n' };
+const ENTER = /send-keys -t %0 (?:-- )?\S*Enter/;
+const isEnter = (cmd: string): boolean => ENTER.test(cmd);
+const isCtrlC = (cmd: string): boolean => cmd.includes("'C-c'");
+const isSnapshot = (cmd: string): boolean => cmd.includes('history_size');
+
+type RunnerSpec = FakeRunnerOptions & { runtime?: AgentRuntimeKind };
+
+function useRunner(spec: RunnerSpec = {}, timing: Partial<AgentManagerDeps> = {}): FakeRunner {
+  const { runtime, ...options } = spec;
+  const runner = createManagerSuiteRunner(runtime
+    ? { ...options, agents: { ...options.agents, 'dev-1': { runtime, ...options.agents?.['dev-1'] } } }
+    : options);
+  const config = structuredClone(harness.config);
+  if (runtime) config.project[0]!.agent[0]![0]!.runtime = runtime;
+  harness.runner = runner;
+  harness.manager = harness.createManager({ config, runnerFactory: () => runner, ...FAST, ...timing });
+  return runner;
 }
+
+async function seedDispatch(overrides: Partial<TaskState> = {}): Promise<TaskState> {
+  const task = await harness.seedTask({ signalToken: 'tok-T1', ...overrides });
+  await harness.seedAgent({ id: 'dev-1', taskId: task.id, paneId: '%0' });
+  return task;
+}
+
+const dispatch = (task: TaskState): Promise<boolean> => harness.manager.startSession(task.id, 'dev-1', 'develop');
+// 带 pass token 的派发走 stage/paste 路径,每一步都经真实 fence 复核
+const fencedDispatch = (task: TaskState): Promise<boolean> =>
+  harness.manager.startSession(task.id, 'dev-1', 'develop', { dispatchPassToken: task.signalToken });
+const continueDispatch = (task: TaskState, opts: ContinueSessionOpts = {}): Promise<boolean> =>
+  harness.manager.continueSession(task.id, 'dev-1', 'develop', opts);
+const fenceOn = (task: TaskState, token: string): ContinueSessionOpts => ({
+  guardBeforeInject: async () => (await harness.taskStore.get(task.id))?.signalToken === token,
+});
+
+async function rotatePass(task: TaskState, token: string): Promise<void> {
+  const fresh = await harness.taskStore.get(task.id);
+  await harness.taskStore.set({ ...fresh!, signalToken: token });
+}
+
+const cmds = (): string[] => harness.runner.exec.mock.calls.map(c => String(c[0]));
+const enters = (): string[] => harness.runner.sentKeys.filter(isEnter);
+const ctrlCs = (): string[] => harness.runner.sentKeys.filter(isCtrlC);
+const literals = (): string[] => harness.runner.sentKeys.filter(k => k.includes('send-keys -l'));
+const hasSessionProbes = (): string[] => cmds().filter(c => c.includes('has-session'));
+const afterFirstEnter = (): string[] => cmds().slice(cmds().findIndex(isEnter));
+const pane = () => harness.runner.sessions.pane('dev-1')!;
+const staged = (): string[] => harness.runner.execWithStdin.mock.calls.map(c => String(c[0]));
+const isAckUnknown = (err: unknown): boolean => err instanceof DispatchTerminalError && err.reason === 'ack_unknown';
 
 function ackInterventions(): BaxianEvent[] {
   return harness.events.filter(
@@ -26,1177 +77,548 @@ function ackInterventions(): BaxianEvent[] {
   );
 }
 
-type SnapRunner = CommandRunner & { sawEnter: () => boolean };
-
-function snapRunner(
-  frame: (enterSent: boolean) => string,
-  scrollback: (enterSent: boolean) => number = () => 0,
-): SnapRunner {
-  let enterSent = false;
-  return {
-    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-        enterSent = true;
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        return { stdout: `BX_PANE_OK|${scrollback(enterSent)}\n${frame(enterSent)}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\n', stderr: '', exitCode: 0 };
-      }
-      return { stdout: '', stderr: '', exitCode: 0 };
-    }),
-    writeFile: vi.fn(async (): Promise<void> => undefined),
-    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    sawEnter: () => enterSent,
-  } as unknown as SnapRunner;
+async function expectBinding(task: TaskState, bound: boolean): Promise<void> {
+  expect((await harness.agentStore.get('dev-1'))?.taskId).toBe(bound ? task.id : undefined);
+  expect(await harness.lockManager.isLocked('dev-1')).toBe(bound);
 }
 
-async function runAck(
-  runner: CommandRunner,
-  opts: {
-    ackMs: number;
-    settleMs: number;
-    prompt?: string;
-    lock?: boolean;
-    resendMs?: number;
-    guard?: () => Promise<boolean>;
-  } = { ackMs: 150, settleMs: 150 },
-): Promise<{ result?: AckResult; caught?: unknown; taskId: string }> {
-  const localManager = makeInjectManager(runner, opts.ackMs, opts.settleMs, opts.resendMs);
-  const t = await harness.seedTask();
-  await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-  if (opts.lock !== false) await harness.acquireAgentLock('dev-1');
-  const tmux = new TmuxManager(runner);
-  try {
-    const result = await callInjectAndAwaitAck(
-      localManager, tmux, '%0', opts.prompt ?? 'hello prompt', 'dev-1', 'claude-code', opts.guard,
-    );
-    return { result, taskId: t.id };
-  } catch (caught) {
-    return { caught, taskId: t.id };
-  }
-}
-const harness = useManagerSuiteHarness();
+describe('fenced dispatch: a rotated pass never reaches the pane', () => {
+  it('rotated while an upload holds the pane mutex: nothing is staged, pasted or typed', async () => {
+    const runner = useRunner();
+    const task = await seedDispatch();
+    let releaseWrite!: () => void;
+    runner.writeFile.mockReturnValueOnce(new Promise<void>(r => { releaseWrite = r; }));
+    const upload = harness.manager.attachImageToRunningAgent('dev-1', PNG, 'png');
+    await vi.waitFor(() => expect(runner.writeFile).toHaveBeenCalled());
 
-describe('injectAndAwaitAck pre-paste generation guard', () => {
-  it('aborts between the pane mutex and the paste when the replay generation moved on', async () => {
-    const localManager = makeInjectManager(createManagerSuiteRunner(), 150, 150);
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined);
-    const guard = vi.fn<[], Promise<boolean>>()
-      .mockResolvedValueOnce(true)
-      .mockResolvedValue(false);
+    const dispatching = fencedDispatch(task);
+    await vi.waitFor(async () => expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBe(task.id));
+    await rotatePass(task, 'tok-T2');
+    releaseWrite();
+    await upload;
 
-    const result = await callInjectAndAwaitAck(
-      localManager, new TmuxManager(createManagerSuiteRunner()), '%0', 'prompt', 'dev-1', 'claude-code', guard,
-    );
-
-    expect(result).toEqual({ acked: false, composerDelivered: false, aborted: true });
-    expect(injectSpy).not.toHaveBeenCalled();
-    expect(guard).toHaveBeenCalledTimes(2);
+    await expect(dispatching).resolves.toBe(false);
+    expect(staged().filter(c => c.startsWith('tmux load-buffer'))).toEqual([]);
+    expect(runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringMatching(/\.png $/) }]);
+    expect(runner.sentKeys).toEqual([]);
   });
 
-  it('re-checks the fence inside the paste and never issues the remote paste command', async () => {
-    const runner = createManagerSuiteRunner();
-    const localManager = makeInjectManager(runner, 150, 150);
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const guard = vi.fn<[], Promise<boolean>>()
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(true)
-      .mockResolvedValue(false);
+  it('rotated during buffer staging: the buffer is dropped and the paste never happens', async () => {
+    const task = await seedDispatch();
+    const runner = useRunner({
+      rules: [{
+        match: /^tmux load-buffer/,
+        reply: async () => { await rotatePass(task, 'tok-T2'); return { outcome: 'ok' as const }; },
+      }],
+    });
 
-    const result = await callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', guard,
-    );
+    await expect(fencedDispatch(task)).resolves.toBe(false);
 
-    expect(result).toEqual({ acked: false, composerDelivered: false, aborted: true });
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    expect(cmds.some(cmd => cmd.includes('paste-buffer'))).toBe(false);
-    expect(guard).toHaveBeenCalledTimes(3);
+    expect(cmds().some(c => c.includes('delete-buffer'))).toBe(true);
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(runner.sentKeys).toEqual([]);
+    expect(pane().composer).toBe('');
   });
 
-  it('a rotation landing during the staging exec aborts before the paste ever starts', async () => {
-    const t = await harness.seedTask({ signalToken: 'stage-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      execWithStdin: vi.fn(async (cmd: string, stdin: Buffer) => {
-        if (cmd.includes('load-buffer')) {
-          const fresh = await harness.taskStore.get(t.id);
-          await harness.taskStore.set({ ...fresh!, signalToken: 'stage-T2' });
-        }
-        return (base.execWithStdin as (cmd: string, stdin: Buffer) => Promise<ExecResult>)(cmd, stdin);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 150, 150);
-    const guard = async (): Promise<boolean> =>
-      (await harness.taskStore.get(t.id))?.signalToken === 'stage-T1';
-
-    const result = await callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', guard,
-    );
-
-    expect(result).toEqual({ acked: false, composerDelivered: false, aborted: true });
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    expect(cmds.some(cmd => cmd.includes('paste-buffer'))).toBe(false);
-  });
-
-  it('serializes the final fence and the paste against task mutations', async () => {
-    const t = await harness.seedTask({ signalToken: 'lock-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
+  it('serializes the final fence and the paste against task mutations; the rotated prompt is scrubbed, not submitted', async () => {
     let releasePaste!: () => void;
-    const pasteGate = new Promise<void>((resolve) => { releasePaste = resolve; });
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('paste-buffer')) await pasteGate;
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 150, 150);
-    const guard = async (): Promise<boolean> =>
-      (await harness.taskStore.get(t.id))?.signalToken === 'lock-T1';
+    const pasteGate = new Promise<void>(r => { releasePaste = r; });
+    const runner = useRunner({ onExec: async cmd => { if (cmd.includes('paste-buffer')) await pasteGate; } });
+    const task = await seedDispatch();
 
-    const ackPromise = callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', guard,
-    );
-    const pasteStarted = (): boolean =>
-      (runner.exec as ReturnType<typeof vi.fn>).mock.calls.some(call => String(call[0]).includes('paste-buffer'));
-    for (let i = 0; i < 400 && !pasteStarted(); i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(pasteStarted()).toBe(true);
-
+    const dispatching = fencedDispatch(task);
+    await vi.waitFor(() => expect(cmds().some(c => c.includes('paste-buffer'))).toBe(true));
     let rotated = false;
-    const rotatePromise = localManager
-      .updateTask(t.id, { signalToken: 'lock-T2' })
-      .then(() => { rotated = true; });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const rotation = harness.manager.updateTask(task.id, { signalToken: 'tok-T2' }).then(() => { rotated = true; });
+    await new Promise(r => setTimeout(r, 50));
     expect(rotated).toBe(false);
 
     releasePaste();
-    const result = await ackPromise;
-    await rotatePromise;
+    await expect(dispatching).resolves.toBe(false);
+    await rotation;
 
-    expect(rotated).toBe(true);
-    expect((await harness.taskStore.get(t.id))?.signalToken).toBe('lock-T2');
-    expect(result).toEqual({ acked: false, composerDelivered: false, aborted: true });
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    expect(cmds.some(cmd => cmd.includes('send-keys') && cmd.includes('Enter'))).toBe(false);
+    expect((await harness.taskStore.get(task.id))?.signalToken).toBe('tok-T2');
+    expect(runner.pastedPrompts).toHaveLength(1);
+    expect(enters()).toEqual([]);
+    expect(pane().composer).toBe('');
   });
 
-  it('cleans up the staged buffer when the paste exec fails', async () => {
-    const t = await harness.seedTask({ signalToken: 'fail-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('paste-buffer')) return { stdout: '', stderr: 'pane vanished', exitCode: 1 };
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 150, 150);
-
-    await expect(callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', async () => true,
-    )).rejects.toThrow(/pane vanished/);
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    expect(cmds.some(cmd => cmd.includes('delete-buffer'))).toBe(true);
-  });
-
-  it('cleans up the staged buffer when the paste transport dies with an unknown outcome', async () => {
-    const t = await harness.seedTask({ signalToken: 'lost-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('paste-buffer')) throw new Error('ssh transport lost');
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 150, 150);
-
-    await expect(callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', async () => true,
-    )).rejects.toThrow(/ssh transport lost/);
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    expect(cmds.some(cmd => cmd.includes('delete-buffer'))).toBe(true);
-  });
-
-  it('reconciles a consumed buffer after an unknown paste outcome by scrubbing the composer', async () => {
-    const t = await harness.seedTask({ signalToken: 'unknown-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('paste-buffer')) throw new Error('ssh reply lost');
-        if (cmd.includes('delete-buffer')) return { stdout: '', stderr: 'no buffer', exitCode: 1 };
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 150, 150);
-
-    await expect(callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', async () => true,
-    )).rejects.toThrow(/ssh reply lost/);
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    const composerScrubs = cmds.filter(cmd => cmd.includes('send-keys') && cmd.includes('C-c'));
-    expect(composerScrubs.length).toBeGreaterThanOrEqual(2);
-  });
-
-  it('ack resends re-check the fence and never re-submit a rotated composer', async () => {
-    const t = await harness.seedTask({ signalToken: 'resend-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          const fresh = await harness.taskStore.get(t.id);
-          await harness.taskStore.set({ ...fresh!, signalToken: 'resend-T2' });
-        }
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 400, 150);
-    Object.assign(localManager, { dispatchAckResendIntervalMs: 30 });
-    const guard = async (): Promise<boolean> =>
-      (await harness.taskStore.get(t.id))?.signalToken === 'resend-T1';
-
-    const result = await callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', guard,
-    );
-
-    expect(result).toEqual({ acked: false, composerDelivered: false, aborted: true });
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    const enterSends = cmds.filter(cmd => cmd.includes('send-keys') && cmd.includes('Enter'));
-    expect(enterSends).toHaveLength(1);
-    const composerScrubs = cmds.filter(cmd => cmd.includes('send-keys') && cmd.includes('C-c'));
-    expect(composerScrubs.length).toBeGreaterThanOrEqual(2);
-  });
-
-  it('escalates when the stale composer cannot be scrubbed after a fence-rejected Enter', async () => {
-    const t = await harness.seedTask({ signalToken: 'scrub-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
+  it('a rotation landing after the paste aborts before Enter and scrubs the composer', async () => {
     let pasted = false;
     let releaseSnapshot!: () => void;
-    const snapGate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      exec: vi.fn(async (cmd: string) => {
+    const snapGate = new Promise<void>(r => { releaseSnapshot = r; });
+    const runner = useRunner({
+      onExec: async cmd => {
         if (cmd.includes('paste-buffer')) pasted = true;
-        if (pasted && cmd.includes('history_size')) await snapGate;
-        if (pasted && cmd.includes('send-keys') && cmd.includes('C-c')) {
-          return { stdout: '', stderr: 'pane is gone', exitCode: 1 };
-        }
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 150, 150);
-    const guard = async (): Promise<boolean> =>
-      (await harness.taskStore.get(t.id))?.signalToken === 'scrub-T1';
+        if (pasted && isSnapshot(cmd)) await snapGate;
+      },
+    });
+    const task = await seedDispatch();
 
-    const ackPromise = callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', guard,
-    );
-    for (let i = 0; i < 400 && !pasted; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(pasted).toBe(true);
-    await localManager.updateTask(t.id, { signalToken: 'scrub-T2' });
+    const dispatching = fencedDispatch(task);
+    await vi.waitFor(() => expect(pasted).toBe(true));
+    await harness.manager.updateTask(task.id, { signalToken: 'tok-T2' });
     releaseSnapshot();
 
-    await expect(ackPromise).rejects.toThrow(/composer/);
+    await expect(dispatching).resolves.toBe(false);
+    expect(runner.pastedPrompts).toHaveLength(1);
+    expect(enters()).toEqual([]);
+    expect(pane().composer).toBe('');
   });
 
-  it('aborts before Enter when the pass rotates after the paste', async () => {
-    const t = await harness.seedTask({ signalToken: 'enter-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
+  it('escalates to ack_unknown and keeps the binding when the fence-rejected composer cannot be scrubbed', async () => {
     let pasted = false;
     let releaseSnapshot!: () => void;
-    const snapGate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
-    const base = createManagerSuiteRunner();
-    const runner = {
-      ...base,
-      exec: vi.fn(async (cmd: string) => {
+    const snapGate = new Promise<void>(r => { releaseSnapshot = r; });
+    useRunner({
+      onExec: async cmd => {
         if (cmd.includes('paste-buffer')) pasted = true;
-        if (pasted && cmd.includes('history_size')) await snapGate;
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
-      }),
-    } as unknown as CommandRunner;
-    const localManager = makeInjectManager(runner, 150, 150);
-    const guard = async (): Promise<boolean> =>
-      (await harness.taskStore.get(t.id))?.signalToken === 'enter-T1';
+        if (pasted && isSnapshot(cmd)) await snapGate;
+      },
+      rules: [{ match: cmd => pasted && isCtrlC(cmd), reply: { stderr: 'pane is gone', exitCode: 1 } }],
+    });
+    const task = await seedDispatch();
 
-    const ackPromise = callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'claude-code', guard,
-    );
-    for (let i = 0; i < 400 && !pasted; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(pasted).toBe(true);
-    await localManager.updateTask(t.id, { signalToken: 'enter-T2' });
+    const dispatching = fencedDispatch(task);
+    await vi.waitFor(() => expect(pasted).toBe(true));
+    await harness.manager.updateTask(task.id, { signalToken: 'tok-T2' });
     releaseSnapshot();
 
-    const result = await ackPromise;
-    expect(result).toEqual({ acked: false, composerDelivered: false, aborted: true });
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(call => String(call[0]));
-    expect(cmds.some(cmd => cmd.includes('send-keys') && cmd.includes('Enter'))).toBe(false);
+    await expect(dispatching).rejects.toMatchObject({
+      name: 'DispatchTerminalError',
+      reason: 'ack_unknown',
+      message: expect.stringMatching(/could not be scrubbed/),
+    });
+    expect(enters()).toEqual([]);
+    await expectBinding(task, true);
+  });
+
+  it('ack resends re-check the fence: a pass rotated after Enter is never re-submitted and the composer is scrubbed', async () => {
+    const task = await seedDispatch();
+    const runner = useRunner({
+      rules: [{ match: isEnter, reply: async () => { await rotatePass(task, 'tok-T2'); return SWALLOW_ENTER; } }],
+    }, { dispatchAckTimeoutMs: 400 });
+
+    await expect(fencedDispatch(task)).resolves.toBe(false);
+
+    expect(enters()).toHaveLength(1);
+    expect(runner.pastedPrompts).toHaveLength(1);
+    expect(pane().composer).toBe('');
+    expect(ctrlCs()).toHaveLength(2);
+    expect(ackInterventions()).toEqual([]);
+  });
+
+  it('stages the buffer first, scrubs the composer inside the paste fence, then pastes', async () => {
+    const runner = useRunner();
+    const task = await seedDispatch();
+
+    await expect(fencedDispatch(task)).resolves.toBe(true);
+
+    const stagedAt = runner.execWithStdin.mock.invocationCallOrder[0]!;
+    const orderOf = (pick: (cmd: string) => boolean): number =>
+      runner.exec.mock.invocationCallOrder[cmds().findIndex(pick)]!;
+    expect(stagedAt).toBeLessThan(orderOf(c => c.includes('send-keys -l')));
+    expect(orderOf(c => c.includes('send-keys -l'))).toBeLessThan(orderOf(isCtrlC));
+    expect(orderOf(isCtrlC)).toBeLessThan(orderOf(c => c.includes('paste-buffer')));
+    expect(runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining('token: tok-T1') }]);
   });
 });
 
-describe('injectAndAwaitAck ack timeout', () => {
-  it('emits human.intervention dispatch-ack-timeout, does not throw, does not send C-c after submit', async () => {
-    const sentCommands: string[] = [];
-    const stuckRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sentCommands.push(cmd);
-        if (cmd.includes('capture-pane')) {
-          const header = cmd.includes('history_size') ? 'BX_PANE_OK|42' : 'BX_PANE_OK';
-          return { stdout: `${header}\nstuck-screen\n`, stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const localManager = harness.createManager({
-      runnerFactory: () => stuckRunner,
-      dispatchAckTimeoutMs: 50,
-    });
+describe('paste failures clean up the staged buffer', () => {
+  it.each([
+    ['exits non-zero', { stderr: 'pane vanished', exitCode: 1 }, /pane vanished/],
+    ['transport throws', () => { throw new Error('ssh transport lost'); }, /ssh transport lost/],
+  ] as const)('paste %s: buffer dropped, nothing pasted, binding released', async (_name, reply, pattern) => {
+    const runner = useRunner({ rules: [{ match: 'paste-buffer', reply }] });
+    const task = await seedDispatch();
 
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
+    await expect(fencedDispatch(task)).rejects.toThrow(pattern);
 
-    const tmux = new TmuxManager(stuckRunner);
+    expect(cmds().some(c => c.includes('delete-buffer'))).toBe(true);
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(pane().composer).toBe('');
+    await expectBinding(task, false);
+  });
 
-    await expect(
-      callInjectAndAwaitAck(localManager, tmux, '%0', 'hello prompt', 'dev-1', 'claude-code'),
-    ).resolves.toEqual({ acked: false, composerDelivered: true });
+  it('a paste that landed but lost its reply is reconciled by scrubbing the composer', async () => {
+    const runner = useRunner({ rules: [{ match: 'paste-buffer', reply: { outcome: 'applied-lost' } }] });
+    const task = await seedDispatch();
 
-    const interventions = ackInterventions();
-    expect(interventions).toHaveLength(1);
-    expect(interventions[0]).toMatchObject({
-      type: 'human.intervention',
+    await expect(fencedDispatch(task)).rejects.toThrow(/neither marker returned/);
+
+    expect(runner.pastedPrompts).toHaveLength(1);
+    expect(cmds().some(c => c.includes('delete-buffer'))).toBe(true);
+    expect(ctrlCs()).toHaveLength(2);
+    expect(pane().composer).toBe('');
+  });
+});
+
+describe('ack timeout', () => {
+  it('a swallowed Enter holds for a human: dispatch-ack-timeout intervention, no C-c, prompt left queued, binding kept', async () => {
+    useRunner({ rules: [{ match: isEnter, reply: SWALLOW_ENTER }] }, { dispatchAckTimeoutMs: 50 });
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).resolves.toBe(true);
+
+    expect(ackInterventions()).toEqual([expect.objectContaining({
       projectId: 'proj',
       agentId: 'dev-1',
-      taskId: t.id,
-    });
-    expect((interventions[0].data as { paneId?: string }).paneId).toBe('%0');
-
-    const firstEnterIdx = sentCommands.findIndex(c => c.includes('send-keys') && c.includes('Enter'));
-    expect(firstEnterIdx).toBeGreaterThanOrEqual(0);
-    const postSubmitCc = sentCommands.slice(firstEnterIdx).filter(c => c.includes('send-keys') && c.includes('C-c'));
-    expect(postSubmitCc).toHaveLength(0);
-
-    expect((await harness.taskStore.get(t.id))?.status).toBe('in_progress');
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBe(t.id);
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
-
-    const ackTimeoutEvent = interventions[0];
-    expect((ackTimeoutEvent.data as { note?: string }).note).toMatch(/REPL did not acknowledge/);
+      taskId: task.id,
+      data: expect.objectContaining({ paneId: '%0', note: expect.stringMatching(/REPL did not acknowledge/) }),
+    })]);
+    expect(afterFirstEnter().filter(isCtrlC)).toEqual([]);
+    expect(pane().composer).toContain('token: tok-T1');
+    expect((await harness.taskStore.get(task.id))?.status).toBe('in_progress');
+    await expectBinding(task, true);
   });
 
-  it('injectAndAwaitAck re-sends Enter when the first is swallowed, then acks', async () => {
+  it('re-sends Enter when the first is swallowed, then acks', async () => {
     let enterCount = 0;
-    const flakyRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterCount++;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          const visible = enterCount >= 2 ? '✻ Working… (3s · esc to interrupt)\n' : 'idle composer\n';
-          const header = cmd.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
-          return { stdout: `${header}\n${visible}`, stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const localManager = makeInjectManager(flakyRunner, 3000, 10);
-    (localManager as unknown as { dispatchAckResendIntervalMs: number }).dispatchAckResendIntervalMs = 50;
-    const tmux = new TmuxManager(flakyRunner);
+    useRunner({
+      rules: [{ match: isEnter, reply: () => (++enterCount === 1 ? SWALLOW_ENTER : { outcome: 'ok' as const }) }],
+    }, { dispatchAckTimeoutMs: 3000, dispatchAckResendIntervalMs: 50 });
+    const task = await seedDispatch();
 
-    const result = await callInjectAndAwaitAck(localManager, tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
+    await expect(dispatch(task)).resolves.toBe(true);
 
-    expect(result).toEqual({ acked: true, composerDelivered: true });
-    expect(enterCount).toBeGreaterThanOrEqual(2);
+    expect(enters().length).toBeGreaterThanOrEqual(2);
+    expect(ackInterventions()).toEqual([]);
+    expect(pane().phase).toBe('working');
   });
 
-  it('infrastructure failure during the post-Enter ack wait throws DispatchTerminalError, not human.intervention', async () => {
-    let enterSent = false;
-    const failingRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterSent = true;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          if (!enterSent) {
-            const header = cmd.includes('history_size') ? 'BX_PANE_OK|10' : 'BX_PANE_OK';
-            return { stdout: `${header}\nidle\n`, stderr: '', exitCode: 0 };
-          }
-          return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const { caught } = await runAck(failingRunner, { ackMs: 50, settleMs: 200, lock: false });
-    expect(caught).toBeInstanceOf(DispatchTerminalError);
-    expect(ackInterventions()).toHaveLength(0);
-  });
-});
-
-describe('injectAndAwaitAck settles the pane before Enter', () => {
-  it('settles the pane before Enter, then acks on submission evidence (idle→busy) after Enter', async () => {
-    const order: string[] = [];
-    const preEnter = [
-      'box: read /img.png\n',
-      'box: [Image #1]\n',
-      'box: [Image #1]\n',
-    ];
-    let enterSent = false;
-    let snap = 0;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterSent = true;
-          order.push('enter');
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('history_size')) {
-          order.push(enterSent ? 'snap-post' : 'snap-pre');
-          const visible = enterSent
-            ? 'box: [Image #1]\n✻ Thinking… (2s · esc to interrupt)\n'
-            : preEnter[Math.min(snap++, preEnter.length - 1)];
-          return { stdout: `BX_PANE_OK|0\n${visible}`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: 'BX_PANE_OK\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const { result } = await runAck(runner, { ackMs: 2000, settleMs: 2000 });
-
-    expect(result).toEqual({ acked: true, composerDelivered: true });
-    const enterIdx = order.indexOf('enter');
-    expect(enterIdx).toBeGreaterThan(-1);
-    const settleSnapsBeforeEnter = order.slice(0, enterIdx).filter(x => x === 'snap-pre').length;
-    expect(settleSnapsBeforeEnter).toBeGreaterThanOrEqual(2);
-    expect(order.indexOf('snap-post')).toBeGreaterThan(enterIdx);
-  });
-});
-
-describe('injectAndAwaitAck never-settle + swallowed Enter is non-ackable', () => {
-  it('does NOT false-ack from redraw deltas when the runtime never goes busy', async () => {
-    let n = 0;
-    let enterSent = false;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterSent = true;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('history_size')) {
-          return { stdout: `BX_PANE_OK|0\nframe ${n++}\n`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: `BX_PANE_OK\ncomposer still open ${n++}\n[Image #1] attaching\n`, stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const { result, taskId } = await runAck(runner, { ackMs: 60, settleMs: 60 });
-
-    expect(result).toEqual({ acked: false, composerDelivered: true });
-    expect(enterSent).toBe(true);
-    expect(ackInterventions()).toHaveLength(1);
-    expect((await harness.taskStore.get(taskId))?.status).toBe('in_progress');
-    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
-  });
-});
-
-describe('injectAndAwaitAck post-approve edge cases', () => {
-  it('acks a quick task on its brief idle-to-busy flash after Enter', async () => {
-    const runner = snapRunner(enterSent => (enterSent ? '✻ Working… (3s · esc to interrupt)\n' : 'composer\n'), () => 5);
-    const { result } = await runAck(runner, { ackMs: 1000, settleMs: 1000 });
-    expect(result).toEqual({ acked: true, composerDelivered: true });
-    expect(runner.sawEnter()).toBe(true);
-  });
-
-  it('does NOT ack on scrollback growth from an uncommitted attach redraw when runtime never gets busy', async () => {
-    let h = 5;
-    const runner = snapRunner(() => 'composer still open\n', enterSent => (enterSent ? ++h : h));
-    const { result } = await runAck(runner, { ackMs: 150, settleMs: 80 });
-    expect(result).toEqual({ acked: false, composerDelivered: true });
-    expect(runner.sawEnter()).toBe(true);
-    expect(ackInterventions()).toHaveLength(1);
-  });
-
-  it('a failed sendEnter is raw cleanup, not ack_unknown', async () => {
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-        }
-        if (cmd.includes('history_size')) {
-          return { stdout: 'BX_PANE_OK|5\nidle\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: 'BX_PANE_OK\nidle\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const { caught } = await runAck(runner, { ackMs: 100, settleMs: 100 });
-    expect(caught).toBeInstanceOf(Error);
-    expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
-  });
-
-  it('does NOT ack on busy text that was already in the pasted prompt when Enter is swallowed', async () => {
-    const screen = `do X\n  esc to interrupt\n`;
-    let pasted = false;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('paste-buffer')) {
-          pasted = true;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('history_size')) {
-          return { stdout: `BX_PANE_OK|3\n${pasted ? screen : '❯ \n'}`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: `BX_PANE_OK\n${pasted ? screen : '❯ \n'}`, stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const { result } = await runAck(runner, { ackMs: 150, settleMs: 150, prompt: 'do X\n  esc to interrupt' });
-    expect(result).toEqual({ acked: false, composerDelivered: true });
-    expect(ackInterventions()).toHaveLength(1);
-  });
-
-  it('a pre-Enter settle/capture failure is not ack_unknown and never sends Enter', async () => {
-    const sent: string[] = [];
-    let snaps = 0;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('history_size')) {
-          snaps++;
-          if (snaps === 1) return { stdout: 'BX_PANE_OK|1\ncomposer\n', stderr: '', exitCode: 0 };
-          return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 150 });
-    expect(caught).toBeInstanceOf(Error);
-    expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
-    const enterCmds = sent.filter(c => c.includes('send-keys') && c.includes('Enter'));
-    expect(enterCmds).toHaveLength(0);
-  });
-});
-
-describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () => {
-  const ccCmds = (sent: string[]): string[] =>
-    sent.filter(c => c.includes('send-keys') && c.includes('C-c'));
-  const hasSessionCmds = (sent: string[]): string[] =>
-    sent.filter(c => c.includes('has-session'));
-
-  function recordRunner(sent: string[], respond: (cmd: string) => ExecResult | undefined): CommandRunner {
-    return {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        return respond(cmd) ?? { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    } as unknown as CommandRunner;
-  }
-
-  it('clears the composer draft after a pre-Enter capture failure → raw, never Enter, no kill probe', async () => {
-    const sent: string[] = [];
-    let snaps = 0;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('history_size')) {
-        snaps++;
-        if (snaps === 1) return { stdout: 'BX_PANE_OK|1\ncomposer\n', stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
-      }
-      return undefined;
+  it('an infrastructure failure after Enter is ack_unknown: no intervention, no C-c, no has-session probe, binding kept', async () => {
+    let enterSeen = false;
+    let dropped = false;
+    useRunner({
+      onExec: cmd => {
+        if (enterSeen && !dropped) { dropped = true; harness.runner.sessions.dropPane('dev-1', '%0'); }
+        if (isEnter(cmd)) enterSeen = true;
+      },
     });
-    const { caught } = await runAck(runner);
-    expect(caught).toBeInstanceOf(Error);
-    expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
-    expect(ccCmds(sent)).toHaveLength(2);
-    expect(hasSessionCmds(sent)).toHaveLength(0);
-    expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(0);
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).rejects.toSatisfy(isAckUnknown);
+
+    expect(ackInterventions()).toEqual([]);
+    expect(afterFirstEnter().filter(isCtrlC)).toEqual([]);
+    expect(hasSessionProbes()).toEqual([]);
+    await expectBinding(task, true);
+  });
+});
+
+describe('submission evidence', () => {
+  it('sends Enter only after the pane settles, then acks on the idle→busy evidence', async () => {
+    let redraws = 0;
+    useRunner({
+      rules: [{
+        match: cmd => isSnapshot(cmd) && redraws < 2,
+        reply: () => ({ stdout: `BX_PANE_OK|0\nbox: [Image #${++redraws}]\n` }),
+      }],
+    }, { dispatchSettleTimeoutMs: 2000, dispatchAckTimeoutMs: 2000 });
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).resolves.toBe(true);
+
+    const enterIdx = cmds().findIndex(isEnter);
+    expect(cmds().slice(0, enterIdx).filter(isSnapshot).length).toBeGreaterThanOrEqual(3);
+    expect(cmds().slice(enterIdx).some(isSnapshot)).toBe(true);
+    expect(ackInterventions()).toEqual([]);
+  });
+
+  it('acks on a brief idle→busy flash after Enter and never touches the composer afterwards', async () => {
+    const runner = useRunner({ ackHoldCaptures: 2 });
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).resolves.toBe(true);
+
+    expect(runner.pastedPrompts).toHaveLength(1);
+    expect(pane().composer).toBe('');
+    expect(ackInterventions()).toEqual([]);
+    expect(afterFirstEnter().filter(isCtrlC)).toEqual([]);
+    expect(hasSessionProbes()).toEqual([]);
+  });
+
+  it('samples the title before Enter: a self-matching baseline still acks through the working title', async () => {
+    expect(classifyScreen('claude-code', BUSY_BASELINE).state).toBe('working');
+    let enterSeen = false;
+    useRunner({
+      agents: { 'dev-1': { title: '' } },
+      onExec: cmd => { if (isEnter(cmd)) enterSeen = true; },
+      rules: [{ match: isSnapshot, reply: () => (enterSeen ? { outcome: 'ok' as const } : { stdout: `BX_PANE_OK|0\n${BUSY_BASELINE}` }) }],
+    });
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).resolves.toBe(true);
+
+    expect(ackInterventions()).toEqual([]);
+    expect(pane().phase).toBe('working');
+  });
+
+  type Snapshot = { frame: string; history?: number } | null;
+  it.each<{ name: string; title?: string; busy?: true; snapshot?: (enterSeen: boolean) => Snapshot }>([
+    {
+      name: 'the runtime never goes busy while redraw deltas keep changing the frame',
+      snapshot: (() => { let n = 0; return () => ({ frame: `> frame ${n++}\n` }); })(),
+    },
+    {
+      name: 'scrollback grows from an uncommitted attach redraw',
+      snapshot: (() => { let h = 5; return (enterSeen: boolean) => ({ frame: '❯ \n', history: enterSeen ? ++h : h }); })(),
+    },
+    { name: 'the baseline after the paste already matches a working rule', title: '', busy: true, snapshot: () => ({ frame: BUSY_BASELINE }) },
+    {
+      name: 'the composer "clears" after submit but the baseline was busy',
+      title: '',
+      busy: true,
+      snapshot: enterSeen => ({ frame: enterSeen ? 'running the task now\n' : BUSY_BASELINE }),
+    },
+    {
+      name: 'a busy baseline keeps redrawing an attach',
+      title: '',
+      busy: true,
+      snapshot: (() => { let n = 0; return () => ({ frame: `${BUSY_BASELINE}[Image #1] frame ${n++}\n` }); })(),
+    },
+    {
+      name: 'a settled busy baseline gets a late attach redraw',
+      title: '',
+      busy: true,
+      snapshot: (() => { let n = 0; return (enterSeen: boolean) => ({ frame: enterSeen ? `${BUSY_BASELINE}[Image #1] frame ${n++}\n` : BUSY_BASELINE }); })(),
+    },
+  ])('a swallowed Enter never false-acks: $name', async ({ title, busy, snapshot }) => {
+    if (busy) expect(classifyScreen('claude-code', BUSY_BASELINE).state).toBe('working');
+    let enterSeen = false;
+    useRunner({
+      ...(title === undefined ? {} : { agents: { 'dev-1': { title } } }),
+      rules: [
+        { match: isEnter, reply: () => { enterSeen = true; return SWALLOW_ENTER; } },
+        ...(snapshot ? [{
+          match: isSnapshot,
+          reply: () => {
+            const view = snapshot(enterSeen);
+            return view === null ? { outcome: 'ok' as const } : { stdout: `BX_PANE_OK|${view.history ?? 0}\n${view.frame}` };
+          },
+        }] : []),
+      ],
+    }, { dispatchAckTimeoutMs: 150, dispatchSettleTimeoutMs: 80 });
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).resolves.toBe(true);
+
+    expect(enters().length).toBeGreaterThanOrEqual(1);
+    expect(ackInterventions()).toHaveLength(1);
+    expect(afterFirstEnter().filter(isCtrlC)).toEqual([]);
+    expect((await harness.taskStore.get(task.id))?.status).toBe('in_progress');
+    await expectBinding(task, true);
+  });
+
+  it.each<[AgentRuntimeKind, string]>([
+    ['opencode', '帮我看下 esc to interrupt 这个判定'],
+    ['qodercli', '文案里写的是 (esc to cancel, 要不要改'],
+  ])('%s has no title rule: a self-matching prompt with a swallowed Enter times out into an intervention', async (runtime, description) => {
+    useRunner({ runtime, rules: [{ match: isEnter, reply: SWALLOW_ENTER }] }, { dispatchAckTimeoutMs: 250, dispatchSettleTimeoutMs: 60 });
+    const task = await seedDispatch({ description });
+
+    await expect(dispatch(task)).resolves.toBe(true);
+
+    expect(classifyScreen(runtime, pane().frame).state).toBe('working');
+    expect(enters().length).toBeGreaterThanOrEqual(1);
+    expect(ackInterventions()).toHaveLength(1);
+  });
+});
+
+describe('pre-Enter failures leave the pane reuse-safe', () => {
+  it('a pre-Enter capture failure scrubs the composer, never sends Enter, never probes has-session, releases the binding', async () => {
+    let snaps = 0;
+    useRunner({ rules: [{ match: cmd => isSnapshot(cmd) && ++snaps > 1, reply: PANE_LOST }] });
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).rejects.toSatisfy(err => err instanceof Error && !isAckUnknown(err));
+
+    expect(enters()).toEqual([]);
+    expect(ctrlCs()).toHaveLength(2);
+    expect(hasSessionProbes()).toEqual([]);
+    expect(pane().composer).toBe('');
+    await expectBinding(task, false);
   });
 
   it.each([
     {
-      name: 'clears the composer draft after a failed sendEnter → raw',
-      onHasSession: undefined as ExecResult | undefined,
-      failKeys: 'enter' as 'enter' | 'all',
-      sendKeys: { stdout: '', stderr: 'no such pane: %0', exitCode: 1 },
-      expectAckUnknown: false,
-      expectCc: 2,
-      hasSessionCount: undefined as number | undefined,
+      name: 'a failed sendEnter is raw cleanup: composer scrubbed, binding released',
+      failKeys: 'enter' as const,
+      keysReply: PANE_LOST,
+      hasSessionReply: undefined as Record<string, unknown> | undefined,
+      ackUnknown: false,
+      ctrlC: 2,
+      probes: 0,
     },
     {
-      name: 'a transient reuse-clear failure on a still-live session escalates to ack_unknown (no blind C-c)',
-      onHasSession: { stdout: '', stderr: '', exitCode: 0 },
-      failKeys: 'after-preclear' as 'enter' | 'after-preclear',
-      sendKeys: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 },
-      expectAckUnknown: true,
-      expectCc: 1,
-      hasSessionCount: 1,
+      name: 'a transient reuse-clear failure on a live session escalates to ack_unknown (no blind C-c)',
+      failKeys: 'after-preclear' as const,
+      keysReply: SSH_TIMEOUT,
+      hasSessionReply: undefined,
+      ackUnknown: true,
+      ctrlC: 1,
+      probes: 1,
     },
     {
-      name: 'a reuse-clear failure on a CONFIRMED-DEAD session is reuse-safe → raw (next dispatch rebuilds fresh)',
-      onHasSession: { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 },
-      failKeys: 'after-preclear' as 'enter' | 'after-preclear',
-      sendKeys: { stdout: '', stderr: 'no such pane: %0', exitCode: 1 },
-      expectAckUnknown: false,
-      expectCc: 1,
-      hasSessionCount: 1,
+      name: 'a reuse-clear failure on a confirmed-dead session is reuse-safe: raw error, binding released',
+      failKeys: 'after-preclear' as const,
+      keysReply: PANE_LOST,
+      hasSessionReply: { stderr: "can't find session: dev-1", exitCode: 1 },
+      ackUnknown: false,
+      ctrlC: 1,
+      probes: 1,
     },
     {
-      name: 'an UNCONFIRMABLE session (reuse clear fails AND has-session probe fails) escalates to ack_unknown',
-      onHasSession: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 2 },
-      failKeys: 'after-preclear' as 'enter' | 'after-preclear',
-      sendKeys: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 },
-      expectAckUnknown: true,
-      expectCc: 1,
-      hasSessionCount: 1,
+      name: 'an unconfirmable session (clear fails and has-session fails) escalates to ack_unknown',
+      failKeys: 'after-preclear' as const,
+      keysReply: SSH_TIMEOUT,
+      hasSessionReply: { stderr: 'ssh: connect: connection timed out', exitCode: 2 },
+      ackUnknown: true,
+      ctrlC: 1,
+      probes: 1,
     },
-  ])('$name', async ({ onHasSession, failKeys, sendKeys, expectAckUnknown, expectCc, hasSessionCount }) => {
-    const sent: string[] = [];
+  ])('$name', async ({ failKeys, keysReply, hasSessionReply, ackUnknown, ctrlC, probes }) => {
     let sendKeysSeen = 0;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('has-session')) return onHasSession;
-      if (cmd.includes('send-keys')) {
-        sendKeysSeen++;
-        const preClearDone = sendKeysSeen > 2;
-        if (failKeys === 'after-preclear' ? preClearDone : cmd.includes('Enter')) return sendKeys;
-      }
-      if (cmd.includes('history_size')) return { stdout: 'BX_PANE_OK|5\nidle\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: 'BX_PANE_OK\nidle\n', stderr: '', exitCode: 0 };
-      return undefined;
+    useRunner({
+      rules: [
+        ...(hasSessionReply ? [{ match: 'has-session', reply: hasSessionReply }] : []),
+        {
+          match: cmd => cmd.includes('send-keys') && (failKeys === 'enter' ? isEnter(cmd) : ++sendKeysSeen > 2),
+          reply: keysReply,
+        },
+      ],
     });
-    const { caught } = await runAck(runner);
-    if (expectAckUnknown) {
-      expect(caught).toBeInstanceOf(DispatchTerminalError);
-      expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    } else {
-      expect(caught).toBeInstanceOf(Error);
-      expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
-    }
-    expect(ccCmds(sent)).toHaveLength(expectCc);
-    if (hasSessionCount !== undefined) expect(hasSessionCmds(sent)).toHaveLength(hasSessionCount);
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).rejects.toSatisfy(err => err instanceof Error && isAckUnknown(err) === ackUnknown);
+
+    expect(ctrlCs()).toHaveLength(ctrlC);
+    expect(hasSessionProbes()).toHaveLength(probes);
+    await expectBinding(task, ackUnknown);
   });
 
-  it('does NOT touch the composer on a post-Enter ack_unknown — the prompt may be running', async () => {
-    const sent: string[] = [];
-    let enterSent = false;
-    let enterIdx = -1;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-        enterSent = true;
-        enterIdx = sent.length - 1;
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane') || cmd.includes('display-message')) {
-        if (!enterSent) {
-          const header = cmd.includes('history_size') ? 'BX_PANE_OK|10' : 'BX_PANE_OK';
-          return { stdout: `${header}\nidle\n`, stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-      }
-      return undefined;
-    });
-    const { caught } = await runAck(runner);
-    expect(caught).toBeInstanceOf(DispatchTerminalError);
-    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    expect(enterIdx).toBeGreaterThanOrEqual(0);
-    expect(ccCmds(sent.slice(enterIdx))).toHaveLength(0);
-    expect(hasSessionCmds(sent)).toHaveLength(0);
+  it('aborts without pasting when the pre-inject composer clear fails', async () => {
+    const runner = useRunner({ rules: [{ match: 'send-keys -l', reply: SSH_TIMEOUT }] });
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).rejects.toThrow(/guarded write/);
+
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(enters()).toEqual([]);
   });
 
-  it('does NOT touch the composer on a clean ack', async () => {
-    const sent: string[] = [];
-    let enterSent = false;
-    let enterIdx = -1;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-        enterSent = true;
-        enterIdx = sent.length - 1;
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : 'composer\n';
-        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
-      }
-      return undefined;
+  it('re-validates the binding after the pre-inject clear: a task cancelled during the clear is never pasted', async () => {
+    const task = await seedDispatch();
+    const runner = useRunner({
+      onExec: async cmd => {
+        if (!cmd.includes('send-keys -l')) return;
+        const fresh = await harness.taskStore.get(task.id);
+        await harness.taskStore.set({ ...fresh!, status: 'cancelled' });
+      },
     });
-    const { result } = await runAck(runner);
-    expect(result).toEqual({ acked: true, composerDelivered: true });
-    expect(enterIdx).toBeGreaterThanOrEqual(0);
-    expect(ccCmds(sent.slice(enterIdx))).toHaveLength(0);
-    expect(hasSessionCmds(sent)).toHaveLength(0);
+
+    await expect(dispatch(task)).rejects.toThrow(/went terminal before paste/);
+
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
   it('clears any leftover composer draft (space then C-c) before pasting the prompt', async () => {
-    const sent: string[] = [];
-    let enterSent = false;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-        enterSent = true;
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : 'composer\n';
-        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
-      }
-      return undefined;
-    });
-    const { result } = await runAck(runner);
-    expect(result).toEqual({ acked: true, composerDelivered: true });
-    const spaceIdx = sent.findIndex(c => c.includes('send-keys -l'));
-    const ccIdx = sent.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
-    const pasteIdx = sent.findIndex(c => c.includes('paste-buffer'));
+    useRunner();
+    const task = await seedDispatch();
+
+    await expect(dispatch(task)).resolves.toBe(true);
+
+    const spaceIdx = cmds().findIndex(c => c.includes('send-keys -l'));
+    const ccIdx = cmds().findIndex(isCtrlC);
+    const pasteIdx = cmds().findIndex(c => c.includes('paste-buffer'));
     expect(spaceIdx).toBeGreaterThanOrEqual(0);
     expect(ccIdx).toBeGreaterThan(spaceIdx);
     expect(pasteIdx).toBeGreaterThan(ccIdx);
   });
 
-  it('keeps a qodercli pane whose spinner frame is a single-dot braille as working: no C-c before the paste', async () => {
-    const sent: string[] = [];
-    const screen = '⠁ Thinking...\nType your message or @path/to/file\n';
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|5\n${screen}`, stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${screen}`, stderr: '', exitCode: 0 };
-      return undefined;
-    });
-    const localManager = makeInjectManager(runner, 150, 150);
-    const t = await harness.seedTask({ signalToken: 'qoder-T1' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    await callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', 'prompt', 'dev-1', 'qodercli', async () => true,
-    ).catch(() => undefined);
-    const pasteIdx = sent.findIndex(c => c.includes('paste-buffer'));
-    expect(pasteIdx).toBeGreaterThanOrEqual(0);
-    expect(ccCmds(sent.slice(0, pasteIdx))).toHaveLength(0);
-  });
-
-  it('aborts the dispatch without pasting when the pre-inject composer clear fails (unconfirmed clear must not paste onto a leftover draft)', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('send-keys -l')) {
-        return { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 };
-      }
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
-      }
-      return undefined;
-    });
-    const { caught } = await runAck(runner);
-    expect(caught).toBeInstanceOf(Error);
-    expect(String((caught as Error).message)).toMatch(/guarded write/);
-    expect(pasted).toBe(false);
-    expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(0);
-  });
-
-  it('herdr: a working title beats a visible ready view (no arbitration) — paste proceeds without a composer clear', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    let enterSent = false;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) {
-        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
-        return { stdout: 'BX_PANE_OK\n❯ \n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : '❯ \n';
-        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-        enterSent = true;
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      return undefined;
-    });
-    await runAck(runner);
-    expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
-    expect(ccCmds(sent)).toHaveLength(0);
-  });
-
-  it('herdr: a working OSC title no longer aborts dispatch — paste proceeds fire-and-forget without a composer clear', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    let captures = 0;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) {
-        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        return { stdout: 'BX_PANE_OK|0\nsoft-wrapped output without any anchor line\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        captures++;
-        return { stdout: `BX_PANE_OK\nsoft-wrapped output without any anchor line ${captures}\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      return undefined;
-    });
-    const { caught } = await runAck(runner);
-    expect(caught).toBeUndefined();
-    expect(pasted).toBe(true);
-    expect(ccCmds(sent)).toHaveLength(0);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
-  });
-
-  it('herdr: under a working title the draft is NOT cleared — the prompt is pasted directly (fire-and-forget)', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    let enterSent = false;
-    const DRAFT = '› 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n';
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) {
-        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
-        return { stdout: `BX_PANE_OK\n${DRAFT}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : '❯ \n';
-        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-        enterSent = true;
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      return undefined;
-    });
-    await runAck(runner);
-    expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
-    expect(ccCmds(sent)).toHaveLength(0);
-  });
-
-  it('herdr: a visibly busy pane no longer aborts dispatch — paste proceeds without a composer clear', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    let captures = 0;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) {
-        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        return { stdout: 'BX_PANE_OK|0\n✶ Grooving… (30s · esc to interrupt)\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        captures++;
-        return { stdout: `BX_PANE_OK\n✶ Grooving… (${12 + captures}s · esc to interrupt)\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      return undefined;
-    });
-    const { caught } = await runAck(runner);
-    expect(caught).toBeUndefined();
-    expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
-    expect(ccCmds(sent)).toHaveLength(0);
-  });
-
   it('clears a leftover draft whose text merely looks busy: an idle title plus a static frame rules out a running turn', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    let enterSent = false;
-    const DRAFT = '❯ 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n';
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) {
-        return { stdout: 'BX_PANE_OKdev-1\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
-        return { stdout: `BX_PANE_OK\n${DRAFT}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        const visible = enterSent ? '✻ Working… (3s · esc to interrupt)\n' : '❯ \n';
-        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-        enterSent = true;
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      return undefined;
-    });
-    await runAck(runner);
-    expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(1);
-    expect(ccCmds(sent)).toHaveLength(1);
-  });
+    const runner = useRunner({ agents: { 'dev-1': { title: IDLE_TITLE, screen: BUSY_LOOKING_DRAFT } } });
+    const task = await seedDispatch();
 
-  it('herdr: no liveness gate — an advancing frame with an idle title still dispatches', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    let captures = 0;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) {
-        return { stdout: 'BX_PANE_OKdev-1\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('history_size')) {
-        return { stdout: 'BX_PANE_OK|0\n✶ Grooving… (30s)\n  esc to interrupt\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        captures++;
-        return { stdout: `BX_PANE_OK\n✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      return undefined;
-    });
-    const { caught } = await runAck(runner);
-    expect(caught).toBeUndefined();
-    expect(pasted).toBe(true);
-  });
+    await expect(continueDispatch(task)).resolves.toBe(true);
 
-  const WORKING_FRAME = '✻ Working… (12s · esc to interrupt)\n';
-
-  it('working pane + 粘贴结果不确定 + buffer 删除失败:不发 C-c,转 ack_unknown 交人工核验', async () => {
-    const sent: string[] = [];
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-      if (cmd.includes('paste-buffer')) return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-      if (cmd.includes('delete-buffer')) return { stdout: '', stderr: 'no buffer', exitCode: 1 };
-      return undefined;
-    });
-    const guard = vi.fn<[], Promise<boolean>>().mockResolvedValue(true);
-    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 150, guard });
-
-    expect(caught).toBeInstanceOf(DispatchTerminalError);
-    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    expect(ccCmds(sent)).toHaveLength(0);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
-  });
-
-  it('working pane + fence 拒绝:不发 C-c,转 ack_unknown', async () => {
-    const sent: string[] = [];
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-      return undefined;
-    });
-    // guard 依次在:外层、steps 入口、paste 锁、submit 锁被调用,最后一次拒绝 = Enter 前 fence 拒绝
-    const guard = vi.fn<[], Promise<boolean>>()
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(true)
-      .mockResolvedValue(false);
-    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 150, guard });
-
-    expect(caught).toBeInstanceOf(DispatchTerminalError);
-    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    expect(ccCmds(sent)).toHaveLength(0);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
-  });
-
-  it.each<['opencode' | 'qodercli', string]>([
-    ['opencode', '帮我看下 esc to interrupt 这个判定'],
-    ['qodercli', '文案里写的是 (esc to cancel, 要不要改'],
-  ])('%s: idle pane 收到自带 working 关键字的提示词且 Enter 被吞 → 走超时并提人工介入,不得报已提交', async (runtime, prompt) => {
-    const sent: string[] = [];
-    // 粘贴后基线含提示词正文,自己命中 whole_recent 的 working 规则;Enter 被吞,屏幕此后不再变化
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${prompt}\n`, stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: 'BX_PANE_OK\nctrl+p commands\n', stderr: '', exitCode: 0 };
-      return undefined;
-    });
-    const localManager = makeInjectManager(runner, 250, 60, 50);
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-
-    const result = await callInjectAndAwaitAck(
-      localManager, new TmuxManager(runner), '%0', prompt, 'dev-1', runtime,
-    );
-
-    expect(result.acked).toBe(false);
-    expect(ackInterventions()).toHaveLength(1);
-  });
-
-  it('派发前就在 working 的 pane 仍然 fire-and-forget:不等 ack、不提人工介入', async () => {
-    const sent: string[] = [];
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-      return undefined;
-    });
-    const { result, caught } = await runAck(runner, { ackMs: 250, settleMs: 60, resendMs: 1 });
-
-    expect(caught).toBeUndefined();
-    expect(result).toEqual({ acked: true, composerDelivered: true });
-    expect(ackInterventions()).toHaveLength(0);
-    // 边界前置的结构性保证:working pane 完全不进入 ack/重发/清稿机制,Enter 只发一次,永不 C-c
-    expect(ccCmds(sent)).toHaveLength(0);
-    expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(1);
-  });
-
-  it('working pane + Enter 前异常:不走 clearComposerForReuse 的 C-c,转 ack_unknown', async () => {
-    const sent: string[] = [];
-    let snaps = 0;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('pane_title')) return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('history_size')) {
-        snaps++;
-        if (snaps === 1) return { stdout: `BX_PANE_OK|0\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-      }
-      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${WORKING_FRAME}`, stderr: '', exitCode: 0 };
-      return undefined;
-    });
-
-    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 60 });
-
-    expect(caught).toBeInstanceOf(DispatchTerminalError);
-    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    expect(ccCmds(sent)).toHaveLength(0);
-    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
-  });
-
-  it('re-validates the binding after the pre-inject clear: a task cancelled during the clear is never pasted', async () => {
-    const sent: string[] = [];
-    let pasted = false;
-    const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('paste-buffer')) {
-        pasted = true;
-        return undefined;
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\n❯ \n', stderr: '', exitCode: 0 };
-      }
-      return undefined;
-    });
-    const localManager = makeInjectManager(runner, 150, 150);
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
-    const tmux = new TmuxManager(runner);
-    vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockImplementation(async () => {
-      const cur = await harness.taskStore.get(t.id);
-      if (cur) await harness.taskStore.set({ ...cur, status: 'cancelled' });
-    });
-    await expect(
-      callInjectAndAwaitAck(localManager, tmux, '%0', 'hello prompt', 'dev-1', 'claude-code'),
-    ).rejects.toThrow(/went terminal before paste/);
-    expect(pasted).toBe(false);
+    expect(literals()).toHaveLength(1);
+    expect(ctrlCs()).toHaveLength(1);
+    expect(runner.pastedPrompts).toHaveLength(1);
   });
 });
 
-describe('injectAndAwaitAck: busy-looking baseline text is not busy under herdr — swallowed Enter surfaces as ack timeout', () => {
-  it.each([
-    {
-      name: 'composer "clears" after submit but baseline was busy → still non-ackable',
-      settleMs: 150,
-      frames: () => (enterSent: boolean) => (enterSent ? 'running the task now\n' : 'review:\n  esc to interrupt\n'),
-    },
-    {
-      name: 'swallowed Enter plus ongoing attach redraw is non-ackable',
-      settleMs: 80,
-      frames: () => { let n = 0; return () => `review:\n  esc to interrupt\n[Image #1] frame ${n++}\n`; },
-    },
-    {
-      name: 'settled busy baseline plus late attach redraw and swallowed Enter is non-ackable',
-      settleMs: 150,
-      frames: () => { let post = 0; return (enterSent: boolean) => (enterSent ? `review:\n  esc to interrupt\n[Image #1] frame ${post++}\n` : 'review:\n  esc to interrupt\n'); },
-    },
-  ])('$name', async ({ frames, settleMs }) => {
-    const runner = snapRunner(frames());
-    const { result } = await runAck(runner, { ackMs: 150, settleMs, prompt: 'review:\n  esc to interrupt' });
-    expect(result).toEqual({ acked: false, composerDelivered: true });
-    expect(ackInterventions().length).toBeGreaterThanOrEqual(1);
+describe('a pane already working at dispatch is fire-and-forget', () => {
+  it.each<{ name: string; agent: NonNullable<FakeRunnerOptions['agents']>[string]; runtime?: AgentRuntimeKind }>([
+    { name: 'a working title over a ready view', agent: { title: WORKING_TITLE } },
+    { name: 'a working title over anchor-less soft-wrapped output', agent: { title: WORKING_TITLE, screen: 'soft-wrapped output without any anchor line\n' } },
+    { name: 'a working title over a busy-looking leftover draft', agent: { title: WORKING_TITLE, screen: BUSY_LOOKING_DRAFT } },
+    { name: 'a working title over a visibly busy frame', agent: { title: WORKING_TITLE, screen: '✶ Grooving… (30s · esc to interrupt)\n' } },
+    { name: 'an advancing busy frame under an idle title (no liveness gate)', agent: { title: IDLE_TITLE, workingTitle: IDLE_TITLE, screen: WORKING_FRAME, interrupt: 'ignored-live' } },
+    { name: 'a working frame with a working title', agent: { title: WORKING_TITLE, screen: WORKING_FRAME } },
+    { name: 'a qodercli single-dot braille spinner', agent: { screen: '⠁ Thinking...\nType your message or @path/to/file\n' }, runtime: 'qodercli' },
+  ])('$name: the prompt is pasted without a composer clear, Enter once, no ack wait, no hold', async ({ agent, runtime }) => {
+    const runner = useRunner({ runtime, agents: { 'dev-1': agent } }, { dispatchSettleTimeoutMs: 60 });
+    const task = await seedDispatch();
+
+    await expect(continueDispatch(task)).resolves.toBe(true);
+
+    expect(runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining('token: tok-T1') }]);
+    expect(literals()).toEqual([]);
+    expect(ctrlCs()).toEqual([]);
+    expect(enters()).toHaveLength(1);
+    expect(ackInterventions()).toEqual([]);
+  });
+
+  const workingPane = { agents: { 'dev-1': { title: WORKING_TITLE, screen: WORKING_FRAME } } };
+
+  it('uncertain paste plus a failed buffer drop: no C-c, ack_unknown for a human to verify', async () => {
+    useRunner({
+      ...workingPane,
+      rules: [
+        { match: 'paste-buffer', reply: PANE_LOST },
+        { match: 'delete-buffer', reply: { stderr: 'no buffer', exitCode: 1 } },
+      ],
+    });
+    const task = await seedDispatch();
+
+    await expect(continueDispatch(task, fenceOn(task, 'tok-T1'))).rejects.toSatisfy(isAckUnknown);
+
+    expect(ctrlCs()).toEqual([]);
+    expect(literals()).toEqual([]);
+  });
+
+  it('fence rejected before Enter: the prompt stays in the composer, no C-c, ack_unknown', async () => {
+    let pasted = false;
+    const task = await seedDispatch();
+    const runner = useRunner({
+      ...workingPane,
+      onExec: async cmd => {
+        if (cmd.includes('paste-buffer')) pasted = true;
+        else if (pasted && isSnapshot(cmd)) await rotatePass(task, 'tok-T2');
+      },
+    });
+
+    await expect(continueDispatch(task, fenceOn(task, 'tok-T1'))).rejects.toMatchObject({
+      reason: 'ack_unknown',
+      message: expect.stringMatching(/stays in the composer of working pane/),
+    });
+
+    expect(runner.pastedPrompts).toHaveLength(1);
+    expect(pane().composer).toContain('token: tok-T1');
+    expect(ctrlCs()).toEqual([]);
+    expect(enters()).toEqual([]);
+  });
+
+  it('a pre-Enter capture failure on a working pane skips the reuse scrub: no C-c, ack_unknown', async () => {
+    let snaps = 0;
+    useRunner({ ...workingPane, rules: [{ match: cmd => isSnapshot(cmd) && ++snaps > 1, reply: PANE_LOST }] });
+    const task = await seedDispatch();
+
+    await expect(continueDispatch(task)).rejects.toSatisfy(isAckUnknown);
+
+    expect(ctrlCs()).toEqual([]);
+    expect(literals()).toEqual([]);
+    expect(enters()).toEqual([]);
   });
 });

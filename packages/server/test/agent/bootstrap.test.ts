@@ -15,6 +15,7 @@ import type { CommandRunner } from '../../src/agent/runner.js';
 const baseConfig: BaxianConfig = {
   review: { rounds: 10 },
   server: DEFAULT_SERVER_CONFIG,
+  host: [],
   project: [{
     id: 'p1', repo: 'https://github.com/u/r1.git', merge: null,
     agent: [
@@ -46,6 +47,7 @@ beforeEach(async () => {
   mockRunner = {
     exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
     writeFile: vi.fn(async () => undefined),
+    execWithStdin: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
   };
 });
 
@@ -254,6 +256,26 @@ describe('runSingleTarget — new behaviors', () => {
     expect((success!.data as { updated: number }).updated).toBe(1);
   });
 
+  it('emitOnUnchanged=false + binding already at the resolved Workdir: no rewrite, no event (poll path stays quiet)', async () => {
+    const updatedAt = '2026-09-01T00:00:00.000Z';
+    await agentStore.set({ id: 'dev-a', projectId: 'p1', workdir: '/r', updatedAt });
+    const target = collectTargets(baseConfig)[0];
+    events.length = 0;
+    await runSingleTarget(target, buildDeps(), { emitOnUnchanged: false });
+    expect(await agentStore.get('dev-a')).toMatchObject({ workdir: '/r', updatedAt });
+    expect(hasEvent('agent.bootstrap_succeeded')).toBe(false);
+  });
+
+  it('emitOnUnchanged=false + binding at a different Workdir: rewritten and counted', async () => {
+    await agentStore.set({ id: 'dev-a', projectId: 'p1', workdir: '/old', updatedAt: '2026-09-01T00:00:00.000Z' });
+    const target = collectTargets(baseConfig)[0];
+    events.length = 0;
+    await runSingleTarget(target, buildDeps(), { emitOnUnchanged: false });
+    expect((await agentStore.get('dev-a'))?.workdir).toBe('/r');
+    const success = events.find(e => e.type === 'agent.bootstrap_succeeded');
+    expect((success!.data as { updated: number }).updated).toBe(1);
+  });
+
   it('emitOnUnchanged=false + binding write fails: does not count the failed write as updated', async () => {
     const now = new Date().toISOString();
     await agentStore.set({ id: 'dev-a', projectId: 'p1', updatedAt: now });
@@ -263,7 +285,7 @@ describe('runSingleTarget — new behaviors', () => {
       if (id !== 'dev-a') return originalUpdate(id, updater);
       const existing = await agentStore.get(id);
       const result = updater(existing);
-      if (result === AGENT_STORE_NOOP) return undefined;
+      if (result === AGENT_STORE_NOOP) return 'noop';
       throw new Error('write failed');
     });
 
@@ -359,7 +381,7 @@ describe('classifyBootstrapError', () => {
 describe('autoBootstrapAgentIds', () => {
   it('includes auto-mode agents (no workdir) and excludes explicit-workdir agents', () => {
     const config: BaxianConfig = {
-      review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
+      review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG, host: [],
       project: [{
         id: 'p', repo: 'https://github.com/u/r.git', merge: null,
         agent: [

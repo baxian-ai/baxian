@@ -72,8 +72,10 @@ describe('AgentManager post-merge release', () => {
   it('releases the dev agent without any pane dialogue: no /clear, no prompt injection', async () => {
     const execs: string[] = [];
     const promptInjections: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs, captureInjection(promptInjections)) });
-    harness.setCompactTiming(harness.manager);
+    harness.manager = harness.createManager({
+      runnerFactory: () => idlePaneRunner(execs, captureInjection(promptInjections)),
+      compactIdleWaitMs: 100,
+    });
     await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/merged-task', status: 'merged' });
     await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
@@ -147,10 +149,11 @@ describe('AgentManager post-merge release', () => {
 
   it('waits for the pane mutex before probing and releasing', async () => {
     const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs) });
-    harness.setCompactTiming(harness.manager);
+    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs), compactIdleWaitMs: 100 });
     await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/merged-task', status: 'merged' });
     await harness.seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
+    // E1: pane 互斥没有可用的公共持有者——upload/inject 对终态绑定直接拒绝,compact 的持有时长又远超 post-merge 的等待窗口;
+    // 仅用它占住互斥,断言全部落在绑定与锁上
     const guard = (harness.manager as unknown as { compactInFlight: Set<string> }).compactInFlight;
     guard.add('dev-1');
 
@@ -167,8 +170,7 @@ describe('AgentManager post-merge release', () => {
 
   it('never force-deletes a local branch during post-merge release', async () => {
     const execs: string[] = [];
-    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs) });
-    harness.setCompactTiming(harness.manager);
+    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs), compactIdleWaitMs: 100 });
     await harness.seedTask({ id: 'merged-task', agentId: 'dev-1', branch: 'bx/task-merge', status: 'merged' });
     await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main-clone', taskId: 'merged-task' });
 
@@ -183,8 +185,7 @@ describe('AgentManager post-merge release', () => {
   it('holds taskId on the binding during local branch cleanup and releases after', async () => {
     const execs: string[] = [];
     let taskIdDuringCheckoutCleanup: string | undefined;
-    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs) });
-    harness.setCompactTiming(harness.manager);
+    harness.manager = harness.createManager({ runnerFactory: () => idlePaneRunner(execs), compactIdleWaitMs: 100 });
     await harness.seedTask({ id: 'merged-task', branch: 'bx/merged-task', status: 'merged', agentId: 'dev-1' });
     await harness.seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'merged-task' });
     vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {

@@ -9,8 +9,7 @@ import type { ProjectConfig, TaskState } from '../src/shared/index.js';
 const appMockState = vi.hoisted(() => {
   const subscribers = new Map<string, Set<(data: unknown) => void>>();
   return {
-    projects: null as unknown,
-    refreshProjects: vi.fn(),
+    projectsList: vi.fn(),
     taskGet: vi.fn(),
     subscribers,
     subscribe: vi.fn((topic: string, onData: (data: unknown) => void) => {
@@ -28,19 +27,15 @@ const appMockState = vi.hoisted(() => {
 });
 
 vi.mock('../src/api.ts', () => ({
+  UNAUTHORIZED_EVENT: 'baxian:unauthorized',
   api: {
     tasks: {
       get: appMockState.taskGet,
     },
+    projects: {
+      list: appMockState.projectsList,
+    },
   },
-}));
-
-vi.mock('../src/hooks/use-projects.ts', () => ({
-  useProjects: () => ({
-    projects: appMockState.projects as ProjectConfig[] | null,
-    error: null,
-    refresh: appMockState.refreshProjects,
-  }),
 }));
 
 vi.mock('../src/stores/events-store.ts', () => ({
@@ -50,22 +45,23 @@ vi.mock('../src/stores/events-store.ts', () => ({
 }));
 
 vi.mock('../src/pages/dashboard.tsx', () => ({
-  Dashboard: () => <div data-testid="page-dashboard" />,
+  Dashboard: () => <div role="region" aria-label="Dashboard page" />,
 }));
 vi.mock('../src/pages/project.tsx', () => ({
-  Project: () => <div data-testid="page-project" />,
+  Project: () => <div role="region" aria-label="Project page" />,
 }));
 vi.mock('../src/pages/task-detail.tsx', () => ({
-  TaskDetail: () => <div data-testid="page-task-detail" />,
+  TaskDetail: () => <div role="region" aria-label="Task detail page" />,
 }));
 vi.mock('../src/pages/terminal.tsx', () => ({
-  Terminal: () => <div data-testid="page-terminal" />,
+  Terminal: () => <div role="region" aria-label="Terminal page" />,
 }));
 vi.mock('../src/components/pending-restart-banner.tsx', () => ({
   PendingRestartBanner: () => null,
 }));
 
 import { App } from '../src/app.tsx';
+import { __resetProjectsCacheForTests, refreshProjects } from '../src/hooks/use-projects.ts';
 import { TOPBAR_ACTIONS_ID, TopbarActions } from '../src/components/topbar-actions.tsx';
 
 const originalNotification = window.Notification;
@@ -97,6 +93,11 @@ function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
     agent: [],
     ...overrides,
   };
+}
+
+async function setProjects(projects: ProjectConfig[]): Promise<void> {
+  appMockState.projectsList.mockResolvedValue(projects);
+  await act(async () => { await refreshProjects(); });
 }
 
 function emitProjectTasks(projectId: string, tasks: TaskState[]): void {
@@ -143,11 +144,12 @@ function restoreNotification(): void {
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   window.history.pushState({}, '', '/');
   localStorage.clear();
-  appMockState.projects = null;
-  appMockState.refreshProjects.mockReset();
+  __resetProjectsCacheForTests();
+  appMockState.projectsList.mockReset();
+  await setProjects([]);
   appMockState.taskGet.mockReset();
   appMockState.subscribe.mockClear();
   appMockState.subscribers.clear();
@@ -169,13 +171,7 @@ describe('App shell layout', () => {
     expect(homeLink.textContent).toContain('baxian');
     expect(homeLink.getAttribute('aria-label')).toBeNull();
 
-    const dot = homeLink.querySelector('span[aria-hidden]');
-    expect(dot).toBeTruthy();
-    expect(dot!.className).toContain('bg-accent');
-    expect(dot!.className).toContain('h-2.5');
-    expect(dot!.className).toContain('w-2.5');
-    expect(dot!.className).toContain('rounded-full');
-    expect(dot!.className).not.toContain('rounded-sm');
+    expect(homeLink.querySelector('span[aria-hidden]')).toBeTruthy();
 
     const nav = container.querySelector('nav')!;
     expect(screen.queryByRole('link', { name: 'Dashboard' })).toBeNull();
@@ -183,10 +179,7 @@ describe('App shell layout', () => {
     expect(container.querySelector('a[href="/tasks"]')).toBeNull();
     expect(nav.querySelector('button[aria-label^="Switch to logo"]')).toBeNull();
 
-    const actions = nav.querySelector(`#${TOPBAR_ACTIONS_ID}`);
-    expect(actions).toBeTruthy();
-    expect(actions!.className).toContain('ml-auto');
-    expect(actions!.className).toContain('justify-end');
+    expect(nav.querySelector(`#${TOPBAR_ACTIONS_ID}`)).toBeTruthy();
 
     const navLinks = nav.querySelectorAll('a');
     expect(navLinks.length).toBe(1);
@@ -195,37 +188,22 @@ describe('App shell layout', () => {
 
   it('still routes "/" to the Dashboard page even though its nav link was removed', () => {
     render(<App />);
-    expect(screen.getByTestId('page-dashboard')).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Dashboard page' })).toBeTruthy();
   });
 
   it('routes /project/:id/task/:taskId to the TaskDetail page', () => {
     window.history.pushState({}, '', '/project/baxian/task/task-172');
     render(<App />);
-    expect(screen.getByTestId('page-task-detail')).toBeTruthy();
-    expect(screen.queryByTestId('page-project')).toBeNull();
+    expect(screen.getByRole('region', { name: 'Task detail page' })).toBeTruthy();
+    expect(screen.queryByRole('region', { name: 'Project page' })).toBeNull();
   });
 
-  it('uses dynamic viewport sizing and aligned nav/main padding', () => {
+  it('sizes the shell to the dynamic viewport (h-dvh, not h-screen) so mobile browser chrome does not clip it', () => {
     const { container } = render(<App />);
-
-    const nav = container.querySelector('nav');
-    const main = container.querySelector('main');
-    expect(nav).toBeTruthy();
-    expect(main).toBeTruthy();
 
     const shell = container.querySelector('nav')!.parentElement!;
     expect(shell.className).toContain('h-dvh');
     expect(shell.className).not.toContain('h-screen');
-
-    const getHorizontalPadding = (el: HTMLElement) => {
-      const padding = Array.from(el.classList).filter((c) => /(?:^|:)px-/.test(c)).sort();
-      expect(padding.length).toBeGreaterThan(0);
-      return padding;
-    };
-
-    expect(getHorizontalPadding(main!)).toEqual(getHorizontalPadding(nav!));
-    expect(main!.classList.contains('py-6')).toBe(true);
-    expect(main!.classList.contains('p-6')).toBe(false);
   });
 
   it('renders the bottom BrandToggle on non-terminal routes and keeps its toggle behavior', () => {
@@ -233,10 +211,6 @@ describe('App shell layout', () => {
 
     const footer = container.querySelector('footer');
     expect(footer).toBeTruthy();
-    expect(footer!.className).toContain('mt-auto');
-    expect(footer!.className).toContain('justify-center');
-    expect(footer!.className).toContain('pt-24');
-    expect(footer!.className).toContain('pb-4');
 
     const toggleBtn = footer!.querySelector('button[aria-label^="Switch to logo"]') as HTMLButtonElement | null;
     expect(toggleBtn).toBeTruthy();
@@ -265,14 +239,14 @@ describe('App shell layout', () => {
     const { container } = render(<App />);
 
     expect(container.querySelector('footer')).toBeNull();
-    expect(screen.getByTestId('page-terminal')).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Terminal page' })).toBeTruthy();
   });
 });
 
 describe('Task completion notifications', () => {
-  it('renders no notification toggle in the topbar — the entry lives in the Settings modal', () => {
+  it('renders no notification toggle in the topbar — the entry lives in the Settings modal', async () => {
     installNotificationMock('default');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
 
     render(<App />);
 
@@ -284,7 +258,7 @@ describe('Task completion notifications', () => {
   it('does not subscribe to project task streams when notifications are turned off via the stored preference', async () => {
     installNotificationMock('granted');
     localStorage.setItem('baxian.taskNotifications.enabled', '0');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
 
     render(<App />);
 
@@ -294,7 +268,7 @@ describe('Task completion notifications', () => {
 
   it('drops an in-flight completion confirmation when notifications are disabled before it resolves', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     let resolveGet: (task: TaskState) => void = () => {};
     appMockState.taskGet.mockImplementation(
       () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
@@ -323,7 +297,7 @@ describe('Task completion notifications', () => {
 
   it('keeps a pre-disable confirmation dead even when notifications are re-enabled before it resolves', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     let resolveGet: (task: TaskState) => void = () => {};
     appMockState.taskGet.mockImplementation(
       () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
@@ -362,21 +336,20 @@ describe('Task completion notifications', () => {
 
   it('keeps an in-flight completion confirmation alive across an unrelated project-list change', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     let resolveGet: (task: TaskState) => void = () => {};
     appMockState.taskGet.mockImplementation(
       () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
     );
 
-    const view = render(<App />);
+    render(<App />);
 
     await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
     emitProjectTasks('proj', [makeTask({ status: 'review' })]);
     emitProjectTasks('proj', []);
     await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
 
-    appMockState.projects = [makeProject(), makeProject({ id: 'other' })];
-    view.rerender(<App />);
+    await setProjects([makeProject(), makeProject({ id: 'other' })]);
     await waitFor(() => {
       expect(appMockState.subscribe).toHaveBeenCalledWith(
         'project-tasks:other',
@@ -395,21 +368,20 @@ describe('Task completion notifications', () => {
 
   it('drops an in-flight completion confirmation when its own project is removed', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     let resolveGet: (task: TaskState) => void = () => {};
     appMockState.taskGet.mockImplementation(
       () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
     );
 
-    const view = render(<App />);
+    render(<App />);
 
     await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
     emitProjectTasks('proj', [makeTask({ status: 'review' })]);
     emitProjectTasks('proj', []);
     await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
 
-    appMockState.projects = [makeProject({ id: 'other' })];
-    view.rerender(<App />);
+    await setProjects([makeProject({ id: 'other' })]);
     await waitFor(() => {
       expect(appMockState.subscribe).toHaveBeenCalledWith(
         'project-tasks:other',
@@ -427,21 +399,20 @@ describe('Task completion notifications', () => {
 
   it('keeps a removed project\'s pre-removal confirmation dead even when the project returns before it resolves', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     let resolveGet: (task: TaskState) => void = () => {};
     appMockState.taskGet.mockImplementation(
       () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
     );
 
-    const view = render(<App />);
+    render(<App />);
 
     await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
     emitProjectTasks('proj', [makeTask({ status: 'review' })]);
     emitProjectTasks('proj', []);
     await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
 
-    appMockState.projects = [makeProject({ id: 'other' })];
-    view.rerender(<App />);
+    await setProjects([makeProject({ id: 'other' })]);
     await waitFor(() => {
       expect(appMockState.subscribe).toHaveBeenCalledWith(
         'project-tasks:other',
@@ -450,8 +421,7 @@ describe('Task completion notifications', () => {
       );
     });
 
-    appMockState.projects = [makeProject(), makeProject({ id: 'other' })];
-    view.rerender(<App />);
+    await setProjects([makeProject(), makeProject({ id: 'other' })]);
     await waitFor(() => {
       const projSubscribes = appMockState.subscribe.mock.calls
         .filter(call => call[0] === 'project-tasks:proj');
@@ -467,21 +437,20 @@ describe('Task completion notifications', () => {
 
   it('re-confirms a new completion after remove/re-add instead of being starved by the stale in-flight key', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     const resolvers: Array<(task: TaskState) => void> = [];
     appMockState.taskGet.mockImplementation(
       () => new Promise<TaskState>((resolve) => { resolvers.push(resolve); }),
     );
 
-    const view = render(<App />);
+    render(<App />);
 
     await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
     emitProjectTasks('proj', [makeTask({ status: 'review' })]);
     emitProjectTasks('proj', []);
     await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(1));
 
-    appMockState.projects = [makeProject({ id: 'other' })];
-    view.rerender(<App />);
+    await setProjects([makeProject({ id: 'other' })]);
     await waitFor(() => {
       expect(appMockState.subscribe).toHaveBeenCalledWith(
         'project-tasks:other',
@@ -490,8 +459,7 @@ describe('Task completion notifications', () => {
       );
     });
 
-    appMockState.projects = [makeProject(), makeProject({ id: 'other' })];
-    view.rerender(<App />);
+    await setProjects([makeProject(), makeProject({ id: 'other' })]);
     await waitFor(() => {
       const projSubscribes = appMockState.subscribe.mock.calls
         .filter(call => call[0] === 'project-tasks:proj');
@@ -518,7 +486,7 @@ describe('Task completion notifications', () => {
 
   it('a queued stale disable storage event still kills in-flight confirmations even when storage already reads enabled', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     let resolveGet: (task: TaskState) => void = () => {};
     appMockState.taskGet.mockImplementation(
       () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
@@ -557,7 +525,7 @@ describe('Task completion notifications', () => {
 
   it('subscribes without a focus event once another tab finishes granting and broadcasts the preference', async () => {
     const notification = installNotificationMock('default');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
 
     render(<App />);
 
@@ -584,7 +552,7 @@ describe('Task completion notifications', () => {
   it('re-subscribes when another tab turns the preference back on', async () => {
     installNotificationMock('granted');
     localStorage.setItem('baxian.taskNotifications.enabled', '0');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
 
     render(<App />);
 
@@ -611,7 +579,7 @@ describe('Task completion notifications', () => {
     const notification = installNotificationMock('granted');
     const active = makeTask({ id: 'task-188', status: 'in_progress' });
     const completed = makeTask({ id: 'task-188', status: 'merged' });
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     appMockState.taskGet.mockResolvedValue(completed);
 
     render(<App />);
@@ -638,7 +606,7 @@ describe('Task completion notifications', () => {
 
   it('does not notify when the disappeared task is terminal but not completed', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     appMockState.taskGet.mockResolvedValue(makeTask({ status: 'failed' }));
 
     render(<App />);
@@ -655,7 +623,7 @@ describe('Task completion notifications', () => {
   it('retries completion confirmation on a later project task frame after a transient GET failure', async () => {
     const notification = installNotificationMock('granted');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     appMockState.taskGet
       .mockRejectedValueOnce(new Error('server restarting'))
       .mockResolvedValueOnce(makeTask({ status: 'done' }));
@@ -669,11 +637,9 @@ describe('Task completion notifications', () => {
 
       await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(1));
       await act(async () => { await Promise.resolve(); });
-      expect(warn).toHaveBeenCalledWith(
-        '[task-notifications] failed to confirm completed task task-188:',
-        expect.any(Error),
-      );
       expect(notification.instances).toHaveLength(0);
+      // no notification is raised for the failed confirmation, so the warning is its only diagnostic
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/failed to confirm.*task-188/), expect.any(Error));
 
       emitProjectTasks('proj', []);
 
@@ -687,7 +653,7 @@ describe('Task completion notifications', () => {
 
   it('ignores an empty task confirmation response without throwing or notifying', async () => {
     const notification = installNotificationMock('granted');
-    appMockState.projects = [makeProject()];
+    await setProjects([makeProject()]);
     appMockState.taskGet.mockResolvedValue(null);
 
     render(<App />);

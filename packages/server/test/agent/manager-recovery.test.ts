@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentBindingFacts, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
-import { EnsureSessionError, canDispatchWithBinding, type AgentManager } from '../../src/agent/manager.js';
+import { canDispatchWithBinding, type AgentManager } from '../../src/agent/manager.js';
 import { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
 import { buildPhaseSignal } from '../../src/agent/phase-signal.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
@@ -16,11 +17,16 @@ import type { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { registerEventHandlers } from '../../src/event/handlers.js';
-import { createManagerHarness } from '../helpers/manager-harness.js';
-import { fakeRunner } from '../helpers/fake-runner.js';
+import type { PhaseSignalWatcherStartArgs } from '../../src/agent/phase-signal-watcher.js';
+import { createManagerHarness, createManagerSuiteRunner, workdirsOf } from '../helpers/manager-harness.js';
+import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
+import type { RepoStore } from '../../src/agent/repo-store.js';
+import type { AgentManagerDeps } from '../../src/agent/manager.js';
 import { makeConfig } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
+// detectStartupDialog 认得的启动遮挡帧:adopt 时分类为 startup-dialog → EnsureSessionError(dialogPending)
+const STARTUP_DIALOG_SCREEN = 'Press enter to continue';
 
 let tempDir: string;
 let config: BaxianConfig;
@@ -29,12 +35,30 @@ let taskStore: TaskStore;
 let lockManager: LockManager;
 let eventBus: EventBus;
 let manager: AgentManager;
+let runner: FakeRunner;
+let workdirFailures: Map<string, string>;
 let createManager: Awaited<ReturnType<typeof createManagerHarness>>['createManager'];
 let seedAgent: Awaited<ReturnType<typeof createManagerHarness>>['seedAgent'];
 let seedHarnessTask: Awaited<ReturnType<typeof createManagerHarness>>['seedTask'];
 let events: BaxianEvent[];
 
-const REF = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
+// 每个 agent 的 Workdir 准备可单独注入失败:git 仓库边界替身(spec E4),不是私有访问
+const repoStoreFactory: NonNullable<AgentManagerDeps['repoStoreFactory']> =
+  (_runner, _repo, _mode, _host, _cache, agentId, workdir) => ({
+    ensure: async () => {
+      const failure = workdirFailures.get(agentId);
+      if (failure) throw new Error(failure);
+      return workdir ?? join(tempDir, agentId);
+    },
+    refresh: async () => undefined,
+  }) as unknown as RepoStore;
+
+// 换一台带不同布置的 live runner(启动对话框帧、命令失败规则…),manager 经公共依赖重建
+function useRunner(options: FakeRunnerOptions): FakeRunner {
+  runner = createManagerSuiteRunner({ workdirs: workdirsOf(config), ...options });
+  manager = createManager({ runnerFactory: () => runner });
+  return runner;
+}
 
 function seedRecoveryTask(overrides: Partial<TaskState> & { id: string }): Promise<TaskState> {
   return seedHarnessTask({
@@ -54,27 +78,19 @@ function postApproveEpisode(token: string, headSha: string): Partial<TaskState> 
   };
 }
 
-function mockEnsureSessionOk(overrides: Record<string, unknown> = {}): void {
-  const paneId = (overrides.paneId as string | undefined) ?? '%1';
-  vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-    ok: true, createdSession: false, freshRuntime: false, paneId,
-    pane: { session: REF, paneId, claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
-    ...overrides,
-  } as never);
-}
-
 interface RecoveryScenario {
   agents: (Partial<AgentBindingFacts> & { id: string })[];
   tasks?: (Partial<TaskState> & { id: string })[];
   locks?: string[];
   emit?: BaxianEvent[];
-  ensureSession?: Record<string, unknown> | { reject: EnsureSessionError };
+  // 运行时布置:会话消失 / claim 被占 / 启动对话框 / Workdir 故障,都经 runner 或公共依赖注入
+  before?: () => void | Promise<void>;
   cleanupImpl?: () => Promise<void>;
 }
 
 interface RecoveryHandles {
-  cleanupSpy: ReturnType<typeof vi.spyOn>;
-  watchSpy: ReturnType<typeof vi.spyOn>;
+  cleanupSpy: MockInstance<BranchManager['cleanupTaskBranch']>;
+  watchSpy: MockInstance<AgentManager['startRuntimeMenuWatch']>;
 }
 
 async function runRecovery(scenario: RecoveryScenario): Promise<RecoveryHandles> {
@@ -82,13 +98,7 @@ async function runRecovery(scenario: RecoveryScenario): Promise<RecoveryHandles>
   for (const task of scenario.tasks ?? []) await seedRecoveryTask(task);
   for (const event of scenario.emit ?? []) await eventBus.emit(event);
   for (const id of scenario.locks ?? []) await acquireBoundLock(id);
-
-  const session = scenario.ensureSession;
-  if (session && 'reject' in session) {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(session.reject);
-  } else {
-    mockEnsureSessionOk(session ?? {});
-  }
+  await scenario.before?.();
 
   const cleanupSpy = vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch')
     .mockImplementation(async () => {
@@ -123,6 +133,8 @@ beforeEach(async () => {
       merge: 'auto',
     }],
   });
+  workdirFailures = new Map();
+  runner = createManagerSuiteRunner({ workdirs: workdirsOf(config) });
   const harness = await createManagerHarness(tempDir, {
     config,
     taskDefaults: {
@@ -132,13 +144,25 @@ beforeEach(async () => {
     },
     lockSeededAgents: true,
     deps: {
-      runnerFactory: () => fakeRunner({
-        agents: {
-          'dev-1': { paneId: '%1' },
-          'qa-1': { paneId: '%1' },
-        },
-      }),
+      runnerFactory: () => runner,
+      repoStoreFactory,
+      // live runtime 下 recover 真的等 idle/ack,节拍压到毫秒级
+      compactIdlePollMs: 1,
+      readyStableSpacingMs: 1,
+      runtimeLivenessProbeMs: 1,
+      cleanComposerWaitMs: 50,
+      bootstrapTimeoutsMs: { trustDialog: 300, waitReplReady: 1_000 },
     },
+  });
+  // git 仓库边界(spec E4):分支切换/清理由 branch.test.ts 覆盖
+  vi.spyOn(BranchManager.prototype, 'assertClean').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockResolvedValue({ status: 'deleted' });
+  vi.spyOn(BranchManager.prototype, 'currentRef').mockImplementation(async workdir => {
+    const binding = (await harness.agentStore.list()).find(state => state.workdir === workdir && state.taskId);
+    const boundTask = binding?.taskId ? await harness.taskStore.get(binding.taskId) : null;
+    return boundTask?.branch ? `refs/heads/${boundTask.branch}` : null;
   });
   ({
     manager,
@@ -221,10 +245,11 @@ describe('recover()', () => {
       expect(await lockManager.isLocked('dev-1')).toBe(true);
       const held = await agentStore.get('dev-1');
       const readHistory = vi.spyOn(eventBus, 'readRangeWithStatus');
-      const start = vi.spyOn(manager, 'startSession');
+      const pastedBefore = runner.pastedPrompts.length;
       await expect(manager.resumeAgent('dev-1')).resolves.toEqual({ resumed: true, releasedBinding: false });
       expect(readHistory).not.toHaveBeenCalled();
-      expect(start).not.toHaveBeenCalled();
+      // Resume 只清标记,不补派提示词
+      expect(runner.pastedPrompts).toHaveLength(pastedBefore);
       expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
       expect(await agentStore.get('dev-1')).toMatchObject({ taskId: 'task-1', lockToken: held?.lockToken });
       expect((await agentStore.get('dev-1'))?.status).not.toBe('awaiting_human');
@@ -254,7 +279,6 @@ describe('recover()', () => {
     await seedRecoveryTask({ id: 'task-live', status: 'review', qaAgentId: 'qa-1' });
     await seedAgent({ id: 'qa-1', taskId: 'task-live' });
     const boundTaskToken = (await agentStore.get('qa-1'))?.lockToken;
-    mockEnsureSessionOk();
 
     await manager.recover();
 
@@ -268,11 +292,11 @@ describe('recover()', () => {
     await seedRecoveryTask({ id: 'task-stale-lock' });
     const before = (await agentStore.get('dev-1'))!;
     await lockManager.releaseIfOwner('dev-1', 'task-stale-lock', before.lockToken!);
-    const ensureSpy = vi.spyOn(manager, 'ensureSession');
 
     await manager.recover();
 
-    expect(ensureSpy).not.toHaveBeenCalled();
+    // 没碰 tmux:runner 轨迹里这个 agent 一条命令都没有
+    expect(runner.exec.mock.calls.some(c => String(c[0]).includes('dev-1'))).toBe(false);
     expect(await agentStore.get('dev-1')).toMatchObject({
       taskId: 'task-stale-lock',
       status: 'awaiting_human',
@@ -288,45 +312,35 @@ describe('recover()', () => {
     });
 
     const state = await agentStore.get('dev-1');
-    expect(state?.paneId).toBe('%1');
+    expect(state?.paneId).toBe('%0');
     expect(state?.creationToken).toBeUndefined();
     expect(state?.taskId).toBe('task-1');
     expect(watchSpy).toHaveBeenCalledWith('dev-1');
   });
 
-  it('releases a recovered merged-task binding directly, with the refreshed pane persisted first', async () => {
-    await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
+  it('releases a recovered merged-task binding directly, onto the refreshed pane', async () => {
+    // 存的是上一代 pane;recover 必须先把探到的真实 pane 落盘,再走释放
+    await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%stale' });
     await seedRecoveryTask({ id: 'task-merged', prNumber: 42, reviewRound: 1, status: 'merged' });
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1',
-      pane: { session: REF, paneId: '%1', claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
-    });
-    const realRelease = manager.releaseAgentForTask.bind(manager);
-    let paneIdSeenByRelease: string | undefined;
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async (agentId, taskId, mode, opts) => {
-      paneIdSeenByRelease = (await agentStore.get(agentId))?.paneId;
-      return realRelease(agentId, taskId, mode, opts);
-    });
 
     await manager.recover();
 
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-merged', 'idle');
-    expect(paneIdSeenByRelease).toBe('%1');
     const state = await agentStore.get('dev-1');
+    expect(state?.paneId).toBe('%0');
     expect(state?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
     expect(canDispatchWithBinding(state)).toBe(true);
   });
 
   it('releases a recovered done-task binding (terminal without pr)', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-done', paneId: '%0' });
     await seedRecoveryTask({ id: 'task-done', status: 'done' });
-    mockEnsureSessionOk();
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
 
     await manager.recover();
 
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-done', 'idle');
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    const state = await agentStore.get('dev-1');
+    expect(state?.taskId).toBeUndefined();
+    expect(canDispatchWithBinding(state)).toBe(true);
   });
 
   it('releases a recovered merged QA binding without a PR (branch merge)', async () => {
@@ -335,13 +349,12 @@ describe('recover()', () => {
       id: 'task-branch-merged', status: 'merged',
       preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1',
     });
-    mockEnsureSessionOk();
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
 
     await manager.recover();
 
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-branch-merged', 'idle');
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    const state = await agentStore.get('qa-1');
+    expect(state?.taskId).toBeUndefined();
+    expect(canDispatchWithBinding(state)).toBe(true);
   });
 
   it('releases a recovered cancelled-task binding', async () => {
@@ -411,10 +424,12 @@ describe('recover()', () => {
       agents: [{ id: 'dev-1', taskId: 'task-1', startedAt: NOW, bootstrappingTaskId: 'task-1' }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
-      ensureSession: { createdSession: true, freshRuntime: true },
+      // 会话没了:recover 重建会话并重新起 REPL(createdSession + freshRuntime)
+      before: () => runner.sessions.drop('dev-1'),
     });
 
     await expectRolledBack('task-1', 'dev-1');
+    expect(runner.sessions.pane('dev-1')?.process).toBe('claude');
     expect((await taskStore.get('task-1'))?.agentId).toBe('');
     expect(watchSpy).not.toHaveBeenCalled();
   });
@@ -425,15 +440,7 @@ describe('recover()', () => {
     });
     await seedRecoveryTask({ id: 'task-pending', status: 'pending' });
     await acquireBoundLock('dev-1');
-    vi.spyOn(manager, 'ensureSession')
-      .mockRejectedValueOnce(new EnsureSessionError(
-        { createdSession: false, agentId: 'dev-1' },
-        'git fetch failed: transient network error',
-      ))
-      .mockResolvedValue({
-        ok: true, createdSession: false, freshRuntime: false, paneId: '%1',
-        pane: { session: REF, paneId: '%1', claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
-      } as never);
+    workdirFailures.set('dev-1', 'git fetch failed: transient network error');
 
     await manager.recover();
     expect(await agentStore.get('dev-1')).toMatchObject({
@@ -443,6 +450,7 @@ describe('recover()', () => {
     });
     expect((await taskStore.get('task-pending'))?.attention).toMatchObject({ reason: 'recovery-failed' });
 
+    workdirFailures.delete('dev-1');
     const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
     await manager.recover();
 
@@ -463,7 +471,8 @@ describe('recover()', () => {
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
-      ensureSession: { createdSession: true, freshRuntime: true },
+      // 会话没了:recover 重建会话并重新起 REPL
+      before: () => runner.sessions.drop('dev-1'),
     });
 
     expect(cleanupSpy).not.toHaveBeenCalled();
@@ -479,7 +488,6 @@ describe('recover()', () => {
       agents: [{ id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0', bootstrappingTaskId: 'task-1' }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
-      ensureSession: { paneId: '%0' },
     });
 
     await expectRolledBack('task-1', 'dev-1');
@@ -566,7 +574,6 @@ describe('recover()', () => {
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
-      ensureSession: { paneId: '%0' },
     });
 
     expect(cleanupSpy).not.toHaveBeenCalled();
@@ -592,9 +599,6 @@ describe('recover()', () => {
   });
 
   it('rolls back a mid-bootstrap task that comes back blocked on a startup dialog (not held forever)', async () => {
-    const dialogSpy = vi.spyOn(
-      manager as never as { markDialogPending: (...a: unknown[]) => Promise<void> }, 'markDialogPending',
-    ).mockResolvedValue(undefined);
     const { cleanupSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
@@ -602,12 +606,13 @@ describe('recover()', () => {
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
-      ensureSession: {
-        reject: new EnsureSessionError({ createdSession: false, agentId: 'dev-1', dialogPending: true }, 'startup dialog'),
-      },
+      // REPL 卡在启动遮挡上:adopt 判 startup-dialog
+      before: () => { useRunner({ agents: { 'dev-1': { screen: STARTUP_DIALOG_SCREEN } } }); },
     });
 
-    expect(dialogSpy).not.toHaveBeenCalled();
+    // 回滚优先于停驻:没有写下 agent_dialog_pending
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
+    expect((await agentStore.get('dev-1'))?.status).toBeUndefined();
     expect(cleanupSpy).not.toHaveBeenCalled();
     await expectRolledBack('task-1', 'dev-1');
   });
@@ -659,10 +664,14 @@ describe('recover()', () => {
       bootstrappingTaskId: 'task-1', workdir: '/tmp/repo',
     });
     await seedRecoveryTask({ id: 'task-1', signalToken: 'replay-tok-1' });
-    vi.spyOn(manager, 'continueSession').mockImplementation(async (_taskId, _agentId, _phase, opts) =>
-      opts.guardBeforeInject?.() ?? true,
-    );
+    await acquireBoundLock('dev-1');
+
     await expect(manager.redispatchTaskPromptAfterReplRestart('dev-1', 'task-1')).resolves.toBe(true);
+    const replayed = await taskStore.get('task-1');
+    expect(runner.pastedPrompts).toEqual([
+      { pane: '%0', body: expect.stringContaining(`token: ${replayed!.signalToken!}`) },
+    ]);
+    expect(runner.pastedPrompts[0]!.body).toContain('phase: develop');
 
     const { cleanupSpy } = await runRecovery({ agents: [], tasks: [] });
 
@@ -695,12 +704,12 @@ describe('recover()', () => {
       agents: [{ id: 'dev-1', taskId: 'task-1', paneId: '%0', creationToken: 'tok' }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
-      ensureSession: {
-        reject: new EnsureSessionError({ createdSession: false, agentId: 'dev-1' }, 'session claim mismatch'),
-      },
+      // 会话被别人认领:recover 拒绝接管外来会话
+      before: () => runner.sessions.reclaim('dev-1', 'someone-else'),
     });
 
     const state = await agentStore.get('dev-1');
+    expect(state?.awaitingReason).toContain('claim mismatch');
     expect(state?.paneId).toBeUndefined();
     expect(state?.creationToken).toBeUndefined();
     expect(state).toMatchObject({
@@ -717,18 +726,7 @@ describe('recover()', () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-1', paneId: '%0', startedAt: NOW });
     await seedAgent({ id: 'qa-1', taskId: 'task-1', paneId: '%2', startedAt: NOW });
     await seedRecoveryTask({ id: 'task-1', status: 'review', reviewRound: 1 });
-    vi.spyOn(manager, 'ensureSession').mockImplementation(async (agentId) => {
-      if (agentId === 'dev-1') {
-        throw new EnsureSessionError(
-          { createdSession: false, agentId },
-          "git fetch failed: cannot lock ref 'refs/remotes/origin/HEAD'",
-        );
-      }
-      return {
-        ok: true, createdSession: false, freshRuntime: false, paneId: '%2',
-        pane: { session: REF, paneId: '%2', claim: agentId }, sessionRef: REF, workdir: '/tmp/repo',
-      } as never;
-    });
+    workdirFailures.set('dev-1', "git fetch failed: cannot lock ref 'refs/remotes/origin/HEAD'");
 
     await manager.recover();
 
@@ -756,12 +754,8 @@ describe('recover()', () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-1', paneId: '%0', startedAt: NOW });
     await seedAgent({ id: 'qa-1', taskId: 'task-1', paneId: '%2', startedAt: NOW });
     await seedRecoveryTask({ id: 'task-1', status: 'review', reviewRound: 1 });
-    vi.spyOn(manager, 'ensureSession').mockImplementation(async (agentId) => {
-      throw new EnsureSessionError(
-        { createdSession: false, agentId },
-        'git fetch failed: transient network error',
-      );
-    });
+    workdirFailures.set('dev-1', 'git fetch failed: transient network error');
+    workdirFailures.set('qa-1', 'git fetch failed: transient network error');
 
     await manager.recover();
 
@@ -782,10 +776,7 @@ describe('recover()', () => {
       bootstrappingTaskId: 'task-pending',
     });
     await seedRecoveryTask({ id: 'task-pending', status: 'pending' });
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
-      { createdSession: false, agentId: 'dev-1' },
-      'git fetch failed: transient network error',
-    ));
+    workdirFailures.set('dev-1', 'git fetch failed: transient network error');
 
     await manager.recover();
 
@@ -803,19 +794,17 @@ describe('recover()', () => {
     expect(canDispatchWithBinding(await agentStore.get('dev-1'))).toBe(true);
     expect((await taskStore.get('task-pending'))?.attention).toBeUndefined();
 
-    const start = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    workdirFailures.delete('dev-1');
     const advanced = await manager.advanceTask('task-pending');
     expect(advanced.status).toBe('in_progress');
-    expect(start).toHaveBeenCalledWith('task-pending', 'dev-1', 'develop');
+    expect(advanced.agentId).toBe('dev-1');
+    expect(runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining('task-pending') }]);
   });
 
   it('does not attach recovery actions to a terminal task', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-done', paneId: '%0', startedAt: NOW });
     await seedRecoveryTask({ id: 'task-done', status: 'done' });
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
-      { createdSession: false, agentId: 'dev-1' },
-      'git fetch failed: transient network error',
-    ));
+    workdirFailures.set('dev-1', 'git fetch failed: transient network error');
 
     await manager.recover();
 
@@ -839,10 +828,7 @@ describe('recover()', () => {
 
   it('does not tell an unbound failed agent to Resume', async () => {
     await seedAgent({ id: 'dev-1', paneId: '%0' });
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
-      { createdSession: false, agentId: 'dev-1' },
-      'git fetch failed: transient network error',
-    ));
+    workdirFailures.set('dev-1', 'git fetch failed: transient network error');
 
     await manager.recover();
 
@@ -859,10 +845,7 @@ describe('recover()', () => {
     registerEventHandlers(eventBus, manager);
     await seedAgent({ id: 'dev-1', taskId: 'task-1', paneId: '%0', startedAt: NOW });
     await seedRecoveryTask({ id: 'task-1' });
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(new EnsureSessionError(
-      { createdSession: false, agentId: 'dev-1' },
-      'git fetch failed: transient network error',
-    ));
+    workdirFailures.set('dev-1', 'git fetch failed: transient network error');
     await manager.recover();
 
     await expect(manager.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: true });
@@ -899,7 +882,7 @@ describe('setupRecoveredPostApproveSignals()', () => {
       ...postApproveEpisode('tok', 'a'.repeat(40)),
     });
     const watcher = {
-      start: vi.fn(async () => true),
+      start: vi.fn(async (_args: PhaseSignalWatcherStartArgs) => true),
       stop: vi.fn(),
     };
     manager = createManager({
@@ -1019,7 +1002,7 @@ describe('git review dispatch recovery', () => {
 describe('setupRecoveredSpecSignals()', () => {
   async function buildManagerWithSpecWatcher() {
     const watcher = {
-      start: vi.fn(async () => true),
+      start: vi.fn(async (_args: PhaseSignalWatcherStartArgs) => true),
       stop: vi.fn(),
       has: vi.fn(() => true),
       isSettling: vi.fn(() => false),
@@ -1127,7 +1110,7 @@ describe('setupRecoveredSpecSignals()', () => {
 
     await manager.setupRecoveredSpecSignals();
 
-    const args = watcher.start.mock.calls[0]![0] as Record<string, unknown>;
+    const args = watcher.start.mock.calls[0]![0];
     expect(args.expectedKinds).toEqual(['pr-fixed']);
     expect(args.skipSnapshot).toBe(false);
     expect('onReadFile' in args).toBe(false);
@@ -1194,24 +1177,31 @@ describe('setupRecoveredSpecSignals()', () => {
 
 describe('recover() deferred branches', () => {
   it('skips the terminal-binding release when the binding refresh does not land', async () => {
-    await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%stale' });
     await seedRecoveryTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
-    mockEnsureSessionOk();
-    vi.spyOn(agentStore, 'update').mockImplementationOnce(async () => {});
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    await acquireBoundLock('dev-1');
+    const realUpdate = agentStore.update.bind(agentStore);
+    // 吞掉「写回刷新后 pane」的那次写(第一次是 ensureSession 写 Workdir)
+    let devUpdates = 0;
+    vi.spyOn(agentStore, 'update').mockImplementation(async (id, fn) => {
+      if (id === 'dev-1' && ++devUpdates === 2) return 'noop';
+      return realUpdate(id, fn);
+    });
 
     await manager.recover();
 
-    expect(releaseSpy).not.toHaveBeenCalledWith('dev-1', 'task-merged', 'idle');
+    // pane 刷新没落盘 → 不释放:绑定与锁都留在原地
+    expect((await agentStore.get('dev-1'))?.taskId).toBe('task-merged');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
   it('falls through to the held-binding release path when the terminal release throws', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
     await seedRecoveryTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
     await acquireBoundLock('dev-1');
-    mockEnsureSessionOk();
     const realRelease = manager.releaseAgentForTask.bind(manager);
     let threw = false;
+    // E2: 只让第一次释放失败、第二次成功是状态机内部的一次性故障,runner 层造不出「同一命令先失败后成功」
     vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async (agentId, taskId, mode, opts) => {
       if (!threw) { threw = true; throw new Error('release exploded'); }
       return realRelease(agentId, taskId, mode, opts);
@@ -1220,9 +1210,13 @@ describe('recover() deferred branches', () => {
 
     await manager.recover();
 
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('releaseAgentForTask'))).toBe(true);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
+    // the fallback succeeds, so the first release's failure is only visible through this warning
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/releaseAgentForTask\(dev-1, task-merged\) failed/),
+      expect.objectContaining({ message: 'release exploded' }),
+    );
     warnSpy.mockRestore();
   });
 
@@ -1267,26 +1261,34 @@ describe('recover() deferred branches', () => {
 
   it('marks the agent dialog-pending and survives a crashing slow poll', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.spyOn(
-      manager as unknown as { slowPollDialogPending: () => Promise<void> },
-      'slowPollDialogPending',
-    ).mockRejectedValue(new Error('poll crashed'));
 
     await runRecovery({
       agents: [{ id: 'dev-1', paneId: '%0' }],
-      ensureSession: {
-        reject: new EnsureSessionError(
-          { createdSession: false, agentId: 'dev-1', dialogPending: true, lastScreen: 'Press enter to continue' },
-          'blocked on startup dialog',
-        ),
+      before: () => {
+        // REPL 卡在启动遮挡上;抓到这一帧之后后台慢轮询再取 runner 就拿不到了(公共依赖失效)
+        let blocked = false;
+        const dialogRunner = createManagerSuiteRunner({
+          workdirs: workdirsOf(config),
+          agents: { 'dev-1': { screen: STARTUP_DIALOG_SCREEN } },
+          onExec: command => { if (command.includes('capture-pane')) blocked = true; },
+        });
+        runner = dialogRunner;
+        manager = createManager({
+          runnerFactory: () => {
+            if (blocked) throw new Error('poll crashed');
+            return dialogRunner;
+          },
+        });
       },
     });
 
     const state = await agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('agent_dialog_pending');
-    await new Promise(r => setTimeout(r, 10));
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('slowPoll'))).toBe(true);
+    // the background poll crash is swallowed by design; its warning is the only diagnostic, so it must name the agent
+    await vi.waitFor(() => {
+      expect(warnSpy.mock.calls.some(call => /slowPoll.*dev-1/.test(String(call[0])))).toBe(true);
+    });
     warnSpy.mockRestore();
   });
 
@@ -1298,16 +1300,15 @@ describe('recover() deferred branches', () => {
       agents: [{ id: 'dev-1', taskId: 'task-1', paneId: '%0' }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
-      ensureSession: {
-        reject: new EnsureSessionError(
-          { createdSession: true, agentId: 'dev-1', sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' }, genAtCreate: 0 },
-          'boot exploded mid-recovery',
-        ),
+      before: () => {
+        // 会话没了 → recover 新建会话,启动命令发不出去 → createdSession 的 partial 带着新会话 ref 回滚
+        useRunner({ rules: [{ match: 'send-keys -l', reply: { stderr: 'boot exploded mid-recovery', exitCode: 1 } }] });
+        runner.sessions.drop('dev-1');
       },
     });
 
     expect(killSpy).toHaveBeenCalledWith(
-      { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' },
+      { sessionId: expect.stringMatching(/^\$\d+$/), serverPid: '4242', serverStart: '1700000000' },
       { kind: 'emptyOr', claim: 'dev-1' },
     );
     expect(warnSpy.mock.calls.some(c => String(c[0]).includes('created-session rollback') && String(c[0]).includes('failed'))).toBe(true);

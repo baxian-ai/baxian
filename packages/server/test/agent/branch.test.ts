@@ -8,9 +8,8 @@ import {
   isAutoDeletableTaskBranch,
 } from '../../src/agent/branch.js';
 import { LocalRunner, shellQuote, type CommandRunner } from '../../src/agent/runner.js';
-import { ReplNotReadyError } from '../../src/agent/tmux.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
-import { fakeRunner } from '../helpers/fake-runner.js';
+import { fakeRunner, RUNTIME_PROFILES } from '../helpers/fake-runner.js';
 import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
 const local = new LocalRunner();
@@ -1169,15 +1168,16 @@ describe('BranchManager', () => {
       deps: {
         runnerFactory: () => runtimeRunner,
         platformRunner: runtimeRunner,
+        cleanComposerWaitMs: 20,
+        compactIdlePollMs: 1,
+        readyStableSpacingMs: 1,
       },
     });
     const { manager, agentStore, taskStore, lockManager } = harness;
     await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', workdir, updatedAt: now });
     await taskStore.set(task);
-    vi.spyOn(
-      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
-      'waitForReplPromptReady',
-    ).mockRejectedValue(new ReplNotReadyError('%7', 'codex', 'runtime still busy'));
+    // pane 停在一帧不变的 working 画面:就绪等待真实超时,分支清理必须让位
+    runtimeRunner.sessions.markWorking('dev-1', RUNTIME_PROFILES.codex.workingFrame);
 
     await manager.reconcileTaskBranches();
 

@@ -12,6 +12,10 @@ import { PrReviewPage } from '../../src/pages/pr-review.tsx';
 
 const ghMock = vi.mocked(api.tasks.prReview);
 
+function flashedIds(): string[] {
+  return Array.from(document.querySelectorAll('.ring-2'), (el) => el.id);
+}
+
 function renderAt(path: string) {
   render(
     <MemoryRouter initialEntries={[path]}>
@@ -144,8 +148,7 @@ describe('PrReviewPage', () => {
     renderAt('/tasks/task-1/pr-review#pr-review-11');
     await screen.findByText('please fix');
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
-    expect(document.getElementById('pr-review-11')?.className).toContain('ring-2');
-    expect(document.getElementById('pr-issue-comment-c1')?.className).not.toContain('ring-2');
+    expect(flashedIds()).toEqual(['pr-review-11']);
   });
 
   it('retries the anchor when a same-task refetch adds the target record', async () => {
@@ -186,7 +189,7 @@ describe('PrReviewPage', () => {
 
     await screen.findByText('late review');
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
-    expect(document.getElementById('pr-review-11')?.className).toContain('ring-2');
+    expect(flashedIds()).toEqual(['pr-review-11']);
   });
 
   it('treats a malformed percent-encoded hash as an anchor miss instead of crashing', async () => {

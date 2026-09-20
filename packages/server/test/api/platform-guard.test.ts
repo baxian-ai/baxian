@@ -39,9 +39,9 @@ function managerWithBound(tasks: Array<{
 }
 
 const twoProjectCfg = (projects: Array<{ id: string; repo: string }>): BaxianConfig => ({
-  review: { rounds: 2 }, server: DEFAULT_SERVER_CONFIG,
+  review: { rounds: 2 }, server: DEFAULT_SERVER_CONFIG, host: [],
   project: projects.map(p => ({ id: p.id, repo: p.repo, merge: null, agent: [] })),
-} as BaxianConfig);
+});
 
 describe('gitBindingBlockers', () => {
   it('blocks repository changes while platform tasks are active', async () => {

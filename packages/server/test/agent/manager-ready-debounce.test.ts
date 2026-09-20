@@ -1,118 +1,177 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import type { AgentManager } from '../../src/agent/manager.js';
-import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
-import { createManagerHarness } from '../helpers/manager-harness.js';
-import { fakeRunner } from '../helpers/fake-runner.js';
+import { describe, it, expect } from 'vitest';
+import type { TaskState } from '../../src/shared/index.js';
+import type { AgentManagerDeps } from '../../src/agent/manager.js';
+import { ReplNotReadyError } from '../../src/agent/tmux.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
 
-const CODEX_IDLE = '› \n\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
+const harness = useManagerSuiteHarness();
+
 const CODEX_BUSY = '• Working (12s • esc to interrupt)\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
 // tmux keeps styled blank cells, so the separator rows arrive as single spaces
 const CODEX_IDLE_STYLED_BLANKS =
   '─ Worked for 9m 16s ───────\n \n \n› Ask Codex to do anything\n \n  gpt-5.5 xhigh · ~/repo\n';
+const BUSY_WINDOW = { cleanComposerWaitMs: 60 };
 
-type WaitOpts = { stableIdle?: boolean };
-type WaitFn = (tmux: TmuxManager, paneId: string, runtime: string, timeoutMs: number, opts?: WaitOpts) => Promise<void>;
+// probeReplPrompt 的抓屏形态(不带 -e);waitReplReady 与 adopt 的抓屏带 -e,不计入
+const isReadyProbe = (cmd: string): boolean => cmd.includes('capture-pane -p -J -S 0');
 
-let tempDir: string;
-let manager: AgentManager;
-let tmux: TmuxManager;
-
-function waitReady(timeoutMs: number, opts?: WaitOpts): Promise<void> {
-  const fn = (manager as unknown as { waitForReplPromptReady: WaitFn }).waitForReplPromptReady.bind(manager) as WaitFn;
-  return fn(tmux, '%0', 'codex', timeoutMs, opts);
+function useRunner(options: FakeRunnerOptions = {}, timing: Partial<AgentManagerDeps> = {}): FakeRunner {
+  const runner = createManagerSuiteRunner(options);
+  harness.runner = runner;
+  harness.manager = harness.createManager({ runnerFactory: () => runner, ...timing });
+  return runner;
 }
 
-function mockFrames(frames: string[], opts: { cycle?: boolean } = {}): ReturnType<typeof vi.spyOn> {
-  let i = 0;
-  return vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockImplementation(async () => {
-    const idx = Math.min(i, frames.length - 1);
-    const frame = opts.cycle ? frames[i % frames.length] : frames[idx];
-    i += 1;
-    return frame;
+async function seedReview(): Promise<TaskState> {
+  const task = await harness.seedTask({
+    id: 'task-review',
+    status: 'review',
+    signalToken: 'tok123456789',
+    latestHeadSha: 'a'.repeat(40),
+    reviewHeadAnchorSha: 'a'.repeat(40),
+    passToken: 'aaaaaaaaaaaa',
+    failToken: 'bbbbbbbbbbbb',
   });
+  await harness.seedAgent({ id: 'qa-1', taskId: task.id, paneId: '%1' });
+  await harness.acquireAgentLock('qa-1', task.id);
+  return task;
 }
 
-beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-debounce-'));
-  const runner = fakeRunner({ defaultResult: {} });
-  const harness = await createManagerHarness(tempDir, {
-    deps: {
-      runnerFactory: () => runner,
-      platformRunner: runner,
-    },
-  });
-  manager = harness.manager;
-  Object.assign(manager, {
-    compactIdlePollMs: 1,
-    readyStableSpacingMs: 1,
-  });
-  tmux = new TmuxManager(runner);
-  vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
-  vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('');
-});
+// review 派发前的 stableIdle 等待是 waitForReplPromptReady 的去抖入口
+const reviewDispatch = (task: TaskState): Promise<boolean> => harness.manager.startSession(task.id, 'qa-1', 'review');
+const cmds = (): string[] => harness.runner.exec.mock.calls.map(c => String(c[0]));
+const before = (marker: string): string[] => {
+  const at = cmds().findIndex(c => c.includes(marker));
+  return at === -1 ? cmds() : cmds().slice(0, at);
+};
+// 预注入抓屏与就绪采样同一命令形态,清稿前的探针数减一才是采样数
+const idleSamplesBeforeClear = (): number => before('send-keys -l').filter(isReadyProbe).length - 1;
 
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await rm(tempDir, { recursive: true, force: true });
-});
+// 第 n 次就绪探针之前把 pane 切成给定相位
+function paneAtProbe(transitions: Record<number, 'busy' | 'idle' | 'exited'>): FakeRunnerOptions['onExec'] {
+  let probes = 0;
+  return cmd => {
+    if (!isReadyProbe(cmd)) return;
+    const next = transitions[++probes];
+    if (next === 'busy') harness.runner.sessions.markWorking('qa-1', CODEX_BUSY);
+    if (next === 'idle') harness.runner.sessions.setProcess('qa-1', 'codex');
+    if (next === 'exited') harness.runner.sessions.setProcess('qa-1', 'zsh');
+  };
+}
 
 describe('waitForReplPromptReady 完整判定优先', () => {
-  it.each([
-    { mode: 'plain', opts: undefined },
-    { mode: 'stableIdle', opts: { stableIdle: true } as WaitOpts },
-  ])('钉底 composer 的空白分隔行不挡就绪判定（$mode）', async ({ opts }) => {
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    mockFrames([CODEX_IDLE_STYLED_BLANKS]);
-    await expect(waitReady(200, opts)).resolves.toBeUndefined();
+  it('钉底 composer 的空白分隔行不挡就绪判定(plain:compact 直接放行)', async () => {
+    const runner = useRunner({ agents: { 'qa-1': { screen: CODEX_IDLE_STYLED_BLANKS } } });
+    await harness.seedAgent({ id: 'qa-1', paneId: '%1' });
+
+    await expect(harness.manager.compactAgent('qa-1')).resolves.toBeUndefined();
+
+    expect(runner.sentKeys.some(k => k.includes('send-keys -l') && k.includes('/compact'))).toBe(true);
+    expect(runner.sessions.pane('qa-1')!.phase).toBe('working');
+  });
+
+  it('钉底 composer 的空白分隔行不挡就绪判定(stableIdle:review 派发放行)', async () => {
+    const runner = useRunner({ agents: { 'qa-1': { screen: CODEX_IDLE_STYLED_BLANKS } } });
+    const task = await seedReview();
+
+    await expect(reviewDispatch(task)).resolves.toBe(true);
+
+    expect(runner.pastedPrompts).toEqual([{ pane: '%1', body: expect.stringContaining('token: tok123456789') }]);
   });
 
   it('screen-only ready 不得绕过 working 的 OSC 标题', async () => {
-    mockFrames([CODEX_IDLE], { cycle: true });
-    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('⠹ 分析');
-    await expect(waitReady(60)).rejects.toBeInstanceOf(ReplNotReadyError);
+    const runner = useRunner({ agents: { 'qa-1': { title: '⠹ 分析' } } }, BUSY_WINDOW);
+    const task = await seedReview();
+
+    await expect(reviewDispatch(task)).rejects.toBeInstanceOf(ReplNotReadyError);
+
+    expect(runner.pastedPrompts).toEqual([]);
+  });
+});
+
+describe('waitForReplPromptReady plain 去抖', () => {
+  // release 的就绪等待不带 stableIdle:走 waitReplReady 之后的忙碌轮询分支
+  it('忙碌到超时抛 ReplNotReadyError:deferWhenBusy 的释放不落 hold,绑定与锁原样保留', async () => {
+    const runner = useRunner({ onExec: paneAtProbe({ 1: 'busy' }) }, BUSY_WINDOW);
+    const task = await harness.seedTask({ id: 'task-release-busy', status: 'review' });
+    await harness.seedAgent({ id: 'qa-1', taskId: task.id, paneId: '%1' });
+    await harness.acquireAgentLock('qa-1', task.id);
+
+    await expect(harness.manager.releaseAgentForTask('qa-1', task.id, 'idle', { deferWhenBusy: true }))
+      .rejects.toBeInstanceOf(ReplNotReadyError);
+
+    const qa = await harness.agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(task.id);
+    expect(qa?.status).toBeUndefined();
+    expect(await harness.lockManager.isLocked('qa-1')).toBe(true);
+    expect(runner.sessions.pane('qa-1')!.phase).toBe('working');
   });
 });
 
 describe('waitForReplPromptReady stableIdle 去抖', () => {
-  it('忙碌序列夹单帧假 idle：不判 ready，超时抛 ReplNotReadyError', async () => {
-    mockFrames([CODEX_BUSY, CODEX_IDLE, CODEX_BUSY, CODEX_IDLE], { cycle: true });
-    await expect(waitReady(30, { stableIdle: true })).rejects.toBeInstanceOf(ReplNotReadyError);
+  it('忙碌序列夹单帧假 idle:不判 ready,超时抛 ReplNotReadyError', async () => {
+    let probes = 0;
+    const runner = useRunner({
+      ackHoldCaptures: 2,
+      onExec: cmd => { if (isReadyProbe(cmd) && probes++ % 2 === 0) harness.runner.sessions.markWorking('qa-1'); },
+    }, BUSY_WINDOW);
+    const task = await seedReview();
+
+    await expect(reviewDispatch(task)).rejects.toBeInstanceOf(ReplNotReadyError);
+
+    expect(probes).toBeGreaterThanOrEqual(4);
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
-  it('连续稳定 idle 帧达到阈值才返回；忙碌帧清零计数', async () => {
-    const spy = mockFrames([CODEX_IDLE, CODEX_BUSY, CODEX_IDLE, CODEX_IDLE, CODEX_IDLE]);
-    await expect(waitReady(200, { stableIdle: true })).resolves.toBeUndefined();
-    expect(spy.mock.calls.length).toBe(5);
+  it('连续稳定 idle 帧达到阈值才返回;忙碌帧清零计数', async () => {
+    const runner = useRunner({ onExec: paneAtProbe({ 2: 'busy', 3: 'idle' }) });
+    const task = await seedReview();
+
+    await expect(reviewDispatch(task)).resolves.toBe(true);
+
+    expect(idleSamplesBeforeClear()).toBe(5);
+    expect(runner.pastedPrompts).toHaveLength(1);
   });
 
-  it('从头稳定 idle：恰好采样阈值帧数后返回', async () => {
-    const spy = mockFrames([CODEX_IDLE]);
-    await expect(waitReady(200, { stableIdle: true })).resolves.toBeUndefined();
-    expect(spy.mock.calls.length).toBe(3);
+  it('从头稳定 idle:恰好采样阈值帧数后返回', async () => {
+    const runner = useRunner();
+    const task = await seedReview();
+
+    await expect(reviewDispatch(task)).resolves.toBe(true);
+
+    expect(idleSamplesBeforeClear()).toBe(3);
+    expect(runner.pastedPrompts).toHaveLength(1);
   });
 
-  it('非 stableIdle 分支的忙碌超时同样抛类型化 ReplNotReadyError', async () => {
-    mockFrames([CODEX_BUSY], { cycle: true });
-    await expect(waitReady(30)).rejects.toBeInstanceOf(ReplNotReadyError);
+  it('两帧 idle 后转忙:不足阈值不放行,超时抛 ReplNotReadyError', async () => {
+    const runner = useRunner({ onExec: paneAtProbe({ 3: 'busy' }) }, BUSY_WINDOW);
+    const task = await seedReview();
+
+    await expect(reviewDispatch(task)).rejects.toBeInstanceOf(ReplNotReadyError);
+
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
-  it('REPL 进程退出立即失败（非 ReplNotReadyError）', async () => {
-    mockFrames([CODEX_IDLE]);
-    const display = vi.spyOn(TmuxManager.prototype, 'displayMessage');
-    display.mockResolvedValueOnce('node').mockResolvedValue('zsh');
-    const err = await waitReady(200, { stableIdle: true }).catch(e => e);
+  it('REPL 进程退出立即失败(非 ReplNotReadyError)', async () => {
+    const runner = useRunner({ onExec: paneAtProbe({ 2: 'exited' }) });
+    const task = await seedReview();
+
+    const err: unknown = await reviewDispatch(task).catch(e => e);
+
     expect(err).toBeInstanceOf(Error);
     expect(err).not.toBeInstanceOf(ReplNotReadyError);
     expect(String(err)).toMatch(/not runtime/);
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
-  it('plain 模式回归：单帧 idle 即返回（既有行为不变）', async () => {
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
-    const spy = mockFrames([CODEX_IDLE]);
-    await expect(waitReady(200)).resolves.toBeUndefined();
-    expect(spy.mock.calls.length).toBe(1);
+  it('plain 模式回归:compact 的两次就绪等待各只采样一帧 idle 即放行', async () => {
+    const runner = useRunner();
+    await harness.seedAgent({ id: 'qa-1', paneId: '%1' });
+
+    await expect(harness.manager.compactAgent('qa-1')).resolves.toBeUndefined();
+
+    expect(before('/compact').filter(isReadyProbe)).toHaveLength(2);
+    expect(runner.sessions.pane('qa-1')!.phase).toBe('working');
   });
 });

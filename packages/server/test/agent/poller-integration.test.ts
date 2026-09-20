@@ -10,9 +10,8 @@ import type { AgentManager } from '../../src/agent/manager.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from '../../src/agent/tmux-probe-poller.js';
 import { BootstrapPoller } from '../../src/agent/bootstrap-poller.js';
 import { createRepoStoreCache } from '../../src/agent/repo-store.js';
-import type { CommandRunner } from '../../src/agent/runner.js';
 import { createManagerHarness } from '../helpers/manager-harness.js';
-import { fakeRunner } from '../helpers/fake-runner.js';
+import { fakeRunner, type FakeRunner } from '../helpers/fake-runner.js';
 import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 const NOW = '2026-04-28T10:00:00Z';
@@ -23,7 +22,7 @@ let agentStore: AgentStore;
 let lockManager: LockManager;
 let eventBus: EventBus;
 let agentManager: AgentManager;
-let noopRunner: CommandRunner;
+let noopRunner: FakeRunner;
 let events: BaxianEvent[];
 
 beforeEach(async () => {
@@ -69,14 +68,14 @@ describe('poller integration', () => {
       updatedAt: NOW,
     });
     await lockManager.acquire('dev-1', 'orphan');
+    const absentSession = { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
+    // manager 在 reconcile 前会链内重探同一个会话:它的 runner 也得答 absent
+    noopRunner.exec.mockImplementation(async (cmd: string) => (/tmux (?:has|list)-session/.test(cmd) ? absentSession : { stdout: '', stderr: '', exitCode: 0 }));
 
     const probePoller = new TmuxProbePoller({
       config, store: new TmuxSessionStatusStore(), agentManager,
       runnerFactory: () => fakeRunner({
-        rules: [{
-          match: 'tmux has-session',
-          reply: { stderr: "can't find session: dev-1", exitCode: 1 },
-        }],
+        rules: [{ match: 'tmux has-session', reply: absentSession }],
         defaultResult: {},
       }),
       intervalMs: 10_000,
@@ -135,7 +134,7 @@ describe('poller integration', () => {
     expect(state?.workdir).toBe('/path/to/repo');
     const succeeded = events.filter(e => e.type === 'agent.bootstrap_succeeded');
     expect(succeeded).toHaveLength(1);
-    expect((succeeded[0] as { data: { updated: number } }).data.updated).toBe(1);
+    expect(succeeded[0]!.data.updated).toBe(1);
   });
 
   it('healthy repo: BootstrapPoller 5 cycles produces zero events', async () => {

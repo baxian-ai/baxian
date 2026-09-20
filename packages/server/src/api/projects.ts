@@ -27,6 +27,7 @@ import {
 import { saveConfig, prepareConfig, ConfigValidationError } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
 import { CleanupFailedError, type DeletionClaimOutcome } from '../agent/manager.js';
+import { ApiError } from '../errors.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
 import { applyConfigHotReload, prepareConfigHotReload } from '../config/hot-reload.js';
 import { gitBindingBlockerDetails, gitBindingBlockers } from './platform-guard.js';
@@ -1277,44 +1278,51 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
       const genAtEntry = app.ctx.agentManager.deletionGenerationOf(agentId);
 
-      const owner = await resolveLockOwnership(app, agentId);
-      const maintenanceOwner = 'maintenance:restart-repl';
-      let maintenanceLockOwner = maintenanceOwner;
-      let maintenanceToken: string | null = null;
-      let acquiredMaintenanceLock = false;
-      if (!owner.takeover) {
-        const stateBefore = await app.ctx.agentStore.get(agentId);
-        const task = stateBefore?.taskId ? await app.ctx.taskStore.get(stateBefore.taskId) : null;
-        if (task && TASK_ACTIVE_STATUS_SET.has(task.status)) {
-          return reply.status(409).send({
-            error:
-              `agent "${agentId}" is bound to active task ${task.id}; ` +
-              `restart-repl is reserved for failed REPLs — interrupting a healthy ` +
-              `task would lose work. cancel the task first.`,
-          });
-        }
-        maintenanceLockOwner = stateBefore?.taskId ?? maintenanceOwner;
-        const lock = await acquireOrReuseExactLock(app, agentId, maintenanceLockOwner);
-        if (!lock) {
-          return reply.status(409).send({ error: `Agent "${agentId}" is locked by another op; please retry later` });
-        }
-        maintenanceToken = lock.token;
-        acquiredMaintenanceLock = lock.acquired;
+      if (!app.ctx.agentManager.tryBeginMaintenance(agentId)) {
+        return reply.status(409).send({ error: `Agent "${agentId}" restart-repl or retry already in progress; wait for it to finish` });
       }
-
       try {
-        await app.ctx.agentManager.restartReplOnly(agentId, { expectedGeneration: genAtEntry });
-      } catch (err) {
-        if (maintenanceToken && acquiredMaintenanceLock) {
-          await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+        const owner = await resolveLockOwnership(app, agentId);
+        const maintenanceOwner = 'maintenance:restart-repl';
+        let maintenanceLockOwner = maintenanceOwner;
+        let maintenanceToken: string | null = null;
+        let acquiredMaintenanceLock = false;
+        if (!owner.takeover) {
+          const stateBefore = await app.ctx.agentStore.get(agentId);
+          const task = stateBefore?.taskId ? await app.ctx.taskStore.get(stateBefore.taskId) : null;
+          if (task && TASK_ACTIVE_STATUS_SET.has(task.status)) {
+            return reply.status(409).send({
+              error:
+                `agent "${agentId}" is bound to active task ${task.id}; ` +
+                `restart-repl is reserved for failed REPLs — interrupting a healthy ` +
+                `task would lose work. cancel the task first.`,
+            });
+          }
+          maintenanceLockOwner = stateBefore?.taskId ?? maintenanceOwner;
+          const lock = await acquireOrReuseExactLock(app, agentId, maintenanceLockOwner);
+          if (!lock) {
+            return reply.status(409).send({ error: `Agent "${agentId}" is locked by another op; please retry later` });
+          }
+          maintenanceToken = lock.token;
+          acquiredMaintenanceLock = lock.acquired;
         }
-        const message = err instanceof Error ? err.message : String(err);
-        return reply.status(500).send({ error: message });
+
+        try {
+          await app.ctx.agentManager.restartReplOnly(agentId, { expectedGeneration: genAtEntry });
+        } catch (err) {
+          if (maintenanceToken && acquiredMaintenanceLock) {
+            await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          return reply.status(err instanceof ApiError ? err.status : 500).send({ error: message });
+        }
+        await pendingCleanupAfterReplReady(app, agentId, owner.takeover, maintenanceToken
+          ? { taskId: maintenanceLockOwner, token: maintenanceToken }
+          : undefined);
+        return reply.send({ ok: true, agentId });
+      } finally {
+        app.ctx.agentManager.endMaintenance(agentId);
       }
-      await pendingCleanupAfterReplReady(app, agentId, owner.takeover, maintenanceToken
-        ? { taskId: maintenanceLockOwner, token: maintenanceToken }
-        : undefined);
-      return reply.send({ ok: true, agentId });
     },
   );
 
@@ -1330,82 +1338,89 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(409).send({ error: `Agent "${agentId}" is being deleted; retry not allowed.` });
       }
       const genAtEntry = app.ctx.agentManager.deletionGenerationOf(agentId);
-      const stateBefore = await app.ctx.agentStore.get(agentId);
-      if (stateBefore?.creationToken) {
-        return reply.status(409).send({
-          error: 'agent is being created, please retry later',
-        });
+      if (!app.ctx.agentManager.tryBeginMaintenance(agentId)) {
+        return reply.status(409).send({ error: `Agent "${agentId}" restart-repl or retry already in progress; wait for it to finish` });
       }
-      if (app.ctx.tmuxSessionStatusStore.get(agentId).tmuxSessionStatus === 'present') {
-        return reply.status(409).send({ error: 'agent is already ready; retry is for failed/missing sessions' });
-      }
-
-      const owner = await resolveLockOwnership(app, agentId);
-      const maintenanceOwner = 'maintenance:retry';
-      const maintenanceLockOwner = stateBefore?.taskId ?? maintenanceOwner;
-      let maintenanceToken: string | null = null;
-      let acquiredMaintenanceLock = false;
-      if (!owner.takeover) {
-        const task = stateBefore?.taskId ? await app.ctx.taskStore.get(stateBefore.taskId) : null;
-        if (task && TASK_ACTIVE_STATUS_SET.has(task.status)) {
-          return reply.status(409).send({
-            error:
-              `agent "${agentId}" is bound to active task ${task.id}, but does not hold that task's ` +
-              `exclusive lock; Resume or cancel the task before retrying the REPL.`,
-          });
-        }
-        const lock = await acquireOrReuseExactLock(app, agentId, maintenanceLockOwner);
-        if (!lock) {
-          return reply.status(409).send({ error: `Agent "${agentId}" is locked by another op; please retry later` });
-        }
-        maintenanceToken = lock.token;
-        acquiredMaintenanceLock = lock.acquired;
-      }
-
       try {
-        const result = await app.ctx.agentManager.ensureSession(agentId, 'runtime', { expectedGeneration: genAtEntry });
-        const now = new Date().toISOString();
-        const paneCommit = await app.ctx.agentStore.update(agentId, (existing) => {
-          if (!existing
-              || app.ctx.agentManager.isDeletionInFlight(agentId)
-              || app.ctx.agentManager.deletionGenerationOf(agentId) !== genAtEntry) {
-            return AGENT_STORE_NOOP;
-          }
-          return { ...existing, paneId: result.paneId, updatedAt: now };
-        });
-        if (paneCommit !== 'committed') {
-          if (maintenanceToken && acquiredMaintenanceLock) {
-            await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
-          }
+        const stateBefore = await app.ctx.agentStore.get(agentId);
+        if (stateBefore?.creationToken) {
           return reply.status(409).send({
-            error: `Agent "${agentId}" was deleted or recreated during retry; re-run retry against the current agent`,
+            error: 'agent is being created, please retry later',
           });
         }
-      } catch (err) {
-        if (await app.ctx.agentManager.handleDialogPendingFromRuntime(agentId, err, { expectedGeneration: genAtEntry })) {
+        if (app.ctx.tmuxSessionStatusStore.get(agentId).tmuxSessionStatus === 'present') {
+          return reply.status(409).send({ error: 'agent is already ready; retry is for failed/missing sessions' });
+        }
+
+        const owner = await resolveLockOwnership(app, agentId);
+        const maintenanceOwner = 'maintenance:retry';
+        const maintenanceLockOwner = stateBefore?.taskId ?? maintenanceOwner;
+        let maintenanceToken: string | null = null;
+        let acquiredMaintenanceLock = false;
+        if (!owner.takeover) {
+          const task = stateBefore?.taskId ? await app.ctx.taskStore.get(stateBefore.taskId) : null;
+          if (task && TASK_ACTIVE_STATUS_SET.has(task.status)) {
+            return reply.status(409).send({
+              error:
+                `agent "${agentId}" is bound to active task ${task.id}, but does not hold that task's ` +
+                `exclusive lock; Resume or cancel the task before retrying the REPL.`,
+            });
+          }
+          const lock = await acquireOrReuseExactLock(app, agentId, maintenanceLockOwner);
+          if (!lock) {
+            return reply.status(409).send({ error: `Agent "${agentId}" is locked by another op; please retry later` });
+          }
+          maintenanceToken = lock.token;
+          acquiredMaintenanceLock = lock.acquired;
+        }
+
+        try {
+          const result = await app.ctx.agentManager.ensureSession(agentId, 'runtime', { expectedGeneration: genAtEntry });
+          const now = new Date().toISOString();
+          const paneCommit = await app.ctx.agentStore.update(agentId, (existing) => {
+            if (!existing
+                || app.ctx.agentManager.isDeletionInFlight(agentId)
+                || app.ctx.agentManager.deletionGenerationOf(agentId) !== genAtEntry) {
+              return AGENT_STORE_NOOP;
+            }
+            return { ...existing, paneId: result.paneId, updatedAt: now };
+          });
+          if (paneCommit !== 'committed') {
+            if (maintenanceToken && acquiredMaintenanceLock) {
+              await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+            }
+            return reply.status(409).send({
+              error: `Agent "${agentId}" was deleted or recreated during retry; re-run retry against the current agent`,
+            });
+          }
+        } catch (err) {
+          if (await app.ctx.agentManager.handleDialogPendingFromRuntime(agentId, err, { expectedGeneration: genAtEntry })) {
+            if (maintenanceToken && acquiredMaintenanceLock) {
+              await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+            }
+            return reply.status(202).send({
+              ok: true,
+              agentId,
+              runtimeStatus: 'pending',
+              message:
+                'REPL launched but blocked on a startup dialog; open the web ' +
+                'terminal to dismiss — baxian will auto-detect ready and resume',
+            });
+          }
+          await app.ctx.agentManager.rollbackEnsureSessionFailure(agentId, err, 'POST /retry ensure rollback');
           if (maintenanceToken && acquiredMaintenanceLock) {
             await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
           }
-          return reply.status(202).send({
-            ok: true,
-            agentId,
-            runtimeStatus: 'pending',
-            message:
-              'REPL launched but blocked on a startup dialog; open the web ' +
-              'terminal to dismiss — baxian will auto-detect ready and resume',
-          });
+          const message = err instanceof Error ? err.message : String(err);
+          return reply.status(500).send({ error: message });
         }
-        await app.ctx.agentManager.rollbackEnsureSessionFailure(agentId, err, 'POST /retry ensure rollback');
-        if (maintenanceToken && acquiredMaintenanceLock) {
-          await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        return reply.status(500).send({ error: message });
+        await pendingCleanupAfterReplReady(app, agentId, owner.takeover, maintenanceToken
+          ? { taskId: maintenanceLockOwner, token: maintenanceToken }
+          : undefined);
+        return reply.send({ ok: true, agentId });
+      } finally {
+        app.ctx.agentManager.endMaintenance(agentId);
       }
-      await pendingCleanupAfterReplReady(app, agentId, owner.takeover, maintenanceToken
-        ? { taskId: maintenanceLockOwner, token: maintenanceToken }
-        : undefined);
-      return reply.send({ ok: true, agentId });
     },
   );
 }
@@ -1521,6 +1536,9 @@ async function pendingCleanupAfterReplReady(
   takeover: boolean,
   maintenance?: { taskId: string; token: string },
 ): Promise<void> {
+  // REPL 已确认就绪:探测器按这一事实换掉旧结论(RUNTIME_EXITED / absent)并立即重看一次,卡片与派发不必等下一轮定时探测
+  await app.ctx.tmuxProbePoller?.confirmReplReady(agentId)
+    .catch(err => app.log.warn({ err, agentId }, 'post-restart probe failed; the periodic probe will catch up'));
   const state = await app.ctx.agentStore.get(agentId);
   const taskId = state?.taskId;
   if (!taskId) {

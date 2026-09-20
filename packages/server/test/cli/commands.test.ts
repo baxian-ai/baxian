@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { Readable } from 'node:stream';
 import { buildCli } from '../../src/cli.js';
 import { startServer } from '../../src/index.js';
@@ -40,7 +41,7 @@ describe('CLI command actions', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
   let errSpy: ReturnType<typeof vi.spyOn>;
-  let exitSpy: ReturnType<typeof vi.spyOn>;
+  let exitSpy: MockInstance<typeof process.exit>;
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;

@@ -7,8 +7,8 @@ describe('Modal', () => {
   it('autofocuses the first focusable element on open (the close button)', () => {
     render(
       <Modal open onClose={() => {}} title="t">
-        <input data-testid="input-1" />
-        <input data-testid="input-2" />
+        <input aria-label="first" />
+        <input aria-label="second" />
       </Modal>,
     );
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close' }));
@@ -19,21 +19,21 @@ describe('Modal', () => {
       const [tick, setTick] = useState(0);
       return (
         <>
-          <button data-testid="bump" onClick={() => setTick(t => t + 1)}>
+          <button onClick={() => setTick(t => t + 1)}>
             bump {tick}
           </button>
           <Modal open onClose={() => {}} title="t">
-            <input data-testid="input-1" />
-            <input data-testid="input-2" />
+            <input aria-label="first" />
+            <input aria-label="second" />
           </Modal>
         </>
       );
     }
     render(<Parent />);
-    const second = screen.getByTestId('input-2');
+    const second = screen.getByLabelText('second');
     second.focus();
     expect(document.activeElement).toBe(second);
-    fireEvent.click(screen.getByTestId('bump'));
+    fireEvent.click(screen.getByRole('button', { name: /^bump/ }));
     expect(document.activeElement).toBe(second);
   });
 
@@ -69,7 +69,7 @@ describe('Modal', () => {
     const handler = vi.fn();
     render(
       <Modal open onClose={handler} title="t">
-        <input data-testid="field" />
+        <input aria-label="field" />
       </Modal>,
     );
     const backdrop = screen.getByRole('presentation');
@@ -82,10 +82,10 @@ describe('Modal', () => {
     const handler = vi.fn();
     render(
       <Modal open onClose={handler} title="t">
-        <input data-testid="field" />
+        <input aria-label="field" />
       </Modal>,
     );
-    fireEvent.mouseDown(screen.getByTestId('field'));
+    fireEvent.mouseDown(screen.getByLabelText('field'));
     fireEvent.click(screen.getByRole('presentation'));
     expect(handler).not.toHaveBeenCalled();
   });
@@ -115,6 +115,18 @@ describe('Modal', () => {
     expect(handler).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps the footer pinned and non-scrolling so action buttons stay reachable under long content on small viewports', () => {
+    render(
+      <Modal open onClose={() => {}} title="t" footer={<button>Save</button>}>
+        <input aria-label="body" />
+      </Modal>,
+    );
+    // layout contract: jsdom applies no CSS, so the non-shrinking / non-scrolling footer can only be asserted by class
+    const region = screen.getByRole('button', { name: 'Save' }).parentElement!;
+    expect(region.className).toContain('shrink-0');
+    expect(region.className).not.toMatch(/overflow-(auto|y-auto|scroll)/);
+  });
+
   it('caps height to the dynamic viewport (max-h-[90dvh]) so a tall modal stays usable on mobile', () => {
     render(
       <Modal open onClose={() => {}} title="t">
@@ -134,8 +146,9 @@ describe('Modal', () => {
       </Modal>,
     );
     const heading = screen.getByRole('heading', { level: 2 });
-    expect(heading.className).toContain('truncate');
     expect(heading.getAttribute('title')).toBe(long);
+    // jsdom does no text layout: the truncate token is the only guard that the shrink-proof header stays one line
+    expect(heading.className.split(/\s+/)).toContain('truncate');
   });
 
   it('can render structured title content while preserving the plain title for dialog labeling', () => {
@@ -151,31 +164,8 @@ describe('Modal', () => {
     );
 
     expect(screen.getByRole('dialog', { name: 'task-010 Clean tests' })).toBeTruthy();
-    const id = screen.getByText('task-010');
-    expect(id.className).toContain('text-og-400');
+    expect(screen.getByText('task-010')).toBeTruthy();
     expect(screen.getByRole('heading', { level: 2 }).getAttribute('title')).toBe('task-010 Clean tests');
-  });
-
-  it('renders the footer in a pinned region (border-separated, non-scrolling) so action buttons never scroll away', () => {
-    render(
-      <Modal open onClose={() => {}} title="t" footer={<button>Save</button>}>
-        <input />
-      </Modal>,
-    );
-    const footerBtn = screen.getByRole('button', { name: 'Save' });
-    const region = footerBtn.parentElement!;
-    expect(region.className).toContain('border-t');
-    expect(region.className).toContain('shrink-0');
-    expect(region.className).not.toContain('overflow-auto');
-  });
-
-  it('renders no footer region when footer is omitted', () => {
-    render(
-      <Modal open onClose={() => {}} title="t">
-        <input data-testid="body-input" />
-      </Modal>,
-    );
-    expect(screen.getByRole('dialog').querySelector('.border-t')).toBeNull();
   });
 
   it('a footer submit button associated via form= submits the body form across the body/footer split', () => {
@@ -227,13 +217,13 @@ describe('Modal focus trap (visible elements)', () => {
   function renderTrap() {
     render(
       <Modal open onClose={() => {}} title="t">
-        <input data-testid="input-1" />
-        <input data-testid="input-2" />
+        <input aria-label="first" />
+        <input aria-label="second" />
       </Modal>,
     );
     return {
       closeBtn: screen.getByRole('button', { name: 'Close' }),
-      lastInput: screen.getByTestId('input-2'),
+      lastInput: screen.getByLabelText('second'),
     };
   }
 

@@ -16,6 +16,7 @@ import {
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
+import type { PrConversationPayload } from '../../src/platform/pr-conversation-cache.js';
 import { repoIdentityKey } from '../../src/platform/driver-host.js';
 
 const REPO = 'https://github.com/owner/repo';
@@ -596,7 +597,7 @@ describe('PlatformPoller: comment flow', () => {
   });
 
   it('filters verdict-token rows, ack replies from any author, and empty bodies', async () => {
-    const ack = buildAckMarker({ sourceKey: 'issue-comments', commentId: '100', bodyDigest: bodyDigest('x') });
+    const ack = buildAckMarker({ sourceKey: 'issue-comments', commentId: '100' });
     driver.comments['issue-comments'] = [
       comment('1', `findings\n${buildReviewTokenLine({ kind: 'fail', anchorSha: ANCHOR, token: FAIL })}`),
       comment('2', `done\n${ack}`, OLD_TS),
@@ -645,7 +646,7 @@ describe('PlatformPoller: comment flow', () => {
     const blocker = comment('55', 'inline blocker', OLD_TS, { discussionId: null });
     driver.comments['inline-comments'] = [blocker];
     driver.comments['issue-comments'] = [
-      comment('700', `handled\n${buildAckMarker({ sourceKey: 'inline-comments', commentId: '55', bodyDigest: bodyDigest('inline blocker') })}`, OLD_TS),
+      comment('700', `handled\n${buildAckMarker({ sourceKey: 'inline-comments', commentId: '55' })}`, OLD_TS),
       comment('701', 'unrelated feedback', OLD_TS),
     ];
     await makePoller().poll();
@@ -1390,7 +1391,7 @@ describe('PlatformPoller: conversation projection revision', () => {
   it('delivers the assembled conversation payload (with bodies) alongside the revision bump', async () => {
     driver.comments['issue-comments'] = [comment('c1', 'top feedback')];
     driver.comments['reviews'] = [comment('r1', 'looks good', OLD_TS, { reviewState: 'COMMENTED' })];
-    const conversations: Array<{ prNumber: number; payload: { items: Array<Record<string, unknown>>; error?: string } } | undefined> = [];
+    const conversations: Array<{ prNumber: number; payload: PrConversationPayload } | undefined> = [];
     const poller = makePoller({
       onConversationRevision: (taskId, conversation) => {
         revisions.push(taskId);

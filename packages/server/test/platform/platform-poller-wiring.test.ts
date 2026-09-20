@@ -3,14 +3,16 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { auditPlatformBindings, platformEntries } from '../../src/platform/startup.js';
-import { PlatformPoller, platformTaskView } from '../../src/platform/platform-poller.js';
+import { PlatformPoller, platformTaskView, type PlatformTaskView } from '../../src/platform/platform-poller.js';
 import type { PlatformDriver } from '../../src/platform/types.js';
 import { computePollerHealth } from '../../src/platform/poller-health.js';
 import { applyConfigHotReload, prepareConfigHotReload } from '../../src/config/hot-reload.js';
 import { createPlatformPollerOptions } from '../../src/index.js';
-import type { AgentManager } from '../../src/agent/manager.js';
-import type { EventBus } from '../../src/event/bus.js';
 import type { BaxianConfig, ProjectConfig, TaskState } from '../../src/shared/index.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { makeConfig } from '../helpers/fixtures.js';
+
+const REPO = 'github.com/user/repo';
 
 const driver = (): PlatformDriver => ({
   visibilityLagMs: 0,
@@ -40,37 +42,40 @@ const task = (over: Partial<TaskState> = {}): TaskState => ({
 } as TaskState);
 
 describe('createPlatformPollerOptions', () => {
-  it('routes every poller callback through the task owner and manager projection', async () => {
-    const owned = task({ id: 'owned', projectId: 'owner-project', agentId: 'dev-1' });
-    const manager = {
-      getTask: vi.fn(async (taskId: string) => taskId === owned.id ? owned : null),
-      listTasksForPlatformEntry: vi.fn(async () => [owned]),
-      pruneConsumedFeedback: vi.fn(async () => undefined),
-      noteReviewConversationRevision: vi.fn(async () => undefined),
-    } as unknown as AgentManager;
-    const emit = vi.fn(async () => undefined);
-    const options = createPlatformPollerOptions(manager, { emit } as unknown as EventBus);
+  it('routes every poller callback through the real manager and event bus', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bx-poller-options-'));
+    try {
+      const harness = await createManagerHarness(dir);
+      // two projects can share one repo entry: task events belong to the task owner, repo-level events to the entry
+      const owned = await harness.seedTask({
+        id: 'owned', projectId: 'owner-project', status: 'review', prNumber: 42,
+        consumedFeedback: { 'reviews:r1:aa': 100, 'reviews:r2:bb': 200, 'issue-comments:c1:cc': 100 },
+      });
+      const mine = await harness.seedTask({ id: 'mine', status: 'in_progress', prNumber: 7 });
+      const options = createPlatformPollerOptions(harness.manager, harness.eventBus);
 
-    await options.onEvent('entry-project', {
-      type: 'pr.updated', taskId: owned.id, data: { headSha: 'a'.repeat(40) },
-    });
-    await options.onEvent('entry-project', { type: 'human.intervention', data: { phase: 'repo' } });
-    expect(emit).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      type: 'pr.updated', projectId: 'owner-project', taskId: owned.id, agentId: 'dev-1',
-    }));
-    expect(emit).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      type: 'human.intervention', projectId: 'entry-project',
-    }));
+      await options.onEvent('entry-project', { type: 'pr.updated', repo: REPO, taskId: 'owned', data: { headSha: 'a'.repeat(40) } });
+      await options.onEvent('entry-project', { type: 'human.intervention', repo: REPO, data: { phase: 'repo' } });
+      await options.onEvent('entry-project', { type: 'pr.updated', repo: REPO, taskId: 'missing', data: { headSha: 'b'.repeat(40) } });
+      expect(harness.events.map(e => [e.type, e.projectId, e.taskId, e.agentId])).toEqual([
+        ['pr.updated', 'owner-project', 'owned', 'dev-1'],
+        ['human.intervention', 'entry-project', undefined, undefined],
+        ['pr.updated', 'entry-project', undefined, undefined],
+      ]);
 
-    expect(await options.tasks('entry-project')).toEqual([platformTaskView(owned)]);
-    expect(await options.task(owned.id)).toEqual(platformTaskView(owned));
-    expect(await options.task('missing')).toBeNull();
-    await options.onCursorCommitted!(owned.id, 42, 'reviews', 123);
-    const conversation = { prNumber: 42, payload: { items: [] } };
-    await options.onConversationRevision!(owned.id, conversation);
-    expect(manager.listTasksForPlatformEntry).toHaveBeenCalledWith('entry-project');
-    expect(manager.pruneConsumedFeedback).toHaveBeenCalledWith(owned.id, 'reviews', 123);
-    expect(manager.noteReviewConversationRevision).toHaveBeenCalledWith(owned.id, conversation);
+      expect(await options.tasks('proj')).toEqual([platformTaskView(mine)]);
+      expect(await options.task('owned')).toEqual(platformTaskView(owned));
+      expect(await options.task('missing')).toBeNull();
+
+      await options.onCursorCommitted!('owned', 42, 'reviews', 150);
+      expect((await harness.taskStore.get('owned'))?.consumedFeedback)
+        .toEqual({ 'reviews:r2:bb': 200, 'issue-comments:c1:cc': 100 });
+
+      await options.onConversationRevision!('owned', { prNumber: 42, payload: { items: [] } });
+      expect((await harness.taskStore.get('owned'))?.reviewConversationUpdatedAt).toMatch(/^\d{4}-/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -126,46 +131,42 @@ describe('auditPlatformBindings', () => {
 });
 
 describe('config hot reload platform interventions', () => {
-  it('reconciles entries and emits active binding interventions', async () => {
-    const validated = cfg([{ id: 'live', repo: 'https://github.com/a/b.git' }]);
-    const removed = task({
-      id: 'removed', projectId: 'removed-project',
-      platformBinding: { repoKey: 'github.com/removed/repo' },
-    });
-    const retainKeys = vi.fn();
-    const emitBinding = vi.fn(async () => undefined);
-    const reconcile = vi.fn();
-    const reschedule = vi.fn();
-    const manager = {
-      listActiveGitTasks: vi.fn(async () => [removed]),
-      replaceConfig: vi.fn(),
-      platformBindingInterventionKey: vi.fn((t: TaskState) => `binding:${t.id}`),
-      retainPlatformBindingInterventionKeys: retainKeys,
-      emitPlatformBindingIntervention: emitBinding,
-    };
-    const ctx = {
-      agentManager: manager,
-      poller: { reconcile, reschedule },
-      platformEntryDeps: deps,
-    } as never;
+  it('reconciles the poller, switches the manager config, and reports orphaned bindings', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bx-hot-reload-'));
+    try {
+      const harness = await createManagerHarness(dir);
+      await harness.seedTask({
+        id: 'removed', projectId: 'removed-project', status: 'review',
+        platformBinding: { repoKey: 'github.com/removed/repo' },
+      });
+      const validated = makeConfig({
+        project: [{ id: 'live', repo: 'https://github.com/a/b.git', merge: null, agent: [] }],
+      });
+      const poller = new PlatformPoller({ onEvent: () => undefined, tasks: async () => [], task: async () => null });
+      const ctx = { agentManager: harness.manager, poller, platformEntryDeps: deps } as never;
 
-    const prepared = await prepareConfigHotReload(ctx, validated);
-    expect(prepared.bindingMismatches).toEqual([
-      expect.objectContaining({
-        task: expect.objectContaining({ id: 'removed' }),
-        mismatch: expect.objectContaining({ reason: 'project-missing' }),
-      }),
-    ]);
-    expect(prepared.platform).toHaveLength(1);
+      const prepared = await prepareConfigHotReload(ctx, validated);
+      expect(prepared.bindingMismatches).toEqual([
+        expect.objectContaining({
+          task: expect.objectContaining({ id: 'removed' }),
+          mismatch: expect.objectContaining({ reason: 'project-missing' }),
+        }),
+      ]);
+      expect(prepared.platform).toHaveLength(1);
 
-    await applyConfigHotReload(ctx, validated, prepared);
+      await applyConfigHotReload(ctx, validated, prepared);
 
-    expect(reconcile).toHaveBeenCalledWith(prepared.platform);
-    expect(retainKeys).toHaveBeenCalledWith(new Set(['binding:removed']));
-    expect(emitBinding).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'removed' }),
-      expect.objectContaining({ reason: 'project-missing' }),
-    );
+      expect(poller.snapshots().map(s => s.projectId)).toEqual(['live']);
+      expect(harness.manager.getProjectConfig('live')?.repo).toBe('https://github.com/a/b.git');
+      expect(harness.manager.getProjectConfig('proj')).toBeUndefined();
+      expect(harness.events.filter(e => e.type === 'human.intervention').map(e => [e.taskId, e.data.reason]))
+        .toEqual([['removed', 'project-missing']]);
+
+      await applyConfigHotReload(ctx, validated, await prepareConfigHotReload(ctx, validated));
+      expect(harness.events.filter(e => e.type === 'human.intervention')).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -189,35 +190,71 @@ describe('PlatformPoller.reconcile', () => {
     expect(p.snapshots().map(s => s.projectId).sort()).toEqual(['a2', 'c']);
   });
 
-  it('keeps preflight state when hot reload reconstructs the fixed driver', () => {
-    const p = poller();
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: driver(), statePath: '/s/a' }]);
-    const entries = p['entries'] as Array<{ driver: PlatformDriver; preflightPassed?: boolean }>;
-    entries[0].preflightPassed = true;
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: driver(), statePath: '/s/a' }]);
-    expect(entries[0].preflightPassed).toBe(true);
+  const spiedDriver = (): PlatformDriver => ({
+    ...driver(),
+    runPreflightSteps: vi.fn(async () => [{ step: 'ok', ok: true, message: 'ok' }]),
+    listPrs: vi.fn(async () => []),
   });
 
-  it('keeps preflight state when the driver instance is unchanged', () => {
-    const p = poller();
-    const d = driver();
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: d, statePath: '/s/a' }]);
-    const entries = p['entries'] as Array<{ preflightPassed?: boolean }>;
-    entries[0].preflightPassed = true;
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: d, statePath: '/s/a' }]);
-    expect(entries[0].preflightPassed).toBe(true);
+  it.each([
+    ['hot reload reconstructs the fixed driver', (_d: PlatformDriver) => spiedDriver(), 0],
+    ['the driver instance is unchanged', (d: PlatformDriver) => d, 1],
+  ])('keeps preflight state when %s: the next poll skips preflight and lists PRs', async (_name, next, expectedPreflightRuns) => {
+    const dir = await mkdtemp(join(tmpdir(), 'bx-poller-preflight-'));
+    try {
+      const p = poller();
+      const first = spiedDriver();
+      const entry = { projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: first, statePath: join(dir, 'cursor.json') };
+      p.reconcile([entry]);
+      await p.poll();
+      expect(first.runPreflightSteps).toHaveBeenCalledTimes(1);
+
+      const second = next(first);
+      p.reconcile([{ ...entry, driver: second }]);
+      await p.poll();
+
+      expect(second.runPreflightSteps).toHaveBeenCalledTimes(expectedPreflightRuns);
+      expect(second.listPrs).toHaveBeenCalledTimes(second === first ? 2 : 1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
-  it('preserves the observation state of a surviving entry while swapping its driver', () => {
-    const p = poller();
-    const first = driver();
-    const second = driver();
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: first, statePath: '/s/a' }]);
-    const entries = p['entries'] as Array<{ driver: PlatformDriver; observedPr: Map<string, unknown> }>;
-    entries[0].observedPr.set('t1:7', { merged: true });
-    p.reconcile([{ projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: second, statePath: '/s/a' }]);
-    expect(entries[0].driver).toBe(second);
-    expect(entries[0].observedPr.get('t1:7')).toEqual({ merged: true });
+  it('preserves the observation state of a surviving entry while swapping its driver: a merge seen once is not re-announced', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bx-poller-observed-'));
+    try {
+      const mergedRow = {
+        prNumber: 7, prUrl: 'https://github.com/o/a/pull/7', branch: 'bx/t1', targetBranch: 'main', headSha: 'a'.repeat(40),
+        state: 'closed', draft: false, mergedAt: '2026-09-18T00:00:00Z', updatedAt: '2026-09-18T00:00:00Z',
+        sourceProjectId: '7', targetProjectId: '7',
+      };
+      const mergedDriver = (): PlatformDriver => ({
+        ...driver(),
+        prView: vi.fn(async () => mergedRow),
+        listPrs: vi.fn(async () => []),
+      });
+      const events: string[] = [];
+      const p = new PlatformPoller({
+        onEvent: (_projectId, event) => { events.push(event.type); },
+        tasks: async () => [platformTaskView(task({ prNumber: 7, branch: 'bx/t1' }))],
+        task: async () => null,
+      });
+      const first = mergedDriver();
+      const second = mergedDriver();
+      const entry = { projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: first, statePath: join(dir, 'cursor.json') };
+      p.reconcile([entry]);
+      await p.poll();
+      expect(events.filter(t => t === 'pr.merged')).toHaveLength(1);
+
+      p.reconcile([{ ...entry, driver: second }]);
+      await p.poll();
+
+      expect(second.prView).toHaveBeenCalledTimes(1);
+      expect(first.prView).toHaveBeenCalledTimes(1);
+      expect(events.filter(t => t === 'pr.merged')).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('applies a reconstructed driver only after the in-flight cycle', async () => {
@@ -255,12 +292,12 @@ describe('PlatformPoller.reconcile', () => {
 
       expect(oldDriver.listPrs).toHaveBeenCalledTimes(1);
       expect(newDriver.runPreflightSteps).not.toHaveBeenCalled();
-      const entries = p['entries'] as Array<{ projectId: string; driver: PlatformDriver; preflightPassed?: boolean }>;
-      expect(entries[0]).toMatchObject({ projectId: 'a2', driver: newDriver, preflightPassed: true });
+      expect(p.snapshots().map(s => s.projectId)).toEqual(['a2']);
 
       await p.poll();
       expect(newDriver.runPreflightSteps).not.toHaveBeenCalled();
       expect(newDriver.listPrs).toHaveBeenCalledTimes(1);
+      expect(oldDriver.listPrs).toHaveBeenCalledTimes(1);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -286,9 +323,7 @@ describe('PlatformPoller.reconcile', () => {
     try {
       const calls: string[] = [];
       const makeDriver = (name: string, fail = false): PlatformDriver => ({
-        visibilityLagMs: 0,
-        commentSources: [],
-        runPreflightSteps: async () => [],
+        ...driver(),
         projectView: vi.fn(async () => {
           calls.push(`${name}:project`);
           if (fail) throw new Error(`${name} offline`);
@@ -326,9 +361,7 @@ describe('PlatformPoller.reconcile', () => {
       const listStarted = new Promise<void>(resolve => { markListStarted = resolve; });
       const listGate = new Promise<void>(resolve => { releaseList = resolve; });
       const retiringDriver: PlatformDriver = {
-        visibilityLagMs: 0,
-        commentSources: [],
-        runPreflightSteps: async () => [],
+        ...driver(),
         projectView: vi.fn(async () => ({ defaultBranch: 'main', pushPermitted: true })),
         listPrs: vi.fn(async () => {
           markListStarted();
@@ -382,9 +415,7 @@ describe('PlatformPoller.reconcile', () => {
         createdAt: '2026-07-21T00:00:00Z', updatedAt: '2026-07-21T00:00:00Z',
       };
       const adoptingDriver: PlatformDriver = {
-        visibilityLagMs: 0,
-        commentSources: [],
-        runPreflightSteps: async () => [],
+        ...driver(),
         projectView: vi.fn(async () => ({ defaultBranch: 'main', pushPermitted: true })),
         listPrs: vi.fn(async () => [row]),
         listComments: vi.fn(async () => []),

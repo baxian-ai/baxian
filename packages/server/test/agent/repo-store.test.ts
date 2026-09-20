@@ -15,6 +15,7 @@ import {
 } from '../../src/agent/repo-store.js';
 import { ExecOutcomeUnknownError } from '../../src/agent/net-exec.js';
 import { LocalRunner, shellQuote, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
+import { makeCommandRunner } from '../helpers/fixtures.js';
 
 const PROJECT_REPO = 'https://github.com/group/project.git';
 const local = new LocalRunner();
@@ -716,7 +717,7 @@ describe('RepoStore destructive-cleanup guards', () => {
   });
 
   it('clones into a unique staging name and only ever trashes that name on failure', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -733,11 +734,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     const removal = runner.commands.find(c => /mv -- '[^']*\/repo\.claim-/.test(c));
     expectTrashMove(removal, `${final}\\.claim-[0-9a-f-]+`);
     expect(runner.commands.some(c => c.includes('rmdir '))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('stops before promote when the claim write returns exit 0 with transient output', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/baxian-promote-claim'$/, { stdout: '', stderr: 'ssh: connect to host box-a port 22: Connection timed out', exitCode: 0 }],
@@ -748,8 +748,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Promote-claim write .* outcome unknown/);
 
     expect(runner.commands.some(c => c.includes('&& mv '))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
-    warn.mockRestore();
+    expectTrashMove(
+      runner.commands.find(c => /mv -- '[^']*\/repo\.claim-/.test(c)),
+      `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`,
+    );
   });
 
   it('treats a transient .baxian exclude reply as outcome unknown, not success', async () => {
@@ -779,8 +781,11 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/git clone .* failed/);
 
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trash outcome UNKNOWN'));
-    warn.mockRestore();
+    // the caller only sees the clone failure: the staging that may linger is reported by the warning alone
+    const unknown = warn.mock.calls.map(c => String(c[0])).find(m => /trash.*outcome UNKNOWN/.test(m));
+    expect(unknown).toMatch(/repo\.claim-[0-9a-f-]+/);
+    expect(unknown).toMatch(/may linger|debris may remain/);
+    expect(unknown).toMatch(/Connection reset by peer/);
   });
 
   it('accepts an auto Workdir routed through a symlinked agents tree (physical top equals physical workdir)', async () => {
@@ -800,7 +805,7 @@ describe('RepoStore destructive-cleanup guards', () => {
   });
 
   it('withdraws only the staging when the promote guard fails before mv (no precheck marker)', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -814,11 +819,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     const removal = runner.commands.find(c => /mv -- '[^']*\/repo\.claim-/.test(c));
     expectTrashMove(removal, `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`);
     expect(runner.commands.some(c => /mv -- '[^']*\/repo\/repo\.claim-/.test(c))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('trashes both staging homes when mv provably started and then failed (precheck marker present)', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -832,11 +836,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     const removals = runner.commands.filter(c => /mv -- '[^']*repo\.claim-/.test(c));
     expect(removals.some(c => /\/repo\.claim-/.test(c) && !/\/repo\/repo\.claim-/.test(c))).toBe(true);
     expect(removals.some(c => /\/repo\/repo\.claim-/.test(c))).toBe(true);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('trashes a nested staging by its unique name when the final path was recreated mid-promote', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -852,11 +855,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     expectTrashMove(removal, `/home/u/\\.baxian/agents/dev-1/repo/repo\\.claim-[0-9a-f-]+`);
     expect(runner.commands.some(c => /^mv '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-/.test(c))).toBe(false);
     expect(runner.commands.some(c => /mv -- '[^']*baxian-promote-claim'/.test(c))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('recreated concurrently'));
   });
 
   it('refuses to adopt the promoted clone when its ownership marker is no longer ours (replaced after mv)', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       // The nonce-checked marker clear reports REFUSED: `final` was replaced after the mv (foreign clone).
@@ -870,11 +872,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/refusing to adopt/i);
-    warn.mockRestore();
   });
 
   it('trashes the staging when the promote-claim stamp cannot be written', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -888,11 +889,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     expect(removals).toHaveLength(1);
     expectTrashMove(removals[0], `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`);
     expect(runner.commands.some(c => c.includes("&& mv '"))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('reconciles an uncertain promote mv as not-executed when the staging is still present', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -907,11 +907,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     const removals = runner.commands.filter(c => /mv -- '[^']*\/repo\.claim-/.test(c));
     expect(removals).toHaveLength(1);
     expectTrashMove(removals[0], `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('keeps everything in place when the reconciliation staging probe is transient-tainted', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -924,11 +923,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/staging probe outcome unknown/);
 
     expect(runner.commands.some(c => /mv -- '/.test(c))).toBe(false);
-    warn.mockRestore();
   });
 
   it('keeps everything in place when the reconciliation nested probe is transient-tainted', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -943,11 +941,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/nested probe outcome unknown/);
 
     expect(runner.commands.some(c => /mv -- '/.test(c))).toBe(false);
-    warn.mockRestore();
   });
 
   it('routes an exit-0 promote mv with transient output into nonce reconciliation, not the success path', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -961,8 +958,10 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     expect(runner.commands.some(c => c.startsWith('test -e ') && c.includes('repo.claim-'))).toBe(true);
     expect(runner.commands.some(c => /^test -e '[^']*\/repo\/repo\.claim-/.test(c))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
-    warn.mockRestore();
+    expectTrashMove(
+      runner.commands.find(c => /mv -- '[^']*\/repo\.claim-/.test(c)),
+      `/home/u/\\.baxian/agents/dev-1/repo\\.claim-[0-9a-f-]+`,
+    );
   });
 
   it('reconciles an uncertain promote mv as completed when the final clone holds our claim nonce', async () => {
@@ -990,7 +989,10 @@ describe('RepoStore destructive-cleanup guards', () => {
 
     await expect(scriptedStore(runner).ensure()).resolves.toBe(final);
 
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('reconciled as already-completed'));
+    // ensure() returns a plain path: the warning is the only trace that the promote was reconciled after a transport fault
+    expect(warn.mock.calls.map(call => String(call[0]))).toContainEqual(
+      expect.stringMatching(/promote to \/home\/u\/\.baxian\/agents\/dev-1\/repo reconciled as already-completed/),
+    );
     expect(runner.commands.some(c => /mv -- '[^']*\/repo\.claim-/.test(c))).toBe(false);
     expect(runner.commands.some(c => c.includes('config --get-regexp '))).toBe(true);
     expect(runner.commands.some(c =>
@@ -1000,7 +1002,7 @@ describe('RepoStore destructive-cleanup guards', () => {
   });
 
   it('treats a marker clear that reports no outcome marker as failed, never as removed', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, { stdout: '', stderr: '', exitCode: 1 }],
       // exit 0 with an empty stdout must not be read as a successful clear.
@@ -1013,12 +1015,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/refusing to adopt/i);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('no outcome marker'));
-    warn.mockRestore();
   });
 
   it('reconcile refuses to adopt when the marker clear reports refused (final replaced after the nonce read)', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     let nonce = '';
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, { stdout: '', stderr: '', exitCode: 1 }],
@@ -1034,11 +1034,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     ]);
 
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/refusing to adopt/i);
-    warn.mockRestore();
   });
 
   it('trashes a nested staging by its unique name when an uncertain promote nested on a target race', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -1055,11 +1054,10 @@ describe('RepoStore destructive-cleanup guards', () => {
     const removals = runner.commands.filter(c => /mv -- '[^']*\/repo\/repo\.claim-/.test(c));
     expect(removals).toHaveLength(1);
     expectTrashMove(removals[0], `/home/u/\\.baxian/agents/dev-1/repo/repo\\.claim-[0-9a-f-]+`);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('trashing staged clone'));
   });
 
   it('keeps every location and fails loud when reconciliation probes are inconclusive', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
@@ -1072,7 +1070,6 @@ describe('RepoStore destructive-cleanup guards', () => {
     await expect(scriptedStore(runner).ensure()).rejects.toThrow(/all locations inconclusive/);
 
     expect(runner.commands.some(c => /mv -- '[^']*\/repo\.claim-/.test(c))).toBe(false);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('outcome UNKNOWN'));
   });
 
   it('keeps both staging homes when the success-path nested probe is transport-uncertain', async () => {
@@ -1128,7 +1125,7 @@ describe('RepoStore destructive-cleanup guards', () => {
   });
 
   it('recovers a leftover empty dir with rmdir and retries the clone', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const runner = new ScriptedRunner('/home/u', [
       [/^test -d /, [
         { stdout: '', stderr: '', exitCode: 0 },
@@ -1148,7 +1145,6 @@ describe('RepoStore destructive-cleanup guards', () => {
       `rmdir '/home/u/.baxian/agents/dev-1/repo'`,
     );
     expect(runner.commands.some(c => c.includes('git clone '))).toBe(true);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removed leftover empty dir'));
   });
 
   it('tolerates pushurl-unset exit 5 (key absent) and moves on', async () => {
@@ -1293,7 +1289,7 @@ describe('moveFileIntoPlace (real filesystem)', () => {
   });
 
   it('refuses to publish a staging leaf that was replaced by a symlink', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const external = `${dir}/external`;
     await write(external, 'foreign');
     await symlink(external, `${dir}/tmp-link`);
@@ -1303,16 +1299,11 @@ describe('moveFileIntoPlace (real filesystem)', () => {
 
     expect(await run(`cat ${shellQuote(external)}`)).toBe('foreign');
     await expect(lstat(`${dir}/final-link`)).rejects.toMatchObject({ code: 'ENOENT' });
-    warn.mockRestore();
   });
 
   it('pins non-symlink checks for both staging and published leaves in the atomic command', async () => {
-    const exec = vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 }));
-    const runner = {
-      exec,
-      writeFile: vi.fn(async () => undefined),
-      execWithStdin: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
-    } as CommandRunner;
+    const exec = vi.fn<CommandRunner['exec']>().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
+    const runner = makeCommandRunner({ exec });
 
     await moveFileIntoPlace(runner, '/work/tmp', '/work/final', { trashDir: testTrash('/work') });
 
@@ -1323,7 +1314,7 @@ describe('moveFileIntoPlace (real filesystem)', () => {
   });
 
   it('fails closed before mv when the target is a directory — no nested tmp ever lands', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     await run(`mkdir -p ${shellQuote(`${dir}/final`)}`);
     await write(`${dir}/tmp2`, 'payload');
 
@@ -1332,7 +1323,6 @@ describe('moveFileIntoPlace (real filesystem)', () => {
     expect(await run(`ls -A ${shellQuote(`${dir}/final`)}`)).toBe('');
     const tmpLeft = await local.exec(`test -e ${shellQuote(`${dir}/tmp2`)}`);
     expect(tmpLeft.exitCode).toBe(1);
-    warn.mockRestore();
   });
 
   it('fails closed when the target is a symlink to a directory', async () => {
@@ -1374,14 +1364,13 @@ describe('moveFileIntoPlace (real filesystem)', () => {
   });
 
   it('moves a swept file into the trash batch instead of deleting it', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     await write(`${dir}/stray`, 'recoverable');
     const trash = testTrash(dir);
 
     await sweepStrayFile(local, `${dir}/stray`, trash);
 
     expect(await run(`cat ${shellQuote(`${trash}/stray`)}`)).toBe('recoverable');
-    warn.mockRestore();
   });
 
   it('gives same-named entries unique targets inside one batch', async () => {
@@ -1563,7 +1552,7 @@ describe('sweepStrayFile real-shell outcomes', () => {
     await sweepStrayFile(local, join(dir, 'src.txt'), join(dir, 'blocker', 'batch'));
     expect(await readFile(join(dir, 'src.txt'), 'utf-8')).toBe('still here');
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0][0])).toMatch(/move failed \(exit [1-9]/);
+    expect(String(warn.mock.calls[0][0])).toMatch(/move failed/);
     expect(String(warn.mock.calls[0][0])).not.toMatch(/UNKNOWN/);
   });
 

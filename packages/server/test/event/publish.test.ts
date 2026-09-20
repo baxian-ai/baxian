@@ -236,6 +236,7 @@ describe('EventPublisher', () => {
     await Promise.resolve();
     await Promise.resolve();
 
+    // E1: 防抖任务表没有任何公共出口,内存不增长本身就是契约(047 已登记的护栏断言例外)
     const broadcasts = (publisher as unknown as { projectTasksBroadcasts: Map<string, unknown> })
       .projectTasksBroadcasts;
     expect(broadcasts.size).toBe(0);
@@ -620,6 +621,7 @@ describe('EventPublisher — deletes, failures and auxiliary channels', () => {
     expect(agentsN).toBe(0);
     expect(pollersN).toBe(0);
     expect(projectN).toBe(0);
+    // E1: 防抖任务表没有任何公共出口,内存不增长本身就是契约(047 已登记的护栏断言例外)
     const broadcasts = (publisher as unknown as { projectTasksBroadcasts: Map<string, unknown> })
       .projectTasksBroadcasts;
     expect(broadcasts.size).toBe(0);

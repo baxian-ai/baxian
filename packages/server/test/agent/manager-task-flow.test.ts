@@ -1,16 +1,77 @@
 import { describe, it, expect, vi } from 'vitest';
-import { DispatchTerminalError, EnsureSessionError } from '../../src/agent/manager.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { TmuxManager } from '../../src/agent/tmux.js';
-import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
-import { clearAwareRunner } from '../helpers/fake-runner.js';
+import type { TaskState } from '../../src/shared/index.js';
+import { DispatchTerminalError } from '../../src/agent/manager.js';
+import { BranchManager } from '../../src/agent/branch.js';
+import type { RepoStore } from '../../src/agent/repo-store.js';
+import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
+import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
+import type { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import { fakeRunner, type FakeRunner, type FakeRunnerOptions } from '../helpers/fake-runner.js';
 import { makeTask } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
-
-const CLAUDE_PANE = { proc: 'claude', idle: '⏵⏵ bypass permissions on /tmp/repo\n\n>' };
+// 既不是 ready 也不是信任对话框的启动遮挡:ensureSession 把它报成 dialogPending + handled
+const STARTUP_DIALOG = 'Auto-updating…\nPress enter to continue\n';
 
 const harness = useManagerSuiteHarness();
+
+type ManagerOverrides = Parameters<typeof harness.createManager>[0];
+
+const cmdsOf = (runner: FakeRunner = harness.runner): string[] => runner.exec.mock.calls.map(c => c[0] as string);
+const escapesTo = (paneId: string, runner: FakeRunner = harness.runner): string[] =>
+  runner.sentKeys.filter(k => k.includes(`-t ${paneId} `) && k.includes("'Escape'"));
+const dispatchRollbackEvents = () => harness.events.filter(
+  e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-rollback',
+);
+const escapeFails = { match: (cmd: string) => cmd.includes("'Escape'"), reply: { exitCode: 1, stderr: 'tmux: send-keys failed' } };
+
+function useRunner(options: FakeRunnerOptions = {}, overrides: ManagerOverrides = {}): FakeRunner {
+  const runner = createManagerSuiteRunner(options);
+  harness.manager = harness.createManager({ ...overrides, runnerFactory: () => runner });
+  return runner;
+}
+
+// Workdir 准备是 live runtime 之外唯一的 git 边界(spec E4):替身决定它的结果,也是 ensureWorkdir 期间交错动作的挂钩点
+function useWorkdirStandIn(ensure: () => Promise<string>): void {
+  harness.manager = harness.createManager({
+    repoStoreFactory: () => ({ ensure, refresh: async () => undefined }) as unknown as RepoStore,
+  });
+}
+
+function fakeStreamer() {
+  const subscribers: Array<NonNullable<SubscriberCallbacks['onVisible']>> = [];
+  const streamer = {
+    subscribeAtomic: async (cbs: SubscriberCallbacks) => {
+      if (cbs.onVisible) subscribers.push(cbs.onVisible);
+      return { snapshot: { data: '', cols: 80, rows: 24 }, snapshotSeq: 0, unsubscribe: () => undefined };
+    },
+  };
+  return { subscribers, paneStreamerManager: { ensure: () => streamer } as unknown as PaneStreamerManager };
+}
+
+function watcherStandIn(start: () => Promise<boolean>) {
+  const startSpy = vi.fn(start);
+  const stop = vi.fn();
+  const watcher = {
+    start: startSpy,
+    stop,
+    stopIfToken: vi.fn(),
+    has: () => false,
+    isSettling: () => false,
+    rearmNeedInput: async () => new Set<string>(),
+  } as unknown as PhaseSignalWatcher;
+  return { watcher, start: startSpy, stop };
+}
+
+async function boundTaskId(agentId = 'dev-1'): Promise<string> {
+  return (await harness.agentStore.get(agentId))?.taskId ?? '';
+}
+
+async function cancelBoundTaskInStore(agentId = 'dev-1'): Promise<void> {
+  const task = (await harness.taskStore.get(await boundTaskId(agentId)))!;
+  await harness.taskStore.set({ ...task, status: 'cancelled', updatedAt: NOW });
+}
 
 describe('AgentManager task binding flow', () => {
   it('createTask binds a free preferred dev and holds its lock', async () => {
@@ -32,14 +93,19 @@ describe('AgentManager task binding flow', () => {
     expect(harness.events.some(e => e.type === 'task.assigned' && e.agentId === 'dev-1')).toBe(true);
   });
 
+  // createTask 不经 tmux/git:交错点只能挂在 pickAgent 的绑定读取上,读完立刻 bump
+  function bumpGenerationAfterBindingRead(agentId: string): void {
+    const realGet = harness.agentStore.get.bind(harness.agentStore);
+    vi.spyOn(harness.agentStore, 'get').mockImplementationOnce(async (id) => {
+      const state = await realGet(id);
+      harness.manager.bumpDeletionGeneration(agentId);
+      return state;
+    });
+  }
+
   it('createTask rejects the binding when a DELETE→recreate bumps the generation during config reads', async () => {
     await harness.seedAgent({ id: 'dev-1' });
-    const realPick = harness.manager.pickAgent.bind(harness.manager);
-    vi.spyOn(harness.manager, 'pickAgent').mockImplementation(async (projectId, agentId) => {
-      const picked = await realPick(projectId, agentId);
-      harness.manager.bumpDeletionGeneration(agentId);
-      return picked;
-    });
+    bumpGenerationAfterBindingRead('dev-1');
 
     const result = await harness.manager.createTask('proj', {
       title: 'racy', description: 'd', preferredAgentId: 'dev-1',
@@ -51,21 +117,18 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('createTask rejects the queued early-return when a DELETE→recreate bumps the generation (no stale participants persisted)', async () => {
-    await harness.seedAgent({ id: 'dev-1' });
-    vi.spyOn(harness.manager, 'pickAgent').mockImplementation(async (_projectId, agentId) => {
-      harness.manager.bumpDeletionGeneration(agentId);
-      return null;
-    });
+    await harness.seedAgent({ id: 'dev-1', taskId: 'other-task' });
+    bumpGenerationAfterBindingRead('dev-1');
 
     await expect(harness.manager.createTask('proj', {
       title: 'racy queued', description: 'd', preferredAgentId: 'dev-1',
     })).rejects.toThrow(/deleted or recreated/);
+    expect(await harness.taskStore.list()).toEqual([]);
   });
 
   it('createTask queued early-return rejects when a team member (QA) is being deleted, even with the dev generation unchanged', async () => {
-    await harness.seedAgent({ id: 'dev-1' });
+    await harness.seedAgent({ id: 'dev-1', taskId: 'other-task' });
     harness.manager.tryClaimDeletion(['qa-1']);
-    vi.spyOn(harness.manager, 'pickAgent').mockResolvedValue(null);
 
     await expect(harness.manager.createTask('proj', {
       title: 'qa-deleting', description: 'd', preferredAgentId: 'dev-1',
@@ -123,52 +186,47 @@ describe('AgentManager task binding flow', () => {
 
   it('ensureSession refuses and skips the Workdir state-write when a DELETE→recreate bumps the generation mid-flight', async () => {
     await harness.seedAgent({ id: 'dev-1' });
-    vi.spyOn(harness.manager as unknown as { ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }> }, 'ensureWorkdir')
-      .mockImplementation(async () => {
-        harness.manager.bumpDeletionGeneration('dev-1');
-        return { workdir: '/tmp/stale-workdir' };
-      });
+    useWorkdirStandIn(async () => {
+      harness.manager.bumpDeletionGeneration('dev-1');
+      return '/tmp/stale-workdir';
+    });
 
     await expect(harness.manager.ensureSession('dev-1', 'runtime')).rejects.toThrow(/being deleted|recreated/);
     expect((await harness.agentStore.get('dev-1'))?.workdir).not.toBe('/tmp/stale-workdir');
   });
 
   it('ensureSession re-gates after the tmux probe: a DELETE tombstone during getSessionSnapshot blocks build/adopt', async () => {
-    await harness.seedAgent({ id: 'dev-1', workdir: '/repo/wt' });
-    vi.spyOn(harness.manager as unknown as { ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }> }, 'ensureWorkdir')
-      .mockResolvedValue({ workdir: '/repo/wt' });
-    const buildSpy = vi.spyOn(
-      harness.manager as unknown as { buildFreshSession: (...a: unknown[]) => Promise<unknown> }, 'buildFreshSession',
-    ).mockResolvedValue({ createdSession: true, agentId: 'dev-1' });
-    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockImplementation(async () => {
-      harness.manager.tryClaimDeletion(['dev-1']);
-      return null;
+    await harness.seedAgent({ id: 'dev-1' });
+    const runner = useRunner({
+      session: 'absent',
+      onExec: cmd => { if (cmd.includes('list-sessions')) harness.manager.tryClaimDeletion(['dev-1']); },
     });
 
     await expect(harness.manager.ensureSession('dev-1', 'runtime')).rejects.toThrow(/being deleted|recreated/);
-    expect(buildSpy).not.toHaveBeenCalled();
+
+    expect(cmdsOf(runner).some(c => c.includes('list-sessions'))).toBe(true);
+    expect(cmdsOf(runner).some(c => c.includes('new-session'))).toBe(false);
+    expect(runner.sessions.present('dev-1')).toBe(false);
   });
 
   it('reconcileTaskBranches skips branch cleanup when a DELETE→recreate bumps the generation during the ref scan', async () => {
     await harness.seedTask({ id: 'rtb-1', status: 'merged', branch: 'bx/rtb-1', branchCreatedByBaxian: true, agentId: 'dev-1' });
     await harness.seedAgent({ id: 'dev-1', workdir: '/repo/wt' });
-
-    const cmds: string[] = [];
-    vi.spyOn(harness.manager as unknown as { createRunnerFor: (a: unknown) => CommandRunner }, 'createRunnerFor')
-      .mockReturnValue({
-        exec: vi.fn(async (cmd: string) => {
-          cmds.push(cmd);
-          if (cmd.includes('for-each-ref')) {
-            harness.manager.bumpDeletionGeneration('dev-1');
-            return { stdout: 'refs/heads/bx/rtb-1\n', stderr: '', exitCode: 0 };
-          }
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }),
-        writeFile: vi.fn(async () => {}),
-      } as unknown as CommandRunner);
+    const runner = fakeRunner({
+      rules: [{
+        match: 'for-each-ref',
+        reply: () => {
+          harness.manager.bumpDeletionGeneration('dev-1');
+          return { stdout: 'refs/heads/bx/rtb-1\n' };
+        },
+      }],
+    });
+    harness.manager = harness.createManager({ runnerFactory: () => runner });
 
     await harness.manager.reconcileTaskBranches();
 
+    const cmds = cmdsOf(runner);
+    expect(cmds.some(c => c.includes('for-each-ref'))).toBe(true);
     expect(cmds.some(c => c.includes('show-ref --verify'))).toBe(false);
     expect(cmds.some(c => /branch\s+-[dD]\b/.test(c))).toBe(false);
   });
@@ -334,30 +392,34 @@ describe('AgentManager task binding flow', () => {
     expect(created).toMatchObject({ projectId: 'proj-b', branch: 'feat/shared', status: 'pending' });
   });
 
-  it('cancelTask delegates releaseAgentForTask for dev and qa after cancelling the task', async () => {
+  it('cancelTask interrupts both panes, then releases dev and qa after cancelling the task', async () => {
     const t = await harness.seedTask({ qaAgentId: 'qa-1' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    harness.mockInterruptPane(harness.manager, true);
-    const releaseSpy = vi.spyOn(harness.manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await harness.manager.cancelTask(t.id);
 
     expect(cancelled.status).toBe('cancelled');
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
+    expect(escapesTo('%0')).toHaveLength(1);
+    expect(escapesTo('%1')).toHaveLength(1);
+    for (const id of ['dev-1', 'qa-1']) {
+      const state = await harness.agentStore.get(id);
+      expect(state?.taskId).toBeUndefined();
+      expect(state?.status).toBeUndefined();
+      expect(await harness.lockManager.isLocked(id)).toBe(false);
+    }
   });
 
   it('cancelTask on a terminal task still interrupts and releases stale bound agents without rewriting the status', async () => {
     await harness.seedTask({ id: 'task-term', status: 'merged', agentId: 'dev-1', qaAgentId: 'qa-1', updatedAt: NOW });
     await harness.seedAgent({ id: 'dev-1', taskId: 'task-term', paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: 'task-term', paneId: '%1' });
-    const interruptSpy = harness.mockInterruptPane(harness.manager, true);
 
     const result = await harness.manager.cancelTask('task-term');
 
     expect(result.status).toBe('merged');
-    expect(interruptSpy).toHaveBeenCalledTimes(2);
+    expect(escapesTo('%0')).toHaveLength(1);
+    expect(escapesTo('%1')).toHaveLength(1);
     expect(await harness.taskStore.get('task-term')).toMatchObject({ status: 'merged', updatedAt: NOW });
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
@@ -367,23 +429,32 @@ describe('AgentManager task binding flow', () => {
   it('cancelTask on a terminal task with no live bindings is a clean no-op', async () => {
     await harness.seedTask({ id: 'task-term2', status: 'cancelled', agentId: 'dev-1', updatedAt: NOW });
     await harness.seedAgent({ id: 'dev-1' });
-    const interruptSpy = harness.mockInterruptPane(harness.manager, true);
 
     const result = await harness.manager.cancelTask('task-term2');
 
     expect(result.status).toBe('cancelled');
-    expect(interruptSpy).not.toHaveBeenCalled();
+    expect(harness.runner.sentKeys).toEqual([]);
     expect((await harness.taskStore.get('task-term2'))?.updatedAt).toBe(NOW);
   });
 
-  it('cancelTask on a terminal task still refuses while completion is in flight (409)', async () => {
-    await harness.seedTask({ id: 'task-term3', status: 'merged' });
-    harness.manager['markCompleteInFlight'].add('task-term3');
-    try {
-      await expect(harness.manager.cancelTask('task-term3')).rejects.toMatchObject({ status: 409 });
-    } finally {
-      harness.manager['markCompleteInFlight'].delete('task-term3');
-    }
+  it('cancelTask refuses (409) while a complete verdict is still merging', async () => {
+    await harness.seedTask({
+      id: 'task-term3', status: 'max_rounds', phase: 'code', prNumber: 5, branch: 'bx/task-term3',
+      latestHeadSha: 'a'.repeat(40),
+      agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1',
+    });
+    await harness.seedAgent({ id: 'dev-1', taskId: 'task-term3' });
+    let release!: () => void;
+    const merging = new Promise<void>(resolve => { release = resolve; });
+    const merge = vi.spyOn(harness.manager, 'platformConfirmMerge').mockImplementation(() => merging);
+
+    const completing = harness.manager.markTaskComplete('task-term3');
+    await vi.waitFor(() => expect(merge).toHaveBeenCalledTimes(1));
+    await expect(harness.manager.cancelTask('task-term3')).rejects.toMatchObject({ status: 409 });
+
+    release();
+    await completing;
+    expect((await harness.taskStore.get('task-term3'))?.status).toBe('merge-ready');
   });
 
   it('re-clicking cancel on a cancelled task retries a failed interrupt cleanup and frees the held agent', async () => {
@@ -395,44 +466,41 @@ describe('AgentManager task binding flow', () => {
       status: 'awaiting_human',
       awaitingPhase: 'cancel-interrupt-failed',
     });
-    harness.mockInterruptPane(harness.manager, true);
 
     await harness.manager.cancelTask('task-term4');
 
+    expect(escapesTo('%0')).toHaveLength(1);
     const dev = await harness.agentStore.get('dev-1');
     expect(dev?.taskId).toBeUndefined();
     expect(dev?.status).toBeUndefined();
   });
 
   it('cancelTask stops the watcher again after the cancelled write (closes rollback re-arm race)', async () => {
-    const stop = vi.fn();
-    const m = harness.createManager({ phaseSignalWatcher: { start: vi.fn(), stop } as never });
+    const { watcher, stop } = watcherStandIn(async () => true);
+    const m = harness.createManager({ phaseSignalWatcher: watcher });
     const t = await harness.seedTask({ qaAgentId: 'qa-1' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    harness.mockInterruptPane(m, true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
 
     await m.cancelTask(t.id);
 
     expect(stop.mock.calls.filter(c => c[0] === t.id)).toHaveLength(2);
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
   });
 
   it('cancelTask releases a bound dev through the real release path without task-lock deadlock', async () => {
-    const localManager = harness.createManager({ runnerFactory: () => clearAwareRunner([], () => CLAUDE_PANE) });
-    harness.setCompactTiming(localManager);
     const t = await harness.seedTask();
     await harness.seedAgent({
       id: 'dev-1',
       taskId: t.id,
       paneId: '%0',
     });
-    await harness.acquireAgentLock('dev-1');
 
     const timeout = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error('cancelTask timed out')), 1_500);
     });
-    const cancelled = await Promise.race([localManager.cancelTask(t.id), timeout]);
+    const cancelled = await Promise.race([harness.manager.cancelTask(t.id), timeout]);
 
     expect(cancelled.status).toBe('cancelled');
     const state = await harness.agentStore.get('dev-1');
@@ -441,111 +509,89 @@ describe('AgentManager task binding flow', () => {
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('rollbackFailedDispatch clears only the matching binding and releases the lock', async () => {
-    const t = await harness.seedTask();
-    await harness.seedAgent({
-      id: 'dev-1',
-      taskId: t.id,
-      workdir: '/tmp/wt',
-      paneId: '%0',
+  // Workdir 准备失败让 startSession 在 tmux 之前就倒下:`during` 在失败前执行交错动作
+  const failDispatch = (during: (taskId: string) => Promise<void> = async () => undefined, message = 'boot failed') =>
+    useWorkdirStandIn(async () => {
+      await during(await boundTaskId());
+      throw new Error(message);
     });
-    await harness.acquireAgentLock('dev-1');
+  const createOnDev1 = () => harness.manager.createAndStartTask('proj', {
+    title: 'T', description: 'D', preferredAgentId: 'dev-1',
+  });
 
-    const token = (await harness.agentStore.get('dev-1'))?.lockToken;
-    await harness.manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, token);
+  it('a failed dispatch rolls the task back to pending, unbinds the dev, releases its lock, and keeps its pane/workdir', async () => {
+    await harness.seedAgent({ id: 'dev-1', workdir: '/tmp/wt', paneId: '%0' });
+    failDispatch();
 
-    expect((await harness.taskStore.get(t.id))?.status).toBe('pending');
+    const created = await createOnDev1();
+
+    expect(created.status).toBe('pending');
     const state = await harness.agentStore.get('dev-1');
     expect(state?.taskId).toBeUndefined();
     expect(state?.workdir).toBe('/tmp/wt');
     expect(state?.paneId).toBe('%0');
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
-  it('rollbackFailedDispatch can safely recover when agent state disappeared but the exact lock remains', async () => {
-    const t = await harness.seedTask({ id: 'task-state-missing' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    const token = (await harness.agentStore.get('dev-1'))!.lockToken!;
-    await harness.agentStore.delete('dev-1');
+  it('a failed dispatch still rolls back and releases the lock when the agent state vanished mid-bootstrap', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    failDispatch(async () => { await harness.agentStore.delete('dev-1'); });
 
-    await harness.manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, token);
+    const created = await createOnDev1();
 
-    expect((await harness.taskStore.get(t.id))?.status).toBe('pending');
+    expect(created.status).toBe('pending');
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('rollbackFailedDispatch does not resurrect state deleted by a DELETE→recreate during the rollback', async () => {
-    const t = await harness.seedTask({ id: 'task-rb-revive', status: 'in_progress' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    const token = (await harness.agentStore.get('dev-1'))!.lockToken!;
-    const realSet = harness.taskStore.set.bind(harness.taskStore);
-    vi.spyOn(harness.taskStore, 'set').mockImplementation(async (task) => {
-      await realSet(task);
-      harness.manager.bumpDeletionGeneration('dev-1');
-      await harness.agentStore.delete('dev-1');
+  it('a failed dispatch does not resurrect agent state deleted by a DELETE→recreate during the rollback', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    failDispatch(async () => {
+      const realSet = harness.taskStore.set.bind(harness.taskStore);
+      vi.spyOn(harness.taskStore, 'set').mockImplementationOnce(async (task) => {
+        await realSet(task);
+        harness.manager.bumpDeletionGeneration('dev-1');
+        await harness.agentStore.delete('dev-1');
+      });
     });
 
-    await harness.manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, token);
+    await createOnDev1();
 
     expect(await harness.agentStore.get('dev-1')).toBeNull();
   });
 
-  it('rollbackFailedDispatch with a reason emits a human.intervention naming the failure', async () => {
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
+  it('a failed dispatch whose task already left in_progress raises no dispatch-rollback intervention', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    failDispatch(async (taskId) => {
+      const t = (await harness.taskStore.get(taskId))!;
+      await harness.taskStore.set({ ...t, status: 'review', updatedAt: NOW });
+    });
 
-    const token = (await harness.agentStore.get('dev-1'))?.lockToken;
-    await harness.manager['rollbackFailedDispatch'](t.id, 'dev-1', {
-      phase: 'dispatch-rollback',
-      message: 'ensureWorkdir failed: git fetch failed: Could not resolve host',
-    }, token);
+    await createOnDev1();
 
-    expect((await harness.taskStore.get(t.id))?.status).toBe('pending');
-    const intervention = harness.events.find(
-      e => e.type === 'human.intervention'
-        && (e.data as { phase?: string }).phase === 'dispatch-rollback',
-    );
-    expect(intervention).toBeDefined();
-    expect((intervention!.data as { message?: string }).message).toContain('Could not resolve host');
+    expect(dispatchRollbackEvents()).toEqual([]);
   });
 
-  it('rollbackFailedDispatch stays silent when the task did not need rolling back', async () => {
-    const t = await harness.seedTask({ status: 'cancelled' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    const token = (await harness.agentStore.get('dev-1'))?.lockToken;
+  it('a failed dispatch cannot roll back over a newer lock generation taken for the same task', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    let newToken: string | null = null;
+    failDispatch(async (taskId) => {
+      const oldToken = (await harness.agentStore.get('dev-1'))!.lockToken!;
+      await harness.lockManager.releaseIfOwner('dev-1', taskId, oldToken);
+      newToken = await harness.lockManager.acquire('dev-1', taskId);
+      await harness.agentStore.update('dev-1', state => ({ ...state!, lockToken: newToken!, updatedAt: NOW }));
+    });
 
-    await harness.manager['rollbackFailedDispatch'](t.id, 'dev-1', {
-      phase: 'dispatch-rollback',
-      message: 'irrelevant',
-    }, token);
+    const created = await createOnDev1();
 
-    expect(harness.events.some(
-      e => e.type === 'human.intervention'
-        && (e.data as { phase?: string }).phase === 'dispatch-rollback',
-    )).toBe(false);
-  });
-
-  it('rollbackFailedDispatch cannot clear a newer lock generation for the same task', async () => {
-    const t = await harness.seedTask();
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    const oldToken = (await harness.agentStore.get('dev-1'))!.lockToken!;
-    await harness.lockManager.releaseIfOwner('dev-1', t.id, oldToken);
-    const newToken = await harness.lockManager.acquire('dev-1', t.id);
-    await harness.agentStore.update('dev-1', state => ({ ...state!, lockToken: newToken!, updatedAt: NOW }));
-
-    await harness.manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, oldToken);
-
-    expect((await harness.taskStore.get(t.id))?.status).toBe('in_progress');
+    expect(created.status).toBe('in_progress');
     expect((await harness.agentStore.get('dev-1'))?.lockToken).toBe(newToken);
-    expect(await harness.lockManager.isOwner('dev-1', t.id, newToken!)).toBe(true);
+    expect(await harness.lockManager.isOwner('dev-1', created.id, newToken!)).toBe(true);
   });
 
   it('createAndStartTask surfaces a non-terminal dispatch error as a dispatch-rollback intervention', async () => {
-    vi.spyOn(harness.manager, 'startSession').mockRejectedValue(
-      new Error('ensureWorkdir failed: git fetch failed at /repo: Connection timed out'),
-    );
+    failDispatch(undefined, 'git fetch failed at /repo: Connection timed out');
 
     const created = await harness.manager.createAndStartTask('proj', {
       title: 'T', description: 'D', preferredAgentId: 'dev-1',
@@ -560,24 +606,43 @@ describe('AgentManager task binding flow', () => {
     expect((intervention!.data as { message?: string }).message).toContain('Connection timed out');
   });
 
-  it('createAndStartTask skips rollbackFailedDispatch when startSession throws EnsureSessionError(handled=true)', async () => {
-    const dialogErr = new EnsureSessionError(
-      { createdSession: true, agentId: 'dev-1', dialogPending: true, handled: true },
-      'develop dispatch runtime dialog handled',
-    );
-    vi.spyOn(harness.manager, 'startSession').mockRejectedValue(dialogErr);
-    const rollbackSpy = vi.spyOn(harness.manager as never as { rollbackFailedDispatch: (taskId: string, agentId: string) => Promise<void> }, 'rollbackFailedDispatch');
+  it('createAndStartTask leaves the dispatch bound when checkout preparation fails (startSession already holds the agent)', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockRejectedValue(new Error('git checkout failed'));
 
     const created = await harness.manager.createAndStartTask('proj', {
       title: 'T', description: 'D', preferredAgentId: 'dev-1',
     });
 
-    expect(rollbackSpy).not.toHaveBeenCalled();
     expect(created.status).toBe('in_progress');
+    const dev = await harness.agentStore.get('dev-1');
+    expect(dev?.taskId).toBe(created.id);
+    expect(dev?.awaitingPhase).toBe('checkout-preparation-failed');
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
+    expect(dispatchRollbackEvents()).toEqual([]);
+    expect(harness.runner.pastedPrompts).toEqual([]);
   });
 
-  it('createAndStartTask({ background: true }) returns without waiting for the session bootstrap', async () => {
-    const startSpy = vi.spyOn(harness.manager, 'startSession').mockReturnValue(new Promise<boolean>(() => {}));
+  it('createAndStartTask leaves the dispatch bound when the runtime is blocked on a startup dialog (handled EnsureSessionError)', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    const runner = useRunner({ agents: { 'dev-1': { screen: STARTUP_DIALOG } } });
+
+    const created = await createOnDev1();
+
+    expect(created.status).toBe('failed');
+    expect(await harness.agentStore.get('dev-1')).toMatchObject({
+      taskId: created.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+    });
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
+    expect(dispatchRollbackEvents()).toEqual([]);
+    expect(cmdsOf(runner).some(c => c.includes('kill-session'))).toBe(false);
+    expect(runner.pastedPrompts).toEqual([]);
+  });
+
+  it('createAndStartTask({ background: true }) returns before the prompt is delivered; the dispatch then completes on its own', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
 
     const created = await harness.manager.createAndStartTask(
       'proj',
@@ -586,16 +651,14 @@ describe('AgentManager task binding flow', () => {
     );
 
     expect(created.status).toBe('in_progress');
-    await vi.waitFor(() => expect(startSpy).toHaveBeenCalledTimes(1));
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    await vi.waitFor(() => expect(harness.runner.pastedPrompts).toHaveLength(1), { timeout: 5_000 });
+    await vi.waitFor(() => expect(harness.events.some(e => e.type === 'session.started' && e.taskId === created.id)).toBe(true));
+    expect((await harness.taskStore.get(created.id))?.status).toBe('in_progress');
   });
 
   it('createAndStartTask({ background: true }) rolls a failed bootstrap back off the create path', async () => {
-    vi.spyOn(harness.manager, 'startSession').mockRejectedValue(new Error('boot failed'));
-    let rolledBack!: () => void;
-    const rollbackDone = new Promise<void>((resolve) => { rolledBack = resolve; });
-    const rollbackSpy = vi
-      .spyOn(harness.manager as never as { rollbackFailedDispatch: (taskId: string, agentId: string) => Promise<void> }, 'rollbackFailedDispatch')
-      .mockImplementation(async () => { rolledBack(); });
+    failDispatch();
 
     const created = await harness.manager.createAndStartTask(
       'proj',
@@ -604,28 +667,25 @@ describe('AgentManager task binding flow', () => {
     );
 
     expect(created.status).toBe('in_progress');
-    await rollbackDone;
-    expect(rollbackSpy).toHaveBeenCalledTimes(1);
+    await vi.waitFor(async () => expect((await harness.taskStore.get(created.id))?.status).toBe('pending'));
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(dispatchRollbackEvents()).toHaveLength(1);
   });
 
-  function mockStartSessionThatCancels(): void {
-    vi.spyOn(harness.manager, 'startSession').mockImplementation(async (cancelledTaskId: string) => {
-      const t = await harness.taskStore.get(cancelledTaskId);
-      if (t) await harness.taskStore.set({ ...t, status: 'cancelled', updatedAt: NOW });
-      return true;
-    });
+  // 提示词已粘贴、尚未回车时任务被取消:startSession 仍会送达并返回 true,收尾落在 createAndStartTask
+  function cancelOnPaste(): FakeRunnerOptions['onExec'] {
+    let cancelled = false;
+    return async cmd => {
+      if (cancelled || !cmd.includes('paste-buffer')) return;
+      cancelled = true;
+      await cancelBoundTaskInStore();
+    };
   }
 
-  it('createAndStartTask({ background: true }): cancel mid-bootstrap interrupts the pane, then idle-releases', async () => {
-    mockStartSessionThatCancels();
-    const interruptSpy = harness.mockInterruptPane(harness.manager, true);
-    let released!: () => void;
-    const releaseDone = new Promise<void>((resolve) => { released = resolve; });
-    const releaseSpy = vi.spyOn(harness.manager, 'releaseAgentForTask').mockImplementation(async () => { released(); return true; });
-    const armSpy = vi.spyOn(
-      harness.manager as never as { armPostDispatchSignalOrHold: (...args: unknown[]) => Promise<void> },
-      'armPostDispatchSignalOrHold',
-    );
+  it('createAndStartTask({ background: true }): cancel mid-bootstrap interrupts the pane, then idle-releases without arming', async () => {
+    const streamer = fakeStreamer();
+    const runner = useRunner({ onExec: cancelOnPaste() }, { paneStreamerManager: streamer.paneStreamerManager });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
 
     const created = await harness.manager.createAndStartTask(
       'proj',
@@ -633,19 +693,19 @@ describe('AgentManager task binding flow', () => {
       { background: true },
     );
 
-    await releaseDone;
-    expect(interruptSpy).toHaveBeenCalledTimes(1);
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', created.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
-    expect(armSpy).not.toHaveBeenCalled();
+    await vi.waitFor(async () => expect(await harness.lockManager.isLocked('dev-1')).toBe(false), { timeout: 5_000 });
+    expect(runner.pastedPrompts).toHaveLength(1);
+    expect(escapesTo('%0', runner)).toHaveLength(1);
+    const dev = await harness.agentStore.get('dev-1');
+    expect(dev?.taskId).toBeUndefined();
+    expect(dev?.status).toBeUndefined();
+    expect((await harness.taskStore.get(created.id))?.status).toBe('cancelled');
+    expect(streamer.subscribers).toEqual([]);
   });
 
   it('createAndStartTask({ background: true }): cancel mid-bootstrap holds the agent when the pane can not be interrupted', async () => {
-    mockStartSessionThatCancels();
-    harness.mockInterruptPane(harness.manager, false);
-    const releaseSpy = vi.spyOn(harness.manager, 'releaseAgentForTask').mockResolvedValue(true);
-    let held!: () => void;
-    const holdDone = new Promise<void>((resolve) => { held = resolve; });
-    const holdSpy = vi.spyOn(harness.manager, 'markAwaitingHuman').mockImplementation(async () => { held(); return true; });
+    const runner = useRunner({ onExec: cancelOnPaste(), rules: [escapeFails] });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
 
     const created = await harness.manager.createAndStartTask(
       'proj',
@@ -653,20 +713,20 @@ describe('AgentManager task binding flow', () => {
       { background: true },
     );
 
-    await holdDone;
-    expect(holdSpy).toHaveBeenCalledWith('dev-1', 'cancel-interrupt-failed', expect.any(String), { expectedTaskId: created.id });
-    expect(releaseSpy).not.toHaveBeenCalled();
+    await vi.waitFor(
+      async () => expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-interrupt-failed'),
+      { timeout: 5_000 },
+    );
+    expect(escapesTo('%0', runner)).toHaveLength(1);
+    const dev = await harness.agentStore.get('dev-1');
+    expect(dev?.taskId).toBe(created.id);
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('createAndStartTask({ background: true }): a watcher arm failure holds the agent instead of being swallowed', async () => {
-    vi.spyOn(harness.manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(harness.manager as never as { armPostDispatchSignalOrHold: (...args: unknown[]) => Promise<void> }, 'armPostDispatchSignalOrHold')
-      .mockRejectedValue(new Error('watcher store down'));
-    let held!: () => void;
-    const holdDone = new Promise<void>((resolve) => { held = resolve; });
-    const holdSpy = vi
-      .spyOn(harness.manager as never as { holdAgentForUnarmedSignal: (...args: unknown[]) => Promise<void> }, 'holdAgentForUnarmedSignal')
-      .mockImplementation(async () => { held(); });
+  it('createAndStartTask({ background: true }): a watcher that throws while arming holds the agent instead of being swallowed', async () => {
+    const { watcher } = watcherStandIn(async () => { throw new Error('watcher store down'); });
+    harness.manager = harness.createManager({ phaseSignalWatcher: watcher });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
 
     const created = await harness.manager.createAndStartTask(
       'proj',
@@ -675,22 +735,32 @@ describe('AgentManager task binding flow', () => {
     );
 
     expect(created.status).toBe('in_progress');
-    await holdDone;
-    expect(holdSpy).toHaveBeenCalledWith(created.id, 'dev-1', ['spec-done', 'pr-created']);
+    await vi.waitFor(
+      async () => expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('signal-arm-failed:spec-done,pr-created'),
+      { timeout: 5_000 },
+    );
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBe(created.id);
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
   });
 
   it('createAndStartTask: a cancel-cleanup hold from a cancel-before-delivery is NOT auto-released by the !started path', async () => {
-    vi.spyOn(harness.manager, 'startSession').mockImplementation(async (cancelledTaskId: string) => {
-      const t = await harness.taskStore.get(cancelledTaskId);
-      if (t) await harness.taskStore.set({ ...t, status: 'cancelled', updatedAt: NOW });
-      await harness.agentStore.update('dev-1', (s) => (s
-        ? { ...s, status: 'awaiting_human' as const, awaitingPhase: 'cancel-interrupt-failed', awaitingSince: NOW }
-        : s));
-      return false;
+    let held = false;
+    const runner = useRunner({
+      // 会话已就绪、提示词尚未粘贴的窗口:任务上下文读取是这一段里第一条 tmux 命令
+      onExec: async cmd => {
+        if (held || !cmd.includes('@baxian-context-task-id')) return;
+        held = true;
+        await cancelBoundTaskInStore();
+        await harness.agentStore.update('dev-1', (s) => (s
+          ? { ...s, status: 'awaiting_human' as const, awaitingPhase: 'cancel-interrupt-failed', awaitingSince: NOW }
+          : s));
+      },
     });
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
 
     const created = await harness.manager.createAndStartTask('proj', { title: 'T', description: 'D', preferredAgentId: 'dev-1' });
 
+    expect(runner.pastedPrompts).toEqual([]);
     const dev = await harness.agentStore.get('dev-1');
     expect(dev?.taskId).toBe(created.id);
     expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
@@ -698,21 +768,21 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('develop dispatch holds the dev when the spec/pr-created watcher fails to arm', async () => {
-    await harness.seedAgent({ id: 'dev-1' });
-    const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };
-    const m = harness.createManager({ phaseSignalWatcher: watcher as never });
-    vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman');
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    const { watcher, start } = watcherStandIn(async () => false);
+    const m = harness.createManager({ phaseSignalWatcher: watcher });
 
-    await m.createAndStartTask('proj', { title: 'T', description: 'D', preferredAgentId: 'dev-1' });
+    const created = await m.createAndStartTask('proj', { title: 'T', description: 'D', preferredAgentId: 'dev-1' });
 
-    expect(watcher.start).toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      expect.stringContaining('signal-arm-failed'),
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: expect.any(String) }),
-    );
+    expect(start).toHaveBeenCalled();
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
+    const dev = await harness.agentStore.get('dev-1');
+    expect(dev?.taskId).toBe(created.id);
+    expect(dev?.status).toBe('awaiting_human');
+    expect(dev?.awaitingPhase).toBe('signal-arm-failed:spec-done,pr-created');
+    expect(harness.events.some(
+      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'signal-arm-failed:spec-done,pr-created',
+    )).toBe(true);
   });
 
   it('setupPhaseSignal through the REAL watcher reports false for a config-removed agent; the hold marks it awaiting_human', async () => {
@@ -783,25 +853,20 @@ describe('AgentManager task binding flow', () => {
     await harness.seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await harness.acquireAgentLock('dev-1');
     const beforeUpdatedAt = NOW;
+    // 回车已发出,随后的第一次抓屏断连:提交结果无法判定
+    let submitted = false;
+    const runner = useRunner({
+      onExec: cmd => { if (runner.pastedPrompts.length > 0 && /send-keys -t %0 .*Enter/.test(cmd)) submitted = true; },
+      rules: [{ match: cmd => submitted && cmd.includes('capture-pane'), reply: { exitCode: 255, stderr: 'ssh: connection reset' } }],
+    });
 
-    harness.stubEnsureSession(harness.manager);
-    vi.spyOn(harness.manager as unknown as { injectAndAwaitAck: () => Promise<void> }, 'injectAndAwaitAck')
-      .mockRejectedValue(new DispatchTerminalError('ack_unknown', 'simulated ack_unknown from infra failure'));
-    const minimalRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('git worktree add')) return { stdout: '', stderr: '', exitCode: 0 };
-        if (cmd.includes('git rev-parse')) return { stdout: 'abc123\n', stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async () => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    (harness.manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
+    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
+      name: 'DispatchTerminalError',
+      reason: 'ack_unknown',
+    });
 
-    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toBeInstanceOf(DispatchTerminalError);
-
+    expect(runner.pastedPrompts).toHaveLength(1);
     const stateAfter = await harness.agentStore.get('dev-1');
     expect(stateAfter?.taskId).toBe(t.id);
     expect(stateAfter?.workdir).toBeTruthy();
@@ -809,38 +874,36 @@ describe('AgentManager task binding flow', () => {
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('startSession cleanup leaves the binding when cancel took it over (cancel-clearing) during the mutex wait', async () => {
+  it('startSession cleanup leaves the binding to cancel when cancel takes the agent over at the composer-clear key (cancel-clearing → cancel-interrupt-failed)', async () => {
     const t = await harness.seedTask({
       id: 'task-ss-cancel-clearing',
       branch: 'bx/task-ss-cancel-clearing',
       signalToken: 'dispatch12345',
     });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await harness.acquireAgentLock('dev-1');
+    let cancel: Promise<TaskState> | undefined;
+    let holdAtTakeover: string | undefined;
+    const runner = useRunner({
+      // 清稿键是派单标记 running 之后、粘贴之前的第一条 tmux 命令:cancel 在这里接管绑定
+      onExec: async cmd => {
+        if (cancel || !cmd.includes('send-keys -l -t %0')) return;
+        cancel = harness.manager.cancelTask(t.id);
+        await vi.waitFor(async () => {
+          holdAtTakeover = (await harness.agentStore.get('dev-1'))?.awaitingPhase;
+          expect(holdAtTakeover).toBe('cancel-clearing');
+        });
+      },
+      rules: [escapeFails],
+    });
 
-    harness.stubEnsureSession(harness.manager);
-    vi.spyOn(harness.manager as unknown as { injectAndAwaitAck: () => Promise<unknown> }, 'injectAndAwaitAck')
-      .mockImplementation(async () => {
-        await (harness.manager as unknown as { markPaneCancelClearing: (a: string, tid: string) => Promise<void> })
-          .markPaneCancelClearing('dev-1', t.id);
-        throw new Error('dispatch aborted: task went terminal while waiting for pane mutex');
-      });
-    const minimalRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('git worktree add')) return { stdout: '', stderr: '', exitCode: 0 };
-        if (cmd.includes('git rev-parse')) return { stdout: 'abc123\n', stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async () => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    (harness.manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
+    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow(/taken over by cancel/);
+    await cancel;
 
-    await expect(harness.manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow(/went terminal/);
-
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(holdAtTakeover).toBe('cancel-clearing');
     const stateAfter = await harness.agentStore.get('dev-1');
     expect(stateAfter?.taskId).toBe(t.id);
-    expect(stateAfter?.awaitingPhase).toBe('cancel-clearing');
+    expect(stateAfter?.awaitingPhase).toBe('cancel-interrupt-failed');
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
 
@@ -851,26 +914,11 @@ describe('AgentManager task binding flow', () => {
       signalToken: 'dispatch12345',
     });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await harness.acquireAgentLock('dev-1');
-
-    harness.stubEnsureSession(harness.manager);
-    const injectSpy = vi.spyOn(harness.manager as unknown as { injectAndAwaitAck: () => Promise<unknown> }, 'injectAndAwaitAck')
-      .mockRejectedValue(new Error('injectAndAwaitAck must not run when a cancel hold owns the binding'));
-    const minimalRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('git worktree add')) return { stdout: '', stderr: '', exitCode: 0 };
-        if (cmd.includes('git rev-parse')) return { stdout: 'abc123\n', stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async () => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    (harness.manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
 
     const result = await harness.manager.startSession(t.id, 'dev-1', 'develop');
 
     expect(result).toBe(false);
-    expect(injectSpy).not.toHaveBeenCalled();
+    expect(harness.runner.pastedPrompts).toEqual([]);
     const stateAfter = await harness.agentStore.get('dev-1');
     expect(stateAfter?.taskId).toBe(t.id);
     expect(stateAfter?.awaitingPhase).toBe('cancel-clearing');
@@ -878,18 +926,18 @@ describe('AgentManager task binding flow', () => {
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('rollbackFailedDispatch leaves the binding/lock when the agent is held by cancel cleanup', async () => {
-    const t = await harness.seedTask({ id: 'task-rollback-cancel', status: 'cancelled' });
-    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await harness.acquireAgentLock('dev-1');
+  it('a failed dispatch leaves the binding/lock alone when cancel cleanup already holds the agent', async () => {
+    await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+    failDispatch(async () => {
+      await harness.agentStore.update('dev-1', state => ({
+        ...state!, status: 'awaiting_human', awaitingPhase: 'cancel-clearing', updatedAt: NOW,
+      }));
+    });
 
-    const token = (await harness.agentStore.get('dev-1'))?.lockToken;
-    await (harness.manager as unknown as {
-      rollbackFailedDispatch: (tid: string, aid: string, reason?: unknown, token?: string) => Promise<void>;
-    }).rollbackFailedDispatch(t.id, 'dev-1', undefined, token);
+    const created = await createOnDev1();
 
     const st = await harness.agentStore.get('dev-1');
-    expect(st?.taskId).toBe(t.id);
+    expect(st?.taskId).toBe(created.id);
     expect(st?.awaitingPhase).toBe('cancel-clearing');
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
@@ -917,14 +965,9 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('failTaskForDispatchError preserves binding on ack_unknown (prompt may already be running)', async () => {
-    const t = await harness.seedTask({ id: 'task-ack-unknown' });
-    await harness.seedAgent({
-      id: 'dev-1',
-      taskId: t.id,
-      paneId: '%0',
-    });
-    await harness.acquireAgentLock('dev-1');
-    const releaseSpy = vi.spyOn(harness.manager, 'releaseAgentForTask');
+    const t = await harness.seedTask({ id: 'task-ack-unknown', qaAgentId: 'qa-1' });
+    await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await harness.seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
 
     await harness.manager.failTaskForDispatchError(
       t.id,
@@ -939,13 +982,9 @@ describe('AgentManager task binding flow', () => {
     expect(stateAfter?.status).toBe('awaiting_human');
     expect(stateAfter?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
-    expect(releaseSpy).toHaveBeenCalledWith(
-      'qa-1',
-      t.id,
-      'idle',
-      { allowAwaitingHuman: true },
-    );
-    expect(releaseSpy.mock.calls.some(([agentId]) => agentId === 'dev-1')).toBe(false);
+    expect(escapesTo('%0')).toEqual([]);
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await harness.lockManager.isLocked('qa-1')).toBe(false);
 
     const interventions = harness.events.filter(
       e => e.type === 'human.intervention' &&
@@ -953,7 +992,5 @@ describe('AgentManager task binding flow', () => {
         (e.data as { phase: string }).phase.startsWith('dispatch-failed:ack_unknown'),
     );
     expect(interventions).toHaveLength(1);
-
-    releaseSpy.mockRestore();
   });
 });

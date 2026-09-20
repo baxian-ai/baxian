@@ -1,3 +1,4 @@
+import type { CommandRunner } from '../../src/agent/runner.js';
 import type { PlatformProvider } from '../../src/platform/types.js';
 import type { AgentConfig, BaxianConfig, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
@@ -86,5 +87,14 @@ export function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     createdAt: '2026-05-14T05:00:00.000Z',
     updatedAt: '2026-05-14T05:00:00.000Z',
     ...cloned,
+  };
+}
+
+export function makeCommandRunner(overrides: Partial<CommandRunner> = {}): CommandRunner {
+  return {
+    exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+    writeFile: async () => undefined,
+    execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+    ...overrides,
   };
 }

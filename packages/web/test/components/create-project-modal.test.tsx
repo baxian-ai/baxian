@@ -1,13 +1,14 @@
 import { it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 import { api } from '../../src/api.ts';
 import { CreateProjectModal } from '../../src/components/create-project-modal.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { makeProject } from '../helpers/fixtures.ts';
+import { expectToast } from '../helpers/toast.tsx';
 
 const configGetMock = vi.mocked(api.config.get);
 const createMock = vi.mocked(api.projects.create);
@@ -23,7 +24,7 @@ beforeEach(() => {
 });
 
 async function renderAndFill(repoValue: string) {
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'newproj' } });
   fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: repoValue } });
@@ -52,13 +53,13 @@ it('trims surrounding whitespace before submitting', async () => {
 });
 
 it('shows baxian as the Project ID placeholder', async () => {
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   expect((screen.getByLabelText('Project ID') as HTMLInputElement).placeholder).toBe('baxian');
 });
 
 it('requires the user to approve the plan by default and submits specApproval human', async () => {
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   expect((screen.getByLabelText('Require your approval (default)') as HTMLInputElement).checked).toBe(true);
   expect((screen.getByLabelText('Start development automatically after plan review') as HTMLInputElement).checked).toBe(false);
@@ -73,10 +74,11 @@ it('requires the user to approve the plan by default and submits specApproval hu
     merge: null,
     specApproval: 'human',
   });
+  await expectToast({ title: 'Project p created' });
 });
 
 it('omits specApproval when automatic development after plan review is selected', async () => {
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'autoproj' } });
   fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/example-owner/example-repo.git' } });
@@ -92,7 +94,7 @@ it('omits specApproval when automatic development after plan review is selected'
 });
 
 it('resets plan approval to require user confirmation when the modal reopens', async () => {
-  const { rerender } = render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  const { rerender } = render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.click(screen.getByLabelText('Start development automatically after plan review'));
   expect((screen.getByLabelText('Start development automatically after plan review') as HTMLInputElement).checked).toBe(true);
@@ -124,7 +126,7 @@ it('keeps blocking an empty repository URL client-side', async () => {
 
 it('surfaces a config load failure instead of silently rendering the github default', async () => {
   configGetMock.mockRejectedValue(new Error('boom'));
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(screen.getByText(/Failed to load/)).toBeTruthy());
 });
 
@@ -137,7 +139,7 @@ it('preserves line breaks in a multiline create failure', async () => {
 });
 
 it('does not render or submit a review mode', async () => {
-  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'gitproj' } });
   fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://github.com/example-owner/example-repo.git' } });

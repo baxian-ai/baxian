@@ -5,27 +5,13 @@ import type { ProjectConfig, AgentSnapshot, TaskState } from '../../src/shared/i
 
 vi.mock('../../src/components/pane-terminal.tsx', async () => (await import('../helpers/pane-terminal-mock.tsx')).createPaneTerminalMock());
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
-
 vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
 
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 vi.mock('../../src/components/create-agent-modal.tsx', () => ({
   CreateAgentModal: ({ open, projectId }: { open: boolean; projectId: string }) =>
-    open ? <div data-testid="agent-modal">agent:{projectId}</div> : null,
-}));
-
-const projectsHookState = {
-  projects: null as ProjectConfig[] | null,
-  error: null as string | null,
-};
-vi.mock('../../src/hooks/use-projects.ts', () => ({
-  useProjects: () => ({
-    projects: projectsHookState.projects,
-    error: projectsHookState.error,
-    refresh: vi.fn(),
-  }),
+    open ? <div role="dialog" aria-label="Add Agent Team">agent:{projectId}</div> : null,
 }));
 
 const agentsHookState = {
@@ -44,31 +30,57 @@ import { api } from '../../src/api.ts';
 import { useAgentsMock, useProjectTasksMock, useTaskMock } from '../helpers/events-mock.ts';
 import { makeProject } from '../helpers/fixtures.ts';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { Dashboard } from '../../src/pages/dashboard.tsx';
+import { __resetProjectsCacheForTests } from '../../src/hooks/use-projects.ts';
 import { TaskNotificationsProvider } from '../../src/hooks/use-task-notifications.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
 function seed(projects: ProjectConfig[], agents: AgentSnapshot[] = []): void {
-  projectsHookState.projects = projects;
+  vi.mocked(api.projects.list).mockResolvedValue(projects);
   agentsHookState.data = agents;
   agentsHookState.loaded = true;
+}
+
+function topbarActions(): HTMLElement {
+  return document.getElementById(TOPBAR_ACTIONS_ID)!;
 }
 
 function renderDashboard() {
   return render(
     <MemoryRouter>
-      <TaskNotificationsProvider>
-        <ConfirmProvider>
-          <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
-          <Dashboard />
-        </ConfirmProvider>
-      </TaskNotificationsProvider>
+      <ToastProvider>
+        <TaskNotificationsProvider>
+          <ConfirmProvider>
+            <div id={TOPBAR_ACTIONS_ID} />
+            <Dashboard />
+          </ConfirmProvider>
+        </TaskNotificationsProvider>
+      </ToastProvider>
     </MemoryRouter>,
   );
 }
 
+const TEAM = [
+  { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
+  { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+] as const;
+const SECOND_TEAM = [
+  { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local' },
+  { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local' },
+] as const;
+
+function demoProject(agent: ProjectConfig['agent'] = []): ProjectConfig {
+  return makeProject({ id: 'demo', repo: '/tmp/demo', agent });
+}
+
+async function findMoreActions(): Promise<HTMLElement> {
+  return screen.findByRole('button', { name: 'More actions' });
+}
+
 beforeEach(() => {
   cleanup();
+  __resetProjectsCacheForTests();
   useAgentsMock.mockImplementation(() => agentsHookState);
   useProjectTasksMock.mockImplementation(() => projectTasksHookState);
   useTaskMock.mockReturnValue({ data: null, loaded: true, error: null });
@@ -83,8 +95,6 @@ beforeEach(() => {
     host: [],
     project: [],
   });
-  projectsHookState.projects = null;
-  projectsHookState.error = null;
   agentsHookState.data = null;
   agentsHookState.loaded = false;
   agentsHookState.error = null;
@@ -95,42 +105,37 @@ beforeEach(() => {
 });
 
 describe('Dashboard layout', () => {
-  it('keeps an sr-only h1 "Dashboard" so screen readers see the page heading even though the visible title is removed', () => {
+  it('exposes a level-1 "Dashboard" heading to screen readers even though no visible title is shown', async () => {
     seed([]);
     renderDashboard();
 
-    const h1 = screen.getByRole('heading', { level: 1, name: 'Dashboard' });
-    expect(h1.className).toContain('sr-only');
+    const h1 = await screen.findByRole('heading', { level: 1, name: 'Dashboard' });
+    // visually-hidden contract: jsdom cannot evaluate the utility, so the class itself is the guard
+    expect(h1.className.split(/\s+/)).toContain('sr-only');
   });
 
-  it('renders each project\'s Agent Teams in a full-width vertical stack (no xl:grid-cols-2 split)', () => {
-    seed([
-      makeProject({
-        id: 'demo',
-        repo: '/tmp/demo',
-        agent: [
-          [
-            { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
-            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
-          ],
-        ],
-      }),
-    ]);
-
-    const { container } = renderDashboard();
-
-    const teamWrapper = container.querySelector('[role="group"]')?.parentElement;
-    expect(teamWrapper).toBeTruthy();
-    expect(teamWrapper!.className).toContain('space-y-3');
-    expect(teamWrapper!.className).not.toContain('xl:grid-cols-2');
-    expect(teamWrapper!.className).not.toContain('grid-cols-1');
-  });
-
-  it('project header row exposes two narrow click targets (project id + Details) and the surrounding row is not clickable, to avoid mis-taps', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it.each([
+    ['a single team stacks full width', [TEAM], false],
+    ['two teams share a two-column grid on wide screens', [TEAM, SECOND_TEAM], true],
+  ] as const)('%s', async (_name, teams, twoColumns) => {
+    seed([demoProject(teams.map(team => [...team]))]);
     renderDashboard();
 
-    const heading = screen.getByRole('heading', { level: 2, name: 'demo' });
+    const teamRegions = await screen.findAllByRole('group');
+    expect(teamRegions).toHaveLength(teams.length);
+    const teamWrapper = teamRegions[0].parentElement!;
+    // layout contract (jsdom computes no media queries): the grid needs its base class and both column steps
+    const tokens = teamWrapper.className.split(/\s+/);
+    for (const cls of ['grid', 'grid-cols-1', 'xl:grid-cols-2']) {
+      expect(tokens.includes(cls), cls).toBe(twoColumns);
+    }
+  });
+
+  it('project header row exposes two narrow click targets (project id + Details) and the repo path is not a link, to avoid mis-taps', async () => {
+    seed([demoProject()]);
+    renderDashboard();
+
+    const heading = await screen.findByRole('heading', { level: 2, name: 'demo' });
     const idLink = within(heading).getByRole('link', { name: 'demo' });
     expect(idLink.getAttribute('href')).toBe('/project/demo');
 
@@ -139,90 +144,54 @@ describe('Dashboard layout', () => {
     expect(detailsLink.getAttribute('aria-label')).toMatch(/demo/);
 
     const row = heading.parentElement!;
-    expect(row.tagName).toBe('DIV');
-    expect(row.className).not.toContain('hover:bg-og-25');
     expect(within(row).getByText('/tmp/demo').closest('a')).toBeNull();
   });
 
-  it('multi-project Dashboard gives each Details link a unique accessible name so SR/voice-control users can distinguish destinations', () => {
+  it('multi-project Dashboard gives each Details link a unique accessible name so SR/voice-control users can distinguish destinations', async () => {
     seed([
       makeProject({ id: 'alpha', repo: '/tmp/alpha' }),
       makeProject({ id: 'beta', repo: '/tmp/beta' }),
     ]);
     renderDashboard();
 
-    const alphaDetails = screen.getByRole('link', { name: /Details.*alpha/ });
+    const alphaDetails = await screen.findByRole('link', { name: /Details.*alpha/ });
     const betaDetails = screen.getByRole('link', { name: /Details.*beta/ });
     expect(alphaDetails.getAttribute('href')).toBe('/project/alpha');
     expect(betaDetails.getAttribute('href')).toBe('/project/beta');
     expect(alphaDetails).not.toBe(betaDetails);
   });
 
-  it('hides the repo path on narrow viewports (mobile) — uses hidden sm:inline-block so 640px+ shows it', () => {
+  it('hides the repo path on narrow viewports (mobile) — uses hidden sm:inline-block so 640px+ shows it', async () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo-repo' })]);
     renderDashboard();
 
-    const repoSpan = screen.getByText('/tmp/demo-repo');
+    const repoSpan = await screen.findByText('/tmp/demo-repo');
     expect(repoSpan.className).toContain('hidden');
     expect(repoSpan.className).toContain('sm:inline-block');
   });
 
-  it('row keeps a single-line layout via truncate + title so a long repo path can not blow up row height', () => {
+  it('exposes the full project id and repo path as hover titles so a truncated row stays readable', async () => {
     seed([
       makeProject({ id: 'very-long-project-id', repo: '/some/very/long/repo/path/that/should/not/wrap' }),
     ]);
     renderDashboard();
 
-    const heading = screen.getByRole('heading', { level: 2, name: 'very-long-project-id' });
-    expect(heading.className).toContain('truncate');
-    expect(heading.className).not.toContain('break-words');
+    const heading = await screen.findByRole('heading', { level: 2, name: 'very-long-project-id' });
     expect(heading.getAttribute('title')).toBe('very-long-project-id');
 
     const repoSpan = screen.getByText('/some/very/long/repo/path/that/should/not/wrap');
-    expect(repoSpan.className).toContain('truncate');
-    expect(repoSpan.className).not.toContain('break-words');
     expect(repoSpan.getAttribute('title')).toBe('/some/very/long/repo/path/that/should/not/wrap');
+    // jsdom does no text layout: the truncate token is the only guard that long values keep the row one line
+    for (const el of [heading, repoSpan]) expect(el.className.split(/\s+/)).toContain('truncate');
   });
 
-  it('multi-team project lays teams out in a 2-column grid at xl so one row holds up to 2 task areas', () => {
-    seed([
-      makeProject({
-        id: 'demo',
-        repo: '/tmp/demo',
-        agent: [
-          [
-            { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
-            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
-          ],
-          [
-            { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local' },
-            { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local' },
-          ],
-        ],
-      }),
-    ]);
-
-    const { container } = renderDashboard();
-
-    const teamRegions = container.querySelectorAll('[role="group"]');
-    expect(teamRegions.length).toBe(2);
-    const teamWrapper = teamRegions[0].parentElement!;
-    expect(teamWrapper.className).toContain('grid');
-    expect(teamWrapper.className).toContain('grid-cols-1');
-    expect(teamWrapper.className).toContain('xl:grid-cols-2');
-    expect(teamWrapper.className).toContain('gap-3');
-    expect(teamWrapper.className).not.toContain('space-y-3');
-  });
-
-  it('renders "+ New task" as a low-key text-style button and demotes "New project" into the right-edge "More actions" kebab menu', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it('renders "+ New task" in the topbar and demotes "New project" into the right-edge "More actions" kebab menu', async () => {
+    seed([demoProject()]);
     renderDashboard();
 
-    const topbarActions = screen.getByTestId('topbar-actions');
+    await screen.findByRole('heading', { level: 2, name: 'demo' });
     const taskBtn = screen.getByRole('button', { name: '+ New task' });
-    expect(taskBtn.className).toContain('btn-ghost');
-    expect(taskBtn.className).not.toContain('btn-primary');
-    expect(topbarActions.contains(taskBtn)).toBe(true);
+    expect(topbarActions().contains(taskBtn)).toBe(true);
 
     expect(screen.queryByRole('button', { name: 'New project' })).toBeNull();
     expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
@@ -233,33 +202,31 @@ describe('Dashboard layout', () => {
 
     const toolbar = taskBtn.parentElement!;
     const triggerWrapper = moreTrigger.parentElement!;
-    expect(toolbar).toBe(topbarActions);
+    expect(toolbar).toBe(topbarActions());
     expect(
       toolbar.compareDocumentPosition(triggerWrapper) & Node.DOCUMENT_POSITION_CONTAINED_BY,
     ).toBeTruthy();
     expect(toolbar.lastElementChild).toBe(triggerWrapper);
   });
 
-  it('keeps the disabled Dashboard "+ New task" action in the topbar when there is no project yet', () => {
+  it('keeps the disabled Dashboard "+ New task" action in the topbar, explained by a hint, when there is no project yet', async () => {
     seed([]);
     renderDashboard();
 
-    const topbarActions = screen.getByTestId('topbar-actions');
-    const taskBtn = within(topbarActions).getByRole('button', { name: '+ New task' }) as HTMLButtonElement;
+    const taskBtn = await within(topbarActions()).findByRole('button', { name: '+ New task' }) as HTMLButtonElement;
     expect(taskBtn.disabled).toBe(true);
     expect(taskBtn.getAttribute('title')).toBeNull();
     expect(taskBtn.parentElement?.getAttribute('title')).toBe('Create a project first');
-    expect(taskBtn.parentElement?.className).toContain('inline-flex');
-
-    const hint = within(topbarActions).getByText('Create a project first');
-    expect(hint.className).toContain('sr-only');
+    // jsdom cannot tell sr-only text from visible text: keep the token so the hint never renders twice
+    const hint = within(topbarActions()).getByText('Create a project first');
+    expect(hint.className.split(/\s+/)).toContain('sr-only');
   });
 
-  it('only sets aria-controls on the More actions kebab while its menu is open', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it('only sets aria-controls on the More actions kebab while its menu is open', async () => {
+    seed([demoProject()]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
+    const moreTrigger = await findMoreActions();
     expect(moreTrigger.getAttribute('aria-controls')).toBeNull();
 
     fireEvent.click(moreTrigger);
@@ -271,11 +238,11 @@ describe('Dashboard layout', () => {
     expect(moreTrigger.getAttribute('aria-controls')).toBeNull();
   });
 
-  it('opens the kebab menu on click and exposes a "New project" menuitem that opens the CreateProject modal', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it('opens the kebab menu on click and exposes a "New project" menuitem that opens the CreateProject modal', async () => {
+    seed([demoProject()]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
+    const moreTrigger = await findMoreActions();
     fireEvent.click(moreTrigger);
 
     expect(moreTrigger.getAttribute('aria-expanded')).toBe('true');
@@ -286,26 +253,22 @@ describe('Dashboard layout', () => {
     expect(screen.getByRole('dialog', { name: 'New project' })).toBeTruthy();
   });
 
-  it('kebab menuitem opens without stealing focus and uses the shared MenuItem hover treatment', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it('kebab menuitem opens without stealing focus', async () => {
+    seed([demoProject()]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
-    fireEvent.click(moreTrigger);
+    fireEvent.click(await findMoreActions());
 
     const item = screen.getByRole('menuitem', { name: 'New project' });
     expect(item.textContent).toBe('New project');
-    expect(item.className).not.toMatch(/(^|\s)bg-/);
-    expect(item.className).not.toMatch(/focus:bg-/);
-    expect(item.className).toMatch(/hover:bg-og-50/);
     expect(document.activeElement).not.toBe(item);
   });
 
-  it('closes the kebab menu when Escape is pressed or an outside click happens', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it('closes the kebab menu when Escape is pressed or an outside click happens', async () => {
+    seed([demoProject()]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
+    const moreTrigger = await findMoreActions();
     fireEvent.click(moreTrigger);
     expect(screen.getByRole('menuitem', { name: 'New project' })).toBeTruthy();
     fireEvent.keyDown(document, { key: 'Escape' });
@@ -318,60 +281,48 @@ describe('Dashboard layout', () => {
     expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
   });
 
-  it('exposes a "Settings" menuitem that opens the SystemSettingsModal', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it('exposes a "Settings" menuitem that opens the SystemSettingsModal', async () => {
+    seed([demoProject()]);
     renderDashboard();
 
-    fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    fireEvent.click(await findMoreActions());
     fireEvent.click(screen.getByRole('menuitem', { name: 'Settings' }));
 
     expect(screen.queryByRole('menuitem', { name: 'Settings' })).toBeNull();
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeTruthy();
   });
 
-  it('surfaces a per-project task-feed error so a broken realtime+REST feed is not silently empty', () => {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+  it('surfaces a per-project task-feed error so a broken realtime+REST feed is not silently empty', async () => {
+    seed([demoProject()]);
     projectTasksHookState.data = null;
     projectTasksHookState.error = { code: 'connection_failed', message: 'realtime down' };
 
     renderDashboard();
 
-    expect(screen.getByText(/Failed to load tasks: realtime down/)).toBeTruthy();
+    expect(await screen.findByText(/Failed to load tasks: realtime down/)).toBeTruthy();
   });
 
-  it('agent cards render the embedded terminal up front (no need to wait for the agent to start working)', () => {
+  it('agent cards render the embedded terminal up front (no need to wait for the agent to start working)', async () => {
     seed(
-      [
-        makeProject({
-          id: 'demo',
-          repo: '/tmp/demo',
-          agent: [
-            [
-              { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
-              { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
-            ],
-          ],
-        }),
-      ],
+      [demoProject([[...TEAM]])],
       [
         { id: 'dev-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
         { id: 'qa-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
       ],
     );
 
-    const { getAllByTestId } = renderDashboard();
+    renderDashboard();
 
-    const terminals = getAllByTestId('pane-terminal');
-    expect(terminals.length).toBe(2);
+    expect(await screen.findAllByTestId('pane-terminal')).toHaveLength(2);
   });
 });
 
 describe('Dashboard "Project created" follow-up modal', () => {
   async function reachContinueDialog(): Promise<HTMLElement> {
-    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+    seed([demoProject()]);
     renderDashboard();
 
-    fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    fireEvent.click(await findMoreActions());
     fireEvent.click(screen.getByRole('menuitem', { name: 'New project' }));
 
     const createDialog = screen.getByRole('dialog', { name: 'New project' });
@@ -384,18 +335,12 @@ describe('Dashboard "Project created" follow-up modal', () => {
     return screen.findByRole('dialog', { name: 'Project created' });
   }
 
-  it('pins both follow-up buttons in the footer region and "Continue adding an Agent Team" enters the add-agent flow', async () => {
+  it('offers both follow-ups and "Continue adding an Agent Team" enters the add-agent flow for the new project', async () => {
     const dialog = await reachContinueDialog();
 
-    const continueBtn = within(dialog).getByRole('button', { name: 'Continue adding an Agent Team' });
-    const laterBtn = within(dialog).getByRole('button', { name: 'Later' });
-    const footer = continueBtn.parentElement!;
-    expect(footer.className).toContain('border-t');
-    expect(footer.className).toContain('shrink-0');
-    expect(laterBtn.parentElement).toBe(footer);
-
-    fireEvent.click(continueBtn);
-    expect(screen.getByTestId('agent-modal').textContent).toContain('newproj');
+    expect(within(dialog).getByRole('button', { name: 'Later' })).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Continue adding an Agent Team' }));
+    expect(screen.getByRole('dialog', { name: 'Add Agent Team' }).textContent).toContain('newproj');
   });
 
   it('"Later" closes the follow-up modal without entering the add-agent flow', async () => {
@@ -404,6 +349,6 @@ describe('Dashboard "Project created" follow-up modal', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Later' }));
 
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Project created' })).toBeNull());
-    expect(screen.queryByTestId('agent-modal')).toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'Add Agent Team' })).toBeNull();
   });
 });

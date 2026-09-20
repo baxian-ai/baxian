@@ -461,7 +461,7 @@ describe('events ws plugin (/api/realtime)', () => {
   it('project-tasks:<id> snapshot excludes terminal (已处理) tasks so the realtime frame stays bounded', async () => {
     const { port, ctx } = await startApp();
     const now = new Date().toISOString();
-    const base = {
+    const base: Omit<TaskState, 'id' | 'status'> = {
       projectId: 'proj',
       title: 't',
       description: '',
@@ -494,7 +494,7 @@ describe('events ws plugin (/api/realtime)', () => {
   it('a task transitioning to a terminal status drops out of the live project-tasks frame', async () => {
     const { port, ctx } = await startApp();
     const now = new Date().toISOString();
-    const base = {
+    const base: Omit<TaskState, 'id' | 'status'> = {
       projectId: 'proj',
       title: 't',
       description: '',

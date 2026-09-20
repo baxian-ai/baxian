@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -28,7 +29,7 @@ const spawnMock = vi.mocked(spawn);
 const writeSentinelMock = vi.mocked(writeRestartSentinelSync);
 
 let tempDir: string;
-let exitSpy: ReturnType<typeof vi.spyOn>;
+let exitSpy: MockInstance<typeof process.exit>;
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-restart-test-'));

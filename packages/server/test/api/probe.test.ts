@@ -6,7 +6,9 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
 import { createTestContext } from '../helpers/context.js';
 import { probeRoutes, type ProbeRoutesOptions } from '../../src/api/probe.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import type { CommandRunner, ExecOptions, ExecResult } from '../../src/agent/runner.js';
+import type { HostConfig } from '../../src/shared/index.js';
+import { makeCommandRunner } from '../helpers/fixtures.js';
 import * as runnerModule from '../../src/agent/runner.js';
 
 let tempDir: string;
@@ -24,7 +26,7 @@ afterEach(async () => {
 });
 
 function makeStubRunner(impl: (cmd: string) => Promise<ExecResult>): CommandRunner {
-  return { exec: async (cmd: string) => impl(cmd) };
+  return makeCommandRunner({ exec: async (cmd: string) => impl(cmd) });
 }
 
 async function buildProbeApp(options: ProbeRoutesOptions): Promise<FastifyInstance> {
@@ -175,14 +177,14 @@ describe('POST /api/agents/probe', () => {
   });
 
   it('per-binary remoteShell: tmux probes match SshRunner default (-lc); claude / codex use login-interactive (tmux pane runtime)', async () => {
-    const remoteOpts: Record<string, { remoteShell?: string } | undefined> = {};
+    const remoteOpts: Record<string, ExecOptions | undefined> = {};
     const probeApp = await buildProbeApp({
       localRunnerFactory: () => makeStubRunner(async (cmd) => {
         if (cmd.startsWith('ssh ')) return { stdout: 'ok\n', stderr: '', exitCode: 0 };
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
-      remoteRunnerFactory: () => ({
-        exec: async (cmd: string, opts?: { remoteShell?: string }) => {
+      remoteRunnerFactory: () => makeCommandRunner({
+        exec: async (cmd, opts) => {
           if (cmd.startsWith('command -v ')) {
             const binary = cmd.slice('command -v '.length);
             remoteOpts[binary] = opts;
@@ -364,8 +366,8 @@ describe('POST /api/agents/probe', () => {
     let sshCmd = '';
     let sshEnv: Record<string, string> | undefined;
     const probeApp = await buildProbeApp({
-      localRunnerFactory: () => ({
-        exec: async (cmd: string, opts?: { env?: Record<string, string> }) => {
+      localRunnerFactory: () => makeCommandRunner({
+        exec: async (cmd, opts) => {
           if (cmd.includes('echo ok')) {
             sshCmd = cmd;
             sshEnv = opts?.env;
@@ -565,7 +567,7 @@ describe('POST /api/agents/install-tmux', () => {
         if (cmd.includes('echo ok')) return { stdout: 'ok', stderr: '', exitCode: 0 };
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
-      remoteRunnerFactory: (host) => {
+      remoteRunnerFactory: (host: HostConfig) => {
         remoteHost = host;
         return makeStubRunner(async (cmd) => {
           if (cmd === 'command -v tmux') return { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 };

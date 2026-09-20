@@ -686,9 +686,9 @@ describe('remote agent host references', () => {
 
 describe('language', () => {
   it('accepts zh-CN, en-US, and absent language', () => {
-    for (const language of ['zh-CN', 'en-US', undefined]) {
+    for (const language of ['zh-CN', 'en-US', undefined] as const) {
       const config = makeConfig();
-      if (language !== undefined) (config as Record<string, unknown>).language = language;
+      if (language !== undefined) config.language = language;
       expect(validateConfig(config)).toEqual([]);
     }
   });
@@ -696,7 +696,7 @@ describe('language', () => {
   it('rejects invalid language values with a clear path and message', () => {
     for (const bad of ['zh-cn', 'fr-FR', 123, null]) {
       const config = makeConfig();
-      (config as Record<string, unknown>).language = bad;
+      Object.assign(config, { language: bad });
       const errors = validateConfig(config);
       expect(errors).toContainEqual({
         path: 'language',

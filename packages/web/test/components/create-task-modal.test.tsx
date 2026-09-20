@@ -5,17 +5,22 @@ import { StrictMode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import type { AgentSnapshot, ProjectConfig, TaskState } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 import { api, fileToBase64 } from '../../src/api.ts';
 import { CreateTaskModal } from '../../src/components/create-task-modal.tsx';
-import { TASK_IMAGE_MAX_COUNT } from '../../src/shared/index.ts';
+import { ToastProvider } from '../../src/components/toast.tsx';
+import { IMAGE_UPLOAD_MAX_BYTES, TASK_IMAGE_MAX_COUNT } from '../../src/shared/index.ts';
+import { getMessages } from '../../src/i18n/index.tsx';
+
+const TOO_MANY_IMAGES_TITLE = getMessages().createTask.tooManyImagesToastTitle(TASK_IMAGE_MAX_COUNT);
+const IMAGE_TOO_LARGE_TITLE = getMessages().createTask.imageTooLargeToastTitle;
 import {
   makeAgent as makeAgentFixture,
   makeProject as makeProjectFixture,
   makeTask as makeTaskFixture,
 } from '../helpers/fixtures.ts';
+import { expectToast } from '../helpers/toast.tsx';
 
 const projectsListMock = vi.mocked(api.projects.list);
 const agentsListMock = vi.mocked(api.agents.list);
@@ -78,12 +83,27 @@ function renderModal(props: ModalProps = {}) {
     <MemoryRouter>
       <CreateTaskModal open onClose={() => {}} {...props} />
     </MemoryRouter>,
+    { wrapper: ToastProvider },
   );
   return result;
 }
 
 async function mountModal(props: ModalProps = {}) {
   const result = renderModal(props);
+  await flushApi();
+  return result;
+}
+
+// StrictMode 会重跑 state updater:副作用留在 updater 里就会被重放,这是超限提示翻倍的触发条件
+async function mountModalStrict(props: ModalProps = {}) {
+  const result = render(
+    <StrictMode>
+      <MemoryRouter>
+        <CreateTaskModal open onClose={() => {}} {...props} />
+      </MemoryRouter>
+    </StrictMode>,
+    { wrapper: ToastProvider },
+  );
   await flushApi();
   return result;
 }
@@ -190,6 +210,7 @@ describe('CreateTaskModal — draft persistence', () => {
     });
 
     expect(localStorage.getItem(DRAFT_KEY_GLOBAL)).toBeNull();
+    await expectToast({ title: 'Task created' });
   });
 
   it('"Discard" button removes the saved draft and resets the form to blank', async () => {
@@ -260,6 +281,7 @@ describe('CreateTaskModal — draft persistence', () => {
           <CreateTaskModal open onClose={() => {}} />
         </MemoryRouter>
       </StrictMode>,
+      { wrapper: ToastProvider },
     );
     await flushApi();
 
@@ -446,11 +468,51 @@ describe('CreateTaskModal — images', () => {
     }));
   });
 
-  it('caps the number of images at the max (soft validation)', async () => {
+  it('caps the number of images at the max, warns exactly once, and never updates the toast during render', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await mountModalStrict({ projectId: 'baxian' });
+      const many = Array.from({ length: TASK_IMAGE_MAX_COUNT + 2 }, (_, i) => png(`f${i}.png`));
+      await act(async () => { fireEvent.change(fileInput(), { target: { files: many } }); });
+
+      expect(screen.getAllByText(/^f\d\.png$/).length).toBe(TASK_IMAGE_MAX_COUNT);
+      // 通知在 setImages 的 updater 之外发出:留在 updater 里会被 React 重放,提示翻倍并打出渲染期更新警告
+      expect(screen.getAllByText(TOO_MANY_IMAGES_TITLE)).toHaveLength(1);
+      expect(errors.mock.calls.map(c => String(c[0])).join('\n')).not.toContain('Cannot update a component');
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('warns again when an already-full picker receives one more image, still capping the list', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await mountModalStrict({ projectId: 'baxian' });
+      const first = Array.from({ length: TASK_IMAGE_MAX_COUNT }, (_, i) => png(`f${i}.png`));
+      await act(async () => { fireEvent.change(fileInput(), { target: { files: first } }); });
+      expect(screen.queryByText(TOO_MANY_IMAGES_TITLE)).toBeNull();
+
+      await act(async () => { fireEvent.change(fileInput(), { target: { files: [png('extra.png')] } }); });
+
+      expect(screen.getAllByText(/^f\d\.png$/).length).toBe(TASK_IMAGE_MAX_COUNT);
+      expect(screen.queryByText('extra.png')).toBeNull();
+      expect(screen.getAllByText(TOO_MANY_IMAGES_TITLE)).toHaveLength(1);
+      expect(errors.mock.calls.map(c => String(c[0])).join('\n')).not.toContain('Cannot update a component');
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('drops an oversized image, names it in an error toast, and keeps the rest of the selection', async () => {
     await mountModal({ projectId: 'baxian' });
-    const many = Array.from({ length: TASK_IMAGE_MAX_COUNT + 2 }, (_, i) => png(`f${i}.png`));
-    await act(async () => { fireEvent.change(fileInput(), { target: { files: many } }); });
-    expect(screen.getAllByText(/^f\d\.png$/).length).toBe(TASK_IMAGE_MAX_COUNT);
+    const oversized = png('big.png');
+    Object.defineProperty(oversized, 'size', { value: IMAGE_UPLOAD_MAX_BYTES + 1 });
+
+    await act(async () => { fireEvent.change(fileInput(), { target: { files: [oversized, png('ok.png')] } }); });
+
+    await expectToast({ title: IMAGE_TOO_LARGE_TITLE, body: /^big\.png exceeds \d+ MiB$/ });
+    expect(screen.queryByText('big.png')).toBeNull();
+    expect(screen.getByText('ok.png')).toBeTruthy();
   });
 
   it('edit mode has no image control', async () => {

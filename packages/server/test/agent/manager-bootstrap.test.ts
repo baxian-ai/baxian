@@ -1,126 +1,86 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import type { AgentBindingFacts, BaxianEvent } from '../../src/shared/index.js';
-import { EnsureSessionError, DispatchTerminalError, type AgentManager } from '../../src/agent/manager.js';
-import { TmuxManager, TmuxOutcomeUnknownError, ReplNotReadyError } from '../../src/agent/tmux.js';
-import type { CommandRunner } from '../../src/agent/runner.js';
-import type { AgentStore } from '../../src/state/agent-store.js';
-import type { LockManager } from '../../src/state/lock.js';
-import type { EventBus } from '../../src/event/bus.js';
+import type { AgentManager, AgentManagerDeps } from '../../src/agent/manager.js';
 import type { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
-import { createManagerHarness } from '../helpers/manager-harness.js';
-import { fakeRunner, type FakeRunnerRule } from '../helpers/fake-runner.js';
-import { makeAgent, makeConfig } from '../helpers/fixtures.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness, workdirsOf } from '../helpers/manager-harness.js';
+import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
+const TOKEN = 'token-abc';
+// startup dialog:trust dialog 的自动应答管不到它,waitReplReady 只能超时 → dialogPending
+const STARTUP_DIALOG = ' Enter to confirm · Esc to cancel\n';
+const LAUNCH_REFUSED = 'launch refused by tmux';
 
-const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
-const PANE = { session: REF, paneId: '%0', claim: 'dev-1' };
+const harness = useManagerSuiteHarness();
 
-let tempDir: string;
-let manager: AgentManager;
-let agentStore: AgentStore;
-let lockManager: LockManager;
-let eventBus: EventBus;
-let createManager: Awaited<ReturnType<typeof createManagerHarness>>['createManager'];
-let events: BaxianEvent[];
+let runner: FakeRunner;
+let onExec: ((cmd: string) => void | Promise<void>) | null;
 
-async function waitFor(check: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await check()) return;
-    await new Promise((r) => setTimeout(r, 5));
-  }
-  throw new Error('waitFor: condition not met within timeout');
+function useRunner(options: FakeRunnerOptions = {}, deps: Partial<AgentManagerDeps> = {}): FakeRunner {
+  runner = createManagerSuiteRunner({ workdirs: workdirsOf(harness.config), ...options, onExec: cmd => onExec?.(cmd) });
+  harness.manager = makeManager(deps);
+  return runner;
 }
 
-beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-bootstrap-test-'));
-  const runner = fakeRunner({ defaultResult: {} });
-  const config = makeConfig({
-    project: [{
-      id: 'proj',
-      repo: 'https://github.com/owner/repo.git',
-      merge: null,
-      agent: [[
-        makeAgent({ yolo: true }),
-        makeAgent({
-          id: 'qa-1',
-          runtime: 'claude-code',
-          role: 'qa',
-          workdir: '/tmp/qa-repo',
-          yolo: true,
-        }),
-      ]],
-    }],
-  });
-  const harness = await createManagerHarness(tempDir, {
-    config,
-    deps: {
-      runnerFactory: () => runner,
-      platformRunner: runner,
-    },
-  });
-  ({ manager, agentStore, lockManager, eventBus, createManager, events } = harness);
-  await harness.seedAgent({
-    creationToken: 'token-abc',
-    updatedAt: NOW,
-  });
-});
+function makeManager(deps: Partial<AgentManagerDeps> = {}): AgentManager {
+  return harness.createManager({ runnerFactory: () => runner, ...deps });
+}
 
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await rm(tempDir, { recursive: true, force: true });
-});
+const cmds = (): string[] => runner.exec.mock.calls.map(c => String(c[0]));
+const sawKill = (from = 0): boolean => cmds().slice(from).some(c => c.includes('kill-session'));
+const pastedBodies = (): string[] => runner.pastedPrompts.map(p => p.body);
+const eventTypes = (): string[] => harness.events.map(e => e.type);
 
-function spyKills(): { byRef: ReturnType<typeof vi.spyOn> } {
+// create 路径才是 bootstrap 的正常入口:会话还不存在
+function withoutSession(): void {
+  runner.sessions.drop('dev-1');
+}
+
+// 启动命令被 tmux 拒收:会话已建、runtime 没起来,是非对话框的硬失败
+function launchFails(): FakeRunnerRule {
   return {
-    byRef: vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed'),
+    match: c => c.includes('send-keys -l') && c.includes('claude'),
+    reply: { exitCode: 1, stderr: LAUNCH_REFUSED },
   };
 }
+type FakeRunnerRule = NonNullable<FakeRunnerOptions['rules']>[number];
+
+beforeEach(async () => {
+  onExec = null;
+  useRunner();
+  withoutSession();
+  await harness.seedAgent({ id: 'dev-1', creationToken: TOKEN, updatedAt: NOW });
+});
 
 describe('AgentManager.startBootstrapAsync', () => {
   it('success records paneId and clears the creation token', async () => {
-    const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true,
-      createdSession: true,
-      paneId: '%0',
-      pane: PANE,
-      workdir: '/tmp/repo',
-    });
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
-
-    expect(ensureSpy).toHaveBeenCalledWith('dev-1', 'create');
-    const state = await agentStore.get('dev-1');
-    expect(state).toMatchObject({ id: 'dev-1', projectId: 'proj', paneId: '%0' });
+    const pane = runner.sessions.pane('dev-1')!;
+    expect(pane.process).toBe('claude');
+    const state = await harness.agentStore.get('dev-1');
+    expect(state).toMatchObject({ id: 'dev-1', projectId: 'proj', paneId: pane.id });
     expect(state?.creationToken).toBeUndefined();
     expect('status' in (state as object)).toBe(false);
     expect('sessionStatus' in (state as object)).toBe(false);
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
+    expect(eventTypes()).toContain('agent.bootstrap_succeeded');
+    // create 轨迹:新建会话 → identity-only 启动命令 → 抓屏确认 runtime 就绪
+    const trace = cmds();
+    expect(trace.findIndex(c => c.includes('new-session'))).toBeGreaterThanOrEqual(0);
+    expect(trace.some(c => c.includes('send-keys -l') && c.includes('claude') && c.includes('BX_TARGET_GONE'))).toBe(true);
   });
 
   it('success clears stale dialog Held fields from an earlier pending bootstrap', async () => {
-    await agentStore.update('dev-1', (state) => state ? {
+    await harness.agentStore.update('dev-1', state => state ? {
       ...state,
       status: 'awaiting_human',
       awaitingPhase: 'agent_dialog_pending',
       awaitingReason: 'startup dialog',
       awaitingSince: NOW,
     } : null);
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true,
-      createdSession: true,
-      paneId: '%0',
-      pane: PANE,
-      workdir: '/tmp/repo',
-    });
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBeUndefined();
     expect(state?.status).toBeUndefined();
     expect(state?.awaitingPhase).toBeUndefined();
@@ -129,154 +89,112 @@ describe('AgentManager.startBootstrapAsync', () => {
   });
 
   it('hard failure clears the creation token and emits bootstrap_failed', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError(
-        { createdSession: true, agentId: 'dev-1', lastScreen: 'still booting...' },
-        'buildFreshSession failed: repl not ready',
-      ),
-    );
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.paneId).toBeUndefined();
     expect(state?.creationToken).toBeUndefined();
-    expect(events.some(e =>
-      e.type === 'agent.bootstrap_failed'
-      && String(e.data.error).includes('repl not ready'),
+    expect(state?.awaitingPhase).toBeUndefined();
+    expect(harness.events.some(e =>
+      e.type === 'agent.bootstrap_failed' && String(e.data.error).includes(LAUNCH_REFUSED),
     )).toBe(true);
   });
 
-  it('hard failure with the same token rolls back by generation-bound session ref', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
-    );
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const kills = spyKills();
+  it('hard failure rolls back the created session by its generation-bound ref', async () => {
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    expect(kills.byRef).toHaveBeenCalledWith(REF, { kind: 'emptyOr', claim: 'dev-1' });
-    expect(warn.mock.calls.some(c => String(c[0]).includes('killed created session $7'))).toBe(true);
+    // 会话真的被拆掉了,不是只清了状态
+    expect(sawKill()).toBe(true);
+    expect(runner.sessions.present('dev-1')).toBe(false);
   });
 
-  it('created-session hard failure: rollback not confirmed (refused) hands off to slow poll instead of clearing over a live session', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom to shell'),
-    );
-    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('refused');
-    const slowPollSpy = vi
-      .spyOn(manager as unknown as {
-        slowPollDialogPending: (id: string, token: string | undefined) => Promise<void>;
-      }, 'slowPollDialogPending')
-      .mockResolvedValue(undefined);
+  it('created-session hard failure: rollback not confirmed (refused) hands off the dialog hold instead of clearing over a live session', async () => {
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
+    // tmux 代次在 kill 之前变了:kill 被服务端条件拒绝,会话可能还活着
+    onExec = c => { if (c.includes('kill-session')) runner.sessions.bumpGeneration('dev-1'); };
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
-    expect(state?.creationToken).toBe('token-abc');
+    const state = await harness.agentStore.get('dev-1');
+    expect(state?.creationToken).toBe(TOKEN);
     expect(state?.awaitingPhase).toBe('agent_dialog_pending');
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-    expect(slowPollSpy).toHaveBeenCalledWith('dev-1', 'token-abc');
+    expect(runner.sessions.present('dev-1')).toBe(true);
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
   });
 
-  it('created-session hard failure: confirmed killed rollback finalizes without a slow-poll handoff', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
-    );
-    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
-    const slowPollSpy = vi
-      .spyOn(manager as unknown as {
-        slowPollDialogPending: (id: string, token: string | undefined) => Promise<void>;
-      }, 'slowPollDialogPending')
-      .mockResolvedValue(undefined);
+  it('a successor queued on the lifecycle lock during hard-failure rollback cannot resurrect the creation token', async () => {
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
+    // 后继在回滚 kill 还在跑时排队拿同一把生命周期锁;收尾与回滚同处一个临界区,后继只会看到已清空的 token
+    let successor: Promise<void> | null = null;
+    onExec = c => {
+      if (successor || !c.includes('kill-session')) return;
+      successor = harness.manager.startBootstrapAsync('dev-1', TOKEN);
+    };
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
+    await successor;
 
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
-    expect((await agentStore.get('dev-1'))?.creationToken).toBeUndefined();
-    expect(slowPollSpy).not.toHaveBeenCalled();
-  });
-
-  it('a successor queued on the lifecycle lock during hard-failure rollback is finalized against, not clobbered after', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
-    );
-    const m = manager as unknown as { runUnderSessionLifecycle: (id: string, fn: () => Promise<void>) => Promise<void> };
-    let tokenSeenBySuccessor: string | undefined | 'UNSET' = 'UNSET';
-    let successorDone: Promise<void> = Promise.resolve();
-    // the successor grabs the same lock while the rollback kill is running; finalize must complete before it runs
-    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(async () => {
-      successorDone = m.runUnderSessionLifecycle('dev-1', async () => {
-        tokenSeenBySuccessor = (await agentStore.get('dev-1'))?.creationToken;
-      });
-      return 'killed';
-    });
-
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
-    await successorDone;
-
-    expect(tokenSeenBySuccessor).toBeUndefined();
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
+    expect(eventTypes()).toContain('agent.bootstrap_failed');
+    expect((await harness.agentStore.get('dev-1'))?.creationToken).toBeUndefined();
   });
 
   it('hard failure with a rotated token leaves the session to its successor', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
-    );
-    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
-    const kills = spyKills();
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
+    await harness.agentStore.update('dev-1', s => s ? { ...s, creationToken: 'token-newer' } : null);
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    expect(kills.byRef).not.toHaveBeenCalled();
-    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
+    expect(sawKill()).toBe(false);
+    expect(runner.sessions.present('dev-1')).toBe(true);
+    expect((await harness.agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
   });
 
   it('rollback stands down when the session was adopted after create', async () => {
-    // the successor reuses the same creationToken, so the token guard alone can't tell it from the losing bootstrap
-    await agentStore.update('dev-1', (s) => s ? { ...s, paneId: '%0' } : null);
-    vi.spyOn(manager, 'ensureSession').mockImplementation(async () => {
-      (manager as unknown as { adoptGeneration: Map<string, number> }).adoptGeneration.set('dev-1', 1);
-      throw new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom');
-    });
-    const kills = spyKills();
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // 真实接管:启动命令阶段排入一次 ensureSession,它在失败的 create 让出生命周期锁后 adopt 并 bump 代次
+    let adopt: Promise<unknown> | null = null;
+    onExec = c => {
+      if (adopt || !c.includes('send-keys -l')) return;
+      adopt = harness.manager.ensureSession('dev-1', 'runtime').catch(() => undefined);
+    };
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
+    await adopt;
 
-    const state = await agentStore.get('dev-1');
-    expect(kills.byRef).not.toHaveBeenCalled();
+    expect(sawKill()).toBe(false);
     expect(warn.mock.calls.some(c => String(c[0]).includes('session adopted since create'))).toBe(true);
-    expect(state?.creationToken).toBe('token-abc');
-    expect(state?.paneId).toBe('%0');
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-  });
-
-  it('rollback is skipped when no session ref was recorded', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', genAtCreate: 0 }, 'boot boom'),
-    );
-    const kills = spyKills();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
-
-    expect(kills.byRef).not.toHaveBeenCalled();
-    expect(warn.mock.calls.some(c => String(c[0]).includes('no session ref recorded'))).toBe(true);
+    expect(runner.sessions.present('dev-1')).toBe(true);
+    const state = await harness.agentStore.get('dev-1');
+    expect(state?.creationToken).toBe(TOKEN);
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
   });
 
   it('skips rollback with the original failure visible when the agent store read rejects', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
-    );
-    vi.spyOn(agentStore, 'get').mockRejectedValueOnce(new Error('EACCES: permission denied'));
-    const kills = spyKills();
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
+    const realGet = harness.agentStore.get.bind(harness.agentStore);
+    let armed = false;
+    vi.spyOn(harness.agentStore, 'get').mockImplementation(async (id: string) => {
+      if (armed) { armed = false; throw new Error('EACCES: permission denied'); }
+      return realGet(id);
+    });
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    onExec = c => { if (c.includes('send-keys -l')) armed = true; };
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    expect(kills.byRef).not.toHaveBeenCalled();
+    expect(sawKill()).toBe(false);
     const storeSkip = warn.mock.calls.find(c => String(c[0]).includes('agent store read failed'));
     expect(storeSkip).toBeDefined();
     expect(String(storeSkip![1])).toContain('EACCES');
@@ -284,145 +202,115 @@ describe('AgentManager.startBootstrapAsync', () => {
   });
 
   it('an in-flight ref kill is not retracted by a token rotation and can never reach a successor session', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
-    );
-    let resolveKill!: (v: 'killed') => void;
-    const killByRef = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(
-      () => new Promise((resolve) => { resolveKill = resolve; }),
-    );
+    useRunner({ rules: [launchFails()] });
+    withoutSession();
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let gated = false;
+    onExec = async c => {
+      if (gated || !c.includes('kill-session')) return;
+      gated = true;
+      await harness.agentStore.update('dev-1', s => s ? { ...s, creationToken: 'token-successor' } : null);
+      await gate;
+    };
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    const bootstrap = manager.startBootstrapAsync('dev-1', 'token-abc');
-    await vi.waitFor(() => expect(killByRef).toHaveBeenCalled());
-    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-successor' } : null);
-    resolveKill('killed');
+    const bootstrap = harness.manager.startBootstrapAsync('dev-1', TOKEN);
+    await vi.waitFor(() => expect(gated).toBe(true));
+    release();
     await bootstrap;
 
-    expect(killByRef).toHaveBeenCalledTimes(1);
-    expect(killByRef).toHaveBeenCalledWith(REF, { kind: 'emptyOr', claim: 'dev-1' });
+    const kills = cmds().filter(c => c.includes('kill-session'));
+    expect(kills).toHaveLength(1);
+    // kill 绑定在创建时的那个会话 ref 上,轮转后的 token 既拦不住它,它也够不到后继会话
+    expect(kills[0]).toContain('@baxian-agent-id');
+    expect(runner.sessions.present('dev-1')).toBe(false);
   });
 
   it('leaves a created dialog-blocked session untouched when the token has rotated', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError(
-        { createdSession: true, agentId: 'dev-1', dialogPending: true, lastScreen: 'Do you trust this folder?' },
-        'blocked on startup dialog',
-      ),
-    );
-    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
-    const killRefSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+    useRunner({ agents: { 'dev-1': { trustDialog: STARTUP_DIALOG } } });
+    withoutSession();
+    await harness.agentStore.update('dev-1', s => s ? { ...s, creationToken: 'token-newer' } : null);
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    expect(killRefSpy).not.toHaveBeenCalled();
-    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
+    expect(sawKill()).toBe(false);
+    expect(runner.sessions.present('dev-1')).toBe(true);
+    expect((await harness.agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
   });
 
   it('dialog-pending bootstrap keeps the creation token and asks for human intervention', async () => {
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError(
-        {
-          createdSession: true,
-          agentId: 'dev-1',
-          dialogPending: true,
-          lastScreen: 'Welcome to Codex\nSign in with ChatGPT\nProvide your own API key',
-        },
-        'buildFreshSession failed: repl not ready',
-      ),
-    );
-    const slowPollSpy = vi
-      .spyOn(manager as unknown as {
-        slowPollDialogPending: (id: string, token: string | undefined) => Promise<void>;
-      }, 'slowPollDialogPending')
-      .mockResolvedValue(undefined);
+    useRunner({ agents: { 'dev-1': { trustDialog: STARTUP_DIALOG } } });
+    withoutSession();
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
-    expect(state?.creationToken).toBe('token-abc');
+    const state = await harness.agentStore.get('dev-1');
+    expect(state?.creationToken).toBe(TOKEN);
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('agent_dialog_pending');
-    expect(events.some(e =>
+    expect(harness.events.some(e =>
       e.type === 'human.intervention'
       && e.agentId === 'dev-1'
       && e.data.phase === 'agent_dialog_pending',
     )).toBe(true);
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-    expect(slowPollSpy).toHaveBeenCalledWith('dev-1', 'token-abc');
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
   });
 
   it('stale bootstrap completion cannot clear a newer creation token', async () => {
-    await agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      creationToken: 'token-new',
-      updatedAt: NOW,
-    });
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true,
-      createdSession: true,
-      paneId: '%0',
-      pane: PANE,
-      workdir: '/tmp/repo',
+    await harness.agentStore.set({
+      id: 'dev-1', projectId: 'proj', creationToken: 'token-new', updatedAt: NOW,
     });
 
-    await manager.startBootstrapAsync('dev-1', 'token-abc');
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBe('token-new');
     expect(state?.paneId).toBeUndefined();
   });
 });
 
 describe('AgentManager greeting capability gate', () => {
-  function makeManagerWithWatcher(awaitOnce: ReturnType<typeof vi.fn>) {
-    const localEvents: BaxianEvent[] = [];
-    eventBus.on('*', (event) => { localEvents.push(event); });
-    const phaseSignalWatcher = { awaitOnce } as unknown as PhaseSignalWatcher;
-    const mgr = createManager({
-      phaseSignalWatcher,
-    });
-    vi.spyOn(mgr, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: true, paneId: '%0', pane: PANE, workdir: '/tmp/repo',
-    });
-    const injectSpy = vi.spyOn(mgr as unknown as {
-      injectAndAwaitAckSteps: (...a: unknown[]) => Promise<unknown>;
-    }, 'injectAndAwaitAckSteps').mockResolvedValue({ acked: true, composerDelivered: true });
-    return { mgr, localEvents, injectSpy };
+  // 边界替身:watcher 是公共依赖,用例只决定它对 greeting 信号的判读
+  function withWatcher(awaitOnce: ReturnType<typeof vi.fn>, deps: Partial<AgentManagerDeps> = {}): AgentManager {
+    return makeManager({ phaseSignalWatcher: { awaitOnce } as unknown as PhaseSignalWatcher, ...deps });
   }
+
+  const greetings = (): string[] => pastedBodies().filter(b => b.includes('[bx:greeting:'));
 
   it('goes ready and clears the creation token when the agent echoes a valid greeting', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('matched');
-    const { mgr, localEvents, injectSpy } = makeManagerWithWatcher(awaitOnce);
+    const mgr = withWatcher(awaitOnce);
 
-    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
+    const pane = runner.sessions.pane('dev-1')!;
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBeUndefined();
     expect(state?.status).toBeUndefined();
-    expect(state?.paneId).toBe('%0');
-    expect(localEvents.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
-    expect(injectSpy).toHaveBeenCalledTimes(1);
+    expect(state?.paneId).toBe(pane.id);
+    expect(eventTypes()).toContain('agent.bootstrap_succeeded');
+    // 问候语真的投进了新建 pane,而不是只被“调用过”
+    expect(runner.pastedPrompts).toEqual([{ pane: pane.id, body: expect.stringContaining('[bx:greeting:') }]);
     expect(awaitOnce).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'dev-1', kind: 'greeting' }));
-    expect(String(injectSpy.mock.calls[0][2])).toContain('[bx:greeting:');
   });
 
   it('holds the agent as awaiting_human (greeting_failed) when greeting never verifies', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('timeout');
-    const { mgr, localEvents } = makeManagerWithWatcher(awaitOnce);
+    const mgr = withWatcher(awaitOnce);
 
-    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBeUndefined();
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');
-    expect(localEvents.some(e =>
+    expect(harness.events.some(e =>
       e.type === 'human.intervention' && e.data.phase === 'greeting_failed',
     )).toBe(true);
-    expect(localEvents.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
+    expect(eventTypes()).not.toContain('agent.bootstrap_succeeded');
     expect(awaitOnce).toHaveBeenCalledTimes(2);
+    expect(greetings()).toHaveLength(2);
     expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
   });
 
@@ -430,72 +318,84 @@ describe('AgentManager greeting capability gate', () => {
     const awaitOnce = vi.fn()
       .mockResolvedValueOnce('session-gone')
       .mockResolvedValueOnce('matched');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    const mgr = withWatcher(awaitOnce);
 
-    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBeUndefined();
     expect(state?.status).toBeUndefined();
     expect(awaitOnce).toHaveBeenCalledTimes(2);
+    expect(greetings()).toHaveLength(2);
   });
 
   it('does not wait for the signal when the greeting paste fails — it retries the paste', async () => {
+    useRunner({ rules: [{ match: 'load-buffer', reply: { exitCode: 1, stderr: 'buffer load refused' } }] });
+    withoutSession();
     const awaitOnce = vi.fn().mockResolvedValue('matched');
-    const { mgr, injectSpy } = makeManagerWithWatcher(awaitOnce);
-    injectSpy.mockRejectedValue(new Error('pane busy'));
+    const mgr = withWatcher(awaitOnce);
 
-    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
-    expect(injectSpy).toHaveBeenCalledTimes(2);
+    expect((await harness.agentStore.get('dev-1'))?.status).toBe('awaiting_human');
+    expect(runner.execWithStdin.mock.calls.filter(c => String(c[0]).includes('load-buffer'))).toHaveLength(2);
+    expect(runner.pastedPrompts).toEqual([]);
     expect(awaitOnce).not.toHaveBeenCalled();
   });
 
   it('holds without retrying when the greeting paste fails ack_unknown (unconfirmed composer)', async () => {
+    // pane 在就绪判定之后转入 working:提交失败后不能碰 composer,只能交人工核验
+    useRunner({
+      rules: [{
+        match: c => c.includes('BX_RUNTIME_OK') && c.includes('Enter'),
+        reply: { exitCode: 1, stderr: 'enter dropped' },
+      }],
+    });
+    withoutSession();
+    // 第 1 次读标题是 create 的就绪判定,第 2 次是 pre-inject 取样:在它之前转 working
+    let titleReads = 0;
+    onExec = c => {
+      if (!c.includes('pane_title')) return;
+      if (++titleReads === 2) runner.sessions.markWorking('dev-1', '✻ Thinking… (3s · esc to interrupt)\n');
+    };
     const awaitOnce = vi.fn().mockResolvedValue('matched');
-    const { mgr, injectSpy } = makeManagerWithWatcher(awaitOnce);
-    injectSpy.mockRejectedValue(new DispatchTerminalError('ack_unknown', 'pre-ack failure'));
+    const mgr = withWatcher(awaitOnce);
 
-    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
-    expect(injectSpy).toHaveBeenCalledTimes(1);
+    expect((await harness.agentStore.get('dev-1'))?.status).toBe('awaiting_human');
+    expect(greetings()).toHaveLength(1);
     expect(awaitOnce).not.toHaveBeenCalled();
   });
 
   it('leaves the session untouched (no kill, no greeting_failed hold) when creationToken rotates mid-greeting', async () => {
-    const awaitOnce = vi.fn().mockResolvedValue('timeout');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
-    const killRefSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+    const mgr = withWatcher(vi.fn().mockResolvedValue('timeout'));
+    await harness.agentStore.update('dev-1', s => s ? { ...s, creationToken: 'token-newer' } : null);
 
-    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    expect(killRefSpy).not.toHaveBeenCalled();
-    const state = await agentStore.get('dev-1');
+    expect(sawKill()).toBe(false);
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBe('token-newer');
     expect(state?.awaitingPhase).not.toBe('greeting_failed');
   });
 
   it('leaves the session untouched when the token rotates between greeting success and the store write', async () => {
-    const awaitOnce = vi.fn().mockResolvedValue('matched');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
-    const killRefSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+    const mgr = withWatcher(vi.fn().mockResolvedValue('matched'));
+    await harness.agentStore.update('dev-1', s => s ? { ...s, creationToken: 'token-newer' } : null);
 
-    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    expect(killRefSpy).not.toHaveBeenCalled();
-    const state = await agentStore.get('dev-1');
+    expect(sawKill()).toBe(false);
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBe('token-newer');
     expect(state?.paneId).toBeUndefined();
   });
 
   it('recover() preserves a greeting_failed hold instead of releasing it to ok', async () => {
-    const awaitOnce = vi.fn().mockResolvedValue('matched');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    await agentStore.set({
+    const mgr = withWatcher(vi.fn().mockResolvedValue('matched'));
+    runner.sessions.seed('dev-1', { present: true });
+    await harness.agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed',
       awaitingReason: 'cap fail', awaitingSince: NOW, updatedAt: NOW,
@@ -503,7 +403,7 @@ describe('AgentManager greeting capability gate', () => {
 
     await mgr.recover();
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');
     expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
@@ -511,86 +411,80 @@ describe('AgentManager greeting capability gate', () => {
 
   it('recover() re-greets an incomplete bootstrap (creationToken set, no task) → ready on pass', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('matched');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
+    const mgr = withWatcher(awaitOnce);
+    await harness.agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
 
     await mgr.recover();
-    await waitFor(async () => (await agentStore.get('dev-1'))?.creationToken === undefined);
+    await vi.waitFor(async () => expect((await harness.agentStore.get('dev-1'))?.creationToken).toBeUndefined(),
+      { timeout: 5_000 });
 
-    const state = await agentStore.get('dev-1');
-    expect(state?.creationToken).toBeUndefined();
-    expect(state?.status).toBeUndefined();
+    expect((await harness.agentStore.get('dev-1'))?.status).toBeUndefined();
     expect(awaitOnce).toHaveBeenCalledWith(expect.objectContaining({ kind: 'greeting' }));
   });
 
   it('recover() holds an incomplete bootstrap that fails its re-greet', async () => {
-    const awaitOnce = vi.fn().mockResolvedValue('timeout');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
+    const mgr = withWatcher(vi.fn().mockResolvedValue('timeout'));
+    await harness.agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
 
     await mgr.recover();
-    await waitFor(async () => (await agentStore.get('dev-1'))?.awaitingPhase === 'greeting_failed');
+    await vi.waitFor(async () => expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed'),
+      { timeout: 5_000 });
 
-    const state = await agentStore.get('dev-1');
-    expect(state?.status).toBe('awaiting_human');
-    expect(state?.awaitingPhase).toBe('greeting_failed');
+    expect((await harness.agentStore.get('dev-1'))?.status).toBe('awaiting_human');
   });
 
   it('regreetHeldAgent clears the hold when the re-greet passes', async () => {
-    const awaitOnce = vi.fn().mockResolvedValue('matched');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockResolvedValue({ ref: REF, claim: 'dev-1' });
-    vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef').mockResolvedValue(PANE);
-    await agentStore.set({
+    const mgr = withWatcher(vi.fn().mockResolvedValue('matched'));
+    runner.sessions.seed('dev-1', { present: true });
+    await harness.agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
     });
 
     expect(await mgr.regreetHeldAgent('dev-1')).toBe(true);
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.status).toBeUndefined();
     expect(state?.awaitingPhase).toBeUndefined();
+    expect(greetings()).toHaveLength(1);
   });
 
   it('regreetHeldAgent keeps the hold when the re-greet fails', async () => {
-    const awaitOnce = vi.fn().mockResolvedValue('timeout');
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockResolvedValue({ ref: REF, claim: 'dev-1' });
-    vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef').mockResolvedValue(PANE);
-    await agentStore.set({
+    const mgr = withWatcher(vi.fn().mockResolvedValue('timeout'));
+    runner.sessions.seed('dev-1', { present: true });
+    await harness.agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
     });
 
     await mgr.regreetHeldAgent('dev-1');
 
-    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed');
+    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed');
   });
 
   it('regreetHeldAgent does not clear a binding that was recreated mid-handshake (generation guard)', async () => {
     const awaitOnce = vi.fn().mockImplementation(async () => {
-      await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-new', updatedAt: 'LATER' });
+      await harness.agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-new', updatedAt: 'LATER' });
       return 'matched';
     });
-    const { mgr } = makeManagerWithWatcher(awaitOnce);
-    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockResolvedValue({ ref: REF, claim: 'dev-1' });
-    vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef').mockResolvedValue(PANE);
-    await agentStore.set({
+    const mgr = withWatcher(awaitOnce);
+    runner.sessions.seed('dev-1', { present: true });
+    await harness.agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
     });
 
     await mgr.regreetHeldAgent('dev-1');
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.creationToken).toBe('tok-new');
     expect(state?.awaitingPhase).toBeUndefined();
   });
 
   it('Resume refuses a greeting_failed hold — capability must be re-proven, not overridden', async () => {
-    const { mgr } = makeManagerWithWatcher(vi.fn().mockResolvedValue('matched'));
-    await agentStore.set({
+    const mgr = withWatcher(vi.fn().mockResolvedValue('matched'));
+    runner.sessions.seed('dev-1', { present: true });
+    await harness.agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
     });
@@ -599,36 +493,36 @@ describe('AgentManager greeting capability gate', () => {
 
     expect(res.resumed).toBe(false);
     expect(res.reason).toMatch(/Restart REPL/);
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');
     expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
   });
 
-  it('markDialogPending does not overwrite a greeting_failed hold (no downgrade to a dialog phase)', async () => {
-    const { mgr } = makeManagerWithWatcher(vi.fn());
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', paneId: '%0',
+  it('a dialog-pending bootstrap does not overwrite a greeting_failed hold (no downgrade to a dialog phase)', async () => {
+    useRunner({ agents: { 'dev-1': { trustDialog: STARTUP_DIALOG } } });
+    withoutSession();
+    const mgr = withWatcher(vi.fn());
+    await harness.agentStore.set({
+      id: 'dev-1', projectId: 'proj', creationToken: TOKEN,
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
     });
 
-    await (mgr as unknown as {
-      markDialogPending: (id: string, tok: string | undefined) => Promise<void>;
-    }).markDialogPending('dev-1', undefined);
+    await mgr.startBootstrapAsync('dev-1', TOKEN);
 
-    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed');
+    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed');
   });
 
   it('reconcileFailedAgent preserves a greeting_failed hold on tmux-absent (does not wipe to idle)', async () => {
-    const { mgr } = makeManagerWithWatcher(vi.fn());
-    await agentStore.set({
+    const mgr = withWatcher(vi.fn());
+    await harness.agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
     });
 
     expect(await mgr.reconcileFailedAgent('dev-1')).toBe(false);
 
-    const state = await agentStore.get('dev-1');
+    const state = await harness.agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');
     expect(state?.paneId).toBe('%0');
@@ -638,61 +532,53 @@ describe('AgentManager greeting capability gate', () => {
 
 describe('AgentManager binding gates', () => {
   it('blocks dispatch while an agent is being created', async () => {
-    expect(await manager.pickAgent('proj', 'dev-1')).toBeNull();
-    expect(await manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(false);
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(await harness.manager.pickAgent('proj', 'dev-1')).toBeNull();
+    expect(await harness.manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(false);
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('allows dispatch once creationToken is cleared and no task is bound', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
-    expect(await manager.pickAgent('proj', 'dev-1')).toMatchObject({ id: 'dev-1' });
-    expect(await manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(true);
-    expect((await agentStore.get('dev-1'))?.taskId).toBe('task-1');
+    await harness.agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    expect(await harness.manager.pickAgent('proj', 'dev-1')).toMatchObject({ id: 'dev-1' });
+    expect(await harness.manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(true);
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBe('task-1');
   });
 
   it('blocks dispatch while another task is bound', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-busy', updatedAt: NOW });
-    expect(await manager.pickAgent('proj', 'dev-1')).toBeNull();
-    expect(await manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(false);
+    await harness.agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-busy', updatedAt: NOW });
+    expect(await harness.manager.pickAgent('proj', 'dev-1')).toBeNull();
+    expect(await harness.manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(false);
   });
 });
 
 describe('AgentManager.waitForBootstrapSettled', () => {
   it('resolves when creationToken clears', async () => {
     setTimeout(() => {
-      void agentStore.update('dev-1', (state) => state ? {
-        ...state,
-        creationToken: undefined,
-        updatedAt: new Date().toISOString(),
+      void harness.agentStore.update('dev-1', state => state ? {
+        ...state, creationToken: undefined, updatedAt: new Date().toISOString(),
       } : null);
     }, 10);
 
-    await expect(manager.waitForBootstrapSettled('dev-1', 500)).resolves.toBeUndefined();
+    await expect(harness.manager.waitForBootstrapSettled('dev-1', 500)).resolves.toBeUndefined();
   });
 
   it('resolves when the agent row is removed', async () => {
-    setTimeout(() => {
-      void agentStore.delete('dev-1');
-    }, 10);
+    setTimeout(() => { void harness.agentStore.delete('dev-1'); }, 10);
 
-    await expect(manager.waitForBootstrapSettled('dev-1', 500)).resolves.toBeUndefined();
+    await expect(harness.manager.waitForBootstrapSettled('dev-1', 500)).resolves.toBeUndefined();
   });
 
   it('throws when creationToken never clears', async () => {
-    await expect(manager.waitForBootstrapSettled('dev-1', 50)).rejects.toThrow(/timed out/);
+    await expect(harness.manager.waitForBootstrapSettled('dev-1', 50)).rejects.toThrow(/timed out/);
   });
 });
 
-describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
-  const TOKEN = 'token-abc';
-  const DIALOG_SCREEN = ' Enter to confirm · Esc to cancel\n';
-  const DIALOG_STILL_PENDING = new ReplNotReadyError('%0', 'claude-code', DIALOG_SCREEN, 'dialog still pending', false);
-  const EXITED_TO_SHELL = new ReplNotReadyError('%0', 'claude-code', DIALOG_SCREEN, 'exited to shell', true);
+describe('dialog-pending slow poll (no hard-fail timeout)', () => {
   const realSetTimeout = globalThis.setTimeout;
   const realDateNow = Date.now;
   let simNow = 0;
 
-  // 虚拟时钟:sleep 立即回调并推进 Date.now,waitReplReady 的 1 s deadline 不再真等
+  // 虚拟时钟:sleep 立即回调并推进 Date.now,5 s 轮询与 1 s 就绪窗口不再真等
   beforeEach(() => {
     simNow = realDateNow();
     Date.now = () => simNow;
@@ -701,74 +587,26 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
       return realSetTimeout(fn, 0);
     }) as unknown as typeof globalThis.setTimeout;
   });
-  afterEach(() => {
+  // 后台轮询是 fire-and-forget:删掉 agent 行让它自行收摊,再让出一个真实 tick,避免与 tempDir 清理抢时序
+  afterEach(async () => {
+    await harness.agentStore.delete('dev-1').catch(() => undefined);
+    await new Promise(r => realSetTimeout(r, 20));
     Date.now = realDateNow;
     globalThis.setTimeout = realSetTimeout;
   });
 
-  type PollScope = { expectedPaneId?: string; expectedTaskId?: string };
-  function slowPoll(token: string | undefined, opts?: PollScope): Promise<void> {
-    return (manager as unknown as {
-      slowPollDialogPending: (id: string, token: string | undefined, opts?: PollScope) => Promise<void>;
-    }).slowPollDialogPending('dev-1', token, opts);
-  }
-
-  function useRunner(runner: CommandRunner): void {
-    vi.spyOn(manager as unknown as {
-      createRunnerFor: (agent: unknown) => CommandRunner;
-    }, 'createRunnerFor').mockReturnValue(runner);
-  }
-
-  async function seedPendingBootstrap(overrides: Partial<AgentBindingFacts> = {}): Promise<void> {
-    await agentStore.update('dev-1', (s) => s ? {
-      ...s,
-      creationToken: TOKEN,
-      paneId: '%0',
-      status: 'awaiting_human',
-      awaitingPhase: 'agent_dialog_pending',
-      awaitingReason: 'startup dialog',
-      awaitingSince: NOW,
-      updatedAt: NOW,
-      ...overrides,
-    } : null);
-  }
-
-  function shellExitRunner(screen = DIALOG_SCREEN, rules: FakeRunnerRule[] = []): ReturnType<typeof fakeRunner> {
-    return fakeRunner({ agents: { 'dev-1': { process: 'zsh', screen } }, rules });
-  }
-
-  function sentKillSession(runner: ReturnType<typeof fakeRunner>): boolean {
-    return runner.exec.mock.calls.some(c => String(c[0]).includes('kill-session'));
-  }
-
-  // ends the loop on poll n by handing back a rotated token; never writes to the store (update() re-enters get() under its mutex)
-  function rotateTokenAtPoll(n: number, onFirstPoll?: () => void): { polls: () => number } {
-    const realGet = agentStore.get.bind(agentStore);
-    let polls = 0;
-    const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
-      polls++;
-      if (polls === 1) onFirstPoll?.();
-      const state = await realGet(id);
-      if (polls < n || !state) return state;
-      getSpy.mockRestore();
-      return { ...state, creationToken: 'token-force-exit' };
-    });
-    return { polls: () => polls };
-  }
-
-  // a successor ensure holds the lifecycle lock from its generation bump until its session work is done
+  // E1: 生命周期锁的排队次序与 adoptGeneration 的代次窗口没有任何外部命令可挂钩 —— 接管在 ensureSession
+  // 内部 bump 之后还要持锁干活,锁外没有可观察的时间点。这里只用私有访问“触发”交错,断言全部落在
+  // agentStore 终态、harness.events 与 runner 轨迹上。
   function fakeTakeover(): { start: () => void; release: () => void; done: () => boolean } {
     let done = false;
     let release!: () => void;
     const gate = new Promise<void>(r => { release = r; });
-    const m = manager as unknown as {
-      adoptGeneration: Map<string, number>;
-      runUnderSessionLifecycle: (id: string, fn: () => Promise<void>) => Promise<void>;
-    };
+    const m = harness.manager as unknown as { adoptGeneration: Map<string, number>; runUnderSessionLifecycle: (id: string, fn: () => Promise<void>) => Promise<void> };
     return {
       start: () => {
         void m.runUnderSessionLifecycle('dev-1', async () => {
-          m.adoptGeneration.set('dev-1', 1);
+          m.adoptGeneration.set('dev-1', (m.adoptGeneration.get('dev-1') ?? 0) + 1);
           await gate;
           done = true;
         });
@@ -778,329 +616,246 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
     };
   }
 
-  // absent until the takeover has rebuilt the session as $2/%1
-  function rebuiltSessionRunner(
-    takeover: ReturnType<typeof fakeTakeover>,
-    onFirstSnapshot?: () => void,
-  ): ReturnType<typeof fakeRunner> {
-    let snapshots = 0;
-    return fakeRunner({
-      agents: { 'dev-1': { paneId: '%1', process: 'claude', screen: DIALOG_SCREEN } },
+  // 结束轮询用的闸门:第 n 次 store 读把 token 换成别人的,循环按代次不符退出(不写盘,避免与 update 的 mutex 重入)
+  function rotateTokenAtPoll(n: number, onFirstPoll?: () => void): { exhausted: () => boolean } {
+    const realGet = harness.agentStore.get.bind(harness.agentStore);
+    let polls = 0;
+    const getSpy = vi.spyOn(harness.agentStore, 'get').mockImplementation(async (id: string) => {
+      polls++;
+      if (polls === 1) onFirstPoll?.();
+      const state = await realGet(id);
+      if (polls < n || !state) return state;
+      getSpy.mockRestore();
+      return { ...state, creationToken: 'token-force-exit' };
+    });
+    return { exhausted: () => polls >= n };
+  }
+
+  // 等到退出闸门真的合上(spy 已还原)再断言,否则读到的是闸门伪造的 token
+  async function drainPoll(loop: { exhausted: () => boolean }): Promise<void> {
+    await vi.waitFor(() => expect(loop.exhausted()).toBe(true), { timeout: 5_000, interval: 1 });
+    await new Promise(r => realSetTimeout(r, 20));
+  }
+
+  // 公共入口:create 撞上启动对话框 → 挂起 + 慢轮询接手
+  async function bootstrapIntoSlowPoll(options: FakeRunnerOptions = {}): Promise<void> {
+    useRunner({ agents: { 'dev-1': { trustDialog: STARTUP_DIALOG } }, ...options });
+    withoutSession();
+    await harness.seedAgent({ id: 'dev-1', creationToken: TOKEN, updatedAt: NOW });
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
+    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('agent_dialog_pending');
+  }
+
+  const waitForEvent = (type: string): Promise<void> =>
+    vi.waitFor(() => expect(eventTypes()).toContain(type), { timeout: 5_000, interval: 1 });
+
+  const waitForState = (check: (s: Awaited<ReturnType<typeof harness.agentStore.get>>) => boolean): Promise<void> =>
+    vi.waitFor(async () => expect(check(await harness.agentStore.get('dev-1'))).toBe(true), { timeout: 5_000, interval: 1 });
+
+  async function expectHoldUntouched(): Promise<void> {
+    const state = await harness.agentStore.get('dev-1');
+    expect(state?.creationToken).toBe(TOKEN);
+    expect(state?.awaitingPhase).toBe('agent_dialog_pending');
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
+  }
+
+  it('REPL exited to a shell → rolls back the dead session and clears the dialog hold so Retry/Resume can rebuild', async () => {
+    await bootstrapIntoSlowPoll();
+    runner.sessions.setProcess('dev-1', 'zsh');
+
+    await waitForEvent('agent.bootstrap_failed');
+
+    expect(eventTypes()).not.toContain('agent.bootstrap_succeeded');
+    const state = await harness.agentStore.get('dev-1');
+    expect(state?.awaitingPhase).toBeUndefined();
+    expect(state?.status).toBeUndefined();
+    // 残留的 shell 会话真的被拆了,不是留着挡住 Retry
+    expect(runner.sessions.present('dev-1')).toBe(false);
+  });
+
+  it('a successor queued on the lifecycle lock during rollback is finalized against, not clobbered after', async () => {
+    await bootstrapIntoSlowPoll();
+    let successor: Promise<void> | null = null;
+    onExec = c => {
+      if (successor || !c.includes('kill-session')) return;
+      successor = harness.manager.startBootstrapAsync('dev-1', TOKEN);
+    };
+    runner.sessions.setProcess('dev-1', 'zsh');
+
+    await waitForEvent('agent.bootstrap_failed');
+    await successor;
+
+    expect((await harness.agentStore.get('dev-1'))?.creationToken).toBeUndefined();
+  });
+
+  it('a successor adopting during the readiness probe is not killed by the losing slow poll', async () => {
+    await bootstrapIntoSlowPoll();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const takeover = fakeTakeover();
+    // 接管落在这一轮的就绪探测中间:代次在 genAtProbe 读完之后才被 bump
+    let started = false;
+    onExec = c => {
+      if (started || !c.includes('capture-pane')) return;
+      started = true;
+      takeover.start();
+      realSetTimeout(takeover.release, 0);
+    };
+    runner.sessions.setProcess('dev-1', 'zsh');
+
+    await vi.waitFor(
+      () => expect(warn.mock.calls.some(c => String(c[0]).includes('session adopted since create'))).toBe(true),
+      { timeout: 5_000, interval: 1 },
+    );
+    await expectHoldUntouched();
+    expect(sawKill()).toBe(false);
+    expect(runner.sessions.present('dev-1')).toBe(true);
+  });
+
+  it('a session ref replaced mid-probe (no panes match) is re-probed, not finalized as failed', async () => {
+    // list-panes 空列表 = 旧 ref 已被替换,生产侧抛普通错误(不是 PaneGoneError),必须继续轮询
+    let replaced = false;
+    await bootstrapIntoSlowPoll({
+      rules: [{ match: c => replaced && c.includes('list-panes'), reply: { stdout: '' } }],
+    });
+    replaced = true;
+    const loop = rotateTokenAtPoll(4);
+
+    await drainPoll(loop);
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
+    expect(sawKill()).toBe(false);
+  });
+
+  it('a takeover already in flight when this poll samples (old session destroyed, new one not yet built) is not finalized as gone', async () => {
+    // 旧会话已被后继销毁,新会话要等接管跑完才出现
+    let rebuilding = false;
+    const pending: { takeover?: ReturnType<typeof fakeTakeover> } = {};
+    await bootstrapIntoSlowPoll({
       rules: [{
-        match: 'list-sessions',
-        reply: () => {
-          if (++snapshots === 1) onFirstSnapshot?.();
-          return { stdout: takeover.done() ? '4242|1700000000|$2|dev-1\n' : '' };
-        },
+        match: c => rebuilding && c.includes('list-sessions'),
+        reply: () => ({ stdout: pending.takeover?.done() ? '4242|1700000000|$2|dev-1\n' : '' }),
       }],
     });
-  }
+    const takeover = fakeTakeover();
+    pending.takeover = takeover;
+    takeover.start();
+    rebuilding = true;
+    const loop = rotateTokenAtPoll(6);
+    realSetTimeout(takeover.release, 15);
 
-  async function expectSuccessorStateUntouched(): Promise<void> {
-    const state = await agentStore.get('dev-1');
-    expect(state?.creationToken).toBe(TOKEN);
-    expect(state?.paneId).toBe('%0');
-    expect(state?.awaitingPhase).toBe('agent_dialog_pending');
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-  }
+    await drainPoll(loop);
+    await expectHoldUntouched();
+    expect(sawKill()).toBe(false);
+  });
 
-  it('no longer hard-fails after 10 minutes while the session cannot be probed (transient), dialog unresolved', async () => {
-    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: TOKEN, updatedAt: NOW } : null);
+  it.each([
+    {
+      label: 'refused (session ref changed / adopted)',
+      arm: () => { onExec = c => { if (c.includes('kill-session')) runner.sessions.bumpGeneration('dev-1'); }; },
+    },
+    {
+      label: 'unknown (SSH connection reset)',
+      arm: () => { /* rule 已在 runner 上 */ },
+    },
+  ])('session teardown $label → keeps the dialog hold and re-probes instead of clearing state over a live session', async ({ label, arm }) => {
+    const rules = label.startsWith('unknown')
+      ? [{ match: 'kill-session', reply: { exitCode: 255, stderr: 'Connection reset by peer' } }]
+      : [];
+    await bootstrapIntoSlowPoll({ rules });
+    arm();
+    runner.sessions.setProcess('dev-1', 'zsh');
+    const loop = rotateTokenAtPoll(6);
 
-    // A transient probe failure (not PaneGoneError) must keep polling, never hard-fail on a time budget.
-    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot')
-      .mockRejectedValue(new TmuxOutcomeUnknownError('list-sessions outcome unknown (transient): exit 255: Connection reset by peer'));
-    const failSpy = vi.spyOn(manager, 'failTasksForAgent').mockResolvedValue({ failedCount: 0, releasedPartners: 0 });
-    const releaseSpy = vi.spyOn(lockManager, 'releaseIfOwner');
-    let iterations = 0;
-    const realGet = agentStore.get.bind(agentStore);
-    const realSet = agentStore.set.bind(agentStore);
-    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
-      iterations++;
-      simNow += 5 * 60_000;
-      if (iterations === 200) {
-        const cur = await realGet(id);
-        if (cur) await realSet({ ...cur, creationToken: 'token-force-exit', updatedAt: new Date().toISOString() });
-      }
+    await drainPoll(loop);
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
+    expect(sawKill()).toBe(true);
+  });
+
+  it('kill applied but response lost (unknown) → next cycle sees the session gone and finalizes', async () => {
+    await bootstrapIntoSlowPoll({
+      rules: [{ match: 'kill-session', reply: { exitCode: 255, stderr: 'Connection reset by peer' } }],
+    });
+    // 远端确实执行了 kill,只是回包丢了:结果未知,但会话已经没了
+    onExec = c => { if (c.includes('kill-session')) runner.sessions.drop('dev-1'); };
+    runner.sessions.setProcess('dev-1', 'zsh');
+
+    await waitForEvent('agent.bootstrap_failed');
+
+    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
+  });
+
+  it('does not roll back or fail when the creation token was already rotated to a successor', async () => {
+    await bootstrapIntoSlowPoll();
+    const killsBefore = cmds().filter(c => c.includes('kill-session')).length;
+    await harness.agentStore.update('dev-1', s => s ? { ...s, creationToken: 'token-newer' } : null);
+    runner.sessions.setProcess('dev-1', 'zsh');
+
+    await new Promise(r => realSetTimeout(r, 50));
+
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
+    expect(cmds().filter(c => c.includes('kill-session'))).toHaveLength(killsBefore);
+    expect((await harness.agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
+  });
+
+  it('exits when the agentStore record is deleted (DELETE path collapses the loop)', async () => {
+    await bootstrapIntoSlowPoll();
+    const realGet = harness.agentStore.get.bind(harness.agentStore);
+    let polls = 0;
+    vi.spyOn(harness.agentStore, 'get').mockImplementation(async (id: string) => {
+      polls++;
+      if (polls === 2) await harness.agentStore.delete('dev-1');
       return realGet(id);
     });
-    await slowPoll(TOKEN);
 
-    expect(failSpy).not.toHaveBeenCalled();
-    expect(releaseSpy).not.toHaveBeenCalled();
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
+    await vi.waitFor(() => expect(polls).toBeGreaterThanOrEqual(2), { timeout: 5_000, interval: 1 });
+    await new Promise(r => realSetTimeout(r, 30));
+
+    expect(polls).toBeLessThan(10);
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
+    expect(eventTypes()).not.toContain('agent.bootstrap_succeeded');
   });
 
-  it('exits cleanly when creationToken is cleared mid-flight (DELETE/recreate)', async () => {
-    await agentStore.update('dev-1', (s) => s ? { ...s, paneId: '%0', creationToken: 'token-newer', updatedAt: NOW } : null);
-    await slowPoll(TOKEN);
+  it('no longer hard-fails while the session cannot be probed (transient), dialog unresolved', async () => {
+    // 瞬时探测失败(非 PaneGoneError)必须继续轮询,不能按时间预算硬失败
+    let transient = false;
+    await bootstrapIntoSlowPoll({
+      rules: [{
+        match: c => transient && c.includes('list-sessions'),
+        reply: { exitCode: 255, stderr: 'Connection reset by peer' },
+      }],
+    });
+    transient = true;
+    const loop = rotateTokenAtPoll(200);
 
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
-    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
+    await drainPoll(loop);
+    await expectHoldUntouched();
+    expect(eventTypes()).not.toContain('agent.bootstrap_succeeded');
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('recovers a runtime dialog after the tmux pane was recreated (stale stored paneId)', async () => {
-    await agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      status: 'awaiting_human',
-      awaitingPhase: 'agent_dialog_pending',
-      awaitingReason: 'startup dialog',
-      awaitingSince: NOW,
-      paneId: '%1',
-      taskId: 'task-1',
-      updatedAt: NOW,
+  it('runtime path: recovers a dialog after the tmux pane was recreated (stale stored paneId)', async () => {
+    useRunner({ agents: { 'dev-1': { screen: STARTUP_DIALOG } } });
+    const task = await harness.seedTask({ id: 'task-1', status: 'in_progress', signalToken: 'devtok123456' });
+    // 存下来的 paneId 已经过期:真实 pane 由 claim 重新发现
+    await harness.seedAgent({ id: 'dev-1', taskId: task.id, paneId: '%9' });
+    await harness.acquireAgentLock('dev-1', task.id);
+
+    await expect(harness.manager.startSession(task.id, 'dev-1', 'develop')).rejects.toMatchObject({
+      partial: { dialogPending: true },
     });
+    await waitForState(s => s?.awaitingPhase === 'agent_dialog_pending');
 
-    const READY_CODEX = [
-      '>_ OpenAI Codex (v0.142.3)',
-      'model:       gpt-5.5 xhigh',
-      'directory:   ~/repo',
-      'permissions: YOLO mode',
-      '',
-      '› ',
-    ].join('\n');
+    // 运维在 web terminal 里把对话框点掉了:pane 回到正常的 runtime idle 帧
+    runner.sessions.seed('dev-1', { present: true });
 
-    useRunner(fakeRunner({
-      rules: [
-        { match: 'list-sessions', reply: { stdout: '9999|1700000000|$1|dev-1\n' } },
-        { match: 'list-panes', reply: { stdout: '%2 node\n' } },
-        {
-          match: cmd => cmd.includes('%1') && !cmd.includes('%2'),
-          reply: { stderr: "can't find pane: %1", exitCode: 1 },
-        },
-        {
-          match: cmd => cmd.includes('capture-pane') && cmd.includes('%2'),
-          reply: { stdout: `BX_PANE_OK\n${READY_CODEX}` },
-        },
-        {
-          match: cmd => cmd.includes('display-message') && cmd.includes('%2'),
-          reply: { stdout: 'BX_PANE_OKnode\n' },
-        },
-      ],
-      defaultResult: {},
-    }));
-    vi.spyOn(manager, 'getAgentConfig').mockReturnValue({
-      id: 'dev-1',
-      projectId: 'proj',
-      runtime: 'codex',
-      role: 'dev',
-      mode: 'local',
-      workdir: '/tmp/repo',
-      yolo: true,
-    });
-    rotateTokenAtPoll(13);
-    await slowPoll(undefined, { expectedPaneId: '%1', expectedTaskId: 'task-1' });
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.awaitingPhase).toBe('agent_dialog_resolved_runtime');
-    expect(state?.paneId).toBe('%2');
+    await waitForState(s => s?.awaitingPhase === 'agent_dialog_resolved_runtime');
+    const state = await harness.agentStore.get('dev-1');
+    expect(state?.paneId).toBe('%0');
     expect(state?.awaitingReason).toContain('cancel it if it is still active');
-    const intervention = events.find(e =>
+    const intervention = harness.events.find(e =>
       e.type === 'human.intervention'
-      && e.taskId === 'task-1'
+      && e.taskId === task.id
       && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',
     );
     expect(intervention?.data.note).toContain('cancel it if it is still active');
-    expect(intervention?.data.note).not.toBe('Runtime dialog resolved; agent REPL ready. Click Resume to continue.');
-  });
-
-  it('bootstrap path: REPL exited to a shell → rolls back the dead session and clears the dialog hold so Retry/Resume can rebuild', async () => {
-    await seedPendingBootstrap();
-    const shellRunner = shellExitRunner();
-    useRunner(shellRunner);
-    await slowPoll(TOKEN);
-
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
-    // Recovery-ready: the dialog hold and creation token are gone so Resume is not rejected and Retry is not blocked.
-    const state = await agentStore.get('dev-1');
-    expect(state?.creationToken).toBeUndefined();
-    expect(state?.awaitingPhase).toBeUndefined();
-    expect(state?.status).toBeUndefined();
-    // The leftover shell session was actually torn down (guarded kill), not left present to block Retry.
-    expect(sentKillSession(shellRunner)).toBe(true);
-  });
-
-  it('bootstrap path: a successor queued on the lifecycle lock during rollback is finalized against, not clobbered after', async () => {
-    await seedPendingBootstrap();
-    useRunner(shellExitRunner());
-    const m = manager as unknown as { runUnderSessionLifecycle: (id: string, fn: () => Promise<void>) => Promise<void> };
-    let tokenSeenBySuccessor: string | undefined | 'UNSET' = 'UNSET';
-    let successorDone: Promise<void> = Promise.resolve();
-    // the losing poll confirms shell → rolls back; a same-token successor queues on the lock while the kill runs
-    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(async () => {
-      successorDone = m.runUnderSessionLifecycle('dev-1', async () => {
-        tokenSeenBySuccessor = (await agentStore.get('dev-1'))?.creationToken;
-      });
-      return 'killed';
-    });
-
-    await slowPoll(TOKEN);
-    await successorDone;
-
-    // finalize ran inside the same critical section as the rollback, so the successor never observes a live token to clobber
-    expect(tokenSeenBySuccessor).toBeUndefined();
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
-  });
-
-  it('bootstrap path: half-created session left as a plain shell (no dialog text) → rolls back and finalizes so Retry can rebuild', async () => {
-    await seedPendingBootstrap();
-    // A create that failed before the launch command leaves a plain shell — no runtime ever started, no dialog on screen.
-    const shellRunner = shellExitRunner('➜  repo git:(main)\n');
-    useRunner(shellRunner);
-    await slowPoll(TOKEN);
-
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
-    const state = await agentStore.get('dev-1');
-    expect(state?.creationToken).toBeUndefined();
-    expect(state?.awaitingPhase).toBeUndefined();
-    expect(sentKillSession(shellRunner)).toBe(true);
-  });
-
-  it('bootstrap path: a successor adopting during the readiness probe is not killed by the losing slow poll', async () => {
-    await seedPendingBootstrap();
-    useRunner(shellExitRunner());
-    // A successor adopts the same ref (bumps adoptGeneration) while this poll's waitReplReady is still running.
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockImplementation(async () => {
-      (manager as unknown as { adoptGeneration: Map<string, number> }).adoptGeneration.set('dev-1', 1);
-      throw EXITED_TO_SHELL;
-    });
-    const killSpy = spyKills().byRef;
-    await slowPoll(TOKEN);
-
-    expect(killSpy).not.toHaveBeenCalled();
-    await expectSuccessorStateUntouched();
-  });
-
-  it('bootstrap path: a session ref replaced mid-probe (no panes match) is re-probed, not finalized as failed', async () => {
-    await seedPendingBootstrap();
-    // getSinglePaneByRef throws a plain Error (not PaneGoneError) for a stale ref, so this path must re-probe
-    useRunner(shellExitRunner(DIALOG_SCREEN, [{ match: 'list-panes', reply: { stdout: '' } }]));
-    const killSpy = spyKills().byRef;
-    const loop = rotateTokenAtPoll(4);
-    await slowPoll(TOKEN);
-
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-    expect(killSpy).not.toHaveBeenCalled();
-    expect(loop.polls()).toBeGreaterThan(1);
-  });
-
-  it('bootstrap path: a takeover that begins during this poll\'s probe and rebuilds the session is not finalized as gone', async () => {
-    await seedPendingBootstrap();
-    const takeover = fakeTakeover();
-    // the successor bumped, killed the old ref and is still building the new one when this poll's snapshot lands
-    useRunner(rebuiltSessionRunner(takeover, () => {
-      takeover.start();
-      realSetTimeout(takeover.release, 0);
-    }));
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(DIALOG_STILL_PENDING);
-    const killSpy = spyKills().byRef;
-    const loop = rotateTokenAtPoll(3);
-    await slowPoll(TOKEN);
-
-    await expectSuccessorStateUntouched();
-    expect(killSpy).not.toHaveBeenCalled();
-    expect(loop.polls()).toBeGreaterThan(1);
-  });
-
-  it('bootstrap path: a takeover already in flight when this poll samples (generation bumped, old session destroyed, new one not yet built) is not finalized as gone', async () => {
-    await seedPendingBootstrap();
-    const takeover = fakeTakeover();
-    takeover.start();
-    useRunner(rebuiltSessionRunner(takeover));
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(DIALOG_STILL_PENDING);
-    const killSpy = spyKills().byRef;
-    // the successor finishes only after this poll has already started its iteration
-    const loop = rotateTokenAtPoll(3, () => realSetTimeout(takeover.release, 0));
-    await slowPoll(TOKEN);
-
-    await expectSuccessorStateUntouched();
-    expect(killSpy).not.toHaveBeenCalled();
-    expect(loop.polls()).toBeGreaterThan(1);
-  });
-
-  it('bootstrap path: a takeover already in flight that relaunches the runtime in the same pane is not killed by a shell observed before it finished', async () => {
-    await seedPendingBootstrap();
-    const takeover = fakeTakeover();
-    takeover.start();
-    useRunner(shellExitRunner());
-    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockImplementation(async () => {
-      throw takeover.done() ? DIALOG_STILL_PENDING : EXITED_TO_SHELL;
-    });
-    const killSpy = spyKills().byRef;
-    const loop = rotateTokenAtPoll(3, () => realSetTimeout(takeover.release, 0));
-    await slowPoll(TOKEN);
-
-    await expectSuccessorStateUntouched();
-    expect(killSpy).not.toHaveBeenCalled();
-    expect(loop.polls()).toBeGreaterThan(1);
-  });
-
-  for (const variant of [
-    { label: 'refused (session ref changed / adopted)', kill: () => vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('refused') },
-    { label: 'unknown (SSH connection reset)', kill: () => vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockRejectedValue(new TmuxOutcomeUnknownError('kill outcome unknown: exit 255: Connection reset by peer')) },
-  ]) {
-    it(`bootstrap path: session teardown ${variant.label} → keeps the dialog hold and re-probes instead of clearing state over a live session`, async () => {
-      await seedPendingBootstrap();
-      useRunner(shellExitRunner());
-      const killSpy = variant.kill();
-      const loop = rotateTokenAtPoll(4);
-      await slowPoll(TOKEN);
-
-      // A not-confirmed-gone session must NOT be treated as failed: no bootstrap_failed, hold not cleared.
-      expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-      expect(killSpy).toHaveBeenCalled();
-      expect(loop.polls()).toBeGreaterThan(1);
-    });
-  }
-
-  it('bootstrap path: kill applied but response lost (unknown) → next cycle sees the session gone and finalizes', async () => {
-    await seedPendingBootstrap();
-    let killApplied = false;
-    useRunner(shellExitRunner(DIALOG_SCREEN, [
-      { match: 'list-sessions', reply: () => ({ stdout: killApplied ? '' : '4242|1700000000|$1|dev-1\n' }) },
-    ]));
-    // Remote kill actually succeeds, but SSH drops before the reply → the session is gone yet the outcome is unknown.
-    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(async () => {
-      killApplied = true;
-      throw new TmuxOutcomeUnknownError('kill outcome unknown: exit 255: Connection reset by peer');
-    });
-    await slowPoll(TOKEN);
-
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
-    const state = await agentStore.get('dev-1');
-    expect(state?.creationToken).toBeUndefined();
-    expect(state?.awaitingPhase).toBeUndefined();
-  });
-
-  it('bootstrap path: does not roll back or fail when the creation token was already rotated to a successor', async () => {
-    await seedPendingBootstrap({ creationToken: 'token-newer' });
-    const shellRunner = shellExitRunner();
-    useRunner(shellRunner);
-    await slowPoll(TOKEN);
-
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-    expect(sentKillSession(shellRunner)).toBe(false);
-    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
-  });
-
-  it('exits when agentStore record is deleted (DELETE path collapses the loop)', async () => {
-    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: TOKEN, updatedAt: NOW } : null);
-    const realGet = agentStore.get.bind(agentStore);
-    let polls = 0;
-    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
-      polls++;
-      if (polls === 2) await agentStore.delete('dev-1');
-      return realGet(id);
-    });
-    await slowPoll(TOKEN);
-
-    expect(polls).toBeGreaterThanOrEqual(2);
-    expect(polls).toBeLessThan(10);
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
   });
 });

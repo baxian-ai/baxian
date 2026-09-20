@@ -34,6 +34,17 @@ const SESSION_REF_FORMAT = '#{pid}|#{start_time}|#{session_id}';
 const REFUSED_MARKER = 'BX_KILL_REFUSED';
 const TARGET_GONE_MARKER = 'BX_TARGET_GONE';
 const PANE_OK_MARKER = 'BX_PANE_OK';
+const SHELL_OK_MARKER = 'BX_SHELL_OK';
+const SHELL_REFUSED_MARKER = 'BX_SHELL_REFUSED';
+const SHELL_WRITE_NONCE_OPTION = '@bx_shell_write';
+const RUNTIME_OK_MARKER = 'BX_RUNTIME_OK';
+const RUNTIME_REFUSED_MARKER = 'BX_RUNTIME_REFUSED';
+
+type ForegroundGuard = 'shell' | AgentRuntimeKind;
+type ForegroundWriteOutcome =
+  | { kind: 'applied' }
+  | { kind: 'refused'; foreground: string }
+  | { kind: 'uncertain'; cause: string; exitCode?: number };
 
 export interface PaneRef {
   session: TmuxSessionRef;
@@ -75,13 +86,14 @@ function sessionCond(ref: TmuxSessionRef, claim: string): string {
   return `#{&&:#{&&:${generationCond(ref)},#{==:#{session_id},${ref.sessionId}}},#{==:#{@baxian-agent-id},${claim}}}`;
 }
 
+// 不比 #{pane_id}:pane 已由 -t <paneId> 锁定,而 display-message 先跑 strftime,%N 字面量会被当转换符吃掉(tmux 3.6a)
 function paneCond(pane: PaneRef): string {
-  const sess = `#{&&:#{==:#{session_id},${pane.session.sessionId}},#{==:#{pane_id},${pane.paneId}}}`;
-  return `#{&&:#{&&:${generationCond(pane.session)},${sess}},#{==:#{@baxian-agent-id},${pane.claim}}}`;
+  return sessionCond(pane.session, pane.claim);
 }
 
+// 拒 %:格式要塞进 display-message 正文,tmux 先跑 strftime,带 % 的字面量会被当转换符吃掉
 function assertPlainFormat(fmt: string): void {
-  if (fmt.includes("'") || fmt.includes('\n')) {
+  if (fmt.includes("'") || fmt.includes('\n') || fmt.includes('%')) {
     throw new Error(`tmux format ${JSON.stringify(fmt)} contains unsupported characters`);
   }
 }
@@ -92,6 +104,12 @@ export function tmuxQuote(value: string): string {
   }
   if (value === '') return "''";
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+// send-keys 的正文是第一个位置参数,getopt 此时还没停止解析:'-l' 会被当成又一个选项吞掉(退出 0、一个键也不送),
+// 其它 - 开头的正文直接 unknown flag 退出 1。-- 终止选项解析,其后的参数才一定按正文/键名处理
+function sendKeysCommand(paneId: string, args: readonly string[], literal = false): string {
+  return `send-keys${literal ? ' -l' : ''} -t ${paneId} -- ${args.map(tmuxQuote).join(' ')}`;
 }
 
 function assertSessionRef(ref: TmuxSessionRef): void {
@@ -222,6 +240,7 @@ export interface WaitOpts {
 
 export interface WaitReplReadyOpts extends WaitOpts {
   failFastOnShell?: boolean;
+  runtimeSeen?: boolean;
   scrollback?: number;
   perCommandTimeoutMs?: number;
   titleIdleFastPath?: boolean;
@@ -235,12 +254,29 @@ export interface WaitSubmitAckOpts extends WaitOpts {
 
 const NEVER_RE = /[^\s\S]/;
 
-const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = {
-  'claude-code': /^(?:claude(?:\.exe)?|\d+\.\d+\.\d+)$/,
-  codex: /^(?:codex|node)$/,
-  opencode: /^opencode$/,
-  qodercli: /^qodercli(?:-[\d.]+)?$/,
+// 前台进程名的判定只写一份:客户端正则与 tmux 服务端条件都从这张表生成
+type ReplProcTitleShape = 'version-triple' | { digitsAndDotsAfter: string };
+const REPL_PROC_TITLE_SPEC: Record<AgentRuntimeKind, { exact: readonly string[]; shapes: readonly ReplProcTitleShape[] }> = {
+  'claude-code': { exact: ['claude', 'claude.exe'], shapes: ['version-triple'] },
+  codex: { exact: ['codex', 'node'], shapes: [] },
+  opencode: { exact: ['opencode'], shapes: [] },
+  qodercli: { exact: ['qodercli'], shapes: [{ digitsAndDotsAfter: 'qodercli-' }] },
 };
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function replProcTitleShapeSource(shape: ReplProcTitleShape): string {
+  return shape === 'version-triple' ? '\\d+\\.\\d+\\.\\d+' : `${escapeRegExp(shape.digitsAndDotsAfter)}[0-9.]+`;
+}
+
+const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = Object.fromEntries(
+  Object.entries(REPL_PROC_TITLE_SPEC).map(([runtime, { exact, shapes }]) => [
+    runtime,
+    new RegExp(`^(?:${[...exact.map(escapeRegExp), ...shapes.map(replProcTitleShapeSource)].join('|')})$`),
+  ]),
+) as Record<AgentRuntimeKind, RegExp>;
 
 const READY_ANCHORS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /⏵⏵ bypass permissions on/,
@@ -374,7 +410,42 @@ export function isBlockedOnStartupDialog(err: unknown, runtime: AgentRuntimeKind
   return err instanceof ReplNotReadyError && !err.shellForeground && detectStartupDialog(err.lastScreen, runtime);
 }
 
-const SHELL_PROC_TITLES = /^(?:zsh|bash|sh|fish|dash|ash|ksh|mksh|tcsh|csh|nu|xonsh|pwsh)$/;
+const SHELL_PROC_NAMES = ['zsh', 'bash', 'sh', 'fish', 'dash', 'ash', 'ksh', 'mksh', 'tcsh', 'csh', 'nu', 'xonsh', 'pwsh'] as const;
+const SHELL_PROC_TITLES = new RegExp(`^(?:${SHELL_PROC_NAMES.join('|')})$`);
+
+// tmux 格式没有正则交替(m/r 要 3.1+),同一份 shell 名单用 || 链搬进服务端条件
+function shellForegroundCond(): string {
+  return SHELL_PROC_NAMES
+    .map(name => `#{==:#{pane_current_command},${name}}`)
+    .reduceRight((rest, eq) => `#{||:${eq},${rest}}`);
+}
+
+// runtime 侧写的服务端条件:前台正是目标 runtime;"不是 shell"放不过 runtime 拉起的编辑器、分页器这类会错收按键的前台进程
+// fnmatch 的 * 匹配任意串而不是重复字符类:版本号形态要由"纯数字点、恰两个点、不以点开头结尾、无连续点"的交集拼出;tmux 格式没有取反,用 #{?c,0,1}
+function runtimeForegroundCond(runtime: AgentRuntimeKind): string {
+  const fg = '#{pane_current_command}';
+  const glob = (pattern: string): string => `#{m:${pattern},${fg}}`;
+  const not = (cond: string): string => `#{?${cond},0,1}`;
+  const all = (conds: string[]): string => conds.reduceRight((rest, cond) => `#{&&:${cond},${rest}}`);
+  const shapeCond = (shape: ReplProcTitleShape): string => (shape === 'version-triple'
+    ? all([glob('*.*.*'), ...['*.*.*.*', '*[!0-9.]*', '.*', '*.', '*..*'].map(pattern => not(glob(pattern)))])
+    : all([glob(`${shape.digitsAndDotsAfter}?*`), not(glob(`${shape.digitsAndDotsAfter}*[!0-9.]*`))]));
+  const { exact, shapes } = REPL_PROC_TITLE_SPEC[runtime];
+  return [...exact.map(name => `#{==:${fg},${name}}`), ...shapes.map(shapeCond)]
+    .reduceRight((rest, cond) => `#{||:${cond},${rest}}`);
+}
+
+// 拒绝按前台分类:shell 前台让调用方走清理/relaunch 分支,其他前台进程只是此刻不可写
+function foreignForegroundError(pane: PaneRef, runtime: AgentRuntimeKind, foreground: string, withheld: string): ReplNotReadyError {
+  const shell = isShellProcTitle(foreground);
+  return new ReplNotReadyError(
+    pane.paneId,
+    runtime,
+    '',
+    `pane foreground is "${foreground}", ${shell ? 'a shell, ' : ''}not ${runtime}; ${withheld}`,
+    shell,
+  );
+}
 
 const ANSI_PATTERN = /\x1b\[[0-9;]*[A-Za-z]/g;
 
@@ -413,6 +484,18 @@ const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
 
 const MIN_POLL_INTERVAL_MS = 50;
 const COMPOSER_DIRTY_SETTLE_MS = 200;
+const COMPOSER_DIRTY_TIMEOUT_MS = 2_000;
+
+// codex 空 composer 上单次 C-c 即退出:只有光标列位移能证明弄脏键已入 composer,而不是还暂存在粘贴突发检测里
+const CTRL_C_QUITS_EMPTY_COMPOSER: ReadonlySet<AgentRuntimeKind> = new Set(['codex']);
+const CODEX_COMPOSER_DIRTY_KEY = ',';
+// 折行边界的 overflowing separator 可让首个字符的光标坐标原地不动,第二个字符必定推进(此时 composer 已非空,C-c 只会清稿)
+const COMPOSER_DIRTY_KEY_ATTEMPTS = 2;
+
+interface ComposerFrame {
+  column: string;
+  foreground: string;
+}
 
 const HISTORY_SUFFIX_RE = /\n---history_size:\d+---$/;
 function stripHistorySuffix(snapshot: string): string {
@@ -748,11 +831,13 @@ export class TmuxManager {
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
       throw new PaneGoneError(pane.paneId, result.stderr.trim());
     }
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux guarded read of ${pane.paneId} failed (exit ${result.exitCode}): ${result.stderr}`);
-    }
     const nl = result.stdout.indexOf('\n');
     const firstLine = nl === -1 ? result.stdout : result.stdout.slice(0, nl);
+    // 只有 header 的读以整行到齐的标记为准:它是服务端已答复的直接证据,SSH 收尾才断开的 255 不推翻它;带 body 的读无法判断 body 是否被截断,仍按 exit code
+    const headerLanded = extra.length === 0 && nl !== -1 && firstLine.startsWith(PANE_OK_MARKER);
+    if (result.exitCode !== 0 && !(headerLanded && execOutcomeUnknown(result))) {
+      throw new Error(`tmux guarded read of ${pane.paneId} failed (exit ${result.exitCode}): ${result.stderr}`);
+    }
     if (!firstLine.startsWith(PANE_OK_MARKER)) {
       throw new PaneGoneError(pane.paneId, 'identity condition failed');
     }
@@ -878,15 +963,138 @@ export class TmuxManager {
 
   async sendKeysToPane(pane: PaneRef, ...keys: string[]): Promise<void> {
     if (keys.length === 0) return;
-    await this.guardedPaneWrite(pane, [
-      `send-keys -t ${pane.paneId} ${keys.map(k => tmuxQuote(k)).join(' ')}`,
-    ]);
+    await this.guardedPaneWrite(pane, [sendKeysCommand(pane.paneId, keys)]);
   }
 
-  async sendKeysLiteral(pane: PaneRef, text: string): Promise<void> {
-    await this.guardedPaneWrite(pane, [
-      `send-keys -l -t ${pane.paneId} ${tmuxQuote(text)}`,
-    ]);
+  // 给出 runtime 即由服务端确认前台不是 shell 才键入;不给的是往 shell 提交启动/退出命令的调用方
+  async sendKeysLiteral(pane: PaneRef, text: string, runtime?: AgentRuntimeKind): Promise<void> {
+    const inner = [sendKeysCommand(pane.paneId, [text], true)];
+    if (runtime) return this.writeIfRuntimeForeground(pane, runtime, inner, `the text ${JSON.stringify(text)}`);
+    await this.guardedPaneWrite(pane, inner);
+  }
+
+  async sendKeysToRuntime(pane: PaneRef, runtime: AgentRuntimeKind, ...keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    await this.writeIfRuntimeForeground(
+      pane,
+      runtime,
+      [sendKeysCommand(pane.paneId, keys)],
+      keys.join(' '),
+    );
+  }
+
+  // 一行文本与回车在同一条守卫命令里排入:分两次守卫,前台在两者之间换了进程会只留半行在 composer(/exit 留到下次回车才生效)
+  async submitToRuntime(pane: PaneRef, runtime: AgentRuntimeKind, text: string): Promise<void> {
+    await this.writeIfRuntimeForeground(
+      pane,
+      runtime,
+      [sendKeysCommand(pane.paneId, [text], true), sendKeysCommand(pane.paneId, ['Enter'])],
+      `the line ${JSON.stringify(text)} and Enter`,
+    );
+  }
+
+  // 前台判定与按键在同一条 if-shell 里由 tmux 服务端一次完成:分两次往返,间隙里前台换了进程,按键就落到另一个进程上
+  private async guardedForegroundWrite(
+    pane: PaneRef,
+    guard: ForegroundGuard,
+    inner: string[],
+    opts?: ExecOptions,
+  ): Promise<ForegroundWriteOutcome> {
+    assertPaneRef(pane);
+    const [okMarker, refusedMarker, cond, label] = guard === 'shell'
+      ? [SHELL_OK_MARKER, SHELL_REFUSED_MARKER, shellForegroundCond(), 'shell']
+      : [RUNTIME_OK_MARKER, RUNTIME_REFUSED_MARKER, runtimeForegroundCond(guard), 'runtime'];
+    const refused = `display-message -p -t ${pane.paneId} '${refusedMarker}|${paneCond(pane)}|#{pane_current_command}'`;
+    let result: ExecResult;
+    try {
+      result = await run(
+        this.runner,
+        `tmux if-shell -t ${shellQuote(pane.paneId)} -F ${shellQuote(`#{&&:${paneCond(pane)},${cond}}`)} ` +
+          `${shellQuote([...inner, `display-message -p ${okMarker}`].join(' ; '))} ${shellQuote(refused)}`,
+        opts,
+      );
+    } catch (err) {
+      return { kind: 'uncertain', cause: `exec rejected: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    // 标记是服务端已执行/已拒绝的直接证据,先于 exit code 判读:成功标记已收到、SSH 却在收尾时断开会给出 exit 255
+    const lines = result.stdout.split('\n');
+    if (lines.some(line => line.startsWith(okMarker))) return { kind: 'applied' };
+    const refusal = lines.find(line => line.startsWith(refusedMarker));
+    if (refusal) {
+      const [, identityOk, foreground = ''] = refusal.split('|');
+      if (identityOk !== '1') throw new PaneGoneError(pane.paneId, 'identity condition failed');
+      return { kind: 'refused', foreground };
+    }
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) throw new PaneGoneError(pane.paneId, result.stderr.trim());
+    if (result.exitCode === 0 || execOutcomeUnknown(result)) {
+      return {
+        kind: 'uncertain',
+        exitCode: result.exitCode,
+        cause: `neither marker returned (exit ${result.exitCode}): ${JSON.stringify(result.stdout)} ${result.stderr.trim()}`.trim(),
+      };
+    }
+    throw new Error(`tmux ${label}-guarded write to ${pane.paneId} failed (exit ${result.exitCode}): ${result.stderr}`);
+  }
+
+  // runtime 侧的按键与粘贴:前台不是目标 runtime 就一个键都不发。落进 shell 的提示词和回车会被当作命令执行,落进其他前台进程的按键会被错收
+  private async writeIfRuntimeForeground(
+    pane: PaneRef,
+    runtime: AgentRuntimeKind,
+    inner: string[],
+    what: string,
+    opts?: ExecOptions,
+  ): Promise<void> {
+    const outcome = await this.guardedForegroundWrite(pane, runtime, inner, opts);
+    if (outcome.kind === 'applied') return;
+    if (outcome.kind === 'refused') throw foreignForegroundError(pane, runtime, outcome.foreground, `${what} withheld`);
+    if (outcome.exitCode === 0) return;
+    throw new Error(`tmux runtime-guarded write to ${pane.paneId} failed: ${outcome.cause}`);
+  }
+
+  // 弄脏键可能已落进 shell 行:只在前台仍是 shell 时 C-c 丢弃它,间隙里被拉起的 runtime 不能吃到这个 C-c
+  private async discardShellInputLine(pane: PaneRef): Promise<boolean> {
+    const outcome = await this.guardedForegroundWrite(pane, 'shell', [sendKeysCommand(pane.paneId, ['C-c'])]);
+    if (outcome.kind === 'refused') return false;
+    if (outcome.kind === 'uncertain' && outcome.exitCode !== 0) {
+      throw new Error(`tmux shell-guarded write to ${pane.paneId} failed: ${outcome.cause}`);
+    }
+    return true;
+  }
+
+  // shell 判定与 C-c/命令/Enter 在同一条 if-shell 里由 tmux 服务端一次完成:分两次往返,间隙里被人手动拉起的 runtime 会吃到 C-c(codex 空 composer 直接退出)
+  async submitCommandOnShell(pane: PaneRef, command: string, opts?: ExecOptions): Promise<void> {
+    // nonce 排在按键之前:tmux 命令列表中途出错即中止,事后读不到本次 nonce 就是一个键都没发
+    const nonce = randomUUID();
+    const outcome = await this.guardedForegroundWrite(pane, 'shell', [
+      `set-option -t ${pane.paneId} ${SHELL_WRITE_NONCE_OPTION} ${nonce}`,
+      sendKeysCommand(pane.paneId, ['C-c']),
+      sendKeysCommand(pane.paneId, [command], true),
+      sendKeysCommand(pane.paneId, ['Enter']),
+    ], opts);
+    if (outcome.kind === 'applied') return;
+    if (outcome.kind === 'refused') {
+      throw new Error(`tmux pane ${pane.paneId} foreground is "${outcome.foreground}", not a shell; C-c, command and Enter withheld`);
+    }
+    return this.reconcileShellWrite(pane, nonce, outcome.cause, opts);
+  }
+
+  // 结果不确定就按 nonce 对账:读到本次 nonce 即按键已排入;没有就是一个键都没发;连 nonce 都读不到则明确报 outcome unknown,不冒充普通失败
+  private async reconcileShellWrite(pane: PaneRef, nonce: string, cause: string, opts?: ExecOptions): Promise<void> {
+    let seen: string;
+    try {
+      seen = (await this.guardedPaneRead(pane, `#{${SHELL_WRITE_NONCE_OPTION}}`, [], opts)).header.trim();
+    } catch (err) {
+      if (err instanceof PaneGoneError) throw err;
+      throw new TmuxOutcomeUnknownError(
+        `tmux shell-guarded write to ${pane.paneId}: outcome unknown (${cause}) and the nonce probe failed ` +
+          `(${err instanceof Error ? err.message : String(err)}); inspect the pane before retrying`,
+      );
+    }
+    if (seen === nonce) {
+      console.warn(`[tmux] shell-guarded write to ${pane.paneId}: reconciled as executed after an uncertain result (${cause})`);
+      return;
+    }
+    throw new Error(`tmux shell-guarded write to ${pane.paneId} did not reach the tmux server (${cause}); nothing was typed`);
   }
 
   async capturePaneById(pane: PaneRef, opts: CapturePaneOpts = {}): Promise<string> {
@@ -909,7 +1117,7 @@ export class TmuxManager {
     return blankSparkles(body, opts.runtime);
   }
 
-  async injectPrompt(pane: PaneRef, prompt: string, agentId: string): Promise<void> {
+  async injectPrompt(pane: PaneRef, prompt: string, agentId: string, runtime: AgentRuntimeKind): Promise<void> {
     assertPaneRef(pane);
     const bytes = Buffer.byteLength(prompt, 'utf8');
     if (bytes > MAX_PROMPT_BYTES) {
@@ -947,10 +1155,11 @@ export class TmuxManager {
         `identity probe or buffer load failed before any buffer was created: ${loaded.stderr.trim() || 'probe mismatch'}`,
       );
     }
+    // 粘贴也由服务端确认前台是目标 runtime:拒绝时顺手删掉 buffer,提示词不在远端滞留
     const pasteCmd =
-      `tmux if-shell -t ${shellQuote(pane.paneId)} -F ${shellQuote(paneCond(pane))} ` +
-        `${shellQuote(`paste-buffer -b ${buf} -t ${pane.paneId} -d -p -r`)} ` +
-        `${shellQuote(`delete-buffer -b ${buf} ; display-message -p ${TARGET_GONE_MARKER}`)}`;
+      `tmux if-shell -t ${shellQuote(pane.paneId)} -F ${shellQuote(`#{&&:${paneCond(pane)},${runtimeForegroundCond(runtime)}}`)} ` +
+        `${shellQuote(`paste-buffer -b ${buf} -t ${pane.paneId} -d -p -r ; display-message -p ${RUNTIME_OK_MARKER}`)} ` +
+        `${shellQuote(`delete-buffer -b ${buf} ; display-message -p -t ${pane.paneId} '${RUNTIME_REFUSED_MARKER}|${paneCond(pane)}|#{pane_current_command}'`)}`;
     let pasted: ExecResult;
     try {
       pasted = await run(this.runner, pasteCmd);
@@ -960,12 +1169,15 @@ export class TmuxManager {
         `tmux injectPrompt ${pane.paneId} failed (paste exec layer): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    if (pasted.exitCode === 0) {
-      if (pasted.stdout.includes(TARGET_GONE_MARKER)) {
-        throw new PaneGoneError(pane.paneId, 'identity condition failed at paste (buffer self-cleaned)');
-      }
-      return;
+    const pastedLines = pasted.stdout.split('\n');
+    if (pastedLines.some(line => line.startsWith(RUNTIME_OK_MARKER))) return;
+    const pasteRefusal = pastedLines.find(line => line.startsWith(RUNTIME_REFUSED_MARKER));
+    if (pasteRefusal) {
+      const [, identityOk, foreground = ''] = pasteRefusal.split('|');
+      if (identityOk !== '1') throw new PaneGoneError(pane.paneId, 'identity condition failed at paste (buffer self-cleaned)');
+      throw foreignForegroundError(pane, runtime, foreground, 'prompt paste withheld (buffer self-cleaned)');
     }
+    if (pasted.exitCode === 0) return;
     await this.reconcileInjectBuffer(buf, `paste failed (exit ${pasted.exitCode}): ${pasted.stderr.trim()}`);
     if (pasted.exitCode === 1 && (isSessionAbsent(pasted.stderr) || isTargetGone(pasted.stderr))) {
       throw new PaneGoneError(pane.paneId, pasted.stderr.trim() || 'pane gone before paste');
@@ -1039,14 +1251,9 @@ export class TmuxManager {
     return { buf };
   }
 
-  async pasteStagedBuffer(paneId: string, buf: string): Promise<void> {
-    const result = await run(
-      this.runner,
-      `tmux paste-buffer -b ${shellQuote(buf)} -t ${shellQuote(paneId)} -d -p -r`,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux pasteStagedBuffer ${paneId} failed: ${result.stderr}`);
-    }
+  // 已暂存的提示词也按 pane 身份 + 前台不是 shell 粘贴;拒绝时 buffer 留给调用方 drop,它据此区分"没贴"与"贴了但结果未知"
+  async pasteStagedBuffer(pane: PaneRef, buf: string, runtime: AgentRuntimeKind): Promise<void> {
+    await this.writeIfRuntimeForeground(pane, runtime, [`paste-buffer -b ${buf} -t ${pane.paneId} -d -p -r`], 'the prompt paste');
   }
 
   async dropStagedBuffer(buf: string): Promise<void> {
@@ -1070,14 +1277,83 @@ export class TmuxManager {
     return `${visible}\n---history_size:${history}---`;
   }
 
-  async sendEnter(pane: PaneRef): Promise<void> {
+  async sendEnter(pane: PaneRef, runtime?: AgentRuntimeKind): Promise<void> {
+    if (runtime) return this.sendKeysToRuntime(pane, runtime, 'Enter');
     await this.sendKeysToPane(pane, 'Enter');
   }
 
-  async clearComposerDraft(pane: PaneRef): Promise<void> {
-    await this.sendKeysLiteral(pane, ' ');
-    await sleep(COMPOSER_DIRTY_SETTLE_MS);
-    await this.sendKeysToPane(pane, 'C-c');
+  async clearComposerDraft(pane: PaneRef, runtime: AgentRuntimeKind, opts: WaitOpts = {}): Promise<void> {
+    if (!CTRL_C_QUITS_EMPTY_COMPOSER.has(runtime)) {
+      await this.sendKeysLiteral(pane, ' ', runtime);
+      await sleep(COMPOSER_DIRTY_SETTLE_MS);
+      await this.sendKeysToRuntime(pane, runtime, 'C-c');
+      return;
+    }
+    const rest = await this.readComposerFrame(pane);
+    if (!hasReplProcTitle(rest.foreground, runtime)) {
+      throw new ReplNotReadyError(
+        pane.paneId,
+        runtime,
+        await this.captureForDiagnosis(pane, runtime),
+        `pane foreground is "${rest.foreground}", not ${runtime}; nothing typed and C-c withheld`,
+      );
+    }
+    for (let attempt = 1; attempt <= COMPOSER_DIRTY_KEY_ATTEMPTS; attempt++) {
+      await this.sendKeysLiteral(pane, CODEX_COMPOSER_DIRTY_KEY, runtime);
+      const frame = await this.waitComposerFrameChange(pane, runtime, rest, opts);
+      if (!frame) continue;
+      if (!hasReplProcTitle(frame.foreground, runtime)) {
+        const shell = isShellProcTitle(frame.foreground);
+        // 弄脏键可能已落进 shell 行,不清会让下一条 relaunch 命令接在逗号后面
+        const discarded = shell && await this.discardShellInputLine(pane);
+        throw new ReplNotReadyError(
+          pane.paneId,
+          runtime,
+          await this.captureForDiagnosis(pane, runtime),
+          `pane foreground became "${frame.foreground}" after the dirtying key; the cursor move is not composer evidence` +
+            (discarded ? '; the stray key was discarded with C-c on the shell' : '') +
+            (shell && !discarded ? '; a runtime took the foreground again before the stray key could be discarded, so no C-c was sent' : ''),
+        );
+      }
+      // 同帧证据到 C-c 之间 runtime 仍可能退出:前台已是 shell 就不发,随 runtime 一起消失的逗号也无需再清
+      await this.sendKeysToRuntime(pane, runtime, 'C-c');
+      return;
+    }
+    throw new ReplNotReadyError(
+      pane.paneId,
+      runtime,
+      await this.captureForDiagnosis(pane, runtime),
+      `${COMPOSER_DIRTY_KEY_ATTEMPTS} dirtying keys "${CODEX_COMPOSER_DIRTY_KEY}" left the cursor at column ${rest.column} ` +
+        `(${opts.timeoutMs ?? COMPOSER_DIRTY_TIMEOUT_MS}ms each); C-c withheld because an empty ${runtime} composer would quit on it`,
+    );
+  }
+
+  // 光标位移只证明"某个行编辑器"收下了字符:与前台进程同帧读取,runtime 退出后 shell 提示符造成的位移不算
+  private async readComposerFrame(pane: PaneRef): Promise<ComposerFrame> {
+    const raw = await this.displayMessage(pane, '#{cursor_x}|#{pane_current_command}');
+    const [column = '', foreground = ''] = raw.trim().split('|');
+    return { column, foreground };
+  }
+
+  private async waitComposerFrameChange(
+    pane: PaneRef,
+    runtime: AgentRuntimeKind,
+    rest: ComposerFrame,
+    opts: WaitOpts,
+  ): Promise<ComposerFrame | undefined> {
+    const deadline = Date.now() + (opts.timeoutMs ?? COMPOSER_DIRTY_TIMEOUT_MS);
+    const interval = Math.max(opts.intervalMs ?? MIN_POLL_INTERVAL_MS, MIN_POLL_INTERVAL_MS);
+    while (true) {
+      const frame = await this.readComposerFrame(pane);
+      if (frame.column !== rest.column || !hasReplProcTitle(frame.foreground, runtime)) return frame;
+      if (Date.now() >= deadline) return undefined;
+      await sleep(interval);
+    }
+  }
+
+  private async captureForDiagnosis(pane: PaneRef, runtime: AgentRuntimeKind): Promise<string> {
+    const { body } = await this.guardedPaneRead(pane, '', [`capture-pane -t ${pane.paneId} -e -p`]);
+    return blankSparkles(stripAnsi(body), runtime).replace(/ +$/gm, '');
   }
 
   async captureSettledSnapshot(
@@ -1211,8 +1487,8 @@ export class TmuxManager {
     const cmdOpts = opts.perCommandTimeoutMs ? { timeout: opts.perCommandTimeoutMs } : undefined;
     let lastStripped = '';
     let lastTitle: string | undefined;
-    // 见过 runtime 后回落 shell 才提前放弃;没见过=启动钩子尚未 exec runtime,等到窗口耗尽仍是 shell 才据实报告
-    let sawRuntime = false;
+    // 见过 runtime 后回落 shell 才提前放弃;没见过=启动钩子尚未 exec runtime,等到窗口耗尽仍是 shell 才据实报告;调用方刚确认过前台是 runtime 时首帧的 shell 就是已退出
+    let sawRuntime = opts.runtimeSeen ?? false;
     while (true) {
       const current = await this.displayMessage(pane, '#{pane_current_command}', cmdOpts);
       if (failFastOnShell && sawRuntime && SHELL_PROC_TITLES.test(current)) {

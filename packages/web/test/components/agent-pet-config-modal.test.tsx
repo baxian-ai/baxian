@@ -2,16 +2,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { PetMeta } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 import { api } from '../../src/api.ts';
 import { AgentPetConfigModal, parsePetPackage, PetPackageError } from '../../src/components/agent-pet-config-modal.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
-import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
+import { expectToast } from '../helpers/toast.tsx';
 import { __resetI18nForTests, syncLocaleFromConfig } from '../../src/i18n/index.tsx';
 
-const showMock = toastShowMock;
 const listMock = vi.mocked(api.pets.list);
 const removeMock = vi.mocked(api.pets.remove);
 const createMock = vi.mocked(api.pets.create);
@@ -29,7 +28,6 @@ beforeEach(() => {
   createMock.mockReset().mockResolvedValue(PETS[0]);
   setPetMock.mockReset().mockResolvedValue({ petId: null });
   fetchSpritesheetMock.mockReset().mockResolvedValue(new Blob(['x']));
-  showMock.mockReset();
   (URL as unknown as { createObjectURL: () => string }).createObjectURL = vi.fn(() => 'blob:x');
   window.matchMedia = vi.fn().mockImplementation((q: string) => ({
     matches: true, media: q, onchange: null,
@@ -40,9 +38,11 @@ beforeEach(() => {
 
 function renderModal(currentPetId: string | null) {
   return render(
-    <ConfirmProvider>
-      <AgentPetConfigModal agentId="dev-1" currentPetId={currentPetId} onClose={vi.fn()} />
-    </ConfirmProvider>,
+    <ToastProvider>
+      <ConfirmProvider>
+        <AgentPetConfigModal agentId="dev-1" currentPetId={currentPetId} onClose={vi.fn()} />
+      </ConfirmProvider>
+    </ToastProvider>,
   );
 }
 
@@ -160,7 +160,7 @@ describe('AgentPetConfigModal', () => {
 
     await act(async () => { fireEvent.click(toggle); });
 
-    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to disable', body: 'server down' });
+    await expectToast({ title: 'Failed to disable', body: 'server down' });
     expect(toggle.checked).toBe(true);
     expect(await screen.findByText('(current)')).toBeTruthy();
   });
@@ -172,7 +172,7 @@ describe('AgentPetConfigModal', () => {
 
     await act(async () => { fireEvent.click(catBtn); });
 
-    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to select', body: 'pet missing' });
+    await expectToast({ title: 'Failed to select', body: 'pet missing' });
     expect(screen.getByText('(current)').closest('button')?.textContent).toContain('Foxy');
   });
 
@@ -185,7 +185,7 @@ describe('AgentPetConfigModal', () => {
     const dialog = await findConfirmDialog();
     await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
 
-    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to delete', body: 'pet in use' });
+    await expectToast({ title: 'Failed to delete', body: 'pet in use' });
     expect(listMock).toHaveBeenCalledTimes(1);
   });
 
@@ -209,7 +209,7 @@ describe('AgentPetConfigModal', () => {
       await waitFor(() =>
         expect(createMock).toHaveBeenCalledWith({ displayName: 'New', spritesheetPath: 'sprite.webp' }, sprite));
       await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
-      await waitFor(() => expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: 'Pet uploaded' }));
+      await expectToast({ title: 'Pet uploaded' });
       expect(uploadInput().value).toBe('');
     });
 
@@ -219,8 +219,7 @@ describe('AgentPetConfigModal', () => {
 
       changeFiles([new File(['IMG'], 'sprite.webp')]);
 
-      await waitFor(() =>
-        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to upload pet', body: 'pet.json not found in the file package' }));
+      await expectToast({ title: 'Failed to upload pet', body: 'pet.json not found in the file package' });
       expect(createMock).not.toHaveBeenCalled();
     });
 
@@ -234,8 +233,7 @@ describe('AgentPetConfigModal', () => {
         new File(['IMG'], 'art.png'),
       ]);
 
-      await waitFor(() =>
-        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to upload pet', body: 'payload too large' }));
+      await expectToast({ title: 'Failed to upload pet', body: 'payload too large' });
       expect(listMock).toHaveBeenCalledTimes(1);
     });
 
@@ -249,7 +247,7 @@ describe('AgentPetConfigModal', () => {
       });
 
       expect(createMock).not.toHaveBeenCalled();
-      expect(showMock).not.toHaveBeenCalled();
+      expect(screen.queryByRole('status')).toBeNull();
     });
   });
 

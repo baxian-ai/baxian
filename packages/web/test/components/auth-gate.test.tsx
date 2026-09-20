@@ -32,9 +32,9 @@ describe('AuthGate', () => {
     const fetchSpy: FetchSpy = vi.fn(async () => jsonResponse(200, { ok: true }));
     installFetch(fetchSpy);
 
-    render(<AuthGate><div data-testid="app">app-loaded</div></AuthGate>);
+    render(<AuthGate><div>app-loaded</div></AuthGate>);
 
-    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+    await waitFor(() => expect(screen.queryByText('app-loaded')).not.toBeNull());
     expect(fetchSpy).toHaveBeenCalledWith('/api/config', expect.any(Object));
   });
 
@@ -42,12 +42,12 @@ describe('AuthGate', () => {
     const fetchSpy: FetchSpy = vi.fn(async () => jsonResponse(401, { error: 'Unauthorized' }));
     installFetch(fetchSpy);
 
-    render(<AuthGate><div data-testid="app">app</div></AuthGate>);
+    render(<AuthGate><div>app-loaded</div></AuthGate>);
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Sign in' })).toBeTruthy();
     });
-    expect(screen.queryByTestId('app')).toBeNull();
+    expect(screen.queryByText('app-loaded')).toBeNull();
     expect(screen.getByLabelText('Token')).toBeTruthy();
   });
 
@@ -72,13 +72,13 @@ describe('AuthGate', () => {
     });
     installFetch(fetchSpy);
 
-    render(<AuthGate><div data-testid="app">app</div></AuthGate>);
+    render(<AuthGate><div>app-loaded</div></AuthGate>);
     const input = await screen.findByLabelText('Token');
 
     fireEvent.change(input, { target: { value: 'good-token' } });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
 
-    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+    await waitFor(() => expect(screen.queryByText('app-loaded')).not.toBeNull());
     expect(localStorage.getItem('baxian.token')).toBe('good-token');
   });
 
@@ -102,28 +102,28 @@ describe('AuthGate', () => {
     });
     installFetch(fetchSpy);
 
-    render(<AuthGate><div data-testid="app">app</div></AuthGate>);
+    render(<AuthGate><div>app-loaded</div></AuthGate>);
     const retry = await screen.findByRole('button', { name: 'Retry' });
     expect(screen.getByText('network down')).toBeTruthy();
 
     mode = 'ok';
     fireEvent.click(retry);
 
-    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+    await waitFor(() => expect(screen.queryByText('app-loaded')).not.toBeNull());
   });
 
   it('flips back to login when global unauthorized event fires after login', async () => {
     installFetch(vi.fn(async () => jsonResponse(200, {})));
 
-    render(<AuthGate><div data-testid="app">app</div></AuthGate>);
-    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+    render(<AuthGate><div>app-loaded</div></AuthGate>);
+    await waitFor(() => expect(screen.queryByText('app-loaded')).not.toBeNull());
 
     act(() => {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     });
 
     expect(await screen.findByText('Session expired, please enter the token again')).toBeTruthy();
-    expect(screen.queryByTestId('app')).toBeNull();
+    expect(screen.queryByText('app-loaded')).toBeNull();
   });
 
   it('renders the session-expired message in the locale switched to after login', async () => {
@@ -131,10 +131,10 @@ describe('AuthGate', () => {
 
     render(
       <I18nProvider>
-        <AuthGate><div data-testid="app">app</div></AuthGate>
+        <AuthGate><div>app-loaded</div></AuthGate>
       </I18nProvider>,
     );
-    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+    await waitFor(() => expect(screen.queryByText('app-loaded')).not.toBeNull());
 
     act(() => syncLocaleFromConfig('zh-CN'));
 
@@ -143,16 +143,16 @@ describe('AuthGate', () => {
     });
 
     expect(await screen.findByText('登录已失效，请重新输入令牌')).toBeTruthy();
-    expect(screen.queryByTestId('app')).toBeNull();
+    expect(screen.queryByText('app-loaded')).toBeNull();
   });
 
   it('syncs the locale from config when the probe succeeds', async () => {
     const fetchSpy: FetchSpy = vi.fn(async () => jsonResponse(200, { language: 'zh-CN' }));
     installFetch(fetchSpy);
 
-    render(<AuthGate><div data-testid="app">app</div></AuthGate>);
+    render(<AuthGate><div>app-loaded</div></AuthGate>);
 
-    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+    await waitFor(() => expect(screen.queryByText('app-loaded')).not.toBeNull());
     expect(getLocale()).toBe('zh-CN');
   });
 });

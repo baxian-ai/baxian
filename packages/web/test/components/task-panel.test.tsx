@@ -7,7 +7,6 @@ const { navigateMock } = vi.hoisted(() => ({
   navigateMock: vi.fn(),
 }));
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
 vi.mock('react-router-dom', async (orig) => ({
   ...(await orig<typeof import('react-router-dom')>()),
@@ -16,6 +15,7 @@ vi.mock('react-router-dom', async (orig) => ({
 
 import { api } from '../../src/api.ts';
 import { TaskPanel } from '../../src/components/task-panel.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
 
 const pageMock = vi.mocked(api.tasks.page);
@@ -64,7 +64,9 @@ function doneCalls() {
 function renderPanel(openTasks: TaskState[], projectId = 'proj') {
   return render(
     <MemoryRouter>
-      <TaskPanel projectId={projectId} openTasks={openTasks} />
+      <ToastProvider>
+        <TaskPanel projectId={projectId} openTasks={openTasks} />
+      </ToastProvider>
     </MemoryRouter>,
   );
 }
@@ -125,10 +127,12 @@ describe('TaskPanel', () => {
 
     rerender(
       <MemoryRouter>
-        <TaskPanel
-          projectId="proj"
-          openTasks={[task({ id: 'task-007', status: 'review', reviewRound: 1, title: 'evolving' })]}
-        />
+        <ToastProvider>
+          <TaskPanel
+            projectId="proj"
+            openTasks={[task({ id: 'task-007', status: 'review', reviewRound: 1, title: 'evolving' })]}
+          />
+        </ToastProvider>
       </MemoryRouter>,
     );
     const activeAfter = screen.getByRole('region', { name: 'In progress' });
@@ -142,7 +146,9 @@ describe('TaskPanel', () => {
 
     rerender(
       <MemoryRouter>
-        <TaskPanel projectId="proj" openTasks={[]} />
+        <ToastProvider>
+          <TaskPanel projectId="proj" openTasks={[]} />
+        </ToastProvider>
       </MemoryRouter>,
     );
     expect(screen.queryByText('evolving')).toBeNull();
@@ -269,20 +275,7 @@ describe('TaskPanel', () => {
     expect(screen.queryByRole('button', { name: 'Close task panel' })).toBeNull();
   });
 
-  it('renders the section titles in normal weight, not bold', () => {
-    renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
-    for (const name of ['In progress', 'Waiting to start']) {
-      const title = screen.getByRole('region', { name }).firstElementChild as HTMLElement;
-      expect(title.textContent).toContain(name);
-      expect(title.className).toContain('font-normal');
-      expect(title.className).not.toContain('font-semibold');
-    }
-    const done = screen.getByRole('button', { name: /Finished/ });
-    expect(done.className).toContain('font-normal');
-    expect(done.className).not.toContain('font-semibold');
-  });
-
-  it('renders each live status as a readable colored pill', () => {
+  it('labels each live status with its readable text and hover title', () => {
     const { container } = renderPanel([
       task({ id: 'task-001', status: 'in_progress' }),
       task({ id: 'task-002', status: 'review' }),
@@ -290,17 +283,17 @@ describe('TaskPanel', () => {
       task({ id: 'task-004', status: 'approved' }),
       task({ id: 'task-005', status: 'pending' }),
     ]);
-    expect((container.querySelector('[data-status="in_progress"]') as HTMLElement).className).toContain('pill-live');
-    expect((container.querySelector('[data-status="review"]') as HTMLElement).className).toContain('pill-review');
-    expect((container.querySelector('[data-status="fixing"]') as HTMLElement).className).toContain('pill-warn');
-    expect((container.querySelector('[data-status="approved"]') as HTMLElement).className).toContain('pill-live');
+    const label = (status: string) => (container.querySelector(`[data-status="${status}"]`) as HTMLElement).textContent;
+    expect(label('in_progress')).toBe('Developing');
+    expect(label('review')).toBe('Reviewing code');
+    expect(label('fixing')).toBe('Revising code');
+    expect(label('approved')).toBe('Running pre-merge checks');
     const pendingBadge = container.querySelector('[data-status="pending"]') as HTMLElement;
-    expect(pendingBadge.className).toContain('pill');
     expect(pendingBadge.textContent).toBe('Waiting to start');
     expect(pendingBadge.getAttribute('title')).toBe('Waiting to start');
   });
 
-  it('colors terminal status pills by outcome', async () => {
+  it('labels each terminal status by its outcome', async () => {
     mockDoneOnly(donePage([
       task({ id: 'task-090', status: 'merged' }),
       task({ id: 'task-091', status: 'max_rounds' }),
@@ -309,27 +302,10 @@ describe('TaskPanel', () => {
     ]));
     renderPanel([]);
     clickDone();
-    expect((await screen.findByText('PR merged')).className).toContain('pill-live');
-    expect(screen.getByText('Code review needs a decision').className).toContain('pill-warn');
-    expect(screen.getByText('Couldn’t complete').className).toContain('pill-danger');
-    expect(screen.getByText('Cancelled').className).toContain('pill');
-  });
-
-  it('gives the DONE divider the same hairline as the live sections', () => {
-    renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
-    const doneWrapper = screen.getByRole('button', { name: /Finished/ }).parentElement!;
-    expect(doneWrapper.className).not.toContain('border-t-2');
-    const pending = screen.getByRole('region', { name: 'Waiting to start' });
-    expect(pending.className).toContain('border-b');
-    expect(pending.className).toContain('border-hairline');
-  });
-
-  it('grows with content instead of painting its own vertical scrollbar', () => {
-    const panel = renderPanel([task({ id: 'task-001', status: 'in_progress' })])
-      .getByRole('complementary', { name: 'Task panel' });
-    expect(panel.className).not.toContain('overflow-y-auto');
-    expect(panel.className).not.toContain('max-h-');
-    expect(panel.querySelector('.overflow-y-auto')).toBeNull();
+    expect(await screen.findByText('PR merged')).toBeTruthy();
+    expect(screen.getByText('Code review needs a decision')).toBeTruthy();
+    expect(screen.getByText('Couldn’t complete')).toBeTruthy();
+    expect(screen.getByText('Cancelled')).toBeTruthy();
   });
 
   it('clicking a task row navigates to its detail page', () => {

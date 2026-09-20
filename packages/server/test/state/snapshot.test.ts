@@ -23,6 +23,7 @@ function task(status: TaskState['status']): TaskState {
     description: 'D',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
     reviewRound: 0,
     status,
     createdAt: NOW,
@@ -210,7 +211,6 @@ describe('agentSnapshot', () => {
         message: 'Agent runtime has been idle while a task is active — likely waiting on user input.',
         latestError: {
           id: 'err-1',
-          agentId: 'dev-1',
           reason: 'PENDING_IDLE',
           message: 'idle',
           occurredAt: NOW,
@@ -234,7 +234,6 @@ describe('agentSnapshot', () => {
         message: 'Agent runtime has been idle while a task is active — likely waiting on user input.',
         latestError: {
           id: 'err-1',
-          agentId: 'qa-1',
           reason: 'PENDING_IDLE',
           message: 'idle',
           occurredAt: NOW,
@@ -258,7 +257,6 @@ describe('agentSnapshot', () => {
         message: 'idle',
         latestError: {
           id: 'err-1',
-          agentId: 'dev-1',
           reason: 'PENDING_IDLE',
           message: 'idle',
           occurredAt: NOW,
@@ -283,7 +281,6 @@ describe('agentSnapshot', () => {
         message: 'ssh dead',
         latestError: {
           id: 'err-2',
-          agentId: 'dev-1',
           reason: 'TMUX_UNREACHABLE',
           message: 'ssh dead',
           occurredAt: NOW,
@@ -430,7 +427,7 @@ describe('QA participant while dev is fixing', () => {
     runtimeStatusHint: 'pending',
     reason: 'PENDING_IDLE',
     message: 'idle',
-    latestError: { id: 'err-1', agentId: 'qa-1', reason: 'PENDING_IDLE', message: 'idle', occurredAt: NOW },
+    latestError: { id: 'err-1', reason: 'PENDING_IDLE', message: 'idle', occurredAt: NOW },
   });
 
   it('QA bound to a fixing task is waiting on dev, so PENDING_IDLE is suppressed', () => {

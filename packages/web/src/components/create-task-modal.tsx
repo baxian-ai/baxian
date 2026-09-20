@@ -305,12 +305,11 @@ export function CreateTaskModal(props: Props) {
       }
       return true;
     });
-    setImages((prev) => {
-      if (prev.length + sized.length > TASK_IMAGE_MAX_COUNT) {
-        show({ kind: 'warn', title: t.createTask.tooManyImagesToastTitle(TASK_IMAGE_MAX_COUNT) });
-      }
-      return [...prev, ...sized].slice(0, TASK_IMAGE_MAX_COUNT);
-    });
+    // 超限判定放在 updater 之外:updater 在 React 计算本组件更新期间运行,在里面 show() 等于渲染期更新 ToastProvider
+    if (images.length + sized.length > TASK_IMAGE_MAX_COUNT) {
+      show({ kind: 'warn', title: t.createTask.tooManyImagesToastTitle(TASK_IMAGE_MAX_COUNT) });
+    }
+    setImages((prev) => [...prev, ...sized].slice(0, TASK_IMAGE_MAX_COUNT));
   };
 
   const removeImage = (idx: number) => setImages((prev) => prev.filter((_, i) => i !== idx));

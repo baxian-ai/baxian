@@ -2,12 +2,13 @@ import { it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { HostConfig } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 import { api } from '../../src/api.ts';
 import { HostManagementModal } from '../../src/components/host-management-modal.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { makeRuntimes } from '../helpers/fixtures.ts';
+import { expectToast } from '../helpers/toast.tsx';
 
 const listMock = vi.mocked(api.hosts.list);
 const createMock = vi.mocked(api.hosts.create);
@@ -45,26 +46,26 @@ beforeEach(() => {
 });
 
 it('shows an empty state when no hosts are configured', async () => {
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   expect(await screen.findByText(/No hosts configured yet/)).toBeTruthy();
 });
 
 it('lists configured hosts with a password indicator', async () => {
   listMock.mockResolvedValue([HOST]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   expect(await screen.findByText('Prod')).toBeTruthy();
   expect(screen.getByText(/Password saved/)).toBeTruthy();
 });
 
 it('shows a portless host with no :port suffix (not :22), reflecting that ~/.ssh/config decides the port', async () => {
   listMock.mockResolvedValue([{ id: 'nas', hostname: 'nas.local', user: 'agent' } as HostConfig]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   expect((await screen.findAllByText('agent@nas.local')).length).toBeGreaterThan(0);
   expect(screen.queryByText(/:22/)).toBeNull();
 });
 
 it('add flow: shows the password warning and creates a host on save', async () => {
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
 
   expect(screen.getByText(/plaintext/)).toBeTruthy();
@@ -75,10 +76,11 @@ it('add flow: shows the password warning and creates a host on save', async () =
   await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
   expect(createMock.mock.calls[0][0]).toMatchObject({ hostname: 'h.example.com' });
   expect(createMock.mock.calls[0][0]).not.toHaveProperty('port');
+  await expectToast({ title: 'Host h-example-com added' });
 });
 
 it('port is optional: a blank port keeps Save enabled and sends NO port (so ~/.ssh/config Port is honored)', async () => {
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
 
@@ -91,7 +93,7 @@ it('port is optional: a blank port keeps Save enabled and sends NO port (so ~/.s
 });
 
 it('a provided port flows through; an out-of-range one blocks Save', async () => {
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
 
@@ -107,7 +109,7 @@ it('a provided port flows through; an out-of-range one blocks Save', async () =>
 });
 
 it('"Test connection" probes the inline host and renders SSH + tmux status', async () => {
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -123,7 +125,7 @@ it('renders an SSH failure and offers no tmux install button when SSH is down', 
     tmux: { ok: false, message: 'SSH 不通，无法探测' },
     runtimes: PROBE_OK.runtimes,
   });
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'bad.host' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -134,7 +136,7 @@ it('renders an SSH failure and offers no tmux install button when SSH is down', 
 });
 
 it('carries the typed password into the inline probe host', async () => {
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.change(screen.getByLabelText('Username (optional)'), { target: { value: 'agent' } });
@@ -149,7 +151,7 @@ it('carries the typed password into the inline probe host', async () => {
 
 it('edit with unchanged connection fields probes by hostId so the stored password is reused', async () => {
   listMock.mockResolvedValue([HOST]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Edit'));
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
 
@@ -158,7 +160,7 @@ it('edit with unchanged connection fields probes by hostId so the stored passwor
 
 it('edit with a changed hostname probes the inline host instead of the stored one', async () => {
   listMock.mockResolvedValue([HOST]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Edit'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'new.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -170,7 +172,7 @@ it('edit with a changed hostname probes the inline host instead of the stored on
 
 it('tmux missing: one-click install installs, refreshes the tmux row from the response, and shows the result', async () => {
   probeMock.mockResolvedValue(PROBE_TMUX_MISSING);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -193,7 +195,7 @@ it('install failure keeps the tmux row red and surfaces the manual command', asy
     message: 'cannot install automatically: not root and passwordless sudo is unavailable — run "sudo apt-get install -y tmux" on the host',
     tmux: { ok: false, message: '请安装 tmux' },
   });
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -211,7 +213,7 @@ it('shows a loading hint while installing and ignores repeated clicks', async ()
   probeMock.mockResolvedValue(PROBE_TMUX_MISSING);
   let resolveInstall: ((value: Awaited<ReturnType<typeof api.agents.installTmux>>) => void) | undefined;
   installTmuxMock.mockReturnValue(new Promise((resolve) => { resolveInstall = resolve; }));
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -240,7 +242,7 @@ it('shows a loading hint while installing and ignores repeated clicks', async ()
 
 it('closing the modal aborts the in-flight probe controller', async () => {
   probeMock.mockReturnValue(new Promise(() => {}));
-  const { rerender } = render(<HostManagementModal open onClose={() => {}} />);
+  const { rerender } = render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -256,7 +258,7 @@ it('closing the modal aborts the in-flight probe controller', async () => {
 
 it('editing a connection field aborts the in-flight probe and re-enables the button', async () => {
   probeMock.mockReturnValue(new Promise(() => {}));
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -272,7 +274,7 @@ it('editing a connection field aborts the in-flight probe and re-enables the but
 });
 
 it('editing a connection field clears the previous probe result', async () => {
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
   fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -284,7 +286,7 @@ it('editing a connection field clears the previous probe result', async () => {
 
 it('surfaces a connectivity-gate error from create (does not silently swallow)', async () => {
   createMock.mockRejectedValue(new Error('SSH 不通\n检查地址 / 端口 / 密码或 key 认证'));
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h' } });
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
@@ -295,14 +297,15 @@ it('surfaces a connectivity-gate error from create (does not silently swallow)',
 
 it('deletes a host', async () => {
   listMock.mockResolvedValue([HOST]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Delete'));
   await waitFor(() => expect(deleteMock).toHaveBeenCalledWith('box'));
+  await expectToast({ title: 'Host box deleted' });
 });
 
 it('edit: clearing alias/user sends explicit empty strings so PATCH can clear them', async () => {
   listMock.mockResolvedValue([HOST]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Edit'));
   fireEvent.change(screen.getByLabelText('Alias (optional)'), { target: { value: '' } });
   fireEvent.change(screen.getByLabelText('Username (optional)'), { target: { value: '' } });
@@ -315,7 +318,7 @@ it('edit: clearing alias/user sends explicit empty strings so PATCH can clear th
 
 it('edit: clearing the port field sends port: null so the server can drop a wrongly-saved 22', async () => {
   listMock.mockResolvedValue([{ id: 'box', hostname: 'h.example.com', port: 2222, user: 'agent' } as HostConfig]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Edit'));
   fireEvent.change(screen.getByLabelText('Port (optional)'), { target: { value: '' } });
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
@@ -326,7 +329,7 @@ it('edit: clearing the port field sends port: null so the server can drop a wron
 
 it('edit: an unchanged prefilled port is sent as its number (not cleared)', async () => {
   listMock.mockResolvedValue([{ id: 'box', hostname: 'h.example.com', port: 2222, user: 'agent' } as HostConfig]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Edit'));
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
@@ -336,7 +339,7 @@ it('edit: an unchanged prefilled port is sent as its number (not cleared)', asyn
 
 it('edit: "clear saved password" checkbox sends password: "" so the server can drop it', async () => {
   listMock.mockResolvedValue([HOST]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Edit'));
   fireEvent.click(screen.getByRole('checkbox', { name: /Clear the saved password/ }));
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
@@ -347,7 +350,7 @@ it('edit: "clear saved password" checkbox sends password: "" so the server can d
 
 it('edit: omitting the password (no clear) does NOT send a password field (keep current)', async () => {
   listMock.mockResolvedValue([HOST]);
-  render(<HostManagementModal open onClose={() => {}} />);
+  render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   fireEvent.click(await screen.findByText('Edit'));
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 

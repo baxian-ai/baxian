@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { AgentManager } from '../../src/agent/manager.js';
 import type { BaxianEvent } from '../../src/shared/index.js';
 import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { makeConfig } from '../helpers/fixtures.js';
@@ -9,6 +10,7 @@ const harness = useManagerSuiteHarness();
 
 const SOURCE = 'task-001';
 const TOKEN = 'spawntok1234';
+const RETRY_MS = 20;
 
 function intent(title = 'fix auth refresh', over: Partial<{ taskId: string; token: string }> = {}) {
   return { agentId: 'dev-1', taskId: SOURCE, projectId: 'proj', token: TOKEN, title, ...over };
@@ -25,6 +27,11 @@ async function children(): Promise<Array<{ id: string; title: string; origin?: {
 async function seedSource(over: Record<string, unknown> = {}) {
   return harness.seedTask({ id: SOURCE, status: 'in_progress', signalToken: TOKEN, agentId: 'dev-1', devAgentId: 'dev-1', ...over });
 }
+
+const today = () => new Date().toISOString().slice(0, 10);
+const failedEvents = async (reason?: string) => (await harness.eventLog.readDate(today()))
+  .filter(e => e.type === 'human.intervention' && e.data.phase === 'task-create-failed'
+    && (reason === undefined || e.data.reason === reason));
 
 describe('AgentManager task-create side channel', () => {
   it('creates a pending, unassigned task carrying its origin and announces it', async () => {
@@ -58,162 +65,161 @@ describe('AgentManager task-create side channel', () => {
     expect((await children()).map(c => c.title).sort()).toEqual(['one', 'two']);
   });
 
-  it('drops the intent when the source task no longer exists', async () => {
-    await harness.manager.spawnTaskFromSignal(intent('orphan', { taskId: 'task-404' }));
-    expect(await children()).toEqual([]);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
-    expect(eventsOf('human.intervention')).toEqual([]);
-  });
-
-  it('fails finally and dequeues when the source project is gone', async () => {
-    await seedSource({ projectId: 'ghost' });
-    await harness.manager.spawnTaskFromSignal(intent());
-    expect(await children()).toEqual([]);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
-    expect(eventsOf('human.intervention', 'task-create-failed').map(e => e.data)).toEqual([
-      expect.objectContaining({ reason: 'project-missing', title: 'fix auth refresh' }),
-    ]);
-  });
-
-  it('queues a storage failure, reports it once, and converges on the retry pass', async () => {
-    await seedSource();
-    const boom = Object.assign(new Error('EIO: i/o error, scandir'), { code: 'EIO' });
-    const failing = vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(boom).mockRejectedValueOnce(boom);
-    const before = await readFile(join(harness.tempDir, 'state', 'tasks', `${SOURCE}.json`), 'utf-8');
-    await harness.manager.spawnTaskFromSignal(intent());
-    await harness.manager.spawnTaskFromSignal(intent());
-    expect(await children()).toEqual([]);
-    expect(await readFile(join(harness.tempDir, 'state', 'tasks', `${SOURCE}.json`), 'utf-8')).toBe(before);
-    expect(harness.manager['spawnRetry'].size).toBe(1);
-    expect(eventsOf('human.intervention', 'task-create-failed').map(e => e.data)).toEqual([
-      expect.objectContaining({ title: 'fix auth refresh', error: expect.stringContaining('EIO') }),
-    ]);
-    failing.mockRestore();
-    await harness.manager['spawnRetryPass']();
-    expect((await children()).map(c => c.id)).toEqual(['task-002']);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
-  });
-
-  it('keeps the queue across need-input generation cleanup, token rotation, and source cancellation', async () => {
-    const source = await seedSource({ status: 'pending', agentId: '', devAgentId: '', qaAgentId: undefined, preferredAgentId: '' });
-    vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
-    await harness.manager.spawnTaskFromSignal(intent());
-    expect(harness.manager['spawnRetry'].size).toBe(1);
-    harness.manager['clearNeedInputRetryFor']('dev-1', SOURCE);
-    await harness.taskStore.set({ ...source, signalToken: 'rotatedtok99', updatedAt: new Date().toISOString() });
-    await harness.manager.cancelTask(SOURCE);
-    expect(harness.manager['spawnRetry'].size).toBe(1);
-    await harness.manager['spawnRetryPass']();
-    expect(await children()).toHaveLength(1);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
-  });
-
-  it('terminates a queued intent on the retry pass once its project has been removed', async () => {
-    await seedSource();
-    vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
-    await harness.manager.spawnTaskFromSignal(intent());
-    harness.manager.replaceConfig(makeConfig({ project: [] }));
-    await harness.manager['spawnRetryPass']();
-    expect(harness.manager['spawnRetry'].size).toBe(0);
-    expect(eventsOf('human.intervention', 'task-create-failed').map(e => e.data.reason)).toEqual([undefined, 'project-missing']);
-    await harness.manager['spawnRetryPass']();
-    expect(eventsOf('human.intervention', 'task-create-failed')).toHaveLength(2);
-  });
-
-  it('refuses to create on an incomplete dedupe scan and names the offending file', async () => {
-    await seedSource();
-    await harness.manager.spawnTaskFromSignal(intent());
-    const bad = join(harness.tempDir, 'state', 'tasks', 'task-bad.json');
-    await writeFile(bad, '{corrupt');
-    await harness.manager.spawnTaskFromSignal(intent());
-    expect(harness.manager['spawnRetry'].size).toBe(1);
-    expect(eventsOf('human.intervention', 'task-create-failed')[0].data.error).toContain('task-bad.json');
-    await writeFile(bad, JSON.stringify({
-      ...(await harness.taskStore.get(SOURCE)), id: 'task-bad', projectId: 'other', status: 'done',
-    }));
-    await harness.manager['spawnRetryPass']();
-    expect(await children()).toHaveLength(1);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
-  });
-
   it('serialises concurrent replays so both resolve to a single child', async () => {
     await seedSource();
     await Promise.all([harness.manager.spawnTaskFromSignal(intent()), harness.manager.spawnTaskFromSignal(intent())]);
     expect(await children()).toHaveLength(1);
   });
-});
 
-describe('AgentManager task-create durability', () => {
+  it('refuses to create on an incomplete dedupe scan and names the offending file', async () => {
+    await seedSource();
+    await harness.manager.spawnTaskFromSignal(intent());
+    await writeFile(join(harness.tempDir, 'state', 'tasks', 'task-bad.json'), '{corrupt');
+    await harness.manager.spawnTaskFromSignal(intent());
+    expect(eventsOf('task.created')).toHaveLength(1);
+    expect(eventsOf('human.intervention', 'task-create-failed')[0].data.error).toContain('task-bad.json');
+  });
+
   it('persists the first failure in the event log with the title a human needs to recreate it', async () => {
     await seedSource();
     vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
     await harness.manager.spawnTaskFromSignal(intent('recover me'));
-    const today = new Date().toISOString().slice(0, 10);
-    const logged = (await harness.eventLog.readDate(today))
-      .filter(e => e.type === 'human.intervention' && e.data.phase === 'task-create-failed' && e.taskId === SOURCE);
-    expect(logged.map(e => e.data)).toEqual([
+    expect((await failedEvents()).filter(e => e.taskId === SOURCE).map(e => e.data)).toEqual([
       expect.objectContaining({ title: 'recover me', token: TOKEN, error: 'EIO' }),
     ]);
   });
-
-  it('retries on the real interval timer, not only when the pass is invoked by hand', async () => {
-    await seedSource();
-    const manager = harness.createManager({ needInputRetryIntervalMs: 20 });
-    vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
-    await manager.spawnTaskFromSignal(intent('timer child'));
-    expect(manager['spawnRetry'].size).toBe(1);
-    await vi.waitFor(async () => {
-      expect((await children()).map(c => c.title)).toEqual(['timer child']);
-    }, { timeout: 2000, interval: 25 });
-    await vi.waitFor(() => expect(manager['spawnRetry'].size).toBe(0), { timeout: 2000, interval: 25 });
-    expect(manager['spawnRetryTimer']).toBeNull();
-  });
 });
 
-describe('AgentManager task-create failure notification durability', () => {
+// Retry scheduling is observed from the clock boundary: a queued intent shows as one pending interval,
+// a drained queue as none. The cancel must be real — a nulled handle without clearInterval keeps the count at 1.
+describe('AgentManager task-create retry (interval clock)', () => {
+  let manager: AgentManager;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    manager = harness.createManager({ needInputRetryIntervalMs: RETRY_MS });
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const tick = () => vi.advanceTimersByTimeAsync(RETRY_MS);
+  const restoreProject = () =>
+    manager.replaceConfig(makeConfig({ project: [{ ...makeConfig().project[0]!, id: 'ghost' }] }));
+
+  it('drops the intent when the source task no longer exists: nothing created, nothing scheduled', async () => {
+    await manager.spawnTaskFromSignal(intent('orphan', { taskId: 'task-404' }));
+    expect(await children()).toEqual([]);
+    expect(eventsOf('human.intervention')).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('fails finally when the source project is gone: verdict persisted, nothing scheduled', async () => {
+    await seedSource({ projectId: 'ghost' });
+    await manager.spawnTaskFromSignal(intent());
+    expect(await children()).toEqual([]);
+    expect((await failedEvents('project-missing')).map(e => e.data.title)).toEqual(['fix auth refresh']);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('queues a storage failure, reports it once, retries on the interval, and stops the clock once done', async () => {
+    await seedSource();
+    const boom = Object.assign(new Error('EIO: i/o error, scandir'), { code: 'EIO' });
+    vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(boom).mockRejectedValueOnce(boom);
+    const sourceFile = join(harness.tempDir, 'state', 'tasks', `${SOURCE}.json`);
+    const before = await readFile(sourceFile, 'utf-8');
+
+    await manager.spawnTaskFromSignal(intent());
+    await manager.spawnTaskFromSignal(intent());
+    expect(await children()).toEqual([]);
+    expect(await readFile(sourceFile, 'utf-8')).toBe(before);
+    expect((await failedEvents()).map(e => e.data)).toEqual([
+      expect.objectContaining({ title: 'fix auth refresh', error: expect.stringContaining('EIO') }),
+    ]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await tick();
+    await vi.waitFor(async () => expect((await children()).map(c => c.id)).toEqual(['task-002']));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
+  });
+
+  it('keeps retrying across need-input generation cleanup, token rotation, and source cancellation', async () => {
+    const source = await seedSource({ status: 'review' });
+    await harness.seedAgent({ id: 'dev-1', taskId: SOURCE, paneId: '%0', needInput: { epoch: 3, askSeq: 1, answeredSeq: 0 } });
+    await harness.acquireAgentLock('dev-1');
+    vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
+    await manager.spawnTaskFromSignal(intent());
+    expect(vi.getTimerCount()).toBe(1);
+
+    await manager.releaseAgentForTask('dev-1', SOURCE, 'waiting');
+    expect((await harness.agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 4 });
+    await harness.taskStore.set({ ...source, signalToken: 'rotatedtok99', updatedAt: new Date().toISOString() });
+    await manager.cancelTask(SOURCE);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await tick();
+    await vi.waitFor(async () => expect(await children()).toHaveLength(1));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
+  });
+
+  it('terminates a queued intent once its project has been removed and never fires again', async () => {
+    await seedSource();
+    vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
+    await manager.spawnTaskFromSignal(intent());
+    manager.replaceConfig(makeConfig({ project: [] }));
+
+    await tick();
+    await vi.waitFor(async () => expect((await failedEvents()).map(e => e.data.reason)).toEqual([undefined, 'project-missing']));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
+    await tick();
+    expect(await failedEvents()).toHaveLength(2);
+    expect(await children()).toEqual([]);
+  });
+
+  it('retries a dedupe scan that failed on a corrupt sibling file once the file is repaired', async () => {
+    await seedSource();
+    await manager.spawnTaskFromSignal(intent());
+    const bad = join(harness.tempDir, 'state', 'tasks', 'task-bad.json');
+    await writeFile(bad, '{corrupt');
+    await manager.spawnTaskFromSignal(intent());
+    expect(vi.getTimerCount()).toBe(1);
+
+    await writeFile(bad, JSON.stringify({
+      ...(await harness.taskStore.get(SOURCE)), id: 'task-bad', projectId: 'other', status: 'done',
+    }));
+    await tick();
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
+    expect(await children()).toHaveLength(1);
+  });
+
   it('keeps trying to persist the failure event on later retries until the log accepts it', async () => {
     await seedSource();
-    const today = new Date().toISOString().slice(0, 10);
-    const failedEvents = async () => (await harness.eventLog.readDate(today))
-      .filter(e => e.type === 'human.intervention' && e.data.phase === 'task-create-failed');
     const eio = new Error('EIO');
-    vi.spyOn(harness.taskStore, 'nextId')
-      .mockRejectedValueOnce(eio).mockRejectedValueOnce(eio).mockRejectedValueOnce(eio);
+    vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(eio).mockRejectedValueOnce(eio).mockRejectedValueOnce(eio);
     vi.spyOn(harness.eventLog, 'append').mockRejectedValueOnce(new Error('log disk full'));
 
-    await harness.manager.spawnTaskFromSignal(intent('notify me'));
+    await manager.spawnTaskFromSignal(intent('notify me'));
     expect(await failedEvents()).toEqual([]);
-    expect(harness.manager['spawnRetry'].size).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
 
-    await harness.manager['spawnRetryPass']();
-    expect((await failedEvents()).map(e => e.data.title)).toEqual(['notify me']);
-
-    await harness.manager['spawnRetryPass']();
-    expect(await failedEvents()).toHaveLength(1);
-
-    await harness.manager['spawnRetryPass']();
-    expect((await children()).map(c => c.title)).toEqual(['notify me']);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
+    await tick();
+    await vi.waitFor(async () => expect((await failedEvents()).map(e => e.data.title)).toEqual(['notify me']));
+    await tick();
+    await vi.waitFor(async () => expect(await failedEvents()).toHaveLength(1));
+    await tick();
+    await vi.waitFor(async () => expect((await children()).map(c => c.title)).toEqual(['notify me']));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
   });
-});
-
-describe('AgentManager task-create final-notification retry', () => {
-  const today = () => new Date().toISOString().slice(0, 10);
-  const failedEvents = async (reason?: string) => (await harness.eventLog.readDate(today()))
-    .filter(e => e.type === 'human.intervention' && e.data.phase === 'task-create-failed'
-      && (reason === undefined || e.data.reason === reason));
 
   it('keeps a notify-only entry when the project-missing verdict did not persist, and never creates on it', async () => {
     await seedSource({ projectId: 'ghost' });
     vi.spyOn(harness.eventLog, 'append').mockRejectedValueOnce(new Error('log disk full'));
-    await harness.manager.spawnTaskFromSignal(intent());
+    await manager.spawnTaskFromSignal(intent());
     expect(await failedEvents('project-missing')).toEqual([]);
-    expect(harness.manager['spawnRetry'].size).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
 
-    harness.manager.replaceConfig(makeConfig({ project: [{ ...makeConfig().project[0]!, id: 'ghost' }] }));
-    await harness.manager['spawnRetryPass']();
-    expect((await failedEvents('project-missing')).map(e => e.data.title)).toEqual(['fix auth refresh']);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
+    restoreProject();
+    await tick();
+    await vi.waitFor(async () => expect((await failedEvents('project-missing')).map(e => e.data.title)).toEqual(['fix auth refresh']));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
     expect(await children()).toEqual([]);
   });
 
@@ -221,9 +227,9 @@ describe('AgentManager task-create final-notification retry', () => {
     await seedSource();
     vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
     vi.spyOn(harness.eventLog, 'append').mockRejectedValueOnce(new Error('log disk full'));
-    await harness.manager.spawnTaskFromSignal(intent());
-    await harness.manager['spawnRetryPass']();
-    expect(await children()).toHaveLength(1);
+    await manager.spawnTaskFromSignal(intent());
+    await tick();
+    await vi.waitFor(async () => expect(await children()).toHaveLength(1));
     expect(await failedEvents()).toEqual([]);
   });
 
@@ -232,44 +238,39 @@ describe('AgentManager task-create final-notification retry', () => {
     const eio = new Error('EIO');
     vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(eio).mockRejectedValueOnce(eio);
     harness.eventBus.on('human.intervention', async () => { throw new Error('handler down'); });
-    await harness.manager.spawnTaskFromSignal(intent());
-    await harness.manager['spawnRetryPass']();
-    expect(await failedEvents()).toHaveLength(2);
-    await harness.manager['spawnRetryPass']();
-    expect(await children()).toHaveLength(1);
+    await manager.spawnTaskFromSignal(intent());
+    await tick();
+    await vi.waitFor(async () => expect(await failedEvents()).toHaveLength(2));
+    await tick();
+    await vi.waitFor(async () => expect(await children()).toHaveLength(1));
   });
-});
 
-describe('AgentManager task-create retry entry identity', () => {
   it('a late final-notification callback never dequeues a newer create retry sharing its key', async () => {
     await seedSource({ projectId: 'ghost' });
     vi.spyOn(harness.eventLog, 'append').mockRejectedValueOnce(new Error('log disk full'));
-    await harness.manager.spawnTaskFromSignal(intent());
-    expect(harness.manager['spawnRetry'].get(`${SOURCE}\0fix auth refresh`)?.final).toBe('project-missing');
+    await manager.spawnTaskFromSignal(intent());
+    expect(vi.getTimerCount()).toBe(1);
 
     let releaseAppend!: () => void;
+    let reached!: () => void;
     const gate = new Promise<void>(resolve => { releaseAppend = resolve; });
+    const reachedGate = new Promise<void>(resolve => { reached = resolve; });
     const realAppend = harness.eventLog.append.bind(harness.eventLog);
-    vi.spyOn(harness.eventLog, 'append').mockImplementationOnce(async (event) => { await gate; await realAppend(event); });
-    const pass = harness.manager['spawnRetryPass']();
-    await new Promise(resolve => setImmediate(resolve));
+    vi.spyOn(harness.eventLog, 'append').mockImplementationOnce(async (event) => { reached(); await gate; await realAppend(event); });
+    await tick();
+    await reachedGate;
 
-    harness.manager.replaceConfig(makeConfig({ project: [{ ...makeConfig().project[0]!, id: 'ghost' }] }));
+    restoreProject();
     vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
-    await harness.manager.spawnTaskFromSignal(intent());
-    const fresh = harness.manager['spawnRetry'].get(`${SOURCE}\0fix auth refresh`);
-    expect(fresh?.final).toBeUndefined();
-
+    await manager.spawnTaskFromSignal(intent());
     releaseAppend();
-    await pass;
-    expect(harness.manager['spawnRetry'].get(`${SOURCE}\0fix auth refresh`)).toBe(fresh);
-    await harness.manager['spawnRetryPass']();
-    expect((await children()).map(c => c.title)).toEqual(['fix auth refresh']);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
-  });
-});
+    await vi.waitFor(async () => expect((await failedEvents('project-missing')).length).toBe(1));
 
-describe('AgentManager task-create final entry write guard', () => {
+    await tick();
+    await vi.waitFor(async () => expect((await children()).map(c => c.title)).toEqual(['fix auth refresh']));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
+  });
+
   it('a first project-missing verdict whose notification fails never overwrites a newer create retry under its key', async () => {
     await seedSource({ projectId: 'ghost' });
     let failAppend!: () => void;
@@ -277,20 +278,17 @@ describe('AgentManager task-create final entry write guard', () => {
     const gate = new Promise<never>((_, reject) => { failAppend = () => reject(new Error('log disk full')); });
     const reachedGate = new Promise<void>(resolve => { reached = resolve; });
     vi.spyOn(harness.eventLog, 'append').mockImplementationOnce(() => { reached(); return gate; });
-    const first = harness.manager.spawnTaskFromSignal(intent());
+    const first = manager.spawnTaskFromSignal(intent());
     await reachedGate;
 
-    harness.manager.replaceConfig(makeConfig({ project: [{ ...makeConfig().project[0]!, id: 'ghost' }] }));
+    restoreProject();
     vi.spyOn(harness.taskStore, 'nextId').mockRejectedValueOnce(new Error('EIO'));
-    await harness.manager.spawnTaskFromSignal(intent());
-    const fresh = harness.manager['spawnRetry'].get(`${SOURCE}\0fix auth refresh`);
-    expect(fresh?.final).toBeUndefined();
-
+    await manager.spawnTaskFromSignal(intent());
     failAppend();
     await first;
-    expect(harness.manager['spawnRetry'].get(`${SOURCE}\0fix auth refresh`)).toBe(fresh);
-    await harness.manager['spawnRetryPass']();
-    expect((await children()).map(c => c.title)).toEqual(['fix auth refresh']);
-    expect(harness.manager['spawnRetry'].size).toBe(0);
+
+    await tick();
+    await vi.waitFor(async () => expect((await children()).map(c => c.title)).toEqual(['fix auth refresh']));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(0));
   });
 });

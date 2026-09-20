@@ -277,7 +277,7 @@ describe('PaneStreamerManager', () => {
       await s.subscribeAtomic(cbs);
 
       let calls = 0;
-      (fakePty as unknown as { writeImpl?: (d: string) => void }).writeImpl = () => {
+      fakePty.writeImpl = () => {
         calls += 1;
         if (calls === 1) throw new Error('pty.write failed');
       };
@@ -812,6 +812,7 @@ describe('probe admission ordering (lazy start, no untracked live bodies)', () =
       });
       const owner = manager.ensure(TEST_AGENT);
       void owner;
+      // E1: 只有内部探针钩子能让 kill 在 deadline 上抛错;仅用于触发,断言走 warn 与公共 _geometryPendingForTest
       const hooks = (manager as unknown as {
         geometryHooksFor: (o: unknown) => { raceProbe: <T>(s: () => { result: Promise<T>; settled: Promise<unknown>; onDeadline: () => void }) => Promise<T> };
         owners: Map<string, unknown>;

@@ -33,20 +33,14 @@ function renderWithToast(technical = false) {
 afterEach(cleanup);
 
 describe('Toast layout (mobile)', () => {
-  it('renders a fluid, viewport-capped toast (never a fixed w-80) so it cannot overflow a 320px screen', () => {
+  it('keeps the toast fluid and viewport-capped inside a region bounded on both sides so it cannot overflow a 320px screen', () => {
     renderWithToast();
     const toast = screen.getByRole('status');
     expect(toast.className).toContain('w-full');
     expect(toast.className).toContain('max-w-xs');
-    expect(toast.className).not.toContain('w-80');
-  });
-
-  it('bounds the toast region on both sides and right-aligns items so narrow screens keep their margins', () => {
-    renderWithToast();
-    const region = screen.getByRole('status').parentElement!;
+    const region = toast.parentElement!;
     expect(region.className).toContain('inset-x-4');
     expect(region.className).toContain('items-end');
-    expect(region.className).not.toContain('right-4');
   });
 
   it('keeps raw action errors in collapsed technical details', () => {

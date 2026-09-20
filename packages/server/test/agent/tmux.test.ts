@@ -1,19 +1,21 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError, ReplNotReadyError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog } from '../../src/agent/tmux.js';
+import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError, ReplNotReadyError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog, hasReplProcTitle } from '../../src/agent/tmux.js';
+import { fakeRunner, foregroundCondAccepts } from '../helpers/fake-runner.js';
 import type { PaneRef } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { blank, CC_NONYOLO_BASH_PERMISSION, CODEX_NONYOLO_ESCALATION } from './runtime-captures.js';
 import { classifyScreen } from '../../src/agent/detect/classify.js';
 
-type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
+type ExecMock = ReturnType<typeof vi.fn<CommandRunner['exec']>>;
+type StdinMock = ReturnType<typeof vi.fn<CommandRunner['execWithStdin']>>;
 
-function mockRunner(): CommandRunner & { exec: ExecMock } {
+function mockRunner(): CommandRunner & { exec: ExecMock; execWithStdin: StdinMock } {
   return {
-    exec: vi.fn<(cmd: string) => Promise<ExecResult>>().mockResolvedValue({
+    exec: vi.fn<CommandRunner['exec']>().mockResolvedValue({
       stdout: '', stderr: '', exitCode: 0,
     }),
-    writeFile: vi.fn<(p: string, c: Buffer | string) => Promise<void>>().mockResolvedValue(undefined),
-    execWithStdin: vi.fn<(cmd: string, stdin: Buffer) => Promise<ExecResult>>().mockResolvedValue({
+    writeFile: vi.fn<CommandRunner['writeFile']>().mockResolvedValue(undefined),
+    execWithStdin: vi.fn<CommandRunner['execWithStdin']>().mockResolvedValue({
       stdout: '', stderr: '', exitCode: 0,
     }),
   };
@@ -55,41 +57,23 @@ describe('TmuxManager', () => {
   describe('createSession', () => {
     const REF_OUT = '4242|1700000000|$1\n';
 
-    it('runs tmux new-session with raw session name (no exact-match prefix needed for new sessions)', async () => {
+    it('new-session carries the raw name, cwd, 200x50 size, a literal PATH via -e, and no post-create options', async () => {
       primeExec(REF_OUT);
       await tmux.createSession('kk-dev-1', '/home/user/code');
       const cmd = lastCmd(runner);
       expect(cmd).toContain('tmux new-session -d');
       expect(cmd).toContain("-s 'kk-dev-1'");
       expect(cmd).toContain("-c '/home/user/code'");
-    });
-
-    it('sets default pane size 200x50 via -x/-y', async () => {
-      primeExec(REF_OUT);
-      await tmux.createSession('kk-dev-1', '/home/user/code');
-      const cmd = lastCmd(runner);
       expect(cmd).toContain('-x 200');
       expect(cmd).toContain('-y 50');
-    });
-
-    it('injects literal PATH via tmux -e (no shell-side $PATH expansion → fish-safe)', async () => {
-      primeExec(REF_OUT);
-      await tmux.createSession('kk-dev-1', '/home/user/code');
-      const cmd = lastCmd(runner);
       expect(cmd).toContain(
         "-e 'PATH=/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'",
       );
       expect(cmd).not.toContain('$PATH');
-    });
-
-    it('does NOT chain post-create options (those live in buildFreshSession for rollback safety)', async () => {
-      primeExec(REF_OUT);
-      await tmux.createSession('kk-dev-1', '/home/user/code');
-      const cmd = lastCmd(runner);
-      expect(cmd).not.toContain('set-option');
-      expect(cmd).not.toContain('mouse');
-      expect(cmd).not.toContain('allow-passthrough');
-      expect(cmd).not.toContain('extended-keys');
+      // post-create options live in buildFreshSession so a failed create rolls back cleanly
+      for (const chained of ['set-option', 'mouse', 'allow-passthrough', 'extended-keys']) {
+        expect(cmd).not.toContain(chained);
+      }
     });
 
     it('throws when new-session fails (e.g. duplicate name)', async () => {
@@ -106,13 +90,6 @@ describe('TmuxManager', () => {
       const cmd = lastCmd(runner);
       expect(cmd).toBe("tmux set-option -s 'extended-keys' 'on'");
     });
-
-    it('throws on non-zero exit', async () => {
-      runner.exec.mockResolvedValueOnce({
-        stdout: '', stderr: 'unknown option: extended-keys', exitCode: 1,
-      });
-      await expect(tmux.setServerOption('extended-keys', 'on')).rejects.toThrow(/unknown option/);
-    });
   });
 
   describe('appendServerOptionIfMissing', () => {
@@ -124,14 +101,18 @@ describe('TmuxManager', () => {
       expect(cmd).toContain("set-option -sa 'terminal-features' 'xterm*:extkeys'");
       expect(cmd).toContain('||');
     });
+  });
 
-    it('throws on non-zero exit', async () => {
-      runner.exec.mockResolvedValueOnce({
-        stdout: '', stderr: 'tmux server not running', exitCode: 1,
-      });
-      await expect(
-        tmux.appendServerOptionIfMissing('terminal-features', 'xterm*:extkeys'),
-      ).rejects.toThrow(/tmux server not running/);
+  describe('non-zero exits propagate tmux stderr', () => {
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+    it.each<[string, () => Promise<unknown>, string, number, RegExp]>([
+      ['setServerOption', () => tmux.setServerOption('extended-keys', 'on'), 'unknown option: extended-keys', 1, /unknown option/],
+      ['appendServerOptionIfMissing', () => tmux.appendServerOptionIfMissing('terminal-features', 'xterm*:extkeys'), 'tmux server not running', 1, /tmux server not running/],
+      ['resizeWindowByRef', () => tmux.resizeWindowByRef(REF, 'dev-1', 80, 24), 'window not found', 1, /window not found/],
+      ['probeTmuxVersion', () => TmuxManager.probeTmuxVersion(runner), 'tmux: command not found', 127, /tmux -V failed/],
+    ])('%s', async (_method, invoke, stderr, exitCode, pattern) => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr, exitCode });
+      await expect(invoke()).rejects.toThrow(pattern);
     });
   });
 
@@ -151,13 +132,11 @@ describe('TmuxManager', () => {
       expect(cmd).toContain('BX_TARGET_GONE');
     });
 
-    it('throws PaneGoneError instead of resizing a mismatched session', async () => {
-      primeExec('BX_TARGET_GONE\n');
-      await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24)).rejects.toThrow(PaneGoneError);
-    });
-
-    it('throws PaneGoneError when the server is gone', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
+    it.each([
+      ['the identity condition fails server-side (mismatched session)', { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 }],
+      ['the server is gone', { stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 }],
+    ])('throws PaneGoneError instead of resizing when %s', async (_label, result) => {
+      runner.exec.mockResolvedValueOnce(result);
       await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24)).rejects.toThrow(PaneGoneError);
     });
 
@@ -165,11 +144,6 @@ describe('TmuxManager', () => {
       await expect(tmux.resizeWindowByRef(REF, 'dev-1', 0, 24)).rejects.toThrow(/invalid dimensions/);
       await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24.5)).rejects.toThrow(/invalid dimensions/);
       expect(runner.exec).not.toHaveBeenCalled();
-    });
-
-    it('throws on other non-zero exits', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'window not found', exitCode: 1 });
-      await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24)).rejects.toThrow(/window not found/);
     });
   });
 
@@ -183,11 +157,6 @@ describe('TmuxManager', () => {
       expect(await TmuxManager.probeTmuxVersion(runner)).toEqual(expected);
     });
 
-    it('throws on non-zero exit', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'tmux: command not found', exitCode: 127 });
-      await expect(TmuxManager.probeTmuxVersion(runner)).rejects.toThrow(/tmux -V failed/);
-    });
-
     it('throws on unparseable output (no version pattern)', async () => {
       primeExec('something unexpected\n');
       await expect(TmuxManager.probeTmuxVersion(runner)).rejects.toThrow(/unparseable/);
@@ -197,19 +166,31 @@ describe('TmuxManager', () => {
   describe('killSessionRef', () => {
     const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
 
-    it('kills through a server-generation-checked if-shell, never a bare name', async () => {
+    it.each<[string, Parameters<TmuxManager['killSessionRef']>[1], string[], string[]]>([
+      ['equals binds the kill to the exact claim (no empty-claim escape hatch)',
+        { kind: 'equals', claim: 'dev-1' }, ['#{==:#{@baxian-agent-id},dev-1}'], ['#{||:']],
+      ['unclaimed adds the claim-empty condition and a session target',
+        { kind: 'unclaimed' }, ['#{==:#{@baxian-agent-id},}', '#{&&:#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}}'], []],
+      ['emptyOr accepts an unclaimed session or the exact claim',
+        { kind: 'emptyOr', claim: 'dev-1' }, ['#{||:#{==:#{@baxian-agent-id},},#{==:#{@baxian-agent-id},dev-1}}'], []],
+    ])('%s — through a server-generation-checked if-shell, never a bare name', async (_label, policy, expected, forbidden) => {
       primeExec('');
-      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('killed');
+      expect(await tmux.killSessionRef(REF, policy)).toBe('killed');
       const cmd = lastCmd(runner);
       expect(cmd).toContain("tmux if-shell -t '$7' -F");
       expect(cmd).toContain('#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}}');
       expect(cmd).toContain(`kill-session -t '\\''$7'\\'`);
       expect(cmd).toContain('BX_KILL_REFUSED');
+      for (const fragment of expected) expect(cmd).toContain(fragment);
+      for (const fragment of forbidden) expect(cmd).not.toContain(fragment);
     });
 
-    it('reports refused when the by-id recheck proves the session still exists', async () => {
+    it.each<[string, Parameters<TmuxManager['killSessionRef']>[1]]>([
+      ['equals', { kind: 'equals', claim: 'dev-1' }],
+      ['unclaimed', { kind: 'unclaimed' }],
+    ])('%s: reports refused when the by-id recheck proves the session still exists', async (_kind, policy) => {
       primeExec('BX_KILL_REFUSED\n', '');
-      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('refused');
+      expect(await tmux.killSessionRef(REF, policy)).toBe('refused');
       expect(lastCmd(runner)).toBe("tmux has-session -t '$7'");
     });
 
@@ -219,16 +200,17 @@ describe('TmuxManager', () => {
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
 
-    it('reclassifies REFUSED as absent when tmux >= 3.6 silently accepted a missing target', async () => {
-      primeExec('BX_KILL_REFUSED\n');
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $7", exitCode: 1 });
-      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('absent');
-    });
-
-    it('reclassifies REFUSED as absent when the server died before the recheck', async () => {
-      primeExec('BX_KILL_REFUSED\n');
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 });
-      expect(await tmux.killSessionRef(REF, { kind: 'unclaimed' })).toBe('absent');
+    it.each<[string, string[], string, Parameters<TmuxManager['killSessionRef']>[1]]>([
+      ['a REFUSED marker followed by a vanished session on recheck (tmux >= 3.6 silently accepts a missing target)',
+        ['BX_KILL_REFUSED\n'], "can't find session: $7", { kind: 'equals', claim: 'dev-1' }],
+      ['a REFUSED marker followed by a dead server on recheck',
+        ['BX_KILL_REFUSED\n'], 'no server running on /tmp/tmux-501/default', { kind: 'unclaimed' }],
+      ['a vanished session (idempotent)', [], "can't find session: $7", { kind: 'equals', claim: 'dev-1' }],
+      ['a dead server', [], 'no server running on /tmp/tmux-501/default', { kind: 'equals', claim: 'dev-1' }],
+    ])('reports absent for %s', async (_label, primed, stderr, policy) => {
+      primeExec(...primed);
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr, exitCode: 1 });
+      expect(await tmux.killSessionRef(REF, policy)).toBe('absent');
     });
 
     it('throws outcome-unknown when the recheck fails transiently (never fabricates refused or absent)', async () => {
@@ -245,76 +227,29 @@ describe('TmuxManager', () => {
         .rejects.toThrow(/recheck unexpected exit 1/);
     });
 
-    it('treats a vanished session as absent (idempotent)', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $7", exitCode: 1 });
-      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('absent');
-    });
-
-    it('treats a dead server as absent', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 });
-      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('absent');
-    });
-
     it('throws on an ssh-layer failure instead of guessing', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
       await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' }))
         .rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
     });
 
-    it('refuses to run with a malformed ref (defense against credential corruption)', async () => {
-      await expect(tmux.killSessionRef({ sessionId: 'dev', serverPid: '1', serverStart: '2' }, { kind: 'unclaimed' }))
-        .rejects.toThrow(/malformed session ref/);
+    it.each<[string, Parameters<TmuxManager['killSessionRef']>[0], Parameters<TmuxManager['killSessionRef']>[1], RegExp]>([
+      ['a malformed ref (defense against credential corruption)',
+        { sessionId: 'dev', serverPid: '1', serverStart: '2' }, { kind: 'unclaimed' }, /malformed session ref/],
+      ['a claim that could alter tmux filter syntax', REF, { kind: 'equals', claim: 'a,b}' }, /unsupported characters/],
+    ])('refuses to run with %s before any exec', async (_label, ref, policy, pattern) => {
+      await expect(tmux.killSessionRef(ref, policy)).rejects.toThrow(pattern);
       expect(runner.exec).not.toHaveBeenCalled();
-    });
-
-    it('refuses to run with a claim that could alter tmux filter syntax', async () => {
-      await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'a,b}' }))
-        .rejects.toThrow(/unsupported characters/);
-      expect(runner.exec).not.toHaveBeenCalled();
-    });
-
-    it('unclaimed adds the claim-empty condition, a session target, and the refused marker', async () => {
-      primeExec('');
-      expect(await tmux.killSessionRef(REF, { kind: 'unclaimed' })).toBe('killed');
-      const cmd = lastCmd(runner);
-      expect(cmd).toContain("-t '$7'");
-      expect(cmd).toContain('#{==:#{@baxian-agent-id},}');
-      expect(cmd).toContain('#{&&:#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}}');
-      expect(cmd).toContain('BX_KILL_REFUSED');
-    });
-
-    it('unclaimed reports refused without killing when the server declines', async () => {
-      primeExec('BX_KILL_REFUSED\n', '');
-      expect(await tmux.killSessionRef(REF, { kind: 'unclaimed' })).toBe('refused');
-    });
-
-    it('equals binds the kill to the exact claim (no empty-claim escape hatch)', async () => {
-      primeExec('');
-      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('killed');
-      const cmd = lastCmd(runner);
-      expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
-      expect(cmd).not.toContain('#{||:');
-    });
-
-    it('emptyOr accepts an unclaimed session or the exact claim', async () => {
-      primeExec('');
-      expect(await tmux.killSessionRef(REF, { kind: 'emptyOr', claim: 'dev-1' })).toBe('killed');
-      expect(lastCmd(runner)).toContain('#{||:#{==:#{@baxian-agent-id},},#{==:#{@baxian-agent-id},dev-1}}');
     });
   });
 
   describe('createSession credential', () => {
-    it('returns the generation-bound ref printed atomically by -PF', async () => {
+    it('returns the generation-bound ref printed atomically by -PF and injects the creation nonce via -e', async () => {
       primeExec('4242|1700000000|$12\n');
       expect(await tmux.createSession('dev', '/wt')).toEqual({
         serverPid: '4242', serverStart: '1700000000', sessionId: '$12',
       });
       expect(lastCmd(runner)).toContain("-PF '#{pid}|#{start_time}|#{session_id}'");
-    });
-
-    it('injects the creation nonce atomically via -e', async () => {
-      primeExec('4242|1700000000|$12\n');
-      await tmux.createSession('dev', '/wt');
       expect(lastCmd(runner)).toMatch(/-e 'BAXIAN_CREATION_NONCE=[0-9a-f-]{36}'/);
     });
 
@@ -330,7 +265,8 @@ describe('TmuxManager', () => {
       expect(await tmux.createSession('dev', '/wt')).toEqual({
         serverPid: '4242', serverStart: '1700000000', sessionId: '$12',
       });
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('reconciled after uncertain outcome'));
+      // the caller gets a normal ref: the warning is the only trace that a transport fault was reconciled
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/createSession dev.*reconciled after uncertain outcome/));
       warn.mockRestore();
     });
 
@@ -352,7 +288,8 @@ describe('TmuxManager', () => {
       expect(await tmux.createSession('dev', '/wt')).toEqual({
         serverPid: '4242', serverStart: '1700000000', sessionId: '$12',
       });
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('reconciled after uncertain outcome'));
+      // the caller gets a normal ref: the warning is the only trace that a transport fault was reconciled
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/createSession dev.*reconciled after uncertain outcome/));
       warn.mockRestore();
     });
 
@@ -392,13 +329,11 @@ describe('TmuxManager', () => {
       expect((await tmux.getSessionSnapshot('dev'))?.claim).toBeNull();
     });
 
-    it('returns null when no session matches', async () => {
-      primeExec('');
-      expect(await tmux.getSessionSnapshot('dev')).toBeNull();
-    });
-
-    it('returns null when the server is not running', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 });
+    it.each([
+      ['no session matches', { stdout: '', stderr: '', exitCode: 0 }],
+      ['the server is not running', { stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 }],
+    ])('returns null when %s', async (_label, result) => {
+      runner.exec.mockResolvedValueOnce(result);
       expect(await tmux.getSessionSnapshot('dev')).toBeNull();
     });
 
@@ -430,23 +365,19 @@ describe('TmuxManager', () => {
       expect(lastCmd(runner)).toContain('#{==:#{@baxian-agent-id},dev-1}');
     });
 
-    it('reports gone instead of configuring a fallback session', async () => {
-      primeExec('BX_TARGET_GONE\n');
+    it.each([
+      ['the identity condition fails (reports gone instead of configuring a fallback session)', { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 }],
+      ['the server is dead', { stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 }],
+    ])('reports gone when %s', async (_label, result) => {
+      runner.exec.mockResolvedValueOnce(result);
       expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']], { expectedClaim: 'dev-1' })).toBe('gone');
     });
 
-    it('treats a dead server as gone', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
-      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']], { expectedClaim: 'dev-1' })).toBe('gone');
-    });
-
-    it('rejects option values tmux quoting cannot hold (newline)', async () => {
-      await expect(tmux.setSessionOptionsIfAlive(REF, [['@k', 'a\nb']], { expectedClaim: 'dev-1' })).rejects.toThrow(/unsupported characters/);
-      expect(runner.exec).not.toHaveBeenCalled();
-    });
-
-    it('rejects an expectedClaim that could alter tmux filter syntax', async () => {
-      await expect(tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']], { expectedClaim: 'a,b}' })).rejects.toThrow(/unsupported characters/);
+    it.each<[string, Array<[string, string]>, string]>([
+      ['an option value tmux quoting cannot hold (newline)', [['@k', 'a\nb']], 'dev-1'],
+      ['an expectedClaim that could alter tmux filter syntax', [['mouse', 'on']], 'a,b}'],
+    ])('rejects %s before any exec', async (_label, options, expectedClaim) => {
+      await expect(tmux.setSessionOptionsIfAlive(REF, options, { expectedClaim })).rejects.toThrow(/unsupported characters/);
       expect(runner.exec).not.toHaveBeenCalled();
     });
   });
@@ -544,7 +475,7 @@ describe('TmuxManager', () => {
       expect(cmd).toContain('BX_PANE_OK');
       expect(cmd).toContain('BX_TARGET_GONE');
       expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
-      expect(cmd).toContain('#{==:#{pane_id},%7}');
+      expect(cmd).toContain('#{==:#{session_id},$1}');
     });
 
     it('throws PaneGoneError when the identity condition fails server-side', async () => {
@@ -552,8 +483,24 @@ describe('TmuxManager', () => {
       await expect(tmux.displayMessage(PANE, '#{pane_current_command}')).rejects.toThrow(PaneGoneError);
     });
 
-    it('rejects formats that could break out of tmux quoting', async () => {
+    it('returns a header whose line landed in full even when the SSH transport exits 255 afterwards: the server already answered', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: okHeader('codex'), stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 });
+      expect(await tmux.displayMessage(PANE, '#{pane_current_command}')).toBe('codex');
+    });
+
+    it('does not trust a header line cut off before its newline under exit 255', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_PANE_OKcod', stderr: 'Connection reset by peer', exitCode: 255 });
+      await expect(tmux.displayMessage(PANE, '#{pane_current_command}')).rejects.toThrow(/guarded read of %7 failed \(exit 255\)/);
+    });
+
+    it('a non-transient failure with a header line is still a failure', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: okHeader('codex'), stderr: 'usage: if-shell', exitCode: 1 });
+      await expect(tmux.displayMessage(PANE, '#{pane_current_command}')).rejects.toThrow(/guarded read of %7 failed \(exit 1\)/);
+    });
+
+    it('rejects formats that could break out of tmux quoting or be eaten by strftime', async () => {
       await expect(tmux.displayMessage(PANE, "#{pane_title}'")).rejects.toThrow(/unsupported characters/);
+      await expect(tmux.displayMessage(PANE, '#{==:#{pane_id},%7}')).rejects.toThrow(/unsupported characters/);
       expect(runner.exec).not.toHaveBeenCalled();
     });
   });
@@ -577,13 +524,11 @@ describe('TmuxManager', () => {
       expect(await tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-context-task-id')).toBeNull();
     });
 
-    it('throws PaneGoneError when the identity condition fails', async () => {
-      primeExec('BX_TARGET_GONE\n');
-      await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-context-task-id')).rejects.toThrow(PaneGoneError);
-    });
-
-    it('throws PaneGoneError when the server is gone', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
+    it.each([
+      ['the identity condition fails', { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 }],
+      ['the server is gone', { stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 }],
+    ])('throws PaneGoneError when %s', async (_label, result) => {
+      runner.exec.mockResolvedValueOnce(result);
       await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-context-task-id')).rejects.toThrow(PaneGoneError);
     });
   });
@@ -596,7 +541,6 @@ describe('TmuxManager', () => {
       expect(cmd).toContain('send-keys -t %7');
       expect(cmd).toContain("'C-c'");
       expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
-      expect(cmd).toContain('#{==:#{pane_id},%7}');
       expect(cmd).toContain('#{==:#{session_id},$1}');
       expect(cmd).toContain('#{==:#{pid},4242}');
       expect(cmd).toContain('BX_TARGET_GONE');
@@ -622,13 +566,11 @@ describe('TmuxManager', () => {
       expect(runner.exec).not.toHaveBeenCalled();
     });
 
-    it('throws PaneGoneError instead of typing into a recycled pane', async () => {
-      primeExec('BX_TARGET_GONE\n');
-      await expect(tmux.sendKeysToPane(PANE, 'Enter')).rejects.toThrow(PaneGoneError);
-    });
-
-    it('throws PaneGoneError when the session/server is gone', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $1", exitCode: 1 });
+    it.each([
+      ['the pane identity was recycled (never types into a recycled pane)', { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 }],
+      ['the session/server is gone', { stdout: '', stderr: "can't find session: $1", exitCode: 1 }],
+    ])('throws PaneGoneError when %s', async (_label, result) => {
+      runner.exec.mockResolvedValueOnce(result);
       await expect(tmux.sendKeysToPane(PANE, 'Enter')).rejects.toThrow(PaneGoneError);
     });
   });
@@ -642,12 +584,138 @@ describe('TmuxManager', () => {
       expect(cmd).toContain("'Enter'");
       expect(cmd).toContain('BX_TARGET_GONE');
     });
+
+    it('with a runtime, Enter is queued only when the server sees that runtime in the foreground', async () => {
+      primeExec('BX_RUNTIME_OK\n');
+      await tmux.sendEnter(PANE, 'codex');
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain("tmux if-shell -t '%7' -F");
+      expect(cmd).toContain('#{==:#{session_id},$1}');
+      expect(cmd).toContain('#{||:#{==:#{pane_current_command},codex},#{==:#{pane_current_command},node}}');
+      expect(cmd).not.toContain('zsh');
+      expect(cmd).toContain("send-keys -t %7 -- '\\''Enter'\\'' ; display-message -p BX_RUNTIME_OK");
+      expect(cmd).toContain('BX_RUNTIME_REFUSED|');
+    });
+
+    it('with a runtime, a shell foreground refuses the Enter as ReplNotReadyError', async () => {
+      primeExec('BX_RUNTIME_REFUSED|1|zsh\n');
+      const err = await tmux.sendEnter(PANE, 'codex').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+      expect((err as Error).message).toMatch(/pane foreground is "zsh", a shell, not codex; Enter withheld/);
+    });
+
+    it('with a runtime, a foreign non-shell foreground (an editor or pager holding the tty) refuses the Enter without the shell classification', async () => {
+      primeExec('BX_RUNTIME_REFUSED|1|vim\n');
+      const err = await tmux.sendEnter(PANE, 'codex').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(false);
+      expect((err as Error).message).toMatch(/pane foreground is "vim", not codex; Enter withheld/);
+    });
+
+    it('with a runtime, a lost identity is PaneGoneError and a shell-refused literal is ReplNotReadyError', async () => {
+      primeExec('BX_RUNTIME_REFUSED|0|zsh\n', 'BX_RUNTIME_REFUSED|1|fish\n');
+      await expect(tmux.sendEnter(PANE, 'codex')).rejects.toThrow(PaneGoneError);
+      await expect(tmux.sendKeysLiteral(PANE, '/compact', 'codex')).rejects.toThrow(/the text "\/compact" withheld/);
+    });
+  });
+
+  describe('runtime foreground condition (REPL_PROC_TITLES evaluated by the tmux server)', () => {
+    const RUNTIMES = ['claude-code', 'codex', 'opencode', 'qodercli'] as const;
+    const HAND_PICKED = [
+      'claude', 'claude.exe', '2.1.26', '0.153.4', '12.345.6789', 'codex', 'node', 'opencode', 'qodercli', 'qodercli-1.2.3', 'qodercli-1',
+      'zsh', 'bash', 'fish', 'pwsh', 'vim', 'git', 'python3', 'less', 'ssh', 'node.exe', 'claude-helper', 'claude.exe.bak',
+      'qodercli-helper', '1.2.3-helper', '1.foo.2.bar.3evil', 'qodercli-', 'qodercli-1a', '1.2', '.1.2', '1.2.', '1..2.3', 'a1.2.3', '1.2.3.4', '',
+    ];
+    // 小字母表上的全部短串,前面再拼上 qodercli 前缀:通配边界(点的个数、位置、非数字字符)都在这张表里
+    const ALPHABET = ['1', '.', '-', 'a'];
+    const generated = (): string[] => {
+      let words = [''];
+      const out: string[] = [];
+      for (let len = 0; len <= 4; len++) {
+        out.push(...words);
+        words = words.flatMap(word => ALPHABET.map(ch => word + ch));
+      }
+      return out;
+    };
+    const CORPUS = [...new Set([...HAND_PICKED, ...generated(), ...generated().map(w => `qodercli-${w}`), ...generated().map(w => `qodercli${w}`)])];
+
+    const condFor = async (runtime: (typeof RUNTIMES)[number]): Promise<{ command: string; cond: string }> => {
+      primeExec('BX_RUNTIME_OK\n');
+      await tmux.sendEnter(PANE, runtime);
+      const command = lastCmd(runner);
+      return { command, cond: /-F '([^']*)'/.exec(command)![1] };
+    };
+
+    it.each(RUNTIMES)('%s: the server condition and hasReplProcTitle agree on every title of the corpus, with no negated shell list', async (runtime) => {
+      const { command, cond } = await condFor(runtime);
+      expect(cond).not.toContain('zsh');
+      expect(CORPUS.length).toBeGreaterThan(900);
+      const disagreements = CORPUS.filter(title => foregroundCondAccepts(command, title) !== hasReplProcTitle(title, runtime));
+      expect(disagreements).toEqual([]);
+    });
+
+    it.each([
+      ['qodercli', 'qodercli-helper'],
+      ['claude-code', '1.2.3-helper'],
+      ['claude-code', '1.foo.2.bar.3evil'],
+      ['qodercli', 'qodercli-'],
+      ['claude-code', '1.2.3.4'],
+    ] as const)('%s: "%s" is refused by both tables (fnmatch * must not widen the version shapes)', async (runtime, title) => {
+      const { command } = await condFor(runtime);
+      expect(hasReplProcTitle(title, runtime)).toBe(false);
+      expect(foregroundCondAccepts(command, title)).toBe(false);
+    });
+
+    it.each([
+      ['claude-code', '2.1.26'],
+      ['claude-code', '0.153.4'],
+      ['qodercli', 'qodercli-1.2.3'],
+      ['codex', 'node'],
+    ] as const)('%s: "%s" is accepted by both tables', async (runtime, title) => {
+      const { command } = await condFor(runtime);
+      expect(hasReplProcTitle(title, runtime)).toBe(true);
+      expect(foregroundCondAccepts(command, title)).toBe(true);
+    });
+  });
+
+  describe('submitToRuntime (one guarded command for the text and its Enter)', () => {
+    it('queues the literal and the Enter in a single runtime-guarded tmux command, literal first', async () => {
+      primeExec('BX_RUNTIME_OK\n');
+      await tmux.submitToRuntime(PANE, 'claude-code', '/exit');
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain("tmux if-shell -t '%7' -F");
+      expect(cmd).toContain('#{==:#{pane_current_command},claude}');
+      expect(cmd).toContain("send-keys -l -t %7 -- '\\''/exit'\\'' ; send-keys -t %7 -- '\\''Enter'\\'' ; display-message -p BX_RUNTIME_OK");
+    });
+
+    it('a shell foreground refuses the whole line as a shellForeground ReplNotReadyError; nothing is typed', async () => {
+      primeExec('BX_RUNTIME_REFUSED|1|zsh\n');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/quit').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+      expect((err as Error).message).toMatch(/pane foreground is "zsh", a shell, not codex; the line "\/quit" and Enter withheld/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('a foreign non-shell foreground refuses the line without the shell classification', async () => {
+      primeExec('BX_RUNTIME_REFUSED|1|vim\n');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/quit').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(false);
+      expect((err as Error).message).toMatch(/pane foreground is "vim", not codex; the line "\/quit" and Enter withheld/);
+    });
   });
 
   describe('clearComposerDraft (dirty-then-C-c: safe on empty and drafted composers)', () => {
-    it('injects a literal space before C-c so C-c always hits a non-empty composer', async () => {
-      await tmux.clearComposerDraft(PANE);
-      const cmds = runner.exec.mock.calls.map(c => String(c[0]));
+    const CODEX_EMPTY = 'permissions: YOLO mode\n\n› Ask Codex to do anything\n\n  gpt-5 · ~/repo';
+    const CODEX_DIRTY = 'permissions: YOLO mode\n\n›\n\n  gpt-5 · ~/repo';
+    const cmdsSent = (): string[] => runner.exec.mock.calls.map(c => String(c[0]));
+
+    it('claude-code: injects a literal space, settles, then C-c without reading the screen', async () => {
+      await tmux.clearComposerDraft(PANE, 'claude-code');
+      const cmds = cmdsSent();
       expect(cmds).toHaveLength(2);
       expect(cmds[0]).toContain('send-keys -l -t %7');
       expect(cmds[0]).toContain("' '");
@@ -658,14 +726,367 @@ describe('TmuxManager', () => {
 
     it('propagates failure when the space injection fails (no blind C-c on unknown composer)', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no such pane', exitCode: 1 });
-      await expect(tmux.clearComposerDraft(PANE)).rejects.toThrow(/guarded write/);
+      await expect(tmux.clearComposerDraft(PANE, 'claude-code')).rejects.toThrow(/guarded write/);
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
 
     it('stops before C-c when the pane identity is gone', async () => {
       primeExec('BX_TARGET_GONE\n');
-      await expect(tmux.clearComposerDraft(PANE)).rejects.toThrow(PaneGoneError);
+      await expect(tmux.clearComposerDraft(PANE, 'codex')).rejects.toThrow(PaneGoneError);
       expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    const cursorReads = (): string[] => cmdsSent().filter(c => c.includes('cursor_x'));
+    const captures = (): string[] => cmdsSent().filter(c => c.includes('capture-pane'));
+    const COMMA = "send-keys -l -t %7 -- '\\'','\\''";
+    const dirtyKeys = (): string[] => cmdsSent().filter(c => c.includes(COMMA));
+    // 帧只随已发出的弄脏键数变化:columns[k] / foregrounds[k] 是发出 k 个键后读到的光标列与前台进程,首项为基线
+    const scriptCursor = (columns: string[], screen = CODEX_EMPTY, foregrounds: string[] = ['codex']): void => {
+      let keys = 0;
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes(COMMA)) keys += 1;
+        if (cmd.includes('cursor_x')) {
+          const column = columns[Math.min(keys, columns.length - 1)];
+          const foreground = foregrounds[Math.min(keys, foregrounds.length - 1)];
+          return { stdout: okHeader(`${column}|${foreground}`), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) return { stdout: okBody(screen), stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+    };
+
+    it('codex: types a comma (not a space) and sends C-c once the cursor column changed, without reading the screen', async () => {
+      scriptCursor(['2', '3']);
+      await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 });
+      const cmds = cmdsSent();
+      expect(cmds[0]).toContain('cursor_x');
+      expect(cmds[1]).toContain(COMMA);
+      expect(cmds[cmds.length - 1]).toContain("'C-c'");
+      expect(cmds[cmds.length - 1]).toContain('BX_RUNTIME_OK');
+      expect(cmds[1]).toContain('BX_RUNTIME_OK');
+      expect(dirtyKeys()).toHaveLength(1);
+      expect(cursorReads()).toHaveLength(2);
+      expect(captures()).toHaveLength(0);
+    });
+
+    // 前台变化落在帧读取之后、按键到达之前:客户端看不到,只能由服务端在同一条 if-shell 里拒绝
+    const refuseAtServer = (columns: string[], foregrounds: string[], refuse: (cmd: string) => string | undefined): void => {
+      scriptCursor(columns, CODEX_EMPTY, foregrounds);
+      const scripted = runner.exec.getMockImplementation()!;
+      runner.exec.mockImplementation(async (cmd: string) => {
+        const refusal = refuse(cmd);
+        if (refusal) return { stdout: `${refusal}\n`, stderr: '', exitCode: 0 };
+        return scripted(cmd);
+      });
+    };
+
+    it('codex: the C-c after same-frame cursor evidence is refused by the server when the runtime exited to a shell in between; nothing else is typed', async () => {
+      refuseAtServer(['2', '3'], ['codex'], cmd => (cmd.includes("'C-c'") && cmd.includes('BX_RUNTIME_OK') ? 'BX_RUNTIME_REFUSED|1|zsh' : undefined));
+      const err = await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+      expect((err as Error).message).toMatch(/pane foreground is "zsh", a shell, not codex; C-c withheld/);
+      const ccs = cmdsSent().filter(c => c.includes("'C-c'"));
+      expect(ccs).toHaveLength(1);
+      expect(ccs[0]).toContain('BX_RUNTIME_OK');
+      expect(ccs[0]).not.toContain('BX_SHELL_OK');
+    });
+
+    it('codex: the dirtying key is refused by the server when the pane is a shell by the time it arrives: no C-c at all', async () => {
+      refuseAtServer(['2'], ['codex'], cmd => (cmd.includes(COMMA) ? 'BX_RUNTIME_REFUSED|1|zsh' : undefined));
+      const err = await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/the text "," withheld/);
+      expect(cmdsSent().some(c => c.includes("'C-c'"))).toBe(false);
+      expect(cursorReads()).toHaveLength(1);
+    });
+
+    it('codex: the stray-key discard is a shell-guarded C-c; a runtime that took the foreground again before it arrived does not receive it', async () => {
+      refuseAtServer(['2', '5'], ['codex', 'zsh'], cmd => (cmd.includes("'C-c'") && cmd.includes('BX_SHELL_OK') ? 'BX_SHELL_REFUSED|1|codex' : undefined));
+      const err = await tmux.clearComposerDraft(PANE, 'codex', { timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/foreground became "zsh" after the dirtying key.*a runtime took the foreground again before the stray key could be discarded, so no C-c was sent/);
+      expect((err as Error).message).not.toMatch(/was discarded/);
+      const ccs = cmdsSent().filter(c => c.includes("'C-c'"));
+      expect(ccs).toHaveLength(1);
+      expect(ccs[0]).toContain('BX_SHELL_OK');
+      expect(ccs[0]).not.toContain('BX_RUNTIME_OK');
+    });
+
+    it('claude-code: the space and the C-c are runtime-guarded too; a shell foreground refuses the space before anything is typed', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_RUNTIME_REFUSED|1|zsh\n', stderr: '', exitCode: 0 });
+      const err = await tmux.clearComposerDraft(PANE, 'claude-code').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/the text " " withheld/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      expect(lastCmd(runner)).toContain('BX_RUNTIME_OK');
+    });
+
+    it('codex: wrap boundary — the comma opens a new row (26 → 3), which counts as accepted', async () => {
+      scriptCursor(['26', '3']);
+      await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 });
+      expect(dirtyKeys()).toHaveLength(1);
+      expect(cmdsSent()[cmdsSent().length - 1]).toContain("'C-c'");
+    });
+
+    it('codex: overflowing-separator aliasing — the first comma leaves the column unchanged, the second one moves it (measured 3 → 3 → 4)', async () => {
+      // 屏幕上滚入/滚出的逗号、history-limit 是否已满都不参与判定:证据只有光标列
+      const scrolling = 'x, y\n› aa\n  aaaaaaaaaaaaaaaaaaaaaaa,\n\n  gpt-5';
+      scriptCursor(['3', '3', '4'], scrolling);
+      await tmux.clearComposerDraft(PANE, 'codex', { timeoutMs: 120, intervalMs: 50 });
+      const cmds = cmdsSent();
+      expect(dirtyKeys()).toHaveLength(2);
+      expect(cmds[cmds.length - 1]).toContain("'C-c'");
+      expect(cmds.filter(c => c.includes("'C-c'"))).toHaveLength(1);
+      expect(captures()).toHaveLength(0);
+      expect(cmds.some(c => c.includes('history_size'))).toBe(false);
+    });
+
+    it('codex: a key the composer never accepts (Vim Normal, modal, hung TUI) fails closed after two keys without C-c', async () => {
+      scriptCursor(['2', '2', '2']);
+      await expect(tmux.clearComposerDraft(PANE, 'codex', { timeoutMs: 120, intervalMs: 50 }))
+        .rejects.toThrow(/2 dirtying keys "," left the cursor at column 2 \(120ms each\); C-c withheld/);
+      expect(dirtyKeys()).toHaveLength(2);
+      expect(cmdsSent().some(c => c.includes("'C-c'"))).toBe(false);
+      expect(cursorReads().length).toBeGreaterThanOrEqual(5);
+    });
+
+    it.each([
+      ['bare › with no placeholder', 'permissions: YOLO mode\n\n›\n\n  gpt-5 · ~/repo'],
+      ['/side placeholder', 'permissions: YOLO mode\n\n› Ask a follow-up question\n\n  gpt-5 · ~/repo'],
+      ['placeholder truncated by a narrow pane', '› Ask Codex to\n\n  gpt-5'],
+      ['default placeholder', CODEX_EMPTY],
+      ['commas already on screen', 'a, b, c\n› \n\n  gpt-5'],
+      ['a Vim Normal composer that swallowed the key', 'permissions: YOLO mode\n\n› \n\n  -- NORMAL --  gpt-5'],
+    ])('codex: screen text is never evidence — withholds C-c while the cursor stays put even though the screen shows %s', async (_label, screen) => {
+      scriptCursor(['2'], screen);
+      await expect(tmux.clearComposerDraft(PANE, 'codex', { timeoutMs: 120, intervalMs: 50 }))
+        .rejects.toThrow(ReplNotReadyError);
+      expect(cmdsSent().some(c => c.includes("'C-c'"))).toBe(false);
+      expect(captures()).toHaveLength(1);
+    });
+
+    it('codex: the timeout error carries the screen captured once, after the last key, for diagnosis', async () => {
+      scriptCursor(['2'], CODEX_DIRTY);
+      const err = await tmux.clearComposerDraft(PANE, 'codex', { timeoutMs: 60, intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).lastScreen).toBe(CODEX_DIRTY);
+      const cmds = cmdsSent();
+      expect(captures()).toHaveLength(1);
+      expect(cmds.indexOf(captures()[0])).toBeGreaterThan(cmds.lastIndexOf(dirtyKeys()[0]));
+    });
+
+    it('codex: the cursor column and the foreground process are read in the same tmux frame', async () => {
+      scriptCursor(['2', '3']);
+      await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 });
+      expect(cursorReads()).toHaveLength(2);
+      for (const read of cursorReads()) expect(read).toContain('#{cursor_x}|#{pane_current_command}');
+    });
+
+    it('codex: node as the foreground title is still the runtime (codex launches through node on some installs)', async () => {
+      scriptCursor(['2', '3'], CODEX_EMPTY, ['node']);
+      await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 });
+      expect(cmdsSent()[cmdsSent().length - 1]).toContain("'C-c'");
+    });
+
+    it('codex: refuses to type anything when the pane is already at a shell prompt', async () => {
+      scriptCursor(['2'], CODEX_EMPTY, ['zsh']);
+      const err = await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/pane foreground is "zsh", not codex; nothing typed and C-c withheld/);
+      expect(cmdsSent().some(c => c.includes('send-keys'))).toBe(false);
+      expect(captures()).toHaveLength(1);
+    });
+
+    it.each([
+      ['a different column', ['2', '5']],
+      ['the same column', ['2', '2']],
+    ])('codex: a shell prompt that replaces the runtime during the dirtying wait at %s is not composer evidence — no success, the stray comma is discarded on the shell', async (_label, columns) => {
+      scriptCursor(columns, CODEX_EMPTY, ['codex', 'zsh']);
+      const err = await tmux.clearComposerDraft(PANE, 'codex', { timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/foreground became "zsh" after the dirtying key.*stray key was discarded with C-c on the shell/);
+      expect(dirtyKeys()).toHaveLength(1);
+      const cmds = cmdsSent();
+      const ccs = cmds.filter(c => c.includes("'C-c'"));
+      expect(ccs).toHaveLength(1);
+      expect(cmds.indexOf(ccs[0])).toBeGreaterThan(cmds.indexOf(dirtyKeys()[0]));
+    });
+
+    it('codex: a foreground that is neither the runtime nor a shell gets no C-c at all', async () => {
+      scriptCursor(['2', '7'], CODEX_EMPTY, ['codex', 'vim']);
+      const err = await tmux.clearComposerDraft(PANE, 'codex', { timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/foreground became "vim" after the dirtying key; the cursor move is not composer evidence/);
+      expect((err as Error).message).not.toMatch(/discarded/);
+      expect(dirtyKeys()).toHaveLength(1);
+      expect(cmdsSent().some(c => c.includes("'C-c'"))).toBe(false);
+    });
+  });
+
+  describe('submitCommandOnShell (shell check and keys in one server-side if-shell)', () => {
+    const LAUNCH = "cd '/tmp/repo' && codex --yolo";
+    const NONCE_RE = /@bx_shell_write ([0-9a-f-]{36})/;
+    const nonceOf = (cmd: string): string => NONCE_RE.exec(cmd)![1];
+    const transport255: ExecResult = { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 };
+
+    it('queues the nonce, C-c, the literal command and Enter behind a condition that requires pane identity and a shell foreground, in one tmux call', async () => {
+      primeExec('BX_SHELL_OK\n');
+      await tmux.submitCommandOnShell(PANE, LAUNCH);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain("tmux if-shell -t '%7' -F");
+      expect(cmd).toContain('#{==:#{session_id},$1}');
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},');
+      for (const shell of ['zsh', 'bash', 'sh', 'fish', 'dash', 'pwsh']) {
+        expect(cmd).toContain(`#{==:#{pane_current_command},${shell}}`);
+      }
+      const order = [`set-option -t %7 @bx_shell_write ${nonceOf(cmd)}`, 'C-c', 'codex --yolo', 'Enter', 'BX_SHELL_OK']
+        .map(part => cmd.indexOf(part));
+      expect(order.every(i => i >= 0)).toBe(true);
+      expect([...order].sort((a, b) => a - b)).toEqual(order);
+      expect(cmd).toContain('BX_SHELL_REFUSED|');
+      expect(cmd.indexOf('BX_SHELL_REFUSED')).toBeGreaterThan(cmd.indexOf('BX_SHELL_OK'));
+    });
+
+    it('uses a fresh nonce per call', async () => {
+      primeExec('BX_SHELL_OK\n', 'BX_SHELL_OK\n');
+      await tmux.submitCommandOnShell(PANE, LAUNCH);
+      await tmux.submitCommandOnShell(PANE, LAUNCH);
+      const [first, second] = runner.exec.mock.calls.map(call => nonceOf(String(call[0])));
+      expect(first).not.toBe(second);
+    });
+
+    it('refuses without any keystroke when tmux reports a non-shell foreground, naming the process', async () => {
+      primeExec('BX_SHELL_REFUSED|1|codex\n');
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH))
+        .rejects.toThrow(/pane %7 foreground is "codex", not a shell; C-c, command and Enter withheld/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a lost pane identity as PaneGoneError, not as a foreground problem', async () => {
+      primeExec('BX_SHELL_REFUSED|0|zsh\n');
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).rejects.toThrow(PaneGoneError);
+    });
+
+    it('maps a vanished session to PaneGoneError', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $1", exitCode: 1 });
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).rejects.toThrow(PaneGoneError);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('a received OK marker is success even when the SSH transport exits 255 afterwards: the server already ran the queue', async () => {
+      runner.exec.mockResolvedValueOnce({ ...transport255, stdout: 'BX_SHELL_OK\n' });
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).resolves.toBeUndefined();
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('a received REFUSED marker with exit 255 is still a refusal, not a transport failure', async () => {
+      runner.exec.mockResolvedValueOnce({ ...transport255, stdout: 'BX_SHELL_REFUSED|1|codex\n' });
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).rejects.toThrow(/foreground is "codex", not a shell/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('an exec rejection is reconciled by reading the nonce back under the pane identity: a match means the keys were queued', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.exec.mockRejectedValueOnce(new Error('Command timed out after 5000ms'));
+      runner.exec.mockImplementationOnce(async () => ({
+        stdout: okHeader(nonceOf(String(runner.exec.mock.calls[0][0]))), stderr: '', exitCode: 0,
+      }));
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).resolves.toBeUndefined();
+      expect(runner.exec).toHaveBeenCalledTimes(2);
+      const probe = lastCmd(runner);
+      expect(probe).toContain("tmux if-shell -t '%7' -F");
+      expect(probe).toContain('#{==:#{@baxian-agent-id},');
+      expect(probe).toContain('display-message -p -t %7 ');
+      expect(probe).toContain('BX_PANE_OK#{@bx_shell_write}');
+      expect(probe).not.toContain('send-keys');
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(
+        /reconciled as executed after an uncertain result \(exec rejected: Command timed out after 5000ms\)/,
+      ));
+      warn.mockRestore();
+    });
+
+    it('a marker-less exit 255 whose nonce probe reads another value means nothing was typed: a plain failure, not outcome unknown', async () => {
+      runner.exec.mockResolvedValueOnce(transport255);
+      runner.exec.mockResolvedValueOnce({ stdout: okHeader('nonce-of-an-earlier-write'), stderr: '', exitCode: 0 });
+      const err = await tmux.submitCommandOnShell(PANE, LAUNCH).catch(e => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/did not reach the tmux server \(neither marker returned \(exit 255\)/);
+      expect((err as Error).message).toMatch(/nothing was typed/);
+      expect(runner.exec).toHaveBeenCalledTimes(2);
+    });
+
+    it('a marker-less exit 0 is not trusted either: the nonce decides', async () => {
+      primeExec('', okHeader(''));
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).rejects.toThrow(/nothing was typed/);
+      expect(runner.exec).toHaveBeenCalledTimes(2);
+    });
+
+    it('reports outcome unknown when the nonce probe fails too, instead of a plain failure', async () => {
+      runner.exec.mockResolvedValueOnce(transport255);
+      runner.exec.mockResolvedValueOnce(transport255);
+      const err = await tmux.submitCommandOnShell(PANE, LAUNCH).catch(e => e);
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/outcome unknown \(neither marker returned \(exit 255\)/);
+      expect((err as Error).message).toMatch(/inspect the pane before retrying/);
+    });
+
+    it('a nonce probe whose BX_PANE_OK line landed before the transport exited 255 still proves the write: reconciled as executed', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.exec.mockResolvedValueOnce(transport255);
+      runner.exec.mockImplementationOnce(async () => ({
+        ...transport255, stdout: okHeader(nonceOf(String(runner.exec.mock.calls[0][0]))),
+      }));
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).resolves.toBeUndefined();
+      expect(runner.exec).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reconciled as executed after an uncertain result \(neither marker returned \(exit 255\)/));
+      warn.mockRestore();
+    });
+
+    it('a nonce line cut off before its newline under exit 255 is evidence of nothing: outcome unknown, never "nothing was typed"', async () => {
+      runner.exec.mockResolvedValueOnce(transport255);
+      runner.exec.mockImplementationOnce(async () => ({
+        ...transport255, stdout: `BX_PANE_OK${nonceOf(String(runner.exec.mock.calls[0][0])).slice(0, 20)}`,
+      }));
+      const err = await tmux.submitCommandOnShell(PANE, LAUNCH).catch(e => e);
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).not.toMatch(/nothing was typed/);
+    });
+
+    it('a pane whose identity is gone by the time of the nonce probe is PaneGoneError', async () => {
+      runner.exec.mockResolvedValueOnce(transport255);
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 });
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).rejects.toThrow(PaneGoneError);
+    });
+
+    it('a definite non-transient failure is reported as such without a nonce probe', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'usage: if-shell [-bF] [-t target-pane] shell-command command [command]', exitCode: 1 });
+      await expect(tmux.submitCommandOnShell(PANE, LAUNCH)).rejects.toThrow(/shell-guarded write to %7 failed \(exit 1\)/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('waitReplReady with runtimeSeen (the caller has just seen the runtime in the foreground)', () => {
+    it('a shell on the very first sample fails fast instead of polling to the deadline', async () => {
+      primeExec(okHeader('zsh'));
+      const started = Date.now();
+      const err = await tmux.waitReplReady(PANE, 'claude-code', { failFastOnShell: true, runtimeSeen: true, timeoutMs: 5_000, intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('without runtimeSeen a first-sample shell still gets the whole window: a launch hook may not have exec-ed the runtime yet', async () => {
+      runner.exec.mockImplementation(async (cmd: string) => (cmd.includes('capture-pane')
+        ? { stdout: okBody('$ '), stderr: '', exitCode: 0 }
+        : { stdout: okHeader('zsh'), stderr: '', exitCode: 0 }));
+      const err = await tmux.waitReplReady(PANE, 'claude-code', { failFastOnShell: true, timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/at deadline/);
+      expect(runner.exec.mock.calls.length).toBeGreaterThan(2);
     });
   });
 
@@ -682,19 +1103,19 @@ describe('TmuxManager', () => {
       expect(cmd).toContain('BX_TARGET_GONE');
     });
 
-    it('opts.ansi=true adds -e (ANSI escape passthrough)', async () => {
+    it.each<[string, Parameters<TmuxManager['capturePaneById']>[1], RegExp[]]>([
+      ['opts.ansi=true adds -e (ANSI escape passthrough)', { ansi: true }, [/(^|\s)-e(\s|$)/]],
+      ['opts.scrollback>0 adds -S -<n>', { scrollback: 2000 }, [/-S/, /-2000/]],
+    ])('%s', async (_label, opts, patterns) => {
       primeExec(okBody(''));
-      await tmux.capturePaneById(PANE, { ansi: true });
+      await tmux.capturePaneById(PANE, opts);
       const cmd = lastCmd(runner);
-      expect(cmd).toMatch(/(^|\s)-e(\s|$)/);
+      for (const pattern of patterns) expect(cmd).toMatch(pattern);
     });
 
-    it('opts.scrollback>0 adds -S -<n>', async () => {
-      primeExec(okBody(''));
-      await tmux.capturePaneById(PANE, { scrollback: 2000 });
-      const cmd = lastCmd(runner);
-      expect(cmd).toContain('-S');
-      expect(cmd).toContain('-2000');
+    it('a body read under exit 255 fails even with the header landed: the body may have been cut short', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: okBody('content\n'), stderr: 'Connection reset by peer', exitCode: 255 });
+      await expect(tmux.capturePaneById(PANE)).rejects.toThrow(/guarded read of %7 failed \(exit 255\)/);
     });
 
     it('throws PaneGoneError when the identity condition fails', async () => {
@@ -704,11 +1125,10 @@ describe('TmuxManager', () => {
   });
 
   describe('injectPrompt (probe-gated stdin load → claim-checked paste-or-self-clean)', () => {
-    const stdinMock = (r: typeof runner): ExecMock =>
-      (r as unknown as { execWithStdin: ExecMock }).execWithStdin;
+    const stdinMock = (r: typeof runner): StdinMock => r.execWithStdin;
 
     it('loads via probe-gated stdin (no openssl), then a separate guarded paste', async () => {
-      await tmux.injectPrompt(PANE, 'hello world', 'dev-1');
+      await tmux.injectPrompt(PANE, 'hello world', 'dev-1', 'claude-code');
       const stdin = stdinMock(runner);
       expect(stdin).toHaveBeenCalledTimes(1);
       const loadCmd = stdin.mock.calls[0][0] as string;
@@ -723,12 +1143,16 @@ describe('TmuxManager', () => {
       expect(pasteCmd).toContain('paste-buffer');
       expect(pasteCmd).toMatch(/-d -p -r/);
       expect(pasteCmd).toContain('delete-buffer');
-      expect(pasteCmd).toContain('BX_TARGET_GONE');
+      expect(pasteCmd).toContain('BX_RUNTIME_OK');
+      expect(pasteCmd).toContain('BX_RUNTIME_REFUSED|');
+      expect(pasteCmd).toContain('#{||:#{==:#{pane_current_command},claude},#{||:#{==:#{pane_current_command},claude.exe},#{&&:#{m:*.*.*,#{pane_current_command}},');
+      expect(pasteCmd).toContain('#{?#{m:*[!0-9.]*,#{pane_current_command}},0,1}');
+      expect(pasteCmd).not.toContain('zsh');
       expect(pasteCmd).toMatch(/baxian-dev-1-[0-9a-f-]{36}/);
     });
 
     it('probe-gates the load: the five-field identity test precedes load-buffer in the load command', async () => {
-      await tmux.injectPrompt(PANE, 'x', 'dev-1');
+      await tmux.injectPrompt(PANE, 'x', 'dev-1', 'claude-code');
       const loadCmd = stdinMock(runner).mock.calls[0][0] as string;
       expect(loadCmd).toContain('#{pid}|#{start_time}|#{session_id}|#{pane_id}|#{@baxian-agent-id}');
       expect(loadCmd).toContain("'4242|1700000000|$1|%7|dev-1'");
@@ -737,51 +1161,68 @@ describe('TmuxManager', () => {
 
     it('throws PaneGoneError when the identity probe fails before load (no buffer, no reconcile)', async () => {
       stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 });
-      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/before any buffer was created/);
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1', 'claude-code')).rejects.toThrow(/before any buffer was created/);
       expect(runner.exec).not.toHaveBeenCalled();
     });
 
-    it('throws PaneGoneError when the paste-time condition fails (buffer self-cleaned server-side)', async () => {
-      primeExec('BX_TARGET_GONE\n');
-      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(PaneGoneError);
+    it('throws PaneGoneError when the paste-time identity condition fails (buffer self-cleaned server-side)', async () => {
+      primeExec('BX_RUNTIME_REFUSED|0|claude\n');
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1', 'claude-code')).rejects.toThrow(PaneGoneError);
       expect(lastCmd(runner)).toContain('delete-buffer');
     });
 
-    it('reconciles the loaded buffer by unique name when the pane vanishes AFTER load (exit 1 can\'t find pane)', async () => {
+    it('refuses the paste server-side when the foreground has become a shell: ReplNotReadyError, buffer self-cleaned, no extra round trip', async () => {
+      primeExec('BX_RUNTIME_REFUSED|1|zsh\n');
+      const err = await tmux.injectPrompt(PANE, 'rm -rf / # a prompt, not a command', 'dev-1', 'codex').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+      expect((err as Error).message).toMatch(/pane foreground is "zsh", a shell, not codex; prompt paste withheld \(buffer self-cleaned\)/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses the paste server-side when a non-shell foreign process owns the pane: not classified as a shell foreground', async () => {
+      primeExec('BX_RUNTIME_REFUSED|1|less\n');
+      const err = await tmux.injectPrompt(PANE, 'a prompt', 'dev-1', 'claude-code').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(false);
+      expect((err as Error).message).toMatch(/pane foreground is "less", not claude-code; prompt paste withheld \(buffer self-cleaned\)/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('a paste whose OK marker landed before the transport exited 255 is a success', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_RUNTIME_OK\n', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 });
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1', 'claude-code')).resolves.toBeUndefined();
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it.each<[string, () => void, RegExp | typeof PaneGoneError, number]>([
+      ['the pane vanishes AFTER load (paste exit 1, can\'t find pane)', () => {
+        runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find pane: %7", exitCode: 1 });
+        primeExec('');
+      }, PaneGoneError, 2],
+      ['the load outcome is unknown (exit 255)', () => {
+        stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 });
+        primeExec('');
+      }, /load outcome unknown/, 1],
+      ['the paste exits non-zero', () => {
+        runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'paste boom', exitCode: 5 });
+        primeExec('');
+      }, /paste failed/, 2],
+    ])('reconciles the loaded buffer by unique name, then rejects, when %s', async (_label, prime, expected, execCalls) => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find pane: %7", exitCode: 1 });
-      primeExec('');
-      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(PaneGoneError);
-      expect(runner.exec).toHaveBeenCalledTimes(2);
+      prime();
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1', 'claude-code')).rejects.toThrow(expected);
+      expect(runner.exec).toHaveBeenCalledTimes(execCalls);
       const deleteCmd = lastCmd(runner);
       expect(deleteCmd).toContain('tmux delete-buffer -b');
       expect(deleteCmd).toMatch(/baxian-dev-1-[0-9a-f-]{36}/);
       warn.mockRestore();
     });
 
-    it('reconciles by name when the load outcome is unknown (exit 255)', async () => {
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 });
-      primeExec('');
-      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/load outcome unknown/);
-      expect(runner.exec).toHaveBeenCalledTimes(1);
-      expect(lastCmd(runner)).toContain('tmux delete-buffer -b');
-      warn.mockRestore();
-    });
-
-    it('reconciles then rejects on a plain paste non-zero exit', async () => {
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'paste boom', exitCode: 5 });
-      primeExec('');
-      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/paste failed/);
-      expect(lastCmd(runner)).toContain('tmux delete-buffer -b');
-      warn.mockRestore();
-    });
-
     it('accepts a prompt at exactly 80KB (boundary inside the cap)', async () => {
       const cap = 80 * 1024;
       const prompt = 'x'.repeat(cap);
-      await expect(tmux.injectPrompt(PANE, prompt, 'dev-1')).resolves.toBeUndefined();
+      await expect(tmux.injectPrompt(PANE, prompt, 'dev-1', 'claude-code')).resolves.toBeUndefined();
       expect(stdinMock(runner)).toHaveBeenCalledTimes(1);
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
@@ -789,7 +1230,7 @@ describe('TmuxManager', () => {
     it('stagePromptBuffer loads via stdin (no openssl); pasteStagedBuffer pastes on the same named buffer', async () => {
       const { buf } = await tmux.stagePromptBuffer('%0', 'hello world', 'dev-1');
       expect(buf).toMatch(/^baxian-dev-1-[0-9a-f-]{36}$/);
-      await tmux.pasteStagedBuffer('%0', buf);
+      await tmux.pasteStagedBuffer(PANE, buf, 'claude-code');
 
       const stdin = stdinMock(runner);
       expect(stdin).toHaveBeenCalledTimes(1);
@@ -802,9 +1243,20 @@ describe('TmuxManager', () => {
       expect(payload.toString('utf8')).toBe('hello world');
       expect(runner.exec).toHaveBeenCalledTimes(1);
       const pasteCmd = String(runner.exec.mock.calls[0][0]);
-      expect(pasteCmd).toContain('tmux paste-buffer');
-      expect(pasteCmd).toContain(buf);
-      expect(pasteCmd).toMatch(/-d -p -r/);
+      expect(pasteCmd).toContain("tmux if-shell -t '%7'");
+      expect(pasteCmd).toContain(`paste-buffer -b ${buf} -t %7 -d -p -r`);
+      expect(pasteCmd).toContain('BX_RUNTIME_OK');
+      expect(pasteCmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+    });
+
+    it('pasteStagedBuffer is refused server-side on a shell foreground and leaves the buffer for the caller to drop', async () => {
+      primeExec('BX_RUNTIME_REFUSED|1|bash\n');
+      const err = await tmux.pasteStagedBuffer(PANE, 'baxian-dev-1-buf', 'claude-code').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(true);
+      expect((err as Error).message).toMatch(/the prompt paste withheld/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      expect(lastCmd(runner)).not.toContain('delete-buffer');
     });
 
     it('dropStagedBuffer deletes the staged buffer and surfaces failures', async () => {
@@ -844,10 +1296,7 @@ describe('TmuxManager', () => {
         (e: unknown) => e as Error,
       );
       expect(err.message).toMatch(/outcome unknown/);
-      const bufMatch = err.message.match(/staged buffer (baxian-dev-1-[0-9a-f-]{36}) may persist remotely/);
-      expect(bufMatch).not.toBeNull();
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining(bufMatch![1]!));
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('exit 255'));
+      expect(err.message).toMatch(/staged buffer baxian-dev-1-[0-9a-f-]{36} may persist remotely/);
       warn.mockRestore();
     });
 
@@ -862,8 +1311,9 @@ describe('TmuxManager', () => {
 
       await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/outcome unknown/);
       await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.not.toThrow(/may persist remotely/);
+      // a confirmed-absent buffer is retired, never reported as a cleanup failure (the warning is the only report channel)
       expect(warn).not.toHaveBeenCalled();
-      expect(info).toHaveBeenCalledWith(expect.stringContaining('retired staged buffer'));
+      expect(info).toHaveBeenCalledWith(expect.stringMatching(/retired staged buffer baxian-dev-1-[0-9a-f-]{36}/));
       warn.mockRestore();
       info.mockRestore();
     });
@@ -877,9 +1327,10 @@ describe('TmuxManager', () => {
       });
 
       await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/ssh channel died/);
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringMatching(/buffer baxian-dev-1-[0-9a-f-]{36} may persist remotely.*exit 255/),
-      );
+      // the caller only sees the transport error: the unconfirmed cleanup (buffer may persist) is reported by the warning alone
+      const unconfirmed = warn.mock.calls.map(call => String(call[0])).find(msg => /may persist/.test(msg));
+      expect(unconfirmed).toMatch(/baxian-dev-1-[0-9a-f-]{36}/);
+      expect(unconfirmed).toMatch(/255/);
       warn.mockRestore();
     });
 
@@ -891,17 +1342,13 @@ describe('TmuxManager', () => {
       expect(cmds.some(cmd => cmd.includes('delete-buffer'))).toBe(false);
     });
 
-    it('stagePromptBuffer rejects an oversized prompt before issuing any tmux command', async () => {
-      const prompt = 'x'.repeat(80 * 1024 + 1);
-      await expect(tmux.stagePromptBuffer('%0', prompt, 'dev-1')).rejects.toThrow(/prompt too large/);
+    it.each<[string, (prompt: string) => Promise<unknown>]>([
+      ['stagePromptBuffer', prompt => tmux.stagePromptBuffer('%0', prompt, 'dev-1')],
+      ['injectPrompt', prompt => tmux.injectPrompt(PANE, prompt, 'dev-1', 'claude-code')],
+    ])('%s rejects a prompt over 80KB before issuing any tmux command (deterministic error)', async (_entry, invoke) => {
+      await expect(invoke('x'.repeat(80 * 1024 + 1))).rejects.toThrow(/prompt too large/);
       expect(runner.exec).not.toHaveBeenCalled();
-    });
-
-    it('rejects a prompt over 80KB before issuing any tmux command (deterministic error)', async () => {
-      const cap = 80 * 1024;
-      const prompt = 'x'.repeat(cap + 1);
-      await expect(tmux.injectPrompt(PANE, prompt, 'dev-1')).rejects.toThrow(/prompt too large/);
-      expect(runner.exec).not.toHaveBeenCalled();
+      expect(stdinMock(runner)).not.toHaveBeenCalled();
     });
   });
 
@@ -2101,16 +2548,11 @@ describe('TmuxManager', () => {
       expect(title).toBe('⠋ Reading file');
     });
 
-    it('returns empty string on failure', async () => {
-      runner.exec.mockResolvedValueOnce({
-        stdout: '', stderr: 'pane not found', exitCode: 1,
-      });
-      const title = await tmux.readPaneTitle(PANE);
-      expect(title).toBe('');
-    });
-
-    it('returns empty string when the pane identity is gone (advisory signal, never authority)', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 });
+    it.each([
+      ['the read fails', { stdout: '', stderr: 'pane not found', exitCode: 1 }],
+      ['the pane identity is gone', { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 }],
+    ])('returns empty string when %s (advisory signal, never authority)', async (_label, result) => {
+      runner.exec.mockResolvedValueOnce(result);
       expect(await tmux.readPaneTitle(PANE)).toBe('');
     });
   });
@@ -2392,26 +2834,27 @@ describe('window geometry read (twelve-field single read)', () => {
     expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
   });
 
-  it('getWindowGeometry: tmux >= 3.6 no-target expansion (exit 0, empty session_id) is typed absent, not unparseable', async () => {
+  it.each([
+    ['tmux >= 3.6 no-target expansion (exit 0, empty session_id)', '  on latest |2491|1784128830|||3.6a|1|\n'],
+    ['a no-target expansion polluted by a global @-option smuggling pipes', '  on latest ||||84630|1785741685|||3.6a|1|\n'],
+  ])('getWindowGeometry: %s is typed absent, not unparseable', async (_label, stdout) => {
     const runner = mockRunner();
-    runner.exec.mockResolvedValue({ stdout: '  on latest |2491|1784128830|||3.6a|1|\n', stderr: '', exitCode: 0 });
+    runner.exec.mockResolvedValue({ stdout, stderr: '', exitCode: 0 });
     const tmux = new TmuxManager(runner);
     await expect(tmux.getWindowGeometry('dev-1')).rejects.toBeInstanceOf(SessionAbsentError);
   });
 
-  it('getWindowGeometry: no-target expansion polluted by a global @-option smuggling pipes is STILL typed absent', async () => {
+  it.each([
+    ['an empty-tailed line without the format separators', 'x|\n'],
+    ['a live session whose owner-gen option smuggles pipes (stays fail-closed)', '80 24 on latest ||||55388|1785690647|$0||3.6a|1|$0\n'],
+    ['exit 0 with empty stdout', ''],
+  ])('getWindowGeometry: %s is unparseable, NOT absent', async (_label, stdout) => {
     const runner = mockRunner();
-    runner.exec.mockResolvedValue({ stdout: '  on latest ||||84630|1785741685|||3.6a|1|\n', stderr: '', exitCode: 0 });
-    const tmux = new TmuxManager(runner);
-    await expect(tmux.getWindowGeometry('dev-1')).rejects.toBeInstanceOf(SessionAbsentError);
-  });
-
-  it('getWindowGeometry: an empty-tailed line without the format separators is unparseable, NOT absent', async () => {
-    const runner = mockRunner();
-    runner.exec.mockResolvedValue({ stdout: 'x|\n', stderr: '', exitCode: 0 });
+    runner.exec.mockResolvedValue({ stdout, stderr: '', exitCode: 0 });
     const tmux = new TmuxManager(runner);
     const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
     expect(err).not.toBeInstanceOf(SessionAbsentError);
+    expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toMatch(/unparseable/);
   });
 
@@ -2422,25 +2865,6 @@ describe('window geometry read (twelve-field single read)', () => {
     const geom = await tmux.getWindowGeometry('dev-1');
     expect(geom.ref.sessionId).toBe('$1');
     expect(geom.claim).toBe('');
-  });
-
-  it('getWindowGeometry: live session whose owner-gen option smuggles pipes stays fail-closed (unparseable, NOT absent)', async () => {
-    const runner = mockRunner();
-    runner.exec.mockResolvedValue({ stdout: '80 24 on latest ||||55388|1785690647|$0||3.6a|1|$0\n', stderr: '', exitCode: 0 });
-    const tmux = new TmuxManager(runner);
-    const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
-    expect(err).not.toBeInstanceOf(SessionAbsentError);
-    expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toMatch(/unparseable/);
-  });
-
-  it('getWindowGeometry: exit 0 with empty stdout is unparseable, NOT absent', async () => {
-    const runner = mockRunner();
-    runner.exec.mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
-    const tmux = new TmuxManager(runner);
-    const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
-    expect(err).not.toBeInstanceOf(SessionAbsentError);
-    expect((err as Error).message).toMatch(/unparseable/);
   });
 
   it.each([
@@ -2556,5 +2980,74 @@ describe('ownerWrite (session-triple ∧ claim ∧ generation server-side guard)
     runner.exec.mockResolvedValue({ stdout: '', stderr: 'boom', exitCode: 1 });
     const tmux = new TmuxManager(runner);
     await expect(tmux.ownerWrite('dev-1', REF, 'dev-1', 1, 'latest', undefined)).rejects.toThrow(/boom/);
+  });
+});
+
+// 真实 tmux 的 send-keys 用 getopt 解析,正文是第一个位置参数:'-l' 会被当成又一个选项吞掉(退出 0、什么也不送),
+// 其它 - 开头的正文直接 unknown flag 退出 1。选项终止符 -- 之后的参数才一定按正文/键名处理
+const FAKE_PANE: PaneRef = {
+  session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' },
+  paneId: '%0',
+  claim: 'dev-1',
+};
+
+// 真实 tmux 的 display-message 会先把整串交给 strftime,%N 形态的 pane id 字面量活不到比较那一步:
+// 拒绝回执里的身份位因此恒为 0,每一次前台不匹配都被误报成 PaneGoneError
+describe('a refusal on a live pane is classified by its foreground, not reported as a gone pane', () => {
+  it('a shell foreground withholds the line as ReplNotReadyError and types nothing', async () => {
+    const runner = fakeRunner({ agents: { 'dev-1': { process: 'zsh' } } });
+    const tmux = new TmuxManager(runner);
+
+    const err = await tmux.submitToRuntime(FAKE_PANE, 'claude-code', 'hello').catch(e => e);
+
+    expect(err).toBeInstanceOf(ReplNotReadyError);
+    expect((err as ReplNotReadyError).shellForeground).toBe(true);
+    expect(runner.sessions.pane('dev-1')!.composer).toBe('');
+  });
+
+  it('a pane whose identity really changed is still PaneGoneError', async () => {
+    const runner = fakeRunner();
+    const tmux = new TmuxManager(runner);
+    runner.sessions.bumpGeneration('dev-1');
+
+    await expect(tmux.submitToRuntime(FAKE_PANE, 'claude-code', 'hello')).rejects.toThrow(PaneGoneError);
+    expect(runner.sessions.pane('dev-1')!.composer).toBe('');
+  });
+});
+
+describe('option-shaped payloads reach the pane instead of being parsed as flags', () => {
+  it.each(['-l', '-x', '--force', '--'])('sendKeysLiteral types %j into the composer', async (text) => {
+    const runner = fakeRunner();
+    const tmux = new TmuxManager(runner);
+    await tmux.sendKeysLiteral(FAKE_PANE, text, 'claude-code');
+    expect(runner.sessions.pane('dev-1')!.composer).toBe(text);
+  });
+
+  it.each(['-l', '-x'])('submitToRuntime delivers the line %j and its Enter', async (text) => {
+    const runner = fakeRunner();
+    const tmux = new TmuxManager(runner);
+    await tmux.submitToRuntime(FAKE_PANE, 'claude-code', text);
+    const pane = runner.sessions.pane('dev-1')!;
+    expect(pane.phase).toBe('working');
+    expect(pane.composer).toBe('');
+  });
+
+  it('C-c after the option terminator still clears the composer instead of being typed', async () => {
+    const runner = fakeRunner();
+    const tmux = new TmuxManager(runner);
+    await tmux.sendKeysLiteral(FAKE_PANE, 'draft', 'claude-code');
+    expect(runner.sessions.pane('dev-1')!.composer).toBe('draft');
+    await tmux.sendKeysToPane(FAKE_PANE, 'C-c');
+    expect(runner.sessions.pane('dev-1')!.composer).toBe('');
+  });
+
+  it('Enter after the option terminator still submits the composer instead of being typed', async () => {
+    const runner = fakeRunner();
+    const tmux = new TmuxManager(runner);
+    await tmux.sendKeysLiteral(FAKE_PANE, 'hello', 'claude-code');
+    await tmux.sendKeysToPane(FAKE_PANE, 'Enter');
+    const pane = runner.sessions.pane('dev-1')!;
+    expect(pane.phase).toBe('working');
+    expect(pane.composer).toBe('');
   });
 });

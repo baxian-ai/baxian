@@ -2,14 +2,42 @@ import { describe, it, expect, vi } from 'vitest';
 import type { TaskState } from '../../src/shared/index.js';
 import { DispatchTerminalError, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
 import { ApiError } from '../../src/errors.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { BranchManager } from '../../src/agent/branch.js';
-import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import { createManagerSuiteRunner, useManagerSuiteHarness } from '../helpers/manager-harness.js';
+import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
 import { makeTask } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
 
 const harness = useManagerSuiteHarness();
+
+// 已确认交付的 code 评审任务:Resume 的复评走真实 lease → 派单链路
+function seedReviewTask(overrides: Partial<TaskState> = {}): Promise<TaskState> {
+  return harness.seedTask({
+    status: 'review',
+    phase: 'code',
+    deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+    qaAgentId: 'qa-1',
+    prNumber: 12,
+    ...overrides,
+    ...(overrides.phase === 'spec'
+      ? { deliveryConfirmation: { phase: 'spec', source: 'signal', at: NOW } }
+      : {}),
+  });
+}
+
+// 没有补派复评:既没往任何 pane 粘贴提示词,也没开出新的评审租约
+async function expectNoRedispatch(taskId: string): Promise<void> {
+  expect(harness.runner.pastedPrompts).toEqual([]);
+  expect((await harness.taskStore.get(taskId))?.reviewDispatch).toBeUndefined();
+}
+
+// 换一台带不同布置的 live runner,manager 经公共依赖重建
+function useRunner(options: FakeRunnerOptions): FakeRunner {
+  const runner = createManagerSuiteRunner(options);
+  harness.manager = harness.createManager({ runnerFactory: () => runner });
+  return runner;
+}
 
 describe('AgentManager awaiting_human lifecycle', () => {
   it('markAwaitingHuman sets status + emits intervention, preserving binding and lock', async () => {
@@ -340,20 +368,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime: retry path (state empty + createdSession=true) probes tmux paneId and marks awaiting_human', async () => {
     await harness.seedAgent({ id: 'dev-1' });
-    const probingRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('list-sessions')) {
-          return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('list-panes')) {
-          return { stdout: '%99 claude\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async () => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    (harness.manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => probingRunner;
+    useRunner({ agents: { 'dev-1': { paneId: '%99' } } });
 
     const err = new EnsureSessionError(
       { createdSession: true, agentId: 'dev-1', dialogPending: true },
@@ -370,17 +385,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime: retry path with tmux probe failure returns false (caller rollbacks)', async () => {
     await harness.seedAgent({ id: 'dev-1' });
-    const failingProbeRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('list-panes')) {
-          return { stdout: '', stderr: 'session not found', exitCode: 1 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async () => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    (harness.manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => failingProbeRunner;
+    // 会话不在了:pane 探测失败,调用方回滚
+    useRunner({ session: 'absent' });
 
     const err = new EnsureSessionError(
       { createdSession: true, agentId: 'dev-1', dialogPending: true },
@@ -396,17 +402,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime retry path: paneId guard rejects writes when fresh agent already has paneId (DELETE+recreate covered)', async () => {
     await harness.seedAgent({ id: 'dev-1', paneId: '%new' });
-    const probingRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string) => {
-        if (cmd.includes('list-panes')) {
-          return { stdout: '%old claude\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async () => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    };
-    (harness.manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => probingRunner;
+    useRunner({ agents: { 'dev-1': { paneId: '%old' } } });
 
     const err = new EnsureSessionError(
       { createdSession: true, agentId: 'dev-1', dialogPending: true },
@@ -687,34 +683,28 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
   it.each(['checkout-preparation-failed', 'dirty-workdir'])(
     'resumes a QA held on %s + active review task by redispatching the review with pass fences',
     async (phase) => {
-      const t = await harness.seedTask({ status: 'review', qaAgentId: 'qa-1', prNumber: 12, signalToken: 'pass-t1' });
+      const t = await seedReviewTask({ signalToken: 'pass-t1' });
       await harness.seedAgent({
         id: 'qa-1', taskId: t.id, paneId: '%1',
         status: 'awaiting_human', awaitingPhase: phase,
         awaitingReason: 'repl not ready', awaitingSince: NOW,
       });
       await harness.acquireAgentLock('qa-1', t.id);
-      const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
 
       const result = await harness.manager.resumeAgent('qa-1');
 
       expect(result).toEqual({ resumed: true, releasedBinding: false });
-      expect(dispatchSpy).toHaveBeenCalledWith(t.id, {
-        bumpRound: false,
-        fromStatus: ['review'],
-        expectPhase: undefined,
-        expectSignalToken: 'pass-t1',
-        expectedTask: {
-          status: t.status,
-          phase: t.phase,
-          signalToken: t.signalToken,
-          agentId: t.agentId,
-          reviewRound: t.reviewRound,
-          specReviewRound: t.specReviewRound,
-        },
-        qaPhase: 'review',
-        onQaAcquired: expect.any(Function),
-      });
+      const after = (await harness.taskStore.get(t.id))!;
+      // 不 bump:轮次原地不动,也没留下未计轮 intent
+      expect(after.reviewRound).toBe(0);
+      expect(after.reviewRoundPending).toBeUndefined();
+      expect(after.signalToken).not.toBe('pass-t1');
+      // 复评提示词落在 QA 的 pane 上,phase=review,带着这一轮的 pass/fail 围栏
+      expect(harness.runner.pastedPrompts).toEqual([{ pane: '%1', body: expect.any(String) }]);
+      const body = harness.runner.pastedPrompts[0]!.body;
+      expect(body).toContain('phase: review');
+      expect(body).toContain(after.passToken!);
+      expect(body).toContain(after.failToken!);
       const qa = await harness.agentStore.get('qa-1');
       expect(qa?.taskId).toBe(t.id);
       expect(qa?.status).toBeUndefined();
@@ -723,13 +713,10 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
   );
 
   it('Resume treats a later spec review round as recheck even when code reviewRound is zero', async () => {
-    const t = await harness.seedTask({
-      status: 'review',
+    const t = await seedReviewTask({
       phase: 'spec',
       specReviewRound: 2,
       reviewRound: 0,
-      qaAgentId: 'qa-1',
-      prNumber: 12,
       signalToken: 'spec-pass-r2',
     });
     await harness.seedAgent({
@@ -742,17 +729,16 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
-    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
 
     await harness.manager.resumeAgent('qa-1');
 
-    const options = dispatchSpy.mock.calls[0]?.[1];
-    expect(options).not.toHaveProperty('qaPhase');
+    // Resume 不指定 qaPhase,由轮次自行判定:spec 第 2 轮 → recheck
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%1', body: expect.stringContaining('phase: recheck') }]);
+    expect((await harness.taskStore.get(t.id))?.specReviewRound).toBe(2);
   });
 
   it('Resume 首评 hold 携带持久化未计轮 intent：bumpRound=true + qaPhase=review', async () => {
-    const t = await harness.seedTask({
-      status: 'review', qaAgentId: 'qa-1', prNumber: 12,
+    const t = await seedReviewTask({
       signalToken: 'pass-t2', reviewRound: 0, reviewRoundPending: true,
     });
     await harness.seedAgent({
@@ -761,15 +747,14 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
-    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
 
     await harness.manager.resumeAgent('qa-1');
 
-    expect(dispatchSpy).toHaveBeenCalledWith(t.id, expect.objectContaining({
-      bumpRound: true,
-      qaPhase: 'review',
-      expectSignalToken: 'pass-t2',
-    }));
+    // 未计轮 intent 在派成后落成第 1 轮,仍是 review 首评
+    const after = (await harness.taskStore.get(t.id))!;
+    expect(after.reviewRound).toBe(1);
+    expect(after.reviewRoundPending).toBeUndefined();
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%1', body: expect.stringContaining('phase: review') }]);
   });
 
   it('releases the held QA binding instead of redispatching when the task has left review', async () => {
@@ -780,12 +765,11 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
-    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
 
     const result = await harness.manager.resumeAgent('qa-1');
 
     expect(result).toEqual({ resumed: true, releasedBinding: true });
-    expect(dispatchSpy).not.toHaveBeenCalled();
+    await expectNoRedispatch(t.id);
     const qa = await harness.agentStore.get('qa-1');
     expect(qa?.taskId).toBeUndefined();
     expect(qa?.status).toBeUndefined();
@@ -807,13 +791,12 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready',
       awaitingNonce: 'gen-a',
     });
-    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
 
     const result = await harness.manager.resumeAgent('qa-1');
 
     expect(result).toMatchObject({ resumed: false, releasedBinding: false });
     expect(result.reason).toBeTruthy();
-    expect(dispatchSpy).not.toHaveBeenCalled();
+    await expectNoRedispatch(t.id);
     const qa = await harness.agentStore.get('qa-1');
     expect(qa?.status).toBe('awaiting_human');
     expect(qa?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
@@ -828,6 +811,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: 派单途中「本轮 pass 被后继取代」是状态机内部的并发换代,runner 层造不出
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockImplementation(async () => {
       const fresh = await harness.taskStore.get(t.id);
       await harness.taskStore.set({
@@ -856,7 +840,8 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
-    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockImplementation(async (_taskId, opts) => {
+    // E2: 同上——用例要在派单中途换掉 phase/token,只有从派单入口内部才能精确插进这个窗口
+    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockImplementation(async (_taskId, opts = {}) => {
       expect(Object.hasOwn(opts, 'expectPhase')).toBe(true);
       expect(Object.hasOwn(opts, 'expectSignalToken')).toBe(true);
       expect(opts.expectPhase).toBeUndefined();
@@ -885,6 +870,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: 派单途中任务离开 review 而 token 不变,是状态机内部的并发换代
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockImplementation(async () => {
       const fresh = await harness.taskStore.get(t.id);
       await harness.taskStore.set({ ...fresh!, status: 'approved', updatedAt: new Date().toISOString() });
@@ -914,12 +900,11 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready',
       awaitingNonce: 'gen-a',
     });
-    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
 
     const result = await harness.manager.resumeAgent('qa-1');
 
     expect(result).toMatchObject({ resumed: false, releasedBinding: false });
-    expect(dispatchSpy).not.toHaveBeenCalled();
+    await expectNoRedispatch(t.id);
     const qa = await harness.agentStore.get('qa-1');
     expect(qa?.taskId).toBe(t.id);
     expect(qa?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
@@ -935,6 +920,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: ack_unknown 要与「派单中途换 token」同时发生,runner 只能造出其中一个
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockImplementation(async () => {
       const fresh = await harness.taskStore.get(t.id);
       await harness.taskStore.set({ ...fresh!, signalToken: 'armed-token', updatedAt: new Date().toISOString() });
@@ -958,6 +944,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: 「派单失败且随后的任务读也失败」是两级存储故障的叠加,不是 tmux 边界能造的
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockImplementation(async () => {
       vi.spyOn(harness.taskStore, 'get').mockRejectedValueOnce(new Error('task store read failed'));
       throw new Error('dispatch blew up');
@@ -982,6 +969,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: 派单途中 QA 被并发重派抢走锁,是状态机内部的锁换代
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockImplementation(async () => {
       const cur = await harness.agentStore.get('qa-1');
       await harness.lockManager.releaseIfOwner('qa-1', t.id, cur!.lockToken!);
@@ -1007,6 +995,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: handled 的 EnsureSessionError(已自行收尾但没落下 hold)是状态机内部约定
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockRejectedValue(new EnsureSessionError(
       { createdSession: false, agentId: 'qa-1', handled: true },
       'checkout preparation failed for task task-1: repl not ready',
@@ -1041,6 +1030,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
     });
     const l1 = await harness.acquireAgentLock('qa-1', t.id);
     await harness.agentStore.update('qa-1', existing => ({ ...existing!, lockToken: l1!, updatedAt: NOW }));
+    // E2: 同上,handled 语义由派单内部设置,runner 层的失败都会带上自己的收尾
     vi.spyOn(harness.manager, 'startSession').mockRejectedValue(new EnsureSessionError(
       { createdSession: false, agentId: 'qa-1', handled: true },
       'git checkout preparation failed after reacquire',
@@ -1064,6 +1054,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: 泛型派单失败 + 重新停驻本身也失败,属状态机内部错误叠加
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockRejectedValue(new Error('dispatch blew up'));
     vi.spyOn(harness.manager, 'markAwaitingHuman').mockRejectedValue(new Error('store down'));
 
@@ -1084,6 +1075,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'repl not ready', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('qa-1', t.id);
+    // E2: 「QA 忙/不可用」由派单入口的绑定闸门判定,不经过 tmux
     vi.spyOn(harness.manager, 'dispatchReviewToQa').mockRejectedValue(new Error('QA agent qa-1 is busy or unavailable'));
 
     const result = await harness.manager.resumeAgent('qa-1');
@@ -1107,13 +1099,12 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingReason: 'workdir broken', awaitingSince: NOW,
     });
     await harness.acquireAgentLock('dev-1', t.id);
-    const dispatchSpy = vi.spyOn(harness.manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
 
     const result = await harness.manager.resumeAgent('dev-1');
 
     expect(result).toMatchObject({ resumed: false, releasedBinding: false });
     expect(result.reason).toContain('cancel');
-    expect(dispatchSpy).not.toHaveBeenCalled();
+    await expectNoRedispatch(t.id);
     expect((await harness.agentStore.get('dev-1'))?.status).toBe('awaiting_human');
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
@@ -1134,55 +1125,65 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       awaitingPhase: 'code-dispatch-failed',
     });
     await harness.acquireAgentLock('dev-1');
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
 
     const result = await m.resumeAgent('dev-1');
 
     expect(result).toMatchObject({ resumed: true, releasedBinding: false });
-    expect(continueSpy).toHaveBeenCalledWith(
-      t.id,
-      'dev-1',
-      'code',
-      expect.objectContaining({ signalToken: 'git-code-resume-token' }),
-    );
-    expect(continueSpy.mock.calls[0]?.[3]).not.toHaveProperty('specDocuments');
+    // code 续派直接落到 Dev 的 pane 上,带着原有的 code 信号 token
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining('phase: code') }]);
+    expect(harness.runner.pastedPrompts[0]!.body).toContain('token: git-code-resume-token');
+    expect((await harness.agentStore.get('dev-1'))?.status).toBeUndefined();
+    expect((await harness.taskStore.get(t.id))?.status).toBe('in_progress');
   });
 
   it('re-holds the agent when the code redispatch is not delivered', async () => {
-    const m = harness.createManager();
     const t = await seedFailedCodeRedispatch();
-    vi.spyOn(m, 'continueSession').mockResolvedValue(false);
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
+    // 派单途中任务离开 in_progress:code 提示词的状态闸门关上,提示词不投递
+    let flipped = false;
+    const runner = useRunner({
+      onExec: async command => {
+        if (flipped || !command.includes('capture-pane')) return;
+        flipped = true;
+        const fresh = (await harness.taskStore.get(t.id))!;
+        await harness.taskStore.set({ ...fresh, status: 'review', updatedAt: new Date().toISOString() });
+      },
+    });
 
-    const result = await m.resumeAgent('dev-1');
+    const result = await harness.manager.resumeAgent('dev-1');
 
+    expect(flipped).toBe(true);
     expect(result).toMatchObject({
       resumed: false,
       releasedBinding: false,
       reason: expect.stringContaining('not delivered'),
     });
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1', 'code-dispatch-failed', expect.stringContaining('not delivered'), { expectedTaskId: t.id },
-    );
+    expect(await harness.agentStore.get('dev-1')).toMatchObject({
+      taskId: t.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'code-dispatch-failed',
+      awaitingReason: expect.stringContaining('not delivered'),
+    });
+    expect(runner.pastedPrompts).toEqual([]);
   });
 
   it('re-holds the agent when the code redispatch throws', async () => {
-    const m = harness.createManager();
     const t = await seedFailedCodeRedispatch();
-    vi.spyOn(m, 'continueSession').mockRejectedValue(new Error('redispatch boom'));
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
+    useRunner({ rules: [{ match: 'capture-pane', reply: { stderr: 'redispatch boom', exitCode: 1 } }] });
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    const result = await m.resumeAgent('dev-1');
+    const result = await harness.manager.resumeAgent('dev-1');
 
     expect(result).toMatchObject({
       resumed: false,
       releasedBinding: false,
       reason: expect.stringContaining('redispatch boom'),
     });
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1', 'code-dispatch-failed', expect.stringContaining('failed'), { expectedTaskId: t.id },
-    );
+    expect(await harness.agentStore.get('dev-1')).toMatchObject({
+      taskId: t.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'code-dispatch-failed',
+      awaitingReason: expect.stringContaining('failed'),
+    });
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
   });

@@ -138,6 +138,15 @@ describe('ErrorRecordStore', () => {
     expect(await store.latestForAgent('dev-2')).toMatchObject({ message: 'other agent' });
   });
 
+  it('purgeAgent queued behind an in-flight append removes that record too: purges and appends share one serialized chain', async () => {
+    const inFlight = appendRecord({ agentId: 'dev-1', message: 'written by a probe that started before the agent was replaced' });
+    const purged = store.purgeAgent('dev-1');
+    await Promise.all([inFlight, purged]);
+
+    expect((await purged).removed).toBe(1);
+    expect(await store.latestForAgent('dev-1')).toBeUndefined();
+  });
+
   it('purgeAgent is idempotent on agents with no records', async () => {
     const result = await store.purgeAgent('nonexistent');
     expect(result.removed).toBe(0);

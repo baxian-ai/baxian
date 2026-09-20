@@ -2,14 +2,14 @@ import { it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { AgentConfig, BaxianConfig, ProjectConfig } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 import { api } from '../../src/api.ts';
 import { CreateAgentModal } from '../../src/components/create-agent-modal.tsx';
+import { ToastProvider } from '../../src/components/toast.tsx';
 import { flagDirtyMock } from '../helpers/pending-restart-mock.tsx';
-import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { expectToast } from '../helpers/toast.tsx';
 import { makeRuntimes } from '../helpers/fixtures.ts';
 
 const configGetMock = vi.mocked(api.config.get);
@@ -47,7 +47,6 @@ beforeEach(() => {
     ],
     restartRequired: false,
   });
-  toastShowMock.mockReset();
   flagDirtyMock.mockReset();
 });
 
@@ -68,7 +67,7 @@ async function renderReady(config?: BaxianConfig): Promise<{ onClose: ReturnType
   configGetMock.mockResolvedValue(config ?? cfg([]));
   const onClose = vi.fn();
   const onCreated = vi.fn();
-  render(<CreateAgentModal open projectId="baxian" onClose={onClose} onCreated={onCreated} />);
+  render(<CreateAgentModal open projectId="baxian" onClose={onClose} onCreated={onCreated} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   return { onClose, onCreated };
 }
@@ -88,7 +87,7 @@ async function continueWithDev(id = 'dev-new'): Promise<void> {
 
 it('remote mode shows a host picker (not a raw hostname input)', async () => {
   configGetMock.mockResolvedValue(cfg([{ id: 'box', hostname: 'h.example.com', port: 2222, alias: 'Prod', user: 'agent' }]));
-  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
 
   fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
@@ -100,7 +99,7 @@ it('remote mode shows a host picker (not a raw hostname input)', async () => {
 
 it('guides the user to manage hosts when no hosts are configured', async () => {
   configGetMock.mockResolvedValue(cfg([]));
-  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   expect(await screen.findByText(/No hosts configured yet/)).toBeTruthy();
@@ -108,7 +107,7 @@ it('guides the user to manage hosts when no hosts are configured', async () => {
 
 it('probes by host id (resolved server-side) once a host is selected', async () => {
   configGetMock.mockResolvedValue(cfg([{ id: 'box', hostname: 'h.example.com', port: 22, user: 'agent' }]));
-  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
@@ -118,7 +117,7 @@ it('probes by host id (resolved server-side) once a host is selected', async () 
 
 it('hides Workdir/Model/Additional Dirs behind a collapsed Advanced options toggle', async () => {
   configGetMock.mockResolvedValue(cfg([]));
-  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
+  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
 
   const toggle = screen.getByRole('button', { name: /Advanced options/ });
@@ -172,8 +171,7 @@ it('collects a complete Dev + QA team and submits it once', async () => {
       },
     ],
   });
-  expect(toastShowMock).toHaveBeenCalledWith({
-    kind: 'success',
+  await expectToast({
     title: 'Agent Team dev-new + qa-new added to baxian',
   });
   expect(onCreated).toHaveBeenCalledTimes(1);
@@ -199,8 +197,7 @@ it('flags a pending server restart when the API reports restartRequired', async 
   });
 
   expect(flagDirtyMock).toHaveBeenCalledTimes(1);
-  expect(toastShowMock).toHaveBeenCalledWith({
-    kind: 'warn',
+  await expectToast({
     title: 'Agent Team dev-new + qa-new added to baxian',
     body: 'in-memory config switch failed after disk commit; restart the server',
   });
@@ -227,8 +224,7 @@ it('surfaces post-commit initialization warnings without flagging a restart', as
   });
 
   expect(flagDirtyMock).not.toHaveBeenCalled();
-  expect(toastShowMock).toHaveBeenCalledWith({
-    kind: 'warn',
+  await expectToast({
     title: 'Agent Team dev-new + qa-new added to baxian',
     body: 'agent qa-new state initialization failed after config commit: disk full\nbootstrap will retry',
   });
@@ -385,7 +381,7 @@ it('shows an SSH probe failure for remote hosts and clears it when switching bac
   await waitFor(() => expect(screen.queryByText('SSH: ⨯ auth failed')).toBeNull());
 });
 
-it('renders installed runtime and tmux probe results in green (text-probe-ok)', async () => {
+it('renders installed runtime and tmux probe results with a ✓ and the resolved path', async () => {
   probeMock.mockResolvedValue({
     tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
     runtimes: makeRuntimes({
@@ -395,25 +391,24 @@ it('renders installed runtime and tmux probe results in green (text-probe-ok)', 
   });
   await renderReady();
 
-  expect((await screen.findByText('✓ /usr/local/bin/claude')).className).toContain('text-probe-ok');
-  expect(screen.getByText('✓ /usr/local/bin/codex').className).toContain('text-probe-ok');
-  expect(screen.getByText('tmux: ✓ /usr/bin/tmux').className).toContain('text-probe-ok');
+  expect(await screen.findByText('✓ /usr/local/bin/claude')).toBeTruthy();
+  expect(screen.getByText('✓ /usr/local/bin/codex')).toBeTruthy();
+  expect(screen.getByText('tmux: ✓ /usr/bin/tmux')).toBeTruthy();
 });
 
-it('renders the SSH ✓ line and tmux install success in green (text-probe-ok)', async () => {
+it('renders the SSH ✓ line and the tmux install success message', async () => {
   probeMock.mockResolvedValue({ ssh: { ok: true, message: 'SSH OK' }, ...TMUX_MISSING });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
   fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
-  expect((await screen.findByText('SSH: ✓ SSH OK')).className).toContain('text-probe-ok');
+  expect(await screen.findByText('SSH: ✓ SSH OK')).toBeTruthy();
 
   await act(async () => {
     fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
   });
 
-  const installMsg = await screen.findByText(/tmux 3.4 installed via apt-get/);
-  expect(installMsg.className).toContain('text-probe-ok');
+  expect(await screen.findByText(/tmux 3.4 installed via apt-get/)).toBeTruthy();
 });
 
 it('prefills the Agent ID placeholder for each team-creation step', async () => {
@@ -591,7 +586,7 @@ it('shows a loading hint while installing and ignores repeated clicks', async ()
 
 it('aborts the in-flight probe controller when the modal closes', async () => {
   configGetMock.mockResolvedValue(cfg([]));
-  const { rerender } = render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
+  const { rerender } = render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(probeMock).toHaveBeenCalled());
   const options = probeMock.mock.calls[0][2];
   expect(options?.signal?.aborted).toBe(false);

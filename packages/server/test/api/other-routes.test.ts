@@ -226,6 +226,61 @@ describe('PATCH /api/config', () => {
     expect((app.ctx.config.project[0].agent[0][0]).host).toBe('box');
   });
 
+  it('rejects changing the mode of a live agent: the connection target is one thing, host and mode together', async () => {
+    const configPath = await seedConfigPath(app, tempDir);
+    app.ctx.config = { ...app.ctx.config, host: [{ id: 'box', hostname: 'h', port: 22 }] };
+    await app.ctx.agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%9', updatedAt: new Date().toISOString() });
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: project.agent.map(team => team.map(agent =>
+        agent.id === 'dev-1' ? { ...agent, mode: 'remote' as const, host: 'box' } : agent)),
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/host\/mode of dev-1 while the agent is live/);
+    expect(app.ctx.config.project[0].agent[0][0].mode).toBe('local');
+    expect(await readFile(configPath, 'utf8')).toBe('{}');
+  });
+
+  it('rejects changing an agent while its restart-repl / retry is in progress, and accepts the same change once it finishes', async () => {
+    const configPath = await seedConfigPath(app, tempDir);
+    expect(app.ctx.agentManager.tryBeginMaintenance('dev-1')).toBe(true);
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: project.agent.map(team => team.map(agent =>
+        agent.id === 'dev-1' ? { ...agent, model: 'sonnet-x' } : agent)),
+    }));
+
+    const blocked = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+    expect(blocked.statusCode).toBe(409);
+    expect(JSON.parse(blocked.body).error).toMatch(/agent dev-1 has a restart-repl or retry in progress/);
+    expect(app.ctx.config.project[0].agent[0][0].model).toBeUndefined();
+    expect(await readFile(configPath, 'utf8')).toBe('{}');
+
+    app.ctx.agentManager.endMaintenance('dev-1');
+    const applied = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+    expect(applied.statusCode).toBe(200);
+    expect(app.ctx.config.project[0].agent[0][0].model).toBe('sonnet-x');
+  });
+
+  it('a change to another agent is not blocked by dev-1 being under maintenance; an unchanged dev-1 entry passes too', async () => {
+    await seedConfigPath(app, tempDir);
+    expect(app.ctx.agentManager.tryBeginMaintenance('dev-1')).toBe(true);
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: project.agent.map(team => team.map(agent =>
+        agent.id === 'qa-1' ? { ...agent, model: 'o-x' } : agent)),
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(200);
+    expect(app.ctx.config.project[0].agent[0].find(agent => agent.id === 'qa-1')?.model).toBe('o-x');
+    app.ctx.agentManager.endMaintenance('dev-1');
+  });
+
   it('rejects changing the Workdir of a task-bound agent and leaves memory and disk unchanged', async () => {
     const configPath = await seedConfigPath(app, tempDir);
     const currentWorkdir = app.ctx.config.project[0].agent[0][0].workdir!;
@@ -614,7 +669,7 @@ describe('PATCH /api/config', () => {
   });
 
   describe('restart-required diff', () => {
-    async function patchAndRead(payload: unknown): Promise<{ statusCode: number; body: { restartRequired: boolean; note: string } }> {
+    async function patchAndRead(payload: Record<string, unknown>): Promise<{ statusCode: number; body: { restartRequired: boolean; note: string } }> {
       await seedConfigPath(app, tempDir);
       const response = await patch('/api/config', payload, { headers: JSON_HEADERS });
       return { statusCode: response.statusCode, body: JSON.parse(response.body) };

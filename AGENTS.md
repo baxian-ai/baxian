@@ -29,16 +29,17 @@
 - 不写多行 docstring 解释设计决策。如果一个函数需要长篇解释才能理解，先考虑能否拆分或重命名使其自解释。
 
 ## File Naming Rules
-- 全栈统一 kebab-case：所有源文件、测试文件、目录使用小写字母 + 连字符（`agent-card.tsx`、`task-store.ts`、`use-web-socket.ts`、`packages/server/src/agent/`）。React 组件、Hook、页面、工具一视同仁，不分文件类型。
+- 全栈统一 kebab-case：所有源文件、测试文件、目录使用小写字母 + 连字符（`agent-card.tsx`）。React 组件、Hook、页面、工具一视同仁，不分文件类型。
 - 单个英文单词文件保留 lowercase 即可（`runner.ts`、`prompt.ts`、`index.ts`、`types.ts`、`main.tsx`、`app.tsx`），不强制加连字符。
 - 文件名与导出符号解耦：导出符号沿用各自语言/框架惯例（React 组件 PascalCase、Hook camelCase、常量 UPPER_SNAKE_CASE），文件名不必跟随。例：`agent-card.tsx` 导出 `AgentCard`，`use-web-socket.ts` 导出 `useTerminalSocket`。
-- 配置文件遵循上游工具默认命名（`vite.config.ts`、`vitest.config.ts`、`tsconfig.json`、`package.json`、`AGENTS.md`），不改写。
+- 配置文件遵循上游工具默认命名（`vite.config.ts`、`tsconfig.json`、`package.json`），不改写。
 - 理由：跨平台一致（macOS APFS 默认大小写不敏感，PascalCase 文件易在 Linux CI 与 macOS 本地间出 bug）、URL/CLI/路由友好、消除同目录混合风格的认知负担。社区现代 TypeScript/React 项目（shadcn/ui、Bulletproof React、Anthropic SDK、Hono、Bun）的主流选择。
 
 ## Test Rules
 - 每次改动代码后必须在本地跑单元测试，确认没有破坏原有功能后再 commit + push。
-- 不能以"本地没有环境"为由跳过，必须先探索验证。
+- 不能以「本地没有环境」为由跳过，必须先探索验证。
 - 每次改动必须补充对应的测试用例，涵盖 Happy path 和边界情况。
+- 单元测试的要求：测试行为，不测试实现。
 
 ## Git Rules
 - 采用分支开发模式：禁止直接向 main 提交代码，所有变更必须通过新建分支 + PR 合并

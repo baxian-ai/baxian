@@ -13,8 +13,9 @@ import { activeParticipantBlockers, gitBindingBlockerDetails, gitBindingBlockers
 import { agentIsLive } from '../agent/liveness.js';
 import { revokeSocketAuthorization } from '../terminal/ws-auth.js';
 
-function hostRefKey(host: unknown): string {
-  return JSON.stringify(host ?? null);
+// mode 与 host 一起决定会话跑在哪台机器上:live agent 的连接目标一个字段都不能换
+function hostRefKey(agent: { mode?: unknown; host?: unknown }): string {
+  return JSON.stringify({ mode: agent.mode ?? null, host: agent.host ?? null });
 }
 
 function agentHostRefs(projects: ProjectConfig[] | undefined): Map<string, string> {
@@ -22,7 +23,31 @@ function agentHostRefs(projects: ProjectConfig[] | undefined): Map<string, strin
   for (const project of projects ?? []) {
     for (const team of project?.agent ?? []) {
       for (const agent of team ?? []) {
-        if (agent && typeof agent.id === 'string') refs.set(agent.id, hostRefKey(agent.host));
+        if (agent && typeof agent.id === 'string') refs.set(agent.id, hostRefKey(agent));
+      }
+    }
+  }
+  return refs;
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonicalJson(entry)]),
+    );
+  }
+  return value;
+}
+
+function agentEntryRefs(projects: ProjectConfig[] | undefined): Map<string, string> {
+  const refs = new Map<string, string>();
+  for (const project of projects ?? []) {
+    for (const team of project?.agent ?? []) {
+      for (const agent of team ?? []) {
+        if (agent && typeof agent.id === 'string') refs.set(agent.id, JSON.stringify(canonicalJson(agent)));
       }
     }
   }
@@ -209,13 +234,24 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
           || blockedRemovals.length > 0
         ) {
           const changes = [
-            ...(blockedHosts.length > 0 ? [`host of ${blockedHosts.join(', ')}`] : []),
+            ...(blockedHosts.length > 0 ? [`host/mode of ${blockedHosts.join(', ')}`] : []),
             ...(blockedWorkdirs.length > 0 ? [`Workdir of ${blockedWorkdirs.join(', ')}`] : []),
             ...(blockedPermissions.length > 0 ? [`permissions/addDirs of ${blockedPermissions.join(', ')}`] : []),
             ...(blockedRemovals.length > 0 ? [`configuration entry for ${blockedRemovals.join(', ')}`] : []),
           ].join(' or ');
           return reply.status(409).send({
             error: `cannot change the ${changes} while the agent is live; stop its session first`,
+          });
+        }
+        // restart-repl / retry 在链内才解析配置并按它退出、拉起、replay:中途换掉这个 agent 的配置,整段操作会按两套配置各做一半
+        const currentEntries = agentEntryRefs(prepareConfig(current).project);
+        const nextEntries = agentEntryRefs(validated.project);
+        const underMaintenance = [...currentEntries]
+          .filter(([agentId, entry]) => nextEntries.get(agentId) !== entry && app.ctx.agentManager.isMaintenanceInFlight(agentId))
+          .map(([agentId]) => agentId);
+        if (underMaintenance.length > 0) {
+          return reply.status(409).send({
+            error: `agent ${underMaintenance.join(', ')} has a restart-repl or retry in progress; apply the change when it finishes`,
           });
         }
       }

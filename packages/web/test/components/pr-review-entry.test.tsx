@@ -72,7 +72,7 @@ describe('PrReviewEntry', () => {
     expect(screen.queryByText('Code review')).toBeNull();
   });
 
-  it('marks development and review role labels as colored text, not pills', async () => {
+  it('labels both sides when dev comments and QA reviews appear in the same timeline', async () => {
     ghMock.mockResolvedValue({
       available: true,
       items: [
@@ -81,12 +81,8 @@ describe('PrReviewEntry', () => {
       ],
     } as PrReviewConversation);
     renderEntry(task());
-    const qa = await screen.findByText('Review agent');
-    expect(qa.className).toContain('text-og-600');
-    expect(qa.className).not.toContain('pill');
-    const dev = screen.getByText('Development agent');
-    expect(dev.className).toContain('text-og-600');
-    expect(dev.className).not.toContain('pill');
+    expect(await screen.findByText('Review agent')).toBeTruthy();
+    expect(screen.getByText('Development agent')).toBeTruthy();
   });
 
   it('renders issue comments as dev-side comments and keeps the author visible', async () => {
@@ -121,22 +117,6 @@ describe('PrReviewEntry', () => {
     expect(await screen.findByText('Response')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · src\/a\.ts:42 · please recheck this line/)).toBeTruthy();
     expect(screen.getByText('Development agent')).toBeTruthy();
-  });
-
-  it('styles the Code review title and review-agent marker like Round x: compact and non-bold', async () => {
-    ghMock.mockResolvedValue({
-      available: true,
-      items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
-    } as PrReviewConversation);
-    renderEntry(task());
-    const title = screen.getByText('Code review');
-    expect(title.className).toContain('text-xs');
-    expect(title.className).not.toContain('font-medium');
-    expect(title.className).not.toContain('font-semibold');
-    const qa = await screen.findByText('Review agent');
-    expect(qa.className).toContain('text-xs');
-    expect(qa.className).not.toContain('font-semibold');
-    expect(qa.className).not.toContain('font-medium');
   });
 
   it('badges a token verdict carried by a non-review comment as the QA round verdict', async () => {

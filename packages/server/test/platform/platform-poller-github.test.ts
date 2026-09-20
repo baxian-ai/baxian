@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, onTestFinished, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -9,14 +9,14 @@ import { platformPollerStatePath } from '../../src/platform/comment-cursor.js';
 import { GitHubDriver } from '../../src/platform/github-driver.js';
 import type { DriverExec } from '../../src/platform/types.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
-import { bodyDigest } from '../../src/platform/body-digest.js';
 import type { PlatformEvent } from '../../src/platform/types.js';
 import { registerEventHandlers } from '../../src/event/handlers.js';
 import type { BaxianEvent } from '../../src/shared/index.js';
-import { createManagerHarness } from '../helpers/manager-harness.js';
+import { useManagerSuiteHarness } from '../helpers/manager-harness.js';
 import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 const execFileAsync = promisify(execFile);
+const harness = useManagerSuiteHarness();
 const SHA = 'd'.repeat(40);
 const ANCHOR = SHA;
 const PASS = 'ffffffffffff';
@@ -120,7 +120,7 @@ describe('PlatformPoller over the GitHub driver (fake gh)', () => {
   });
 
   it('filters the dev ack reply and confirms the recheck pass across two cycles', async () => {
-    const ack = buildAckMarker({ sourceKey: 'issue-comments', commentId: '300', bodyDigest: bodyDigest('please also fix naming') });
+    const ack = buildAckMarker({ sourceKey: 'issue-comments', commentId: '300' });
     world.issueComments = [
       ghIssueComment(300, 'please also fix naming'),
       ghIssueComment(301, `Fixed.\n${ack}`, { login: 'devbot', id: 77 }),
@@ -152,6 +152,11 @@ describe('PlatformPoller over the GitHub driver (fake gh)', () => {
     expect(events.filter(e => e.type === 'pr.merged')).toHaveLength(1);
   });
 });
+
+const lastPaste = () => harness.runner.pastedPrompts.at(-1);
+// [pane, phase]:投递的目标 pane 与提示头部声明的相位
+const pasteTrace = (): Array<[string, string]> => harness.runner.pastedPrompts
+  .map(prompt => [prompt.pane, /^phase: (.+)$/m.exec(prompt.body)?.[1] ?? ''] as [string, string]);
 
 function lifecyclePr(
   branch: string,
@@ -194,11 +199,7 @@ function lifecycleReview(
 }
 
 async function lifecycleHarness() {
-  const dir = await mkdtemp(join(tmpdir(), 'bx-github-lifecycle-'));
-  onTestFinished(async () => {
-    vi.restoreAllMocks();
-    await rm(dir, { recursive: true, force: true });
-  });
+  const dir = harness.tempDir;
   let now = Date.now();
   const commands: string[] = [];
   const world = {
@@ -274,31 +275,23 @@ async function lifecycleHarness() {
 
   const repo = 'git@github.com:owner/repo.git';
   const driver = new GitHubDriver('owner/repo', exec);
+  // live runtime 的 pane 模型按 suite 配置的 workdir 建模,两者必须一致
+  const workdirOf = (id: string) => harness.config.project[0]!.agent.flat().find(a => a.id === id)!.workdir;
   const config = makeConfig({
     review: { rounds: 3 },
     project: [{
       id: 'proj', repo, merge: 'auto',
       agent: [[
-        makeAgent({ workdir: '/tmp/lifecycle-dev' }),
-        makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/lifecycle-qa' }),
+        makeAgent({ workdir: workdirOf('dev-1') }),
+        makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: workdirOf('qa-1') }),
       ]],
     }],
   });
-  const harness = await createManagerHarness(dir, { config });
-  const { taskStore, eventBus, manager, events: emittedEvents } = harness;
+  const { taskStore, eventBus, events: emittedEvents } = harness;
+  const manager = harness.createManager({ config });
   vi.spyOn(manager, 'platformDriverFor').mockReturnValue(driver);
-  vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-  vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-  vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-  vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-  vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-  vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue(undefined);
-  let rotated = 0;
-  vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async (taskId) => {
-    const token = (++rotated).toString(16).padStart(12, '0');
-    await manager.updateTask(taskId, { signalToken: token });
-    return { token, armed: true };
-  });
+  await harness.seedAgent({ id: 'dev-1', paneId: '%0' });
+  await harness.seedAgent({ id: 'qa-1', paneId: '%1' });
   registerEventHandlers(eventBus, manager);
 
   const verdictLog = join(dir, 'fake-gh-verdict.log');
@@ -442,16 +435,13 @@ describe('GitHub driver lifecycle integration', () => {
     task = (await h.taskStore.get(created.id))!;
     expect(task.status).toBe('fixing');
     expect(task.signalToken).toMatch(/^[0-9a-f]{12}$/);
+    expect(lastPaste()).toMatchObject({ pane: '%0', body: expect.stringContaining(`token: ${task.signalToken}`) });
 
     const ackAt = h.advance();
     h.world.issueComments = [
       humanComment,
-      h.comment(301, `fixed\n${buildAckMarker({
-        sourceKey: 'issue-comments', commentId: '300', bodyDigest: bodyDigest(humanBody),
-      })}`, 77, ackAt),
-      h.comment(302, `addressed review\n${buildAckMarker({
-        sourceKey: 'reviews', commentId: '900', bodyDigest: bodyDigest(failBody),
-      })}`, 77, ackAt),
+      h.comment(301, `fixed\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: '300' })}`, 77, ackAt),
+      h.comment(302, `addressed review\n${buildAckMarker({ sourceKey: 'reviews', commentId: '900' })}`, 77, ackAt),
     ];
     const fixToken = task.signalToken!;
     const firstPassToken = task.passToken;
@@ -479,6 +469,7 @@ describe('GitHub driver lifecycle integration', () => {
     task = (await h.taskStore.get(created.id))!;
     expect(task.status).toBe('approved');
     expect(task.passProvenance).toMatchObject({ sourceKey: 'reviews', id: '901', anchorSha: SHA });
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
 
     const firstCompletion = await h.manager.getPostApproveCompletion(created.id);
     expect(firstCompletion?.pendingRedispatch).toBe(false);
@@ -495,9 +486,7 @@ describe('GitHub driver lifecycle integration', () => {
     const c2 = h.comment(402, c2Body, 55, r1At);
     h.world.issueComments = [
       ...h.world.issueComments,
-      h.comment(401, `handled C1\n${buildAckMarker({
-        sourceKey: 'issue-comments', commentId: '400', bodyDigest: bodyDigest(c1Body),
-      })}`, 77, r1At),
+      h.comment(401, `handled C1\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: '400' })}`, 77, r1At),
       c2,
     ];
     await h.poller.poll();
@@ -518,9 +507,7 @@ describe('GitHub driver lifecycle integration', () => {
     const r2At = h.advance();
     h.world.issueComments = [
       ...h.world.issueComments,
-      h.comment(403, `handled C2\n${buildAckMarker({
-        sourceKey: 'issue-comments', commentId: '402', bodyDigest: bodyDigest(c2Body),
-      })}`, 77, r2At),
+      h.comment(403, `handled C2\n${buildAckMarker({ sourceKey: 'issue-comments', commentId: '402' })}`, 77, r2At),
     ];
     await h.eventBus.emit({
       id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
@@ -557,6 +544,11 @@ describe('GitHub driver lifecycle integration', () => {
     expect(verdictCommands.every(command => command.startsWith('github.com\tpr review 42 -R owner/repo'))).toBe(true);
     expect(h.emittedEvents.some(event => event.type === 'review.submitted'
       && event.data.source === 'pane-signal')).toBe(false);
+    // 每一段都真的投进了对应 agent 的 pane,而不是只走完状态机
+    expect(pasteTrace()).toEqual([
+      ['%1', 'review'], ['%0', 'fix'], ['%1', 'recheck'], ['%0', 'post-approve'], ['%0', 'post-approve'],
+    ]);
+    expect((await harness.agentStore.get('qa-1'))?.taskId).toBeUndefined();
   });
 
   it('routes cancellation cleanup through the declared close and deleteBranch operations', async () => {

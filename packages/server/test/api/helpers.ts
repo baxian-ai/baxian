@@ -26,14 +26,15 @@ export async function teardownApiHarness(harness?: ApiHarness): Promise<void> {
   await rm(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 }
 
-type Inject = FastifyInstance['inject'];
+type InjectPayload = InjectOptions['payload'];
+type InjectResponse = Promise<LightMyRequestResponse>;
 
 export interface RequestHelpers {
-  get(url: string, opts?: InjectOptions): ReturnType<Inject>;
-  post(url: string, payload?: unknown, opts?: InjectOptions): ReturnType<Inject>;
-  put(url: string, payload?: unknown, opts?: InjectOptions): ReturnType<Inject>;
-  patch(url: string, payload?: unknown, opts?: InjectOptions): ReturnType<Inject>;
-  del(url: string, opts?: InjectOptions): ReturnType<Inject>;
+  get(url: string, opts?: InjectOptions): InjectResponse;
+  post(url: string, payload?: InjectPayload, opts?: InjectOptions): InjectResponse;
+  put(url: string, payload?: InjectPayload, opts?: InjectOptions): InjectResponse;
+  patch(url: string, payload?: InjectPayload, opts?: InjectOptions): InjectResponse;
+  del(url: string, opts?: InjectOptions): InjectResponse;
 }
 
 export function requesters(getApp: () => FastifyInstance): RequestHelpers {

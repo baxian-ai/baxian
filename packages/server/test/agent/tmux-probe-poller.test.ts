@@ -2,12 +2,18 @@ import { mkdtemp, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, it, expect, vi } from 'vitest';
-import type { AgentConfig, BaxianConfig } from '../../src/shared/index.js';
+import type { AgentConfig, BaxianConfig, HostConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { createRunner, type CommandRunner, type ExecResult } from '../../src/agent/runner.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from '../../src/agent/tmux-probe-poller.js';
 import { blank } from './runtime-captures.js';
 import { ErrorRecordStore } from '../../src/state/error-record-store.js';
+import { makeCommandRunner } from '../helpers/fixtures.js';
+
+vi.mock('../../src/agent/runner.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/agent/runner.js')>();
+  return { ...actual, createRunner: vi.fn(actual.createRunner) };
+});
 
 const noopAgentManager = {
   getAgentState: async () => null,
@@ -28,6 +34,7 @@ function makeConfig(agents: AgentConfig[]): BaxianConfig {
   return {
     review: { rounds: 10 },
     server: DEFAULT_SERVER_CONFIG,
+    host: [],
     project: [{
       id: 'proj',
       repo: 'https://github.com/user/repo.git',
@@ -152,7 +159,7 @@ function makePoller(opts: MakePollerOptions = {}): TmuxProbePoller {
     config: config ?? makeConfig(agents ?? [makeAgent('dev-1')]),
     store: opts.store ?? new TmuxSessionStatusStore(),
     agentManager: noopAgentManager,
-    runnerFactory: runnerFactory ?? (() => ({ exec: resolvedExec })),
+    runnerFactory: runnerFactory ?? (() => makeCommandRunner({ exec: resolvedExec })),
     ...rest,
   });
 }
@@ -229,7 +236,7 @@ describe('TmuxProbePoller', () => {
     const poller = makePoller({
       config: makeConfig([makeAgent('dev-1'), makeAgent('qa-1')]),
       store,
-      runnerFactory: agent => ({ exec: execForSession(results.get(agent.id)!) }),
+      runnerFactory: agent => makeCommandRunner({ exec: execForSession(results.get(agent.id)!) }),
     });
 
     await poller.pollOnce();
@@ -325,6 +332,963 @@ describe('TmuxProbePoller', () => {
         runtimeStatusHint: 'error',
         reason: 'UNSUPPORTED_FOREGROUND_PROCESS',
       },
+    });
+  });
+
+  it('an issue re-detected right after a published unreachable carries its own error record, never the unreachable one', async () => {
+    const errorRecordStore = await makeErrorRecordStore();
+    let firstErrorId: string | undefined;
+    await runProbeScenario({
+      errorRecordStore,
+      exec: makeExec({ hasSession: scripted([present, unreachable, unreachable, present]), classify: text('vim\nediting') }),
+      failureThreshold: 2,
+      steps: [
+        {
+          then: (s) => {
+            expect(s.get('dev-1').reason).toBe('UNSUPPORTED_FOREGROUND_PROCESS');
+            firstErrorId = s.get('dev-1').latestError?.id;
+            expect(firstErrorId).toBeTruthy();
+          },
+        },
+        { then: (s) => expect(s.get('dev-1').reason).toBe('UNSUPPORTED_FOREGROUND_PROCESS') },
+        {
+          then: (s) => {
+            expect(s.get('dev-1').tmuxSessionStatus).toBe('unreachable');
+            expect(s.get('dev-1').latestError?.reason).toBe('TMUX_UNREACHABLE');
+          },
+        },
+        {
+          then: (s) => {
+            expect(s.get('dev-1').reason).toBe('UNSUPPORTED_FOREGROUND_PROCESS');
+            expect(s.get('dev-1').latestError?.reason).toBe('UNSUPPORTED_FOREGROUND_PROCESS');
+            expect(s.get('dev-1').latestError?.id).not.toBe(firstErrorId);
+          },
+        },
+      ],
+    });
+  });
+
+  describe('RUNTIME_EXITED (pane back at a shell prompt)', () => {
+    const shellPane: ExecResult = text('zsh\n$ ');
+    const GRACE = 20_000;
+
+    it('flags RUNTIME_EXITED with an error record once the shell persisted across consecutive probes for the grace period', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({ classify: shellPane }),
+        failureThreshold: 2,
+        steps: [
+          {
+            then: (s) => {
+              expect(s.get('dev-1').paneState).toBe('shell');
+              expect(s.get('dev-1').runtimeStatusHint).toBeUndefined();
+            },
+          },
+          {
+            advance: GRACE,
+            then: (s) => expect(s.get('dev-1')).toMatchObject({
+              paneState: 'shell',
+              runtimeStatusHint: 'error',
+              reason: 'RUNTIME_EXITED',
+            }),
+          },
+        ],
+      });
+      expect(await errorRecordStore.latestForAgent('dev-1')).toMatchObject({
+        agentId: 'dev-1',
+        reason: 'RUNTIME_EXITED',
+        recommendation: expect.stringContaining('Restart REPL'),
+      });
+    });
+
+    it('a 1s probe interval does not turn a normal startup window into RUNTIME_EXITED: the count is met but the grace is not', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      let scenario: 'live' | 'shell' = 'shell';
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({ classify: () => (scenario === 'shell' ? shellPane : liveRuntimePane) }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: 1_000 },
+          { advance: 1_000, then: (s) => expect(s.get('dev-1').reason).toBeUndefined() },
+          { advance: 1_000, set: () => { scenario = 'live'; } },
+        ],
+        expectClear: true,
+      });
+      expect(await errorRecordStore.latestForAgent('dev-1')).toBeFalsy();
+    });
+
+    it('with a 1s probe interval the flag still lands once the shell has persisted for the grace period', async () => {
+      await runProbeScenario({
+        exec: makeExec({ classify: shellPane }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: 1_000 },
+          { advance: 1_000, then: (s) => expect(s.get('dev-1').reason).toBeUndefined() },
+          { advance: GRACE, then: (s) => expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED') },
+        ],
+      });
+    });
+
+    it('a single shell sighting between live probes (launch / restart window) does not flag', async () => {
+      let scenario: 'live' | 'shell' = 'live';
+      await runProbeScenario({
+        exec: makeExec({ classify: () => (scenario === 'shell' ? shellPane : liveRuntimePane) }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: GRACE, set: () => { scenario = 'shell'; } },
+          { advance: GRACE, set: () => { scenario = 'live'; } },
+          { advance: GRACE, set: () => { scenario = 'shell'; } },
+        ],
+        expectClear: true,
+      });
+    });
+
+    it('a probe that does not see the pane (unreachable) breaks an unconfirmed shell streak instead of bridging two sightings', async () => {
+      await runProbeScenario({
+        exec: makeExec({ hasSession: scripted([present, unreachable, present, present]), classify: shellPane }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: GRACE },
+          { advance: GRACE, then: (s) => expect(s.get('dev-1').reason).toBeUndefined() },
+          { advance: GRACE, then: (s) => expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED') },
+        ],
+      });
+    });
+
+    it('a transient probe failure does not un-confirm a published RUNTIME_EXITED (no flicker, no duplicate record)', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      let firstErrorId: string | undefined;
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({ hasSession: scripted([present, present, unreachable, present]), classify: shellPane }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          {
+            advance: GRACE,
+            then: (s) => {
+              firstErrorId = s.get('dev-1').latestError?.id;
+              expect(firstErrorId).toBeTruthy();
+            },
+          },
+          { advance: 10_000, then: (s) => expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED') },
+          {
+            advance: 10_000,
+            then: (s) => {
+              expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED');
+              expect(s.get('dev-1').latestError?.id).toBe(firstErrorId);
+            },
+          },
+        ],
+      });
+    });
+
+    it('a live runtime whose first screen is a skip view (transcript) does not inherit RUNTIME_EXITED from the shell observation', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      let scenario: 'live' | 'shell' = 'shell';
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({
+          classify: () => (scenario === 'shell' ? shellPane : liveRuntimePane),
+          capturePane: transcriptCapture,
+        }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: GRACE, then: (s) => expect(s.get('dev-1').latestError?.reason).toBe('RUNTIME_EXITED') },
+          { set: () => { scenario = 'live'; } },
+        ],
+        expect: (s) => {
+          expect(s.get('dev-1').paneState).toBe('live-runtime');
+          expect(s.get('dev-1').reason).toBeUndefined();
+          expect(s.get('dev-1').runtimeStatusHint).toBeUndefined();
+          expect(s.get('dev-1').latestError).toBeUndefined();
+        },
+      });
+    });
+
+    it('an unrelated config rewrite (same agent content, fresh objects) keeps the shell streak', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let nowMs = 1_000_000;
+      const poller = makePoller({
+        store,
+        config: makeConfig([agent]),
+        exec: makeExec({ classify: shellPane }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      await poller.pollOnce();
+      poller.replaceConfig(makeConfig([{ ...agent }]));
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+    });
+
+    it('a same-ID agent whose config changed (runtime swapped) restarts the shell streak', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let nowMs = 1_000_000;
+      const poller = makePoller({
+        store,
+        config: makeConfig([agent]),
+        exec: makeExec({ classify: shellPane }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      await poller.pollOnce();
+      poller.replaceConfig(makeConfig([{ ...agent, runtime: 'codex' }]));
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBeUndefined();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+    });
+
+    it('probeAgent rebuilds a purged agent\'s observation to present/live-runtime in one call and drops the confirmed exit', async () => {
+      const store = new TmuxSessionStatusStore();
+      const errorRecordStore = await makeErrorRecordStore();
+      let nowMs = 1_000_000;
+      let scenario: 'shell' | 'live' = 'shell';
+      const poller = makePoller({
+        store,
+        errorRecordStore,
+        exec: makeExec({ classify: () => (scenario === 'shell' ? shellPane : liveRuntimePane) }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      await poller.pollOnce();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+
+      scenario = 'live';
+      poller.purgeAgent('dev-1');
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+      await poller.probeAgent('dev-1');
+      expect(store.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', paneState: 'live-runtime' });
+      expect(store.get('dev-1').reason).toBeUndefined();
+      expect(store.get('dev-1').observedAt).toBeTruthy();
+    });
+
+    it('confirmReplReady publishes the maintenance-confirmed present first; an immediate probe failing below the threshold leaves it in place instead of unknown, and the failure still counts toward the next poll', async () => {
+      const store = new TmuxSessionStatusStore();
+      const errorRecordStore = await makeErrorRecordStore();
+      let nowMs = 1_000_000;
+      let hasSession: ExecResult = present;
+      const poller = makePoller({
+        store,
+        errorRecordStore,
+        exec: makeExec({ hasSession: () => hasSession, classify: shellPane }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      await poller.pollOnce();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+
+      hasSession = unreachable;
+      await poller.confirmReplReady('dev-1');
+      expect(store.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', paneState: 'live-runtime' });
+      expect(store.get('dev-1').reason).toBeUndefined();
+      expect(store.get('dev-1').error).toBeUndefined();
+      expect(store.get('dev-1').lastPresentAt).toBe(store.get('dev-1').observedAt);
+
+      await poller.pollOnce();
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unreachable');
+    });
+
+    it('confirmReplReady: a successful immediate probe replaces the seeded present with the full observation', async () => {
+      const store = new TmuxSessionStatusStore();
+      const poller = makePoller({
+        store,
+        exec: makeExec({ capturePane: text('✻ Hatching… (3s · esc to interrupt)') }),
+        failureThreshold: 2,
+      });
+
+      await poller.confirmReplReady('dev-1');
+
+      expect(store.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', paneState: 'live-runtime', runtimeStatusHint: 'working' });
+    });
+
+    it('confirmReplReady for an agent that is not configured writes nothing', async () => {
+      const store = new TmuxSessionStatusStore();
+      const poller = makePoller({ store });
+
+      await poller.confirmReplReady('ghost');
+
+      expect(store.get('ghost')).toEqual({ tmuxSessionStatus: 'unknown' });
+    });
+
+    it('purgeAgent voids an absent probe paused inside reconcile: its stillCurrent reads false, and the probeAgent that follows lands present', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const guardAtWrite: boolean[] = [];
+      let session: ExecResult = absent;
+      const poller = new TmuxProbePoller({
+        config: makeConfig([agent]),
+        store,
+        agentManager: {
+          getAgentState: async () => null,
+          reconcileFailedAgent: async (_id: string, opts?: { stillCurrent?: () => boolean }) => {
+            await gate;
+            guardAtWrite.push(opts?.stillCurrent?.() ?? true);
+            return true;
+          },
+        } as unknown as import('../../src/agent/manager.js').AgentManager,
+        runnerFactory: () => ({ exec: makeExec({ hasSession: () => session }) } as unknown as CommandRunner),
+        failureThreshold: 2,
+      });
+      const periodic = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('absent');
+
+      // retry 重建了 REPL:维护路径先 purge 再即时探测
+      poller.purgeAgent('dev-1');
+      session = present;
+      const targeted = poller.probeAgent('dev-1');
+      release();
+      await Promise.all([periodic, targeted]);
+
+      expect(guardAtWrite).toEqual([false]);
+      expect(store.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', paneState: 'live-runtime' });
+    });
+
+    it('purgeAgent voids a probe still waiting on has-session: it commits nothing and reconciles nothing when it resumes', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let gated = true;
+      const reconciled: string[] = [];
+      const poller = new TmuxProbePoller({
+        config: makeConfig([agent]),
+        store,
+        agentManager: {
+          getAgentState: async () => null,
+          reconcileFailedAgent: async (id: string) => { reconciled.push(id); return true; },
+        } as unknown as import('../../src/agent/manager.js').AgentManager,
+        runnerFactory: () => ({
+          exec: makeExec({ hasSession: async () => { if (gated) { await gate; return absent; } return present; } }),
+        } as unknown as CommandRunner),
+        failureThreshold: 2,
+      });
+      const periodic = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      poller.purgeAgent('dev-1');
+      gated = false;
+      release();
+      await periodic;
+
+      expect(reconciled).toEqual([]);
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+      await poller.probeAgent('dev-1');
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('present');
+    });
+
+    it('probeAgent queues behind an in-flight probe of the same agent, so the fresh observation is the one that lands last', async () => {
+      const store = new TmuxSessionStatusStore();
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let classifies = 0;
+      const poller = makePoller({
+        store,
+        exec: makeExec({
+          classify: async () => {
+            classifies += 1;
+            if (classifies === 1) { await gate; return shellPane; }
+            return liveRuntimePane;
+          },
+        }),
+        failureThreshold: 2,
+      });
+      const periodic = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      const targeted = poller.probeAgent('dev-1');
+      await new Promise(resolve => setImmediate(resolve));
+      expect(classifies).toBe(1);
+
+      release();
+      await Promise.all([periodic, targeted]);
+      expect(classifies).toBe(2);
+      expect(store.get('dev-1').paneState).toBe('live-runtime');
+    });
+
+    it('probeAgent for an agent that is not configured is a no-op', async () => {
+      const store = new TmuxSessionStatusStore();
+      const exec = makeExec();
+      const poller = makePoller({ store, exec });
+      await poller.probeAgent('ghost');
+      expect(store.get('ghost').tmuxSessionStatus).toBe('unknown');
+      expect(exec).not.toHaveBeenCalled();
+    });
+
+    it('a same-content reload while a probe is in flight keeps both the observation and the shell streak', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let nowMs = 1_000_000;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let gated = true;
+      const poller = makePoller({
+        store,
+        config: makeConfig([agent]),
+        exec: makeExec({ classify: shellPane, hasSession: async () => { if (gated) await gate; return present; } }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      const inFlight = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      poller.replaceConfig(makeConfig([{ ...agent }]));
+      gated = false;
+      release();
+      await inFlight;
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('present');
+
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+    });
+
+    it.each([
+      ['host alias', (agent: AgentConfig, cfg: BaxianConfig): BaxianConfig => ({ ...cfg, host: [{ ...cfg.host![0], alias: 'renamed' }] })],
+      ['host password', (agent: AgentConfig, cfg: BaxianConfig): BaxianConfig => ({ ...cfg, host: [{ ...cfg.host![0], password: 'rotated' }] })],
+      ['agent model', (agent: AgentConfig, cfg: BaxianConfig): BaxianConfig => ({ ...makeConfig([{ ...agent, model: 'gpt-5-codex' }]), host: cfg.host })],
+      ['agent workdir', (agent: AgentConfig, cfg: BaxianConfig): BaxianConfig => ({ ...makeConfig([{ ...agent, workdir: '/tmp/elsewhere' }]), host: cfg.host })],
+      ['host ref swapped to another id with the same connection target', (agent: AgentConfig, cfg: BaxianConfig): BaxianConfig => ({ ...makeConfig([{ ...agent, host: 'h2' }]), host: [cfg.host![0], { ...cfg.host![0], id: 'h2', alias: 'twin' }] })],
+    ])('%s changing does not restart the shell streak: the probed pane and its reading are unchanged', async (_label, mutate) => {
+      const store = new TmuxSessionStatusStore();
+      const agent: AgentConfig = { ...makeAgent('dev-1'), mode: 'remote', host: 'h1' };
+      const config: BaxianConfig = { ...makeConfig([agent]), host: [{ id: 'h1', hostname: 'a.example', user: 'ops', password: 'pw', alias: 'box' }] };
+      let nowMs = 1_000_000;
+      const poller = makePoller({ store, config, exec: makeExec({ classify: shellPane }), failureThreshold: 2, now: () => nowMs });
+      await poller.pollOnce();
+      poller.replaceConfig(mutate(agent, config));
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('present');
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+    });
+
+    it.each([
+      ['deleted', (h1: HostConfig): HostConfig[] => [{ ...h1, id: 'h2' }]],
+      ['re-pointed at another machine', (h1: HostConfig): HostConfig[] => [{ ...h1, hostname: 'b.example' }, { ...h1, id: 'h2' }]],
+    ])('a probe queued behind an in-flight one connects with the instance current when it runs: after a same-target host ref swap whose old ref is %s, it resolves the new ref, not the captured one', async (_label, hostsAfter) => {
+      const realCreateRunner = vi.mocked(createRunner).getMockImplementation()!;
+      const store = new TmuxSessionStatusStore();
+      const agent: AgentConfig = { ...makeAgent('dev-1'), mode: 'remote', host: 'h1' };
+      const h1: HostConfig = { id: 'h1', hostname: 'a.example', user: 'ops', password: 'pw' };
+      const before: BaxianConfig = { ...makeConfig([agent]), host: [h1] };
+      const after: BaxianConfig = { ...makeConfig([{ ...agent, host: 'h2' }]), host: hostsAfter(h1) };
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const hosts: Array<HostConfig | undefined> = [];
+      vi.mocked(createRunner).mockImplementation((mode, host) => {
+        hosts.push(host);
+        if (!host) return realCreateRunner(mode, host);
+        const exec = execForSession(present);
+        const gated = hosts.length === 1;
+        return { exec: gated ? async (cmd: string) => { await gate; return exec(cmd); } : exec } as unknown as CommandRunner;
+      });
+      try {
+        const poller = new TmuxProbePoller({ config: before, store, agentManager: noopAgentManager, failureThreshold: 1 });
+
+        const inFlight = poller.probeAgent('dev-1');
+        await vi.waitFor(() => expect(hosts).toHaveLength(1));
+        const queued = poller.probeAgent('dev-1');
+        poller.replaceConfig(after);
+        release();
+        await Promise.all([inFlight, queued]);
+
+        expect(hosts.map(host => `${host?.id}@${host?.hostname}`)).toEqual(['h1@a.example', 'h2@a.example']);
+        expect(store.get('dev-1').tmuxSessionStatus).toBe('present');
+      } finally {
+        vi.mocked(createRunner).mockImplementation(realCreateRunner);
+      }
+    });
+
+    it('a password rotated while a probe is in flight voids that probe: its old-credential failure neither counts nor publishes, and the pane conclusion survives', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      const store = new TmuxSessionStatusStore();
+      const agent: AgentConfig = { ...makeAgent('dev-1'), mode: 'remote', host: 'h1' };
+      const configWith = (password: string): BaxianConfig => ({ ...makeConfig([agent]), host: [{ id: 'h1', hostname: 'a.example', user: 'ops', password }] });
+      let nowMs = 1_000_000;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let gated = false;
+      const sessions = scripted([present, present, unreachable, unreachable, present]);
+      const poller = makePoller({
+        store,
+        errorRecordStore,
+        config: configWith('old'),
+        exec: makeExec({ classify: shellPane, hasSession: async () => { if (gated) await gate; return sessions(''); } }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      await poller.pollOnce();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      const exitedId = store.get('dev-1').latestError?.id;
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+      nowMs += 10_000;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+
+      gated = true;
+      const inFlight = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      poller.replaceConfig(configWith('new'));
+      gated = false;
+      release();
+      await inFlight;
+      expect(store.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', reason: 'RUNTIME_EXITED' });
+      expect((await errorRecordStore.latestForAgent('dev-1'))?.reason).toBe('RUNTIME_EXITED');
+
+      nowMs += 10_000;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+      expect(store.get('dev-1').latestError?.id).toBe(exitedId);
+    });
+
+    it('a password rotated while the unreachable record is being written leaves count, pane baseline and store untouched: the new connection counts from zero and RUNTIME_EXITED continues', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      const store = new TmuxSessionStatusStore();
+      const agent: AgentConfig = { ...makeAgent('dev-1'), mode: 'remote', host: 'h1' };
+      const configWith = (password: string): BaxianConfig => ({ ...makeConfig([agent]), host: [{ id: 'h1', hostname: 'a.example', user: 'ops', password }] });
+      let nowMs = 1_000_000;
+      const sessions = scripted([present, present, unreachable, unreachable, unreachable, present]);
+      const poller = makePoller({
+        store,
+        errorRecordStore,
+        config: configWith('old'),
+        exec: makeExec({ classify: shellPane, hasSession: () => sessions('') }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      await poller.pollOnce();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      const exitedId = store.get('dev-1').latestError?.id;
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+      nowMs += 10_000;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const realAppend = errorRecordStore.append.bind(errorRecordStore);
+      vi.spyOn(errorRecordStore, 'append').mockImplementationOnce(async (input) => { await gate; return realAppend(input); });
+      const inFlight = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      poller.replaceConfig(configWith('new'));
+      release();
+      await inFlight;
+      expect(store.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', reason: 'RUNTIME_EXITED' });
+      expect(store.get('dev-1').latestError?.id).toBe(exitedId);
+
+      nowMs += 10_000;
+      await poller.pollOnce();
+      expect(store.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', reason: 'RUNTIME_EXITED' });
+
+      nowMs += 10_000;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+      expect(store.get('dev-1').latestError?.id).toBe(exitedId);
+    });
+
+    it('a password rotation restarts the consecutive unreachable count: one old-connection failure plus one new-connection failure does not publish', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent: AgentConfig = { ...makeAgent('dev-1'), mode: 'remote', host: 'h1' };
+      const configWith = (password: string): BaxianConfig => ({ ...makeConfig([agent]), host: [{ id: 'h1', hostname: 'a.example', user: 'ops', password }] });
+      const poller = makePoller({ store, config: configWith('old'), exec: execForSession(unreachable), failureThreshold: 2 });
+      await poller.pollOnce();
+      poller.replaceConfig(configWith('new'));
+      await poller.pollOnce();
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+      await poller.pollOnce();
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unreachable');
+    });
+
+    it('a host user change restarts the shell streak: another account means another tmux server', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent: AgentConfig = { ...makeAgent('dev-1'), mode: 'remote', host: 'h1' };
+      const configAs = (user: string): BaxianConfig => ({ ...makeConfig([agent]), host: [{ id: 'h1', hostname: 'a.example', user }] });
+      let nowMs = 1_000_000;
+      const poller = makePoller({ store, config: configAs('ops'), exec: makeExec({ classify: shellPane }), failureThreshold: 2, now: () => nowMs });
+      await poller.pollOnce();
+      poller.replaceConfig(configAs('deploy'));
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBeUndefined();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+    });
+
+    it('a host whose connection target changed under the same host id restarts the shell streak', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent: AgentConfig = { ...makeAgent('dev-1'), mode: 'remote', host: 'h1' };
+      const configOn = (hostname: string): BaxianConfig => ({ ...makeConfig([agent]), host: [{ id: 'h1', hostname }] });
+      let nowMs = 1_000_000;
+      const poller = makePoller({
+        store,
+        config: configOn('a.example'),
+        exec: makeExec({ classify: shellPane }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      await poller.pollOnce();
+      poller.replaceConfig(configOn('b.example'));
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBeUndefined();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+    });
+
+    it('a generation change during the present-session observation halts the stale probe: no reconcile, no commit, no purge', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let gated = true;
+      const reconciled: string[] = [];
+      const poller = new TmuxProbePoller({
+        config: makeConfig([agent]),
+        store,
+        agentManager: {
+          getAgentState: async () => null,
+          reconcileFailedAgent: async (id: string) => { reconciled.push(id); return true; },
+        } as unknown as import('../../src/agent/manager.js').AgentManager,
+        runnerFactory: () => ({
+          exec: makeExec({ sessionSnapshot: async () => { if (gated) await gate; return text(''); } }),
+        } as unknown as CommandRunner),
+        failureThreshold: 2,
+      });
+      const inFlight = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      poller.replaceConfig(makeConfig([{ ...agent, runtime: 'codex' }]));
+      gated = false;
+      release();
+      await inFlight;
+
+      expect(reconciled).toEqual([]);
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+    });
+
+    it('an absent probe whose reconcile is still in flight when the generation changes hands the manager a stillCurrent guard that reads false', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const guardAtWrite: boolean[] = [];
+      const poller = new TmuxProbePoller({
+        config: makeConfig([agent]),
+        store,
+        agentManager: {
+          getAgentState: async () => null,
+          reconcileFailedAgent: async (_id: string, opts?: { stillCurrent?: () => boolean }) => {
+            await gate;
+            guardAtWrite.push(opts?.stillCurrent?.() ?? true);
+            return true;
+          },
+        } as unknown as import('../../src/agent/manager.js').AgentManager,
+        runnerFactory: () => ({ exec: makeExec({ hasSession: absent }) } as unknown as CommandRunner),
+        failureThreshold: 2,
+      });
+      const inFlight = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('absent');
+      poller.replaceConfig(makeConfig([{ ...agent, runtime: 'codex' }]));
+      release();
+      await inFlight;
+
+      expect(guardAtWrite).toEqual([false]);
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+    });
+
+    it('the stillCurrent guard reads true for a reconcile that finishes under the same generation', async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      const guardAtWrite: boolean[] = [];
+      const poller = new TmuxProbePoller({
+        config: makeConfig([agent]),
+        store,
+        agentManager: {
+          getAgentState: async () => null,
+          reconcileFailedAgent: async (_id: string, opts?: { stillCurrent?: () => boolean }) => {
+            poller.replaceConfig(makeConfig([{ ...agent }]));
+            guardAtWrite.push(opts?.stillCurrent?.() ?? false);
+            return true;
+          },
+        } as unknown as import('../../src/agent/manager.js').AgentManager,
+        runnerFactory: () => ({ exec: makeExec({ hasSession: absent }) } as unknown as CommandRunner),
+        failureThreshold: 2,
+      });
+      await poller.pollOnce();
+      expect(guardAtWrite).toEqual([true]);
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('absent');
+    });
+
+    it("a stale probe released after a generation change does not seed the new generation's shell streak", async () => {
+      const store = new TmuxSessionStatusStore();
+      const agent = makeAgent('dev-1');
+      let nowMs = 1_000_000;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let gated = true;
+      const poller = makePoller({
+        store,
+        config: makeConfig([agent]),
+        exec: makeExec({
+          classify: shellPane,
+          sessionSnapshot: async (cmd: string) => { if (gated) await gate; return defaultSessionSnapshot(cmd); },
+        }),
+        failureThreshold: 2,
+        now: () => nowMs,
+      });
+      const inFlight = poller.pollOnce();
+      await new Promise(resolve => setImmediate(resolve));
+      poller.replaceConfig(makeConfig([{ ...agent, runtime: 'codex' }]));
+      gated = false;
+      release();
+      await inFlight;
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBeUndefined();
+      nowMs += GRACE;
+      await poller.pollOnce();
+      expect(store.get('dev-1').reason).toBe('RUNTIME_EXITED');
+    });
+
+    it('a transient pane-probe failure keeps the published RUNTIME_EXITED and its record; the next shell sighting appends nothing', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let listPanesResult: ExecResult = oneClaudePane;
+      let firstErrorId: string | undefined;
+      const stillExited = (s: TmuxSessionStatusStore): void => {
+        expect(s.get('dev-1')).toMatchObject({ tmuxSessionStatus: 'present', paneState: 'shell', runtimeStatusHint: 'error', reason: 'RUNTIME_EXITED' });
+        expect(s.get('dev-1').latestError?.id).toBe(firstErrorId);
+      };
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({ classify: shellPane, listPanes: () => listPanesResult }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          {
+            advance: GRACE,
+            then: (s) => {
+              expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED');
+              firstErrorId = s.get('dev-1').latestError?.id;
+              expect(firstErrorId).toBeTruthy();
+            },
+          },
+          { set: () => { listPanesResult = text('%1 claude\n%2 zsh\n'); }, advance: 10_000, then: stillExited },
+          { set: () => { listPanesResult = oneClaudePane; }, advance: 10_000, then: stillExited },
+        ],
+      });
+      expect((await errorRecordStore.latestForAgent('dev-1'))?.id).toBe(firstErrorId);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('pane probe failed (1/2); keeping RUNTIME_EXITED'), expect.anything());
+      warnSpy.mockRestore();
+    });
+
+    it('pane-probe failures reaching failureThreshold replace RUNTIME_EXITED with PANE_PROBE_FAILED; the shell is then re-confirmed with a fresh record', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let listPanesResult: ExecResult = oneClaudePane;
+      let firstErrorId: string | undefined;
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({ classify: shellPane, listPanes: () => listPanesResult }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: GRACE, then: (s) => { firstErrorId = s.get('dev-1').latestError?.id; expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED'); } },
+          { set: () => { listPanesResult = text('%1 claude\n%2 zsh\n'); }, advance: 10_000, then: (s) => expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED') },
+          {
+            advance: 10_000,
+            then: (s) => {
+              expect(s.get('dev-1')).toMatchObject({ runtimeStatusHint: 'error', reason: 'PANE_PROBE_FAILED' });
+              expect(s.get('dev-1').paneState).toBeUndefined();
+              expect(s.get('dev-1').latestError?.reason).toBe('PANE_PROBE_FAILED');
+            },
+          },
+          { set: () => { listPanesResult = oneClaudePane; }, advance: 10_000, then: (s) => expect(s.get('dev-1').reason).toBeUndefined() },
+          {
+            advance: GRACE,
+            then: (s) => {
+              expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED');
+              expect(s.get('dev-1').latestError?.id).toBeTruthy();
+              expect(s.get('dev-1').latestError?.id).not.toBe(firstErrorId);
+            },
+          },
+        ],
+      });
+      vi.restoreAllMocks();
+    });
+
+    it('a live-runtime foreground refutes RUNTIME_EXITED even when the screen capture keeps failing afterwards: PANE_PROBE_FAILED, never the stale exit', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let scenario: 'shell' | 'live-broken-capture' | 'live' = 'shell';
+      await runProbeScenario({
+        exec: makeExec({
+          classify: () => (scenario === 'shell' ? shellPane : liveRuntimePane),
+          capturePane: async () => {
+            if (scenario === 'live-broken-capture') throw new Error('capture-pane: ssh channel closed');
+            return readyCapture;
+          },
+        }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: GRACE, then: (s) => expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED') },
+          {
+            set: () => { scenario = 'live-broken-capture'; },
+            advance: 10_000,
+            then: (s) => {
+              expect(s.get('dev-1').reason).toBe('PANE_PROBE_FAILED');
+              expect(s.get('dev-1').paneState).toBeUndefined();
+            },
+          },
+          { advance: 10_000, then: (s) => expect(s.get('dev-1').reason).toBe('PANE_PROBE_FAILED') },
+          { advance: 10_000, then: (s) => expect(s.get('dev-1').reason).toBe('PANE_PROBE_FAILED') },
+          { set: () => { scenario = 'live'; }, advance: 10_000 },
+        ],
+        expectClear: true,
+      });
+      vi.restoreAllMocks();
+    });
+
+    it('a pane-probe failure with no confirmed RUNTIME_EXITED still publishes PANE_PROBE_FAILED at once and drops the candidate streak', async () => {
+      let listPanesResult: ExecResult = oneClaudePane;
+      await runProbeScenario({
+        exec: makeExec({ classify: shellPane, listPanes: () => listPanesResult }),
+        failureThreshold: 2,
+        steps: [
+          { then: (s) => expect(s.get('dev-1').paneState).toBe('shell') },
+          { set: () => { listPanesResult = text('%1 claude\n%2 zsh\n'); }, advance: 10_000, then: (s) => expect(s.get('dev-1').reason).toBe('PANE_PROBE_FAILED') },
+          { set: () => { listPanesResult = oneClaudePane; }, advance: GRACE, then: (s) => expect(s.get('dev-1').reason).toBeUndefined() },
+          { advance: GRACE, then: (s) => expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED') },
+        ],
+      });
+    });
+
+    it('RUNTIME_EXITED → published unreachable → shell again re-confirms with a fresh record; reason and latestError never disagree', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      let firstErrorId: string | undefined;
+      const consistent = (s: TmuxSessionStatusStore): void => {
+        const observed = s.get('dev-1');
+        if (observed.reason) expect(observed.latestError?.reason).toBe(observed.reason);
+      };
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({
+          hasSession: scripted([present, present, unreachable, unreachable, present, present]),
+          classify: shellPane,
+        }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          {
+            advance: GRACE,
+            then: (s) => {
+              expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED');
+              firstErrorId = s.get('dev-1').latestError?.id;
+              expect(firstErrorId).toBeTruthy();
+              consistent(s);
+            },
+          },
+          { advance: 10_000, then: (s) => { expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED'); consistent(s); } },
+          {
+            advance: 10_000,
+            then: (s) => {
+              expect(s.get('dev-1').tmuxSessionStatus).toBe('unreachable');
+              expect(s.get('dev-1').reason).toBeUndefined();
+              expect(s.get('dev-1').latestError?.reason).toBe('TMUX_UNREACHABLE');
+            },
+          },
+          {
+            advance: 10_000,
+            then: (s) => {
+              expect(s.get('dev-1').tmuxSessionStatus).toBe('present');
+              expect(s.get('dev-1').reason).toBeUndefined();
+              consistent(s);
+            },
+          },
+          {
+            advance: GRACE,
+            then: (s) => {
+              expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED');
+              expect(s.get('dev-1').latestError?.reason).toBe('RUNTIME_EXITED');
+              expect(s.get('dev-1').latestError?.id).not.toBe(firstErrorId);
+            },
+          },
+        ],
+      });
+    });
+
+    it('shell×2 → live/transcript(skip) → shell×2 records a second, distinct RUNTIME_EXITED error', async () => {
+      const errorRecordStore = await makeErrorRecordStore();
+      let scenario: 'live' | 'shell' = 'shell';
+      let firstErrorId: string | undefined;
+      await runProbeScenario({
+        errorRecordStore,
+        exec: makeExec({
+          classify: () => (scenario === 'shell' ? shellPane : liveRuntimePane),
+          capturePane: transcriptCapture,
+        }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          {
+            advance: GRACE,
+            then: (s) => {
+              firstErrorId = s.get('dev-1').latestError?.id;
+              expect(firstErrorId).toBeTruthy();
+            },
+          },
+          { set: () => { scenario = 'live'; }, then: (s) => expect(s.get('dev-1').latestError).toBeUndefined() },
+          { set: () => { scenario = 'shell'; } },
+          {
+            advance: GRACE,
+            then: (s) => {
+              expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED');
+              expect(s.get('dev-1').latestError?.id).toBeTruthy();
+              expect(s.get('dev-1').latestError?.id).not.toBe(firstErrorId);
+            },
+          },
+        ],
+      });
+    });
+
+    it('clears RUNTIME_EXITED once the runtime is back in the foreground', async () => {
+      let scenario: 'live' | 'shell' = 'shell';
+      await runProbeScenario({
+        exec: makeExec({ classify: () => (scenario === 'shell' ? shellPane : liveRuntimePane) }),
+        failureThreshold: 2,
+        steps: [
+          {},
+          { advance: GRACE, then: (s) => expect(s.get('dev-1').reason).toBe('RUNTIME_EXITED') },
+          { set: () => { scenario = 'live'; } },
+        ],
+        expectClear: true,
+      });
     });
   });
 
@@ -778,7 +1742,7 @@ describe('TmuxProbePoller', () => {
 
   it('reuses one runner for session presence and present-session observation', async () => {
     const exec = makeExec();
-    const runnerFactory = vi.fn(() => ({ exec }));
+    const runnerFactory = vi.fn(() => makeCommandRunner({ exec }));
     const poller = makePoller({ runnerFactory });
 
     await poller.pollOnce();
@@ -794,7 +1758,7 @@ describe('TmuxProbePoller', () => {
     const store = new TmuxSessionStatusStore();
     const runnerFactory = vi.fn((agent: AgentConfig) => {
       if (agent.id === 'dev-1') throw new Error('runner boom');
-      return { exec: execForSession(present) };
+      return makeCommandRunner({ exec: execForSession(present) });
     });
     const poller = makePoller({
       config: makeConfig([makeAgent('dev-1'), makeAgent('dev-2')]),
@@ -842,7 +1806,7 @@ describe('TmuxProbePoller', () => {
       config: makeConfig(agents),
       probeTimeoutMs: 123,
       concurrency: 2,
-      runnerFactory: () => ({
+      runnerFactory: () => makeCommandRunner({
         exec: async (cmd, options) => {
           calls.push({ cmd, timeout: options?.timeout });
           active += 1;
@@ -895,7 +1859,7 @@ describe('TmuxProbePoller', () => {
     let probeStarted = 0;
     let release: (() => void) | null = null;
     const poller = makePoller({
-      runnerFactory: () => ({
+      runnerFactory: () => makeCommandRunner({
         exec: async (cmd: string) => {
           if (cmd.includes('pane_title')) return emptyPaneTitle;
           if (!cmd.includes('has-session')) return oneClaudePane;
@@ -933,6 +1897,25 @@ describe('TmuxProbePoller', () => {
       '[tmux-session] dev-1 present -> absent',
     ]);
     logSpy.mockRestore();
+  });
+
+  it('a generation change resets the unreachable failure count, so the new instance is not published unreachable on its first failure', async () => {
+    const store = new TmuxSessionStatusStore();
+    const agent = makeAgent('dev-1');
+    const poller = makePoller({
+      store,
+      config: makeConfig([agent]),
+      exec: makeExec({ hasSession: unreachable }),
+      failureThreshold: 2,
+    });
+    await poller.pollOnce();
+    expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+
+    poller.replaceConfig(makeConfig([{ ...agent, runtime: 'codex' }]));
+    await poller.pollOnce();
+    expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+    await poller.pollOnce();
+    expect(store.get('dev-1').tmuxSessionStatus).toBe('unreachable');
   });
 
   it('replaceConfig prunes store and failure counts for agents removed from config', async () => {
@@ -1025,13 +2008,14 @@ describe('TmuxProbePoller', () => {
     const baseConfig: BaxianConfig = {
       review: { rounds: 10 },
       server: { ...DEFAULT_SERVER_CONFIG, tmuxProbePollIntervalMs: 2000 },
+      host: [],
       project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[ag1]] }],
     };
     const exec = vi.fn(async () => present);
     const poller = makePoller({
       config: baseConfig,
       store,
-      runnerFactory: () => ({ exec }) as unknown as CommandRunner,
+      runnerFactory: () => makeCommandRunner({ exec }),
     });
     poller.start();
     await vi.advanceTimersByTimeAsync(0);
@@ -1061,12 +2045,13 @@ describe('TmuxProbePoller', () => {
     const baseConfig: BaxianConfig = {
       review: { rounds: 10 },
       server: { ...DEFAULT_SERVER_CONFIG, tmuxProbeConcurrency: 2, tmuxProbeTimeoutMs: 1500 },
+      host: [],
       project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[makeAgent('dev-1')]] }],
     };
     const poller = makePoller({
       config: baseConfig,
       store,
-      runnerFactory: () => ({ exec: vi.fn(async () => present) }) as unknown as CommandRunner,
+      runnerFactory: () => makeCommandRunner({ exec: vi.fn(async () => present) }),
     }) as unknown as { concurrency: number; probeTimeoutMs: number; replaceConfig: (c: BaxianConfig) => void };
 
     expect(poller.concurrency).toBe(2);
@@ -1090,12 +2075,13 @@ describe('TmuxProbePoller', () => {
         tmuxProbeTimeoutMs: 4000,
         tmuxProbeConcurrency: 8,
       },
+      host: [],
       project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[makeAgent('dev-1')]] }],
     };
     const poller = makePoller({
       config: customConfig,
       store,
-      runnerFactory: () => ({ exec: vi.fn(async () => present) }) as unknown as CommandRunner,
+      runnerFactory: () => makeCommandRunner({ exec: vi.fn(async () => present) }),
     }) as unknown as {
       concurrency: number;
       probeTimeoutMs: number;
@@ -1111,6 +2097,7 @@ describe('TmuxProbePoller', () => {
     poller.replaceConfig({
       review: { rounds: 10 },
       server: DEFAULT_SERVER_CONFIG,
+      host: [],
       project: customConfig.project,
     });
 
