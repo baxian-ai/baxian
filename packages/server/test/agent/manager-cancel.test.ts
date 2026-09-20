@@ -74,13 +74,12 @@ function fakeClock() {
       await new Promise(resolve => setImmediate(resolve));
     }
   };
-  // 虚拟预算不能按"每 100 ms 只让一拍真实事件循环"折算:coverage 插桩下 store/fs I/O 需要更多拍,
-  // 两者耦合会在真实工作还没跑完时就烧光预算。改成先把真实 I/O 排空,再推进虚拟时钟,并用真实时间兜底。
-  const settle = async <T>(pending: Promise<T>, maxMs = 120_000): Promise<T> => {
+  // 真实 I/O 的完成期限不能用累计虚拟时间衡量。
+  const settle = async <T>(pending: Promise<T>): Promise<T> => {
     let done = false;
     pending.then(() => { done = true; }, () => { done = true; });
     const realDeadline = performance.now() + 60_000;
-    for (let elapsed = 0; !done && elapsed < maxMs && performance.now() < realDeadline; elapsed += 100) {
+    while (!done && performance.now() < realDeadline) {
       for (let turn = 0; turn < 20 && !done; turn++) {
         await new Promise(resolve => setImmediate(resolve));
       }
