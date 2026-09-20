@@ -657,19 +657,35 @@ describe('AgentManager task binding flow', () => {
     expect((await harness.taskStore.get(created.id))?.status).toBe('in_progress');
   });
 
-  it('createAndStartTask({ background: true }) rolls a failed bootstrap back off the create path', async () => {
+  it.each([false, true])('createAndStartTask({ background: true }) rolls a failed bootstrap back off the create path (delayed event: %s)', async delayedEvent => {
     failDispatch();
+    let release!: () => void;
+    const delivery = new Promise<void>(resolve => { release = resolve; });
+    const emit = harness.eventBus.emit.bind(harness.eventBus);
+    if (delayedEvent) {
+      vi.spyOn(harness.eventBus, 'emit').mockImplementation(async event => {
+        if (event.type === 'human.intervention' && event.data.phase === 'dispatch-rollback') await delivery;
+        return emit(event);
+      });
+    }
+    try {
+      const created = await harness.manager.createAndStartTask(
+        'proj',
+        { title: 'T', description: 'D', preferredAgentId: 'dev-1' },
+        { background: true },
+      );
 
-    const created = await harness.manager.createAndStartTask(
-      'proj',
-      { title: 'T', description: 'D', preferredAgentId: 'dev-1' },
-      { background: true },
-    );
-
-    expect(created.status).toBe('in_progress');
-    await vi.waitFor(async () => expect((await harness.taskStore.get(created.id))?.status).toBe('pending'));
-    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(dispatchRollbackEvents()).toHaveLength(1);
+      expect(created.status).toBe('in_progress');
+      await vi.waitFor(async () => expect((await harness.taskStore.get(created.id))?.status).toBe('pending'));
+      release();
+      await vi.waitFor(async () => {
+        expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+        expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
+        expect(dispatchRollbackEvents()).toHaveLength(1);
+      }, { timeout: 5_000 });
+    } finally {
+      release();
+    }
   });
 
   // 提示词已粘贴、尚未回车时任务被取消:startSession 仍会送达并返回 true,收尾落在 createAndStartTask

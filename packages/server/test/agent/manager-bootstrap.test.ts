@@ -832,30 +832,46 @@ describe('dialog-pending slow poll (no hard-fail timeout)', () => {
     expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('runtime path: recovers a dialog after the tmux pane was recreated (stale stored paneId)', async () => {
-    useRunner({ agents: { 'dev-1': { screen: STARTUP_DIALOG } } });
-    const task = await harness.seedTask({ id: 'task-1', status: 'in_progress', signalToken: 'devtok123456' });
-    // 存下来的 paneId 已经过期:真实 pane 由 claim 重新发现
-    await harness.seedAgent({ id: 'dev-1', taskId: task.id, paneId: '%9' });
-    await harness.acquireAgentLock('dev-1', task.id);
+  it.each([false, true])('runtime path: recovers a dialog after the tmux pane was recreated (delayed event: %s)', async delayedEvent => {
+    let release!: () => void;
+    const delivery = new Promise<void>(resolve => { release = resolve; });
+    const emit = harness.eventBus.emit.bind(harness.eventBus);
+    if (delayedEvent) {
+      vi.spyOn(harness.eventBus, 'emit').mockImplementation(async event => {
+        if (event.type === 'human.intervention' && event.data.phase === 'agent_dialog_resolved_runtime') await delivery;
+        return emit(event);
+      });
+    }
+    try {
+      useRunner({ agents: { 'dev-1': { screen: STARTUP_DIALOG } } });
+      const task = await harness.seedTask({ id: 'task-1', status: 'in_progress', signalToken: 'devtok123456' });
+      // 存下来的 paneId 已经过期:真实 pane 由 claim 重新发现
+      await harness.seedAgent({ id: 'dev-1', taskId: task.id, paneId: '%9' });
+      await harness.acquireAgentLock('dev-1', task.id);
 
-    await expect(harness.manager.startSession(task.id, 'dev-1', 'develop')).rejects.toMatchObject({
-      partial: { dialogPending: true },
-    });
-    await waitForState(s => s?.awaitingPhase === 'agent_dialog_pending');
+      await expect(harness.manager.startSession(task.id, 'dev-1', 'develop')).rejects.toMatchObject({
+        partial: { dialogPending: true },
+      });
+      await waitForState(s => s?.awaitingPhase === 'agent_dialog_pending');
 
-    // 运维在 web terminal 里把对话框点掉了:pane 回到正常的 runtime idle 帧
-    runner.sessions.seed('dev-1', { present: true });
+      // 运维在 web terminal 里把对话框点掉了:pane 回到正常的 runtime idle 帧
+      runner.sessions.seed('dev-1', { present: true });
 
-    await waitForState(s => s?.awaitingPhase === 'agent_dialog_resolved_runtime');
-    const state = await harness.agentStore.get('dev-1');
-    expect(state?.paneId).toBe('%0');
-    expect(state?.awaitingReason).toContain('cancel it if it is still active');
-    const intervention = harness.events.find(e =>
-      e.type === 'human.intervention'
-      && e.taskId === task.id
-      && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',
-    );
-    expect(intervention?.data.note).toContain('cancel it if it is still active');
+      await waitForState(s => s?.awaitingPhase === 'agent_dialog_resolved_runtime');
+      const state = await harness.agentStore.get('dev-1');
+      expect(state?.paneId).toBe('%0');
+      expect(state?.awaitingReason).toContain('cancel it if it is still active');
+      release();
+      await vi.waitFor(() => {
+        const intervention = harness.events.find(e =>
+          e.type === 'human.intervention'
+          && e.taskId === task.id
+          && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',
+        );
+        expect(intervention?.data.note).toContain('cancel it if it is still active');
+      }, { timeout: 5_000, interval: 1 });
+    } finally {
+      release();
+    }
   });
 });
