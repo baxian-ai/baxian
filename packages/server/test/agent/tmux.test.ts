@@ -3,6 +3,7 @@ import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError
 import { fakeRunner, foregroundCondAccepts } from '../helpers/fake-runner.js';
 import type { PaneRef } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { ExecNotStartedError } from '../../src/agent/runner.js';
 import { blank, CC_NONYOLO_BASH_PERMISSION, CODEX_NONYOLO_ESCALATION } from './runtime-captures.js';
 import { classifyScreen } from '../../src/agent/detect/classify.js';
 
@@ -680,6 +681,30 @@ describe('TmuxManager', () => {
   });
 
   describe('submitToRuntime (one guarded command for the text and its Enter)', () => {
+    it('preserves a known refusal to start execution instead of reporting an unknown result', async () => {
+      const error = new ExecNotStartedError('Context command deadline exceeded');
+      runner.exec.mockRejectedValueOnce(error);
+      await expect(tmux.submitToRuntime(PANE, 'codex', '/clear')).rejects.toBe(error);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([0, 255])('requires an execution marker even when transport exits %s', async exitCode => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode });
+      await expect(tmux.submitToRuntime(PANE, 'codex', '/clear')).rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a submission timeout as unknown without retrying', async () => {
+      runner.exec.mockRejectedValueOnce(new Error('Command timed out after 5000ms'));
+      await expect(tmux.submitToRuntime(PANE, 'codex', '/clear')).rejects.toThrow(/outcome unknown.*timed out/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('accepts a confirmed submission when SSH fails after returning its marker', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_RUNTIME_OK\n', stderr: 'connection reset', exitCode: 255 });
+      await expect(tmux.submitToRuntime(PANE, 'codex', '/clear')).resolves.toBeUndefined();
+    });
+
     it('queues the literal and the Enter in a single runtime-guarded tmux command, literal first', async () => {
       primeExec('BX_RUNTIME_OK\n');
       await tmux.submitToRuntime(PANE, 'claude-code', '/exit');
@@ -1087,6 +1112,52 @@ describe('TmuxManager', () => {
       expect(err).toBeInstanceOf(ReplNotReadyError);
       expect((err as Error).message).toMatch(/at deadline/);
       expect(runner.exec.mock.calls.length).toBeGreaterThan(2);
+    });
+  });
+
+  describe('readReplSnapshot', () => {
+    const primeSnapshot = (title: string, cap: string): void => {
+      runner.exec.mockImplementationOnce(async cmd => {
+        const marker = cmd.match(/BX_REPL_TITLE_[a-f0-9-]+/)![0];
+        return { stdout: `BX_PANE_OKcodex\n${cap}${marker}${title}\n`, stderr: '', exitCode: 0 };
+      });
+    };
+
+    it.each(['✳ 标题 | 50%', '✳ first\nsecond | 50%'])('reads title %j and the visible screen in one identity-guarded command', async title => {
+      primeSnapshot(title, '› draft\n');
+      await expect(tmux.readReplSnapshot(PANE, 'codex', { timeout: 123 })).resolves.toEqual({
+        current: 'codex', title, cap: '› draft\n',
+      });
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      expect(runner.exec).toHaveBeenCalledWith(expect.stringContaining('capture-pane -p -J -S 0'), { timeout: 123 });
+      expect(lastCmd(runner)).toContain('#{==:#{@baxian-agent-id},dev-1}');
+    });
+
+    it('preserves an empty title and screen', async () => {
+      primeSnapshot('', '');
+      await expect(tmux.readReplSnapshot(PANE, 'codex')).resolves.toEqual({ current: 'codex', title: '', cap: '' });
+    });
+
+    it.each(['', '› draft  \n\n', '• Working (3s • esc to interrupt)\n'])('keeps screen content identical to a standalone visible capture for %j', async cap => {
+      primeSnapshot('codex', cap);
+      const snapshot = await tmux.readReplSnapshot(PANE, 'codex');
+      primeExec(okBody(cap));
+      expect(snapshot.cap).toBe(await tmux.capturePaneById(PANE, { scrollback: 0, runtime: 'codex' }));
+    });
+
+    it('refuses a snapshot of a replaced pane', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.readReplSnapshot(PANE, 'codex')).rejects.toBeInstanceOf(PaneGoneError);
+    });
+
+    it('refuses an incomplete snapshot', async () => {
+      primeExec('BX_PANE_OKcodex\n› prompt\n');
+      await expect(tmux.readReplSnapshot(PANE, 'codex')).rejects.toThrow('incomplete snapshot');
+    });
+
+    it('does not treat a partial SSH response as a complete snapshot', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_PANE_OKcodex|idle\n› ', stderr: 'connection reset', exitCode: 255 });
+      await expect(tmux.readReplSnapshot(PANE, 'codex')).rejects.toThrow(/guarded read.*exit 255/);
     });
   });
 

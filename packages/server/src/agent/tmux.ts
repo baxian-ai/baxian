@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { CommandRunner, ExecOptions, ExecResult } from './runner.js';
-import { shellQuote } from './runner.js';
+import { ExecNotStartedError, shellQuote } from './runner.js';
 import { execOutcomeUnknown, isTransientNetworkFailure } from './net-exec.js';
 import { classifyScreen, isTrustedIdleRule } from './detect/classify.js';
 import type { AgentRuntimeKind, ManifestDetection } from './detect/manifest.js';
@@ -231,6 +231,17 @@ export interface CapturePaneOpts {
   scrollback?: number;
   timeoutMs?: number;
   runtime?: AgentRuntimeKind;
+}
+
+function capturePaneCommand(paneId: string, opts: CapturePaneOpts): string {
+  const flags = ['-p', '-J'];
+  if (opts.ansi) flags.push('-e');
+  if (typeof opts.scrollback === 'number' && opts.scrollback > 0) {
+    flags.push('-S', `-${opts.scrollback}`);
+  } else if (opts.scrollback === 0) {
+    flags.push('-S', '0');
+  }
+  return `capture-pane ${flags.join(' ')} -t ${paneId}`;
 }
 
 export interface WaitOpts {
@@ -985,12 +996,17 @@ export class TmuxManager {
 
   // 一行文本与回车在同一条守卫命令里排入:分两次守卫,前台在两者之间换了进程会只留半行在 composer(/exit 留到下次回车才生效)
   async submitToRuntime(pane: PaneRef, runtime: AgentRuntimeKind, text: string): Promise<void> {
-    await this.writeIfRuntimeForeground(
+    const outcome = await this.guardedForegroundWrite(
       pane,
       runtime,
       [sendKeysCommand(pane.paneId, [text], true), sendKeysCommand(pane.paneId, ['Enter'])],
-      `the line ${JSON.stringify(text)} and Enter`,
     );
+    if (outcome.kind === 'refused') {
+      throw foreignForegroundError(pane, runtime, outcome.foreground, `the line ${JSON.stringify(text)} and Enter withheld`);
+    }
+    if (outcome.kind === 'uncertain') {
+      throw new TmuxOutcomeUnknownError(`tmux submit to ${pane.paneId} outcome unknown: ${outcome.cause}; inspect the pane before retrying`);
+    }
   }
 
   // 前台判定与按键在同一条 if-shell 里由 tmux 服务端一次完成:分两次往返,间隙里前台换了进程,按键就落到另一个进程上
@@ -1014,6 +1030,7 @@ export class TmuxManager {
         opts,
       );
     } catch (err) {
+      if (err instanceof ExecNotStartedError) throw err;
       return { kind: 'uncertain', cause: `exec rejected: ${err instanceof Error ? err.message : String(err)}` };
     }
     // 标记是服务端已执行/已拒绝的直接证据,先于 exit code 判读:成功标记已收到、SSH 却在收尾时断开会给出 exit 255
@@ -1098,23 +1115,41 @@ export class TmuxManager {
   }
 
   async capturePaneById(pane: PaneRef, opts: CapturePaneOpts = {}): Promise<string> {
-    const ansi = opts.ansi ?? false;
-    const scrollback = opts.scrollback;
-    const flags: string[] = ['-p', '-J'];
-    if (ansi) flags.push('-e');
-    if (typeof scrollback === 'number' && scrollback > 0) {
-      flags.push('-S', `-${scrollback}`);
-    } else if (scrollback === 0) {
-      flags.push('-S', '0');
-    }
     const execOpts = opts.timeoutMs ? { timeout: opts.timeoutMs } : undefined;
     const { body } = await this.guardedPaneRead(
       pane,
       '',
-      [`capture-pane ${flags.join(' ')} -t ${pane.paneId}`],
+      [capturePaneCommand(pane.paneId, opts)],
       execOpts,
     );
     return blankSparkles(body, opts.runtime);
+  }
+
+  async readReplSnapshot(
+    pane: PaneRef,
+    runtime: AgentRuntimeKind,
+    opts?: ExecOptions,
+  ): Promise<{ current: string; title: string; cap: string }> {
+    const titleMarker = `BX_REPL_TITLE_${randomUUID()}`;
+    const { header, body } = await this.guardedPaneRead(
+      pane,
+      '#{pane_current_command}',
+      [
+        capturePaneCommand(pane.paneId, { scrollback: 0 }),
+        `display-message -p -t ${pane.paneId} '${titleMarker}#{pane_title}'`,
+      ],
+      opts,
+    );
+    // 标题可含换行或分隔符,不能与抓屏共用固定行数/固定分隔符。
+    const separator = body.startsWith(titleMarker) ? 0 : body.lastIndexOf(`\n${titleMarker}`) + 1;
+    if (!body.slice(separator).startsWith(titleMarker) || !body.endsWith('\n')) {
+      throw new Error(`tmux readReplSnapshot ${pane.paneId}: incomplete snapshot`);
+    }
+    return {
+      current: header,
+      title: body.slice(separator + titleMarker.length, -1),
+      cap: blankSparkles(body.slice(0, separator), runtime),
+    };
   }
 
   async injectPrompt(pane: PaneRef, prompt: string, agentId: string, runtime: AgentRuntimeKind): Promise<void> {

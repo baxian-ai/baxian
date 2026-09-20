@@ -68,28 +68,33 @@ async function outcomeFor(agentId: AgentId, taskId: string): Promise<CancelOutco
 // ESC 后生产硬等 10 s 的 ready 窗口才做 liveness 判定:假时钟推进等待,setImmediate 保持真实让 store I/O 落定
 function fakeClock() {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
-  const step = async (totalMs: number, until: () => boolean = () => false): Promise<void> => {
-    for (let elapsed = 0; elapsed < totalMs && !until(); elapsed += 100) {
+  // 真实 I/O 的完成期限不能用累计虚拟时间衡量。
+  const until = async (satisfied: () => boolean, realBudgetMs = 60_000): Promise<void> => {
+    const realDeadline = performance.now() + realBudgetMs;
+    while (!satisfied() && performance.now() < realDeadline) {
+      for (let turn = 0; turn < 20 && !satisfied(); turn++) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      if (satisfied()) break;
       await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(satisfied()).toBe(true);
+  };
+  const advance = async (totalMs: number): Promise<void> => {
+    for (let elapsed = 0; elapsed < totalMs;) {
+      const stepMs = Math.min(100, totalMs - elapsed);
+      await vi.advanceTimersByTimeAsync(stepMs);
       await new Promise(resolve => setImmediate(resolve));
+      elapsed += stepMs;
     }
   };
-  // 真实 I/O 的完成期限不能用累计虚拟时间衡量。
   const settle = async <T>(pending: Promise<T>): Promise<T> => {
     let done = false;
     pending.then(() => { done = true; }, () => { done = true; });
-    const realDeadline = performance.now() + 60_000;
-    while (!done && performance.now() < realDeadline) {
-      for (let turn = 0; turn < 20 && !done; turn++) {
-        await new Promise(resolve => setImmediate(resolve));
-      }
-      if (done) break;
-      await vi.advanceTimersByTimeAsync(100);
-    }
-    expect(done).toBe(true);
+    await until(() => done);
     return pending;
   };
-  return { step, settle };
+  return { advance, until, settle };
 }
 async function onFakeClock<T>(run: (clock: ReturnType<typeof fakeClock>) => Promise<T>): Promise<T> {
   const clock = fakeClock();
@@ -329,7 +334,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
       await vi.waitFor(async () => {
         expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
       });
-      await clock.step(40_000);
+      await clock.advance(40_000);
       expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
       expect(interruptKeys(runner, '%0')).toEqual([]);
 
@@ -772,7 +777,7 @@ describe('cancelTask: ESC, liveness probe and composer clearing', () => {
 
     await onFakeClock(async clock => {
       const cancel = harness.manager.cancelTask(taskId);
-      await clock.step(200);
+      await clock.advance(200);
       expect(interruptKeys(runner, '%1')).toEqual([]);
       gate.release();
       await clock.settle(upload);
@@ -794,8 +799,7 @@ describe('cancelTask: ESC, liveness probe and composer clearing', () => {
 
     await onFakeClock(async clock => {
       const cancel = harness.manager.cancelTask(taskId);
-      await clock.step(60_000, () => clearing);
-      expect(clearing).toBe(true);
+      await clock.until(() => clearing);
       await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({ status: 409 });
       gate.release();
       await clock.settle(cancel);
@@ -1025,5 +1029,33 @@ describe('AgentManager.cancelTask release failure tolerance', () => {
     expect(interruptKeys(runner, '%0')).toEqual(['Escape', 'C-c']);
     expect(errSpy.mock.calls.some(c => String(c[0]).includes('releaseAgentForTask'))).toBe(true);
     errSpy.mockRestore();
+  });
+});
+
+describe('fakeClock', () => {
+  it('until() waits on real event-loop turns, so work needing far more turns than any virtual budget still lands', async () => {
+    await onFakeClock(async clock => {
+      let landed = false;
+      // 2000 拍远超任何按虚拟时间折算出的迭代预算:这个条件只能靠真实事件循环推进才会成立
+      void (async () => {
+        for (let turn = 0; turn < 2_000; turn++) await new Promise(resolve => setImmediate(resolve));
+        landed = true;
+      })();
+
+      await clock.until(() => landed);
+    });
+  });
+
+  it('until() gives up at its real-time budget instead of hanging when the condition never holds', async () => {
+    await expect(onFakeClock(clock => clock.until(() => false, 50))).rejects.toThrow();
+  });
+
+  // 非整百输入是边界:按固定 100 ms 步进会向上取整,卡在 timeout 边界的用例会观察到错的状态
+  it.each([0, 37, 2_500, 2_501])('advance(%d) moves virtual time by exactly that span', async (totalMs) => {
+    await onFakeClock(async clock => {
+      const before = Date.now();
+      await clock.advance(totalMs);
+      expect(Date.now() - before).toBe(totalMs);
+    });
   });
 });

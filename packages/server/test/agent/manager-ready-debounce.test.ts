@@ -165,13 +165,13 @@ describe('waitForReplPromptReady stableIdle 去抖', () => {
     expect(runner.pastedPrompts).toEqual([]);
   });
 
-  it('plain 模式回归:compact 的两次就绪等待各只采样一帧 idle 即放行', async () => {
+  it('手动 compact 在清稿前后都确认连续三帧 idle 才提交', async () => {
     const runner = useRunner();
     await harness.seedAgent({ id: 'qa-1', paneId: '%1' });
 
     await expect(harness.manager.compactAgent('qa-1')).resolves.toBeUndefined();
 
-    expect(before('/compact').filter(isReadyProbe)).toHaveLength(2);
+    expect(before('/compact').filter(isReadyProbe)).toHaveLength(6);
     expect(runner.sessions.pane('qa-1')!.phase).toBe('working');
   });
 });

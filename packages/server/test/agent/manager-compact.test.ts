@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { AgentManagerDeps } from '../../src/agent/manager.js';
 import { ReplNotReadyError } from '../../src/agent/tmux.js';
+import { LocalRunner } from '../../src/agent/runner.js';
 import { createManagerSuiteRunner, useManagerSuiteHarness, workdirsOf } from '../helpers/manager-harness.js';
 import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
 
@@ -11,13 +12,13 @@ const COMMA_LITERAL = "'\\'','\\''";
 const harness = useManagerSuiteHarness();
 
 let runner: FakeRunner;
-let onExec: ((cmd: string) => void | Promise<void>) | null;
+let onExec: FakeRunnerOptions['onExec'] | null;
 
 function useRunner(options: FakeRunnerOptions = {}, deps: Partial<AgentManagerDeps> = {}): FakeRunner {
   runner = createManagerSuiteRunner({
     workdirs: workdirsOf(harness.config),
     ...options,
-    onExec: cmd => onExec?.(cmd),
+    onExec: (cmd, options) => onExec?.(cmd, options),
   });
   harness.manager = harness.createManager({ runnerFactory: () => runner, ...deps });
   return runner;
@@ -80,7 +81,7 @@ describe('compactAgent', () => {
     expect(ccIdx).toBeGreaterThan(spaceIdx);
     expect(literalIdx).toBeGreaterThan(ccIdx);
     expect(calls[literalIdx]).toContain("'%0'");
-    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBeGreaterThan(literalIdx);
+    expect(calls[literalIdx]).toContain('Enter');
     // 提交确实落在 runtime 上:pane 进入 working,composer 已清空
     expect(runner.sessions.pane('dev-1')).toMatchObject({ phase: 'working', composer: '' });
 
@@ -135,6 +136,7 @@ describe('compactAgent', () => {
   });
 
   it('rejects 409 without sending anything when the runtime is not at an idle prompt, and leaves a server-side trace', async () => {
+    useRunner({}, { manualCompactWaitMs: 40 });
     await seedLiveAgent();
     // REPL 在就绪判定之后、清稿之前退出前台:探针读回的前台不再是 runtime
     let flipped = false;
@@ -315,7 +317,7 @@ describe('clearAgent', () => {
     const literalIdx = idxOf(calls, c => isLiteral(c, '/clear'));
     expect(literalIdx).toBeGreaterThanOrEqual(0);
     expect(calls.some(c => c.includes('/compact'))).toBe(false);
-    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBeGreaterThan(literalIdx);
+    expect(calls[literalIdx]).toContain('Enter');
     // /clear 同时清掉会话上的任务上下文标记,下一次派单必须重发完整上下文
     expect(runner.sessions.option('dev-1', '@baxian-context-task-id')).toBe('');
 
@@ -360,6 +362,290 @@ describe('clearAgent', () => {
     gate.release();
     await compact;
     await waitGuardFree('dev-1');
+  });
+});
+
+describe('manual context command latency and failure boundaries', () => {
+  const isSnapshot = (cmd: string): boolean => cmd.includes('pane_title') && cmd.includes('capture-pane');
+
+  it.each(['foreground', 'menu', 'transport'])('recovers from one transient %s observation before submitting', async fault => {
+    let probes = 0;
+    useRunner({ rules: [{
+      match: cmd => isSnapshot(cmd) && ++probes === 2,
+      reply: cmd => {
+        if (fault === 'transport') throw new Error('ssh: connection reset');
+        const marker = cmd.match(/BX_REPL_TITLE_[a-f0-9-]+/)![0];
+        const current = fault === 'foreground' ? 'bash' : 'codex';
+        const cap = fault === 'menu'
+          ? 'permissions: YOLO mode\n\n› $bax\n  $baxian-task Dispatch\n\n  Press enter to insert or esc to close\n'
+          : 'permissions: YOLO mode\n\n› \n';
+        return { stdout: `BX_PANE_OK${current}\n${cap}${marker}\n` };
+      },
+    }] }, { manualCompactWaitMs: 100 });
+    await seedLiveAgent('qa-1', '%1');
+    await expect(harness.manager.clearAgent('qa-1')).resolves.toBeUndefined();
+    expect(probes).toBe(8);
+    expect(cmds().filter(cmd => isLiteral(cmd, '/clear'))).toHaveLength(1);
+    await waitGuardFree('qa-1');
+  });
+
+  it('reports a deadline before submission as definitely not submitted and releases the guard immediately', async () => {
+    await seedLiveAgent('qa-1', '%1');
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    onExec = cmd => { if (cmd.includes('set-option') && cmd.includes('@baxian-context-task-id')) now = 15_000; };
+    try {
+      await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+        status: 409, message: expect.stringContaining('/clear was not submitted'),
+      });
+      expect(cmds().some(cmd => isLiteral(cmd, '/clear'))).toBe(false);
+      await expect(harness.manager.attachImageToRunningAgent('qa-1', PNG, 'png')).resolves.toHaveProperty('path');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(['session', 'composerClear', 'diagnosis'])('exposes a deadline during %s as an actionable preparation failure', async phase => {
+    useRunner(phase === 'diagnosis' ? { rules: [{ match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|bash\n' } }] } : {});
+    await seedLiveAgent('qa-1', '%1');
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    onExec = cmd => {
+      if ((phase === 'session' && cmd.includes('list-sessions'))
+        || (phase === 'composerClear' && isLiteral(cmd, COMMA_LITERAL))
+        || (phase === 'diagnosis' && cmd.includes('cursor_x'))) now = 15_000;
+    };
+    try {
+      await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+        status: 409, message: expect.stringContaining('/clear was not submitted'),
+      });
+      expect(cmds().some(cmd => isLiteral(cmd, '/clear'))).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(['session', 'composerClear', 'diagnosis'])('exposes a running command timeout during %s without submitting', async phase => {
+    let now = 0;
+    let probes = 0;
+    const stalled = (cmd: string): boolean => phase === 'session' ? cmd.includes('list-panes')
+      : phase === 'composerClear' ? cmd.includes('cursor_x')
+        : cmd.includes('capture-pane') && !isSnapshot(cmd);
+    useRunner({ rules: [
+      { match: stalled, reply: (_cmd, options) => new LocalRunner().exec('sleep 30', options) },
+      { match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|bash\n' } },
+    ] });
+    await seedLiveAgent('qa-1', '%1');
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    onExec = cmd => {
+      if ((phase === 'session' && cmd.includes('list-sessions'))
+        || (phase === 'composerClear' && isSnapshot(cmd) && ++probes === 3)
+        || (phase === 'diagnosis' && cmd.includes('cursor_x'))) now = 14_950;
+    };
+    try {
+      await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+        status: 409, message: expect.stringMatching(/\/clear was not submitted:.*Command timed out after 50ms/),
+      });
+      expect(cmds().some(cmd => isLiteral(cmd, '/clear'))).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each([
+    ['replaced pane', 'BX_TARGET_GONE\n', 'identity condition failed'],
+    ['malformed response', 'BX_PANE_OKcodex\n› prompt\n', 'incomplete snapshot'],
+  ])('aborts immediately on a %s instead of retrying permanent failures', async (_label, stdout, message) => {
+    useRunner({ rules: [{ match: isSnapshot, reply: { stdout } }] });
+    await seedLiveAgent('qa-1', '%1');
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining(message),
+    });
+    expect(cmds().filter(isSnapshot)).toHaveLength(1);
+    expect(runner.sentKeys).toEqual([]);
+  });
+
+  it('reports unconfirmed idle and the last transient error when reads never recover', async () => {
+    useRunner({ rules: [{ match: isSnapshot, reply: () => { throw new Error('ssh: connection reset'); } }] }, { manualCompactWaitMs: 40 });
+    await seedLiveAgent('qa-1', '%1');
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 409, message: expect.stringMatching(/stable idle not confirmed.*last observation: ssh: connection reset/),
+    });
+    expect(cmds().filter(isSnapshot).length).toBeGreaterThan(1);
+    expect(runner.sentKeys).toEqual([]);
+  });
+
+  it('submits after 800ms of stable observations with production polling defaults', async () => {
+    useRunner({}, { readyStableSpacingMs: undefined });
+    await seedLiveAgent('qa-1', '%1');
+    const binding = await harness.agentStore.get('qa-1');
+    const get = vi.spyOn(harness.agentStore, 'get').mockResolvedValue(binding);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date', 'performance'] });
+    try {
+      const pending = harness.manager.clearAgent('qa-1');
+      await vi.advanceTimersByTimeAsync(799);
+      expect(cmds().some(cmd => isLiteral(cmd, '/clear'))).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(runner.sessions.pane('qa-1')?.phase).toBe('working');
+      await vi.advanceTimersByTimeAsync(20);
+    } finally {
+      vi.useRealTimers();
+      get.mockRestore();
+    }
+  });
+
+  it.each(['compactAgent', 'clearAgent'] as const)('%s uses six combined idle observations and one guarded submission', async method => {
+    await seedLiveAgent('qa-1', '%1');
+    const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    await harness.manager[method]('qa-1');
+
+    const command = method === 'compactAgent' ? '/compact' : '/clear';
+    const calls = runner.exec.mock.calls;
+    const submitted = calls.findIndex(([cmd]) => isLiteral(cmd, command));
+    const observations = calls.slice(0, submitted).filter(([cmd]) => isSnapshot(cmd));
+    expect(observations).toHaveLength(6);
+    expect(calls[submitted]![0]).toContain('Enter');
+    for (const [, options] of calls.slice(0, submitted + 1)) {
+      expect(options?.timeout).toBeGreaterThan(0);
+      expect(options?.timeout).toBeLessThanOrEqual(5_000);
+    }
+    expect(runner.sessions.pane('qa-1')).toMatchObject({ phase: 'working', composer: '' });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('timing:'), expect.objectContaining({
+      outcome: 'submitted', session: expect.any(Number), readyBeforeClear: expect.any(Number),
+      composerClear: expect.any(Number), readyAfterClear: expect.any(Number), submit: expect.any(Number),
+    }));
+    await waitGuardFree('qa-1');
+  });
+
+  it.each(['before', 'after'])('resets the idle streak on a busy frame %s composer cleanup', async phase => {
+    await seedLiveAgent('qa-1', '%1');
+    let cleared = false;
+    let observations = 0;
+    onExec = cmd => {
+      if (cmd.includes('C-c')) cleared = true;
+      if (!isSnapshot(cmd) || cleared !== (phase === 'after')) return;
+      observations++;
+      if (observations === 3) runner.sessions.markWorking('qa-1');
+      else runner.sessions.setProcess('qa-1', 'codex');
+    };
+
+    await harness.manager.compactAgent('qa-1');
+
+    expect(observations).toBe(6);
+    expect(runner.sessions.pane('qa-1')?.phase).toBe('working');
+    await waitGuardFree('qa-1');
+  });
+
+  it('withholds the command when idle frames never become stable', async () => {
+    useRunner({}, { manualCompactWaitMs: 60 });
+    await seedLiveAgent('qa-1', '%1');
+    let probes = 0;
+    onExec = cmd => {
+      if (!isSnapshot(cmd)) return;
+      if (++probes % 2 === 0) runner.sessions.markWorking('qa-1');
+      else runner.sessions.setProcess('qa-1', 'codex');
+    };
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({ status: 409 });
+
+    expect(probes).toBeGreaterThan(2);
+    expect(runner.sentKeys).toEqual([]);
+  });
+
+  it('an idle screen cannot override a working title', async () => {
+    useRunner({ agents: { 'qa-1': { title: '⠹ 分析' } } }, { manualCompactWaitMs: 40 });
+    await seedLiveAgent('qa-1', '%1');
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({ status: 409 });
+    expect(runner.sentKeys).toEqual([]);
+  });
+
+  it('withholds submission when the session changes after composer cleanup', async () => {
+    await seedLiveAgent('qa-1', '%1');
+    onExec = async cmd => {
+      if (cmd.includes('C-c')) await harness.seedAgent({ id: 'qa-1', paneId: '%9' });
+    };
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('session changed'),
+    });
+    expect(cmds().some(cmd => isLiteral(cmd, '/clear'))).toBe(false);
+  });
+
+  it('terminates a stalled probe at its remaining budget and allows a later retry', async () => {
+    const rules: NonNullable<FakeRunnerOptions['rules']> = [{
+      match: isSnapshot,
+      reply: (_cmd, options) => new LocalRunner().exec('sleep 30', options),
+    }];
+    useRunner({ rules }, { manualCompactWaitMs: 100 });
+    await seedLiveAgent('qa-1', '%1');
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('Command timed out after'),
+    });
+    expect(runner.sentKeys).toEqual([]);
+    rules.length = 0;
+    await expect(harness.manager.clearAgent('qa-1')).resolves.toBeUndefined();
+    await waitGuardFree('qa-1');
+  });
+
+  it('does not start another terminal command after the total operation budget expires', async () => {
+    useRunner({}, { manualCompactWaitMs: 100 });
+    await seedLiveAgent('qa-1', '%1');
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    onExec = () => { now += 8_000; };
+    try {
+      await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+        status: 409, message: expect.stringContaining('deadline exceeded'),
+      });
+      expect(runner.exec.mock.calls.map(([, options]) => options?.timeout)).toEqual([5_000, 5_000]);
+      expect(runner.sentKeys).toEqual([]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('bounds a stalled submission, reports unknown and never retries it', async () => {
+    useRunner({ rules: [{
+      match: cmd => isLiteral(cmd, '/clear'),
+      reply: (_cmd, options) => new LocalRunner().exec('sleep 30', options),
+    }] });
+    await seedLiveAgent('qa-1', '%1');
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    onExec = cmd => { if (cmd.includes('set-option') && cmd.includes('@baxian-context-task-id')) now = 14_950; };
+    try {
+      await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+        status: 504, message: expect.stringContaining('execution outcome unknown'),
+      });
+      const submissions = runner.exec.mock.calls.filter(([cmd]) => isLiteral(cmd, '/clear'));
+      expect(submissions).toHaveLength(1);
+      expect(submissions[0]![1]?.timeout).toBe(50);
+      await waitGuardFree('qa-1');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(['applied-lost', 'not-applied-lost'] as const)('reports %s submission as unknown without resending, retaining the guard during observation', async outcome => {
+    useRunner({ rules: [{ match: cmd => isLiteral(cmd, '/clear'), reply: { outcome } }] });
+    await seedLiveAgent('qa-1', '%1');
+    let submitted = false;
+    const gate = gateOn(cmd => {
+      if (isLiteral(cmd, '/clear')) submitted = true;
+      return submitted && isCapture(cmd);
+    });
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 504, message: expect.stringContaining('execution outcome unknown'),
+    });
+    await vi.waitFor(() => expect(gate.hit()).toBe(true));
+    await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({ status: 409 });
+    expect(cmds().filter(cmd => isLiteral(cmd, '/clear'))).toHaveLength(1);
+    expect(runner.sessions.pane('qa-1')?.phase).toBe(outcome === 'applied-lost' ? 'working' : 'idle');
+    gate.release();
+    await waitGuardFree('qa-1');
   });
 });
 

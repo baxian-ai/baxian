@@ -848,6 +848,29 @@ describe('AgentManager.ensureSession', () => {
       expect(runner.sessions.pane('dev-1')!.process).toBe('claude');
     });
 
+    it.each([0, 255])('reconciles a missing exit receipt (transport exit %s) with the shell before relaunching', async exitCode => {
+      live({
+        onExec: cmd => { if (cmd.includes("'/exit'")) runner.sessions.setProcess('dev-1', 'zsh'); },
+        rules: [{ match: "'/exit'", reply: { stdout: '', exitCode } }],
+      });
+      await manager.restartReplOnly('dev-1');
+      expect(keysWith("'/exit'")).toHaveLength(1);
+      expect(keysWith(CLAUDE_LAUNCH)).toHaveLength(1);
+      expect(traceOrder(["'/exit'", '#{pane_current_command}', 'BX_SHELL_OK'])).toBe(true);
+      expect(runner.sessions.pane('dev-1')?.process).toBe('claude');
+    });
+
+    it.each(['claude', 'vim'])('does not resend exit or relaunch after a lost receipt while %s remains foreground', async process => {
+      live({
+        onExec: cmd => { if (cmd.includes("'/exit'")) runner.sessions.setProcess('dev-1', process); },
+        rules: [{ match: "'/exit'", reply: { stdout: '' } }],
+      }, { replExitWaitMs: 100 });
+      await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/did not exit within 100ms/);
+      expect(keysWith("'/exit'")).toHaveLength(1);
+      expect(keysWith(CLAUDE_LAUNCH)).toHaveLength(0);
+      expect(runner.sessions.pane('dev-1')?.process).toBe(process);
+    });
+
     it('refuses to send the exit command while the runtime is still mid-turn after Escape', async () => {
       live({ ackHoldCaptures: Infinity, agents: { 'dev-1': { interrupt: 'ignored-live' } } }, { restartInterruptWaitMs: 100 });
       runner.sessions.markWorking('dev-1');

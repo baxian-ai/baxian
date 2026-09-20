@@ -74,6 +74,7 @@ import type { ErrorRecordStore, ErrorRecordInput } from '../state/error-record-s
 import type { CommandRunner } from './runner.js';
 import {
   createRunner,
+  ExecNotStartedError,
   LocalRunner,
   shellQuote,
   hostGroupKey,
@@ -85,6 +86,7 @@ import { classifyScreen, isMenuRule } from './detect/classify.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
 import {
   TmuxManager,
+  TmuxOutcomeUnknownError,
   ReplNotReadyError,
   isBlockedOnStartupDialog,
   hasRuntimeReadyView,
@@ -367,6 +369,8 @@ const DEFAULT_DISPATCH_ACK_TIMEOUT_MS = 30_000;
 const DEFAULT_NEED_INPUT_RETRY_INTERVAL_MS = 5_000;
 const DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS = 3_000;
 const DELETE_CLEANUP_TIMEOUT_MS = 15_000;
+const MANUAL_CONTEXT_COMMAND_TIMEOUT_MS = 5_000;
+const MANUAL_CONTEXT_TIMEOUT_MS = 15_000;
 const PLATFORM_HEAD_SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
 
 function branchCleanupIdentity(task: TaskState): AutoDeleteIdentity {
@@ -4250,7 +4254,12 @@ export class AgentManager {
     if (foreground === 'shell') return;
     await tmux.clearComposerDraft(pane, runtime);
     // 退出文本与 Enter 是同一条守卫命令:到达前 runtime 已退到 shell 就整组不发(/exit 不会被 shell 当命令执行),前台是 vim 这类进程也不会只留半行在 composer
-    if (!await this.reachedRuntime(() => tmux.submitToRuntime(pane, runtime, REPL_EXIT_COMMAND[cfg.runtime]))) return;
+    try {
+      if (!await this.reachedRuntime(() => tmux.submitToRuntime(pane, runtime, REPL_EXIT_COMMAND[cfg.runtime]))) return;
+    } catch (err) {
+      if (!(err instanceof TmuxOutcomeUnknownError)) throw err;
+      console.warn(`[AgentManager] restart-repl: exit outcome unknown for ${cfg.id}; checking for shell before relaunch`, err);
+    }
     const after = await this.pollPaneCommandStable(tmux, pane, { timeoutMs: this.replExitWaitMs, expectShell: true });
     if (!isShellProcTitle(after)) {
       throw new Error(
@@ -7692,6 +7701,20 @@ export class AgentManager {
       throw new ApiError(409, `Agent ${agentId} compact or upload already in progress`);
     }
     let guardHandedOff = false;
+    const startedAt = performance.now();
+    let deadline = startedAt + MANUAL_CONTEXT_TIMEOUT_MS;
+    const timings: Record<string, number> = {};
+    let stage = 'session';
+    let outcome = 'failed';
+    const timed = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
+      stage = name;
+      const start = performance.now();
+      try {
+        return await fn();
+      } finally {
+        timings[name] = Math.round(performance.now() - start);
+      }
+    };
     try {
       const state = await this.agentStore.get(agentId);
       const paneId = state?.paneId;
@@ -7709,21 +7732,32 @@ export class AgentManager {
           throw new ApiError(409, `Agent ${agentId} session changed while waiting; ${command} aborted`);
         }
       };
-      const tmux = new TmuxManager(this.createRunnerFor(cfg));
-      const pane = await this.resolveClaimedPane(tmux, agentId, paneId);
-      const waitReady = async (stage: string): Promise<void> => {
+      const runner = this.createRunnerFor(cfg);
+      const tmux = new TmuxManager({
+        exec: (cmd, options) => {
+          const remaining = Math.ceil(deadline - performance.now());
+          if (remaining <= 0) throw new ExecNotStartedError(`Context command deadline exceeded during ${guardHandedOff ? 'post idle wait' : stage}`);
+          const timeout = Math.min(options?.timeout ?? MANUAL_CONTEXT_COMMAND_TIMEOUT_MS, remaining, MANUAL_CONTEXT_COMMAND_TIMEOUT_MS);
+          return runner.exec(cmd, { ...options, timeout });
+        },
+        execWithStdin: runner.execWithStdin.bind(runner),
+        writeFile: runner.writeFile.bind(runner),
+      });
+      const pane = await timed('session', () => this.resolveClaimedPane(tmux, agentId, paneId));
+      const waitReady = async (label: string): Promise<void> => {
         try {
-          await this.waitForReplPromptReady(tmux, pane, cfg.runtime, this.manualCompactWaitMs);
+          await this.waitForReplPromptStableIdle(tmux, pane, cfg.runtime, this.manualCompactWaitMs, { manual: true });
         } catch (err) {
-          console.warn(`[AgentManager] sendSlashCommand(${agentId}, ${command}) ${stage}: runtime not at an idle prompt:`, err);
+          if (err instanceof ExecNotStartedError) throw err;
+          console.warn(`[AgentManager] sendSlashCommand(${agentId}, ${command}) ${label}: runtime not at an idle prompt:`, err);
           const detail = err instanceof Error ? err.message : String(err);
           throw new ApiError(409, `Agent ${agentId} runtime is not at an idle REPL prompt: ${detail}`);
         }
       };
-      await waitReady('before composer clear');
+      await timed('readyBeforeClear', () => waitReady('before composer clear'));
       await assertSessionUnchanged();
       try {
-        await tmux.clearComposerDraft(pane, cfg.runtime);
+        await timed('composerClear', () => tmux.clearComposerDraft(pane, cfg.runtime));
       } catch (err) {
         console.warn(`[AgentManager] sendSlashCommand(${agentId}, ${command}) composer clear failed:`, err);
         if (err instanceof ReplNotReadyError || err instanceof PaneGoneError) {
@@ -7731,19 +7765,27 @@ export class AgentManager {
         }
         throw err;
       }
-      await waitReady('after composer clear');
+      await timed('readyAfterClear', () => waitReady('after composer clear'));
       await assertSessionUnchanged();
       if (command === '/clear') {
-        await this.setSessionOptions(
+        await timed('contextMarker', () => this.setSessionOptions(
           tmux,
           agentId,
           pane.session,
           [[TASK_CONTEXT_SESSION_OPTION, '']],
-        );
+        ));
       }
-      await tmux.sendKeysLiteral(pane, command, cfg.runtime);
-      await tmux.sendEnter(pane, cfg.runtime);
+      let submitError: TmuxOutcomeUnknownError | undefined;
+      try {
+        await timed('submit', () => tmux.submitToRuntime(pane, cfg.runtime, command));
+        outcome = 'submitted';
+      } catch (err) {
+        if (!(err instanceof TmuxOutcomeUnknownError)) throw err;
+        submitError = err;
+        outcome = 'unknown';
+      }
       guardHandedOff = true;
+      deadline = performance.now() + this.compactIdleWaitMs;
       void this.outsideTaskMutationScope(
         () => this.waitForReplPromptReady(tmux, pane, cfg.runtime, this.compactIdleWaitMs),
       )
@@ -7753,8 +7795,18 @@ export class AgentManager {
         .finally(() => {
           this.compactInFlight.delete(agentId);
         });
+      if (submitError) throw new ApiError(504, `${command} execution outcome unknown; inspect the agent terminal before retrying: ${submitError.message}`);
+    } catch (err) {
+      if (!guardHandedOff && (err instanceof ExecNotStartedError
+        || (err instanceof Error && isTransientNetworkFailure(err.message)))) {
+        throw new ApiError(409, `Agent ${agentId} could not prepare ${command} during ${stage}; ${command} was not submitted: ${err.message}`);
+      }
+      throw err;
     } finally {
       if (!guardHandedOff) this.compactInFlight.delete(agentId);
+      console.info(`[AgentManager] sendSlashCommand(${agentId}, ${command}) timing:`, {
+        outcome, stage, totalMs: Math.round(performance.now() - startedAt), ...timings,
+      });
     }
   }
 
@@ -11014,19 +11066,27 @@ export class AgentManager {
     tmux: TmuxManager,
     pane: PaneRef,
     runtime: AgentRuntimeKind,
+    snapshotOpts?: { timeoutMs: number },
   ): Promise<{ cap: string; ready: boolean; working: boolean }> {
     const paneId = pane.paneId;
-    const current = await tmux.displayMessage(pane, '#{pane_current_command}');
+    const snapshot = snapshotOpts
+      ? await tmux.readReplSnapshot(pane, runtime, { timeout: snapshotOpts.timeoutMs })
+      : undefined;
+    const current = snapshot?.current ?? await tmux.displayMessage(pane, '#{pane_current_command}');
     if (!hasReplProcTitle(current, runtime)) {
-      throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
+      const detail = `waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`;
+      if (snapshot) throw new ReplNotReadyError(paneId, runtime, snapshot.cap, detail);
+      throw new Error(detail);
     }
-    const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0, runtime });
+    const cap = snapshot?.cap ?? await tmux.capturePaneById(pane, { ansi: false, scrollback: 0, runtime });
     let detection = classifyScreen(runtime, cap);
     // 标题规则优先级最高:屏幕判 idle 不作数,必须带标题复核
-    if (detection.state === 'idle') detection = classifyScreen(runtime, cap, await tmux.readPaneTitle(pane));
+    if (detection.state === 'idle') detection = classifyScreen(runtime, cap, snapshot?.title ?? await tmux.readPaneTitle(pane));
     const ready = hasRuntimeReadyView(cap, runtime, detection);
     if (detection.state === 'pending' || detection.skipStateUpdate) {
-      throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
+      const detail = `waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`;
+      if (snapshot) throw new ReplNotReadyError(paneId, runtime, cap, detail);
+      throw new Error(detail);
     }
     return { cap, ready, working: detection.state === 'working' };
   }
@@ -11036,26 +11096,38 @@ export class AgentManager {
     pane: PaneRef,
     runtime: AgentRuntimeKind,
     timeoutMs: number,
+    opts: { manual?: boolean } = {},
   ): Promise<void> {
     const paneId = pane.paneId;
     const samples = Math.max(1, this.readyStableSamples);
-    const spacing = this.readyStableSpacingMs;
-    const deadline = Date.now() + timeoutMs + (samples - 1) * spacing;
+    const spacing = opts.manual ? Math.min(200, this.readyStableSpacingMs) : this.readyStableSpacingMs;
+    const stabilityWindow = opts.manual ? 0 : (samples - 1) * spacing;
+    const deadline = performance.now() + timeoutMs + stabilityWindow;
     let streak = 0;
+    let cap = '';
+    let lastError: Error | undefined;
     while (true) {
-      const { cap, ready } = await this.probeReplPrompt(tmux, pane, runtime);
-      streak = ready ? streak + 1 : 0;
-      if (streak >= samples) return;
-      if (Date.now() >= deadline) {
-        throw new ReplNotReadyError(
-          paneId,
-          runtime,
-          cap,
-          `stable idle not confirmed within ${timeoutMs}ms (+${(samples - 1) * spacing}ms stability window)`,
-        );
+      const remaining = Math.ceil(deadline - performance.now());
+      if (remaining <= 0) break;
+      try {
+        const probe = await this.probeReplPrompt(tmux, pane, runtime, opts.manual ? { timeoutMs: remaining } : undefined);
+        cap = probe.cap;
+        lastError = undefined;
+        streak = probe.ready ? streak + 1 : 0;
+        if (streak >= samples) return;
+      } catch (err) {
+        if (!opts.manual || !(err instanceof Error)
+          || err instanceof ExecNotStartedError || err instanceof PaneGoneError
+          || !(err instanceof ReplNotReadyError || isTransientNetworkFailure(err.message))) throw err;
+        lastError = err;
+        if (err instanceof ReplNotReadyError) cap = err.lastScreen;
+        streak = 0;
       }
-      await new Promise(r => setTimeout(r, spacing));
+      await new Promise(r => setTimeout(r, Math.max(0, Math.min(spacing, deadline - performance.now()))));
     }
+    throw new ReplNotReadyError(paneId, runtime, cap,
+      `stable idle not confirmed within ${timeoutMs}ms (+${stabilityWindow}ms stability window)`
+      + (lastError ? `; last observation: ${lastError.message}` : ''));
   }
 
   stopPhaseSignalWatcher(taskId: string): void {

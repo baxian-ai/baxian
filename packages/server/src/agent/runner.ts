@@ -11,6 +11,13 @@ export interface ExecResult {
   exitCode: number;
 }
 
+export class ExecNotStartedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ExecNotStartedError';
+  }
+}
+
 export type RemoteShellMode = 'login' | 'login-interactive';
 
 export interface ExecOptions {
