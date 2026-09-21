@@ -838,8 +838,8 @@ describe('AgentManager.ensureSession', () => {
     });
 
     it('fails closed without relaunching when the runtime is still in the foreground after the exit command', async () => {
-      // tmux 收下了退出命令(OK 标记),runtime 却没有退出
-      live({ rules: [{ match: "'/exit'", reply: { stdout: 'BX_RUNTIME_OK\n' } }] }, { replExitWaitMs: 300 });
+      // 退出命令进了 composer、tmux 也收下了回车(OK 标记),runtime 却没有退出
+      live({ rules: [{ match: c => c.includes("'Enter'"), reply: { stdout: 'BX_RUNTIME_OK\n' } }] }, { replExitWaitMs: 300 });
 
       await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/did not exit within 300ms/);
 
@@ -1092,7 +1092,7 @@ describe('AgentManager.ensureSession', () => {
       expect(runner.sessions.pane('dev-1')!.process).toBe('zsh');
     });
 
-    it('the exit command and its Enter travel in one runtime-guarded tmux command', async () => {
+    it('the exit command and its Enter are two runtime-guarded tmux commands, text first', async () => {
       live();
 
       await manager.restartReplOnly('dev-1');
@@ -1100,9 +1100,15 @@ describe('AgentManager.ensureSession', () => {
       const exits = trace("'/exit'");
       expect(exits).toHaveLength(1);
       expect(exits[0]).toContain('BX_RUNTIME_OK');
-      expect(exits[0]).toContain("'Enter'");
-      expect(exits[0]!.indexOf("'/exit'")).toBeLessThan(exits[0]!.indexOf("'Enter'"));
       expect(exits[0]).toContain('#{==:#{pane_current_command},claude}');
+      // 同一条命令列表里的文本与 Enter 落在同一批输入,会被粘贴突发检测吞成草稿换行
+      expect(exits[0]).not.toContain("'Enter'");
+      const all = cmds();
+      const textIdx = all.indexOf(exits[0]!);
+      const enterIdx = all.findIndex((c, i) =>
+        i > textIdx && c.includes('send-keys -t %0 --') && c.includes('Enter') && c.includes('BX_RUNTIME_OK'));
+      expect(enterIdx).toBeGreaterThan(textIdx);
+      expect(all[enterIdx]).toContain('#{==:#{pane_current_command},claude}');
     });
 
     it('an exit command the server refuses because the runtime already dropped to the shell is not an error: the restart relaunches', async () => {

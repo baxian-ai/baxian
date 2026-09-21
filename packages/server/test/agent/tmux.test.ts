@@ -680,7 +680,41 @@ describe('TmuxManager', () => {
     });
   });
 
-  describe('submitToRuntime (one guarded command for the text and its Enter)', () => {
+  describe('submitToRuntime (the line, then the drafted evidence, then the Enter)', () => {
+    // 提交要先读一帧基线、写文本、再读到草稿变化才发回车:只有两条写命令的回复由 writes 依次给出
+    let pinnedColumn = false;
+    let wrapsToNextRow = false;
+    let resizesUnderUs = false;
+    let failReadAfterWrite: number | null = null;
+    const submitReplies = (foreground: string, ...writes: Array<{ stdout?: string; stderr?: string; exitCode?: number } | Error>): void => {
+      const queue = [...writes];
+      let column = '2';
+      let row = '30';
+      let geometry = '120x40';
+      let written = false;
+      let readsAfterWrite = 0;
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('cursor_x')) {
+          if (failReadAfterWrite !== null && written) {
+            readsAfterWrite += 1;
+            if (readsAfterWrite === failReadAfterWrite) throw new Error('ssh: connection reset by peer');
+          }
+          return { stdout: okHeader(`${column}|${row}|${geometry}|${foreground}`), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) return { stdout: okBody('› Ask Codex to do anything'), stderr: '', exitCode: 0 };
+        if (cmd.includes('send-keys -l')) {
+          written = true;
+          if (resizesUnderUs) { row = '9'; geometry = '120x10'; }
+          else if (wrapsToNextRow) row = '31';
+          else if (!pinnedColumn) column = '9';
+        }
+        const next = queue.shift() ?? { stdout: 'BX_RUNTIME_OK\n' };
+        if (next instanceof Error) throw next;
+        return { stdout: '', stderr: '', exitCode: 0, ...next };
+      });
+    };
+    const writesSent = (): string[] => runner.exec.mock.calls.map(c => String(c[0])).filter(c => c.includes('send-keys'));
+
     it('preserves a known refusal to start execution instead of reporting an unknown result', async () => {
       const error = new ExecNotStartedError('Context command deadline exceeded');
       runner.exec.mockRejectedValueOnce(error);
@@ -688,48 +722,119 @@ describe('TmuxManager', () => {
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
 
-    it.each([0, 255])('requires an execution marker even when transport exits %s', async exitCode => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode });
+    it.each([0, 255])('requires an execution marker on the line even when transport exits %s', async exitCode => {
+      submitReplies('codex', { stdout: '', exitCode });
       await expect(tmux.submitToRuntime(PANE, 'codex', '/clear')).rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
-      expect(runner.exec).toHaveBeenCalledTimes(1);
+      expect(writesSent()).toHaveLength(1);
     });
 
     it('reports a submission timeout as unknown without retrying', async () => {
-      runner.exec.mockRejectedValueOnce(new Error('Command timed out after 5000ms'));
+      submitReplies('codex', new Error('Command timed out after 5000ms'));
       await expect(tmux.submitToRuntime(PANE, 'codex', '/clear')).rejects.toThrow(/outcome unknown.*timed out/);
-      expect(runner.exec).toHaveBeenCalledTimes(1);
+      expect(writesSent()).toHaveLength(1);
     });
 
     it('accepts a confirmed submission when SSH fails after returning its marker', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: 'BX_RUNTIME_OK\n', stderr: 'connection reset', exitCode: 255 });
+      submitReplies('codex',
+        { stdout: 'BX_RUNTIME_OK\n', stderr: 'connection reset', exitCode: 255 },
+        { stdout: 'BX_RUNTIME_OK\n', stderr: 'connection reset', exitCode: 255 });
       await expect(tmux.submitToRuntime(PANE, 'codex', '/clear')).resolves.toBeUndefined();
+      expect(writesSent()).toHaveLength(2);
     });
 
-    it('queues the literal and the Enter in a single runtime-guarded tmux command, literal first', async () => {
-      primeExec('BX_RUNTIME_OK\n');
+    // 紧跟文本的回车会被 codex 的粘贴突发检测当成草稿正文,相邻两条 exec 之间的几毫秒仍落在窗口内:必须先读到草稿
+    it('reads the draft between the line and the Enter, and guards both writes', async () => {
+      submitReplies('claude');
       await tmux.submitToRuntime(PANE, 'claude-code', '/exit');
-      expect(runner.exec).toHaveBeenCalledTimes(1);
-      const cmd = lastCmd(runner);
-      expect(cmd).toContain("tmux if-shell -t '%7' -F");
-      expect(cmd).toContain('#{==:#{pane_current_command},claude}');
-      expect(cmd).toContain("send-keys -l -t %7 -- '\\''/exit'\\'' ; send-keys -t %7 -- '\\''Enter'\\'' ; display-message -p BX_RUNTIME_OK");
+      const sent = runner.exec.mock.calls.map(c => String(c[0]));
+      const [text, enter] = writesSent();
+      expect(text).toContain("send-keys -l -t %7 -- '\\''/exit'\\'' ; display-message -p BX_RUNTIME_OK");
+      expect(text).not.toContain('Enter');
+      expect(enter).toContain("send-keys -t %7 -- '\\''Enter'\\'' ; display-message -p BX_RUNTIME_OK");
+      for (const cmd of [text, enter]) {
+        expect(cmd).toContain("tmux if-shell -t '%7' -F");
+        expect(cmd).toContain('#{==:#{pane_current_command},claude}');
+      }
+      const readBetween = sent.findIndex((c, i) => i > sent.indexOf(text!) && c.includes('cursor_x'));
+      expect(readBetween).toBeGreaterThan(sent.indexOf(text!));
+      expect(readBetween).toBeLessThan(sent.indexOf(enter!));
     });
 
     it('a shell foreground refuses the whole line as a shellForeground ReplNotReadyError; nothing is typed', async () => {
-      primeExec('BX_RUNTIME_REFUSED|1|zsh\n');
+      submitReplies('codex', { stdout: 'BX_RUNTIME_REFUSED|1|zsh\n' });
       const err = await tmux.submitToRuntime(PANE, 'codex', '/quit').catch(e => e);
       expect(err).toBeInstanceOf(ReplNotReadyError);
       expect((err as ReplNotReadyError).shellForeground).toBe(true);
       expect((err as Error).message).toMatch(/pane foreground is "zsh", a shell, not codex; the line "\/quit" and Enter withheld/);
-      expect(runner.exec).toHaveBeenCalledTimes(1);
+      expect(writesSent()).toHaveLength(1);
     });
 
     it('a foreign non-shell foreground refuses the line without the shell classification', async () => {
-      primeExec('BX_RUNTIME_REFUSED|1|vim\n');
+      submitReplies('codex', { stdout: 'BX_RUNTIME_REFUSED|1|vim\n' });
       const err = await tmux.submitToRuntime(PANE, 'codex', '/quit').catch(e => e);
       expect(err).toBeInstanceOf(ReplNotReadyError);
       expect((err as ReplNotReadyError).shellForeground).toBe(false);
       expect((err as Error).message).toMatch(/pane foreground is "vim", not codex; the line "\/quit" and Enter withheld/);
+    });
+
+    // 8 列窗格里 /quit 折到下一行,列回到基线值:只比列会把已经渲染出来的草稿判成没进 composer
+    it('accepts a draft that wrapped to the next row with the column back at the baseline', async () => {
+      wrapsToNextRow = true;
+      submitReplies('codex');
+      await tmux.submitToRuntime(PANE, 'codex', '/quit', { timeoutMs: 300, intervalMs: 50 });
+      wrapsToNextRow = false;
+      expect(writesSent()).toHaveLength(2);
+      expect(writesSent()[1]).toContain('Enter');
+    });
+
+    // 并发 resize 会重排整屏:光标相对旧基线的位移与"文本被收下"无关,不能拿它当提交证据
+    it('does not take a row moved by a concurrent resize as proof that the line landed', async () => {
+      resizesUnderUs = true;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/quit', { timeoutMs: 300, intervalMs: 50 }).catch(e => e);
+      resizesUnderUs = false;
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect(writesSent().map(c => c.includes("'/quit'") ? 'line' : c.includes('C-u') ? 'scrub' : 'other'))
+        .toEqual(['line', 'scrub']);
+    });
+
+    // 正文那一写已经 applied:此后读帧断线不能直接退出,否则 /compact 留在 composer 与下一次写拼在一起
+    it.each([1, 2])('scrubs the line when the draft observation throws on read #%i after the write', async nth => {
+      failReadAfterWrite = nth;
+      // 光标钉住,这样第二次读也还在轮询里
+      pinnedColumn = true;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/compact', { timeoutMs: 400, intervalMs: 20 }).catch(e => e);
+      failReadAfterWrite = null;
+      pinnedColumn = false;
+      expect((err as Error).message).toMatch(/connection reset by peer/);
+      expect(writesSent().map(c => c.includes("'/compact'") ? 'line' : c.includes('C-u') ? 'scrub' : 'other'))
+        .toEqual(['line', 'scrub']);
+      expect(writesSent().some(c => c.includes('Enter'))).toBe(false);
+    });
+
+    // 挂起的 runtime 还没读走这些字节:恢复后文本与回车会一起进来,墙钟时间不能当证据
+    it('withholds the Enter when the line never shows up in the composer, even though the foreground stayed the runtime', async () => {
+      pinnedColumn = true;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/quit', { timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      pinnedColumn = false;
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as ReplNotReadyError).shellForeground).toBe(false);
+      expect((err as Error).message).toMatch(/never showed up in the composer .*Enter withheld because codex may not have read the line yet/s);
+      // 回车不发,但排在正文后面的 C-u 会把它清掉:正文只是还没被读走时,C-u 跟着一起被消费
+      expect((err as Error).message).toMatch(/the line was scrubbed with C-u/);
+      expect(writesSent().map(c => c.includes("'/quit'") ? 'line' : c.includes('C-u') ? 'scrub' : 'other'))
+        .toEqual(['line', 'scrub']);
+      expect(writesSent().some(c => c.includes('Enter'))).toBe(false);
+    });
+
+    it('a foreground that changes after the line lands withholds only the Enter, and says the line is still drafted', async () => {
+      submitReplies('codex', { stdout: 'BX_RUNTIME_OK\n' }, { stdout: 'BX_RUNTIME_REFUSED|1|zsh\n' });
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/quit').catch(e => e);
+      expect(err).toBeInstanceOf(ReplNotReadyError);
+      expect((err as Error).message).toMatch(/the Enter for the line "\/quit" withheld; the line stays in the composer/);
+      expect(writesSent()).toHaveLength(2);
     });
   });
 
@@ -773,7 +878,7 @@ describe('TmuxManager', () => {
         if (cmd.includes('cursor_x')) {
           const column = columns[Math.min(keys, columns.length - 1)];
           const foreground = foregrounds[Math.min(keys, foregrounds.length - 1)];
-          return { stdout: okHeader(`${column}|${foreground}`), stderr: '', exitCode: 0 };
+          return { stdout: okHeader(`${column}|12|120x40|${foreground}`), stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) return { stdout: okBody(screen), stderr: '', exitCode: 0 };
         return { stdout: '', stderr: '', exitCode: 0 };
@@ -901,11 +1006,11 @@ describe('TmuxManager', () => {
       expect(cmds.indexOf(captures()[0])).toBeGreaterThan(cmds.lastIndexOf(dirtyKeys()[0]));
     });
 
-    it('codex: the cursor column and the foreground process are read in the same tmux frame', async () => {
+    it('codex: the cursor position and the foreground process are read in the same tmux frame', async () => {
       scriptCursor(['2', '3']);
       await tmux.clearComposerDraft(PANE, 'codex', { intervalMs: 50 });
       expect(cursorReads()).toHaveLength(2);
-      for (const read of cursorReads()) expect(read).toContain('#{cursor_x}|#{pane_current_command}');
+      for (const read of cursorReads()) expect(read).toContain('#{cursor_x}|#{cursor_y}|#{pane_width}x#{pane_height}|#{pane_current_command}');
     });
 
     it('codex: node as the foreground title is still the runtime (codex launches through node on some installs)', async () => {

@@ -6,6 +6,7 @@ import { createManagerSuiteRunner, useManagerSuiteHarness, workdirsOf } from '..
 import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+const CONTEXT_OPTION = '@baxian-context-task-id';
 const SPACE_LITERAL = "'\\'' '\\''";
 const COMMA_LITERAL = "'\\'','\\''";
 
@@ -81,7 +82,9 @@ describe('compactAgent', () => {
     expect(ccIdx).toBeGreaterThan(spaceIdx);
     expect(literalIdx).toBeGreaterThan(ccIdx);
     expect(calls[literalIdx]).toContain("'%0'");
-    expect(calls[literalIdx]).toContain('Enter');
+    // 文本与 Enter 同批到达会被 codex / opencode 的粘贴突发检测吞掉,两者必须是两条命令
+    expect(calls[literalIdx]).not.toContain('Enter');
+    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBeGreaterThan(literalIdx);
     // 提交确实落在 runtime 上:pane 进入 working,composer 已清空
     expect(runner.sessions.pane('dev-1')).toMatchObject({ phase: 'working', composer: '' });
 
@@ -180,7 +183,7 @@ describe('compactAgent', () => {
   it('codex: rejects 409, withholds C-c and logs when the cursor never moves (keystroke not yet in the composer)', async () => {
     await seedLiveAgent('qa-1', '%1');
     // 光标停住=弄脏键还没进 composer,空 composer 上的 C-c 会直接退出 codex
-    useRunner({ rules: [{ match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|codex\n' } }] });
+    useRunner({ rules: [{ match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|10|80x40|codex\n' } }] });
     await seedLiveAgent('qa-1', '%1');
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -197,6 +200,66 @@ describe('compactAgent', () => {
       expect.stringContaining('sendSlashCommand(qa-1, /compact) composer clear failed'),
       expect.any(ReplNotReadyError),
     );
+  }, 15_000);
+
+  it.each(['compactAgent', 'clearAgent'] as const)('codex: %s rejects 409, withholds the Enter and scrubs the line it typed', async method => {
+    // runtime 被挂起时字节还没被读走:回车若照发,恢复后它会和正文一起进来,命令仍不会提交
+    const command = method === 'compactAgent' ? '/compact' : '/clear';
+    let typed = false;
+    useRunner({
+      rules: [{ match: cmd => typed && cmd.includes('cursor_x'), reply: { stdout: 'BX_PANE_OK2|10|80x40|codex\n' } }],
+    });
+    onExec = cmd => { if (isLiteral(cmd, command)) typed = true; };
+    await seedLiveAgent('qa-1', '%1');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(harness.manager[method]('qa-1')).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining(`did not take ${command} into its composer`),
+    });
+
+    const calls = cmds();
+    const literalIdx = idxOf(calls, c => isLiteral(c, command));
+    expect(literalIdx).toBeGreaterThanOrEqual(0);
+    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBe(-1);
+    // 排在正文后面的 C-u 把它清掉:后续往同一 pane 的写(图片上传)不会接在 /compact 后面
+    expect(runner.sessions.pane('qa-1')).toMatchObject({ phase: 'idle', composer: '' });
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`sendSlashCommand(qa-1, ${command}) submission unconfirmed`),
+      expect.any(ReplNotReadyError),
+    );
+
+    await harness.manager.attachImageToRunningAgent('qa-1', PNG, 'png');
+    expect(runner.sessions.pane('qa-1')!.composer).toMatch(/\.png $/);
+    expect(runner.sessions.pane('qa-1')!.composer).not.toContain(command);
+  }, 15_000);
+
+  // 正文已经写进 composer 之后读帧断线:不能当成"还没开始写"的准备失败,残留要试着清掉,人也要知道去看一眼
+  it('codex: a dropped frame read after the line landed scrubs it and says the line may still be drafted', async () => {
+    let typed = false;
+    let dropped = false;
+    useRunner({
+      rules: [{
+        match: cmd => typed && !dropped && cmd.includes('cursor_x'),
+        reply: () => { dropped = true; throw new Error('ssh: connection reset by peer'); },
+      }],
+    });
+    onExec = cmd => { if (isLiteral(cmd, '/compact')) typed = true; };
+    await seedLiveAgent('qa-1', '%1');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('its line may still be in the composer'),
+    });
+
+    const calls = cmds();
+    const literalIdx = idxOf(calls, c => isLiteral(c, '/compact'));
+    expect(idxOf(calls, c => c.includes('C-u'), literalIdx + 1)).toBeGreaterThan(literalIdx);
+    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBe(-1);
+    expect(runner.sessions.pane('qa-1')).toMatchObject({ phase: 'idle', composer: '' });
+    warnSpy.mockRestore();
+    await waitGuardFree('qa-1');
   }, 15_000);
 
   it('rejects 409 when the agent has no live session (no paneId)', async () => {
@@ -317,12 +380,128 @@ describe('clearAgent', () => {
     const literalIdx = idxOf(calls, c => isLiteral(c, '/clear'));
     expect(literalIdx).toBeGreaterThanOrEqual(0);
     expect(calls.some(c => c.includes('/compact'))).toBe(false);
-    expect(calls[literalIdx]).toContain('Enter');
+    expect(idxOf(calls, c => c.includes('send-keys') && c.includes('Enter'), literalIdx + 1)).toBeGreaterThan(literalIdx);
     // /clear 同时清掉会话上的任务上下文标记,下一次派单必须重发完整上下文
     expect(runner.sessions.option('dev-1', '@baxian-context-task-id')).toBe('');
 
     await waitGuardFree('dev-1');
   });
+
+  it('clears a previously marked context on the way to a submitted /clear', async () => {
+    useRunner({ agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } } });
+    await seedLiveAgent('qa-1', '%1');
+
+    await harness.manager.clearAgent('qa-1');
+
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('');
+
+    await waitGuardFree('qa-1');
+  });
+
+  it('restores the context marker when the composer never took /clear', async () => {
+    // 光标不动 = 正文没进 composer,回车被扣下:runtime 里的上下文还在,标记不能停在"已清空"
+    let typed = false;
+    useRunner({
+      agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } },
+      rules: [{ match: cmd => typed && cmd.includes('cursor_x'), reply: { stdout: 'BX_PANE_OK2|10|80x40|codex\n' } }],
+    });
+    onExec = cmd => { if (isLiteral(cmd, '/clear')) typed = true; };
+    await seedLiveAgent('qa-1', '%1');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('did not take /clear into its composer'),
+    });
+
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('task-7');
+  }, 15_000);
+
+  it('restores the context marker when the budget runs out before the line is typed', async () => {
+    useRunner({ agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } } });
+    await seedLiveAgent('qa-1', '%1');
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    onExec = cmd => { if (cmd.includes('set-option') && cmd.includes(CONTEXT_OPTION)) now = 15_000; };
+    try {
+      await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+        status: 409, message: expect.stringContaining('/clear was not submitted'),
+      });
+      expect(cmds().some(cmd => isLiteral(cmd, '/clear'))).toBe(false);
+      // 恢复自带一条命令的额度:总预算已经耗尽,否则这一步只会再抛一次 deadline
+      expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('task-7');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('restores the context marker when the clearing write lands but its reply is lost', async () => {
+    let sets = 0;
+    useRunner({
+      agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } },
+      rules: [{ match: cmd => cmd.includes('set-option') && cmd.includes(CONTEXT_OPTION) && ++sets === 1, reply: { outcome: 'applied-lost' } }],
+    });
+    await seedLiveAgent('qa-1', '%1');
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('could not prepare /clear during contextMarker'),
+    });
+
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('task-7');
+    expect(cmds().some(cmd => isLiteral(cmd, '/clear'))).toBe(false);
+  });
+
+  it('keeps the original failure and warns when the marker cannot be restored', async () => {
+    let typed = false;
+    let sets = 0;
+    useRunner({
+      agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } },
+      rules: [
+        { match: cmd => typed && cmd.includes('cursor_x'), reply: { stdout: 'BX_PANE_OK2|10|80x40|codex\n' } },
+        { match: cmd => cmd.includes('set-option') && cmd.includes(CONTEXT_OPTION) && ++sets === 2, reply: { stdout: 'BX_TARGET_GONE\n' } },
+      ],
+    });
+    onExec = cmd => { if (isLiteral(cmd, '/clear')) typed = true; };
+    await seedLiveAgent('qa-1', '%1');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('did not take /clear into its composer'),
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('sendSlashCommand(qa-1, /clear) context marker could not be restored'),
+      expect.any(Error),
+    );
+  }, 15_000);
+
+  it('leaves the context marker cleared when the submission outcome is unknown', async () => {
+    useRunner({
+      agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } },
+      rules: [{ match: cmd => isLiteral(cmd, '/clear'), reply: { outcome: 'applied-lost' } }],
+    });
+    await seedLiveAgent('qa-1', '%1');
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 504, message: expect.stringContaining('execution outcome unknown'),
+    });
+
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('');
+
+    await waitGuardFree('qa-1');
+  });
+
+  it('writes the context marker once when there was no marker to restore', async () => {
+    let typed = false;
+    useRunner({ rules: [{ match: cmd => typed && cmd.includes('cursor_x'), reply: { stdout: 'BX_PANE_OK2|10|80x40|codex\n' } }] });
+    onExec = cmd => { if (isLiteral(cmd, '/clear')) typed = true; };
+    await seedLiveAgent('qa-1', '%1');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({ status: 409 });
+
+    expect(cmds().filter(c => c.includes('set-option') && c.includes(CONTEXT_OPTION))).toHaveLength(1);
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('');
+  }, 15_000);
 
   it('dirties the composer with a comma before C-c for codex, so a leftover draft is cleared and an empty-composer C-c cannot kill the REPL', async () => {
     await seedLiveAgent('qa-1', '%1');
@@ -406,7 +585,7 @@ describe('manual context command latency and failure boundaries', () => {
   });
 
   it.each(['session', 'composerClear', 'diagnosis'])('exposes a deadline during %s as an actionable preparation failure', async phase => {
-    useRunner(phase === 'diagnosis' ? { rules: [{ match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|bash\n' } }] } : {});
+    useRunner(phase === 'diagnosis' ? { rules: [{ match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|10|80x40|bash\n' } }] } : {});
     await seedLiveAgent('qa-1', '%1');
     let now = 0;
     const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
@@ -433,7 +612,7 @@ describe('manual context command latency and failure boundaries', () => {
         : cmd.includes('capture-pane') && !isSnapshot(cmd);
     useRunner({ rules: [
       { match: stalled, reply: (_cmd, options) => new LocalRunner().exec('sleep 30', options) },
-      { match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|bash\n' } },
+      { match: 'cursor_x', reply: { stdout: 'BX_PANE_OK2|10|80x40|bash\n' } },
     ] });
     await seedLiveAgent('qa-1', '%1');
     const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
@@ -495,7 +674,7 @@ describe('manual context command latency and failure boundaries', () => {
     }
   });
 
-  it.each(['compactAgent', 'clearAgent'] as const)('%s uses six combined idle observations and one guarded submission', async method => {
+  it.each(['compactAgent', 'clearAgent'] as const)('%s uses six combined idle observations, then submits the line, its drafted evidence and the Enter', async method => {
     await seedLiveAgent('qa-1', '%1');
     const log = vi.spyOn(console, 'info').mockImplementation(() => {});
 
@@ -506,8 +685,11 @@ describe('manual context command latency and failure boundaries', () => {
     const submitted = calls.findIndex(([cmd]) => isLiteral(cmd, command));
     const observations = calls.slice(0, submitted).filter(([cmd]) => isSnapshot(cmd));
     expect(observations).toHaveLength(6);
-    expect(calls[submitted]![0]).toContain('Enter');
-    for (const [, options] of calls.slice(0, submitted + 1)) {
+    expect(calls[submitted]![0]).not.toContain('Enter');
+    // 文本与回车之间必须夹着一次草稿读,回车才不会被 codex 的粘贴突发检测吞掉
+    const enter = calls.findIndex(([cmd], i) => i > submitted && String(cmd).includes('send-keys') && String(cmd).includes('Enter'));
+    expect(String(calls[enter - 1]![0])).toContain('cursor_x');
+    for (const [, options] of calls.slice(0, enter + 1)) {
       expect(options?.timeout).toBeGreaterThan(0);
       expect(options?.timeout).toBeLessThanOrEqual(5_000);
     }
@@ -643,7 +825,11 @@ describe('manual context command latency and failure boundaries', () => {
     await vi.waitFor(() => expect(gate.hit()).toBe(true));
     await expect(harness.manager.compactAgent('qa-1')).rejects.toMatchObject({ status: 409 });
     expect(cmds().filter(cmd => isLiteral(cmd, '/clear'))).toHaveLength(1);
-    expect(runner.sessions.pane('qa-1')?.phase).toBe(outcome === 'applied-lost' ? 'working' : 'idle');
+    // 文本这一写的结果未知就不再发 Enter:applied-lost 把 /clear 留在草稿里等人看,not-applied-lost 连字都没打进去
+    expect(runner.sessions.pane('qa-1')).toMatchObject({
+      phase: 'idle',
+      composer: outcome === 'applied-lost' ? '/clear' : '',
+    });
     gate.release();
     await waitGuardFree('qa-1');
   });
@@ -669,10 +855,18 @@ describe('prompt injection under the compact guard', () => {
     return { settle, done };
   }
 
+  // 先等被测操作真的开始发命令,再要求连续三个静默窗口:只等一次"25ms 无新命令"会在它还没起步时就返回,
+  // 于是改 binding 的时机落在派发的前置校验之前,报错变成 generation 而不是 binding
   async function settleTrace(): Promise<void> {
-    let prev = -1;
-    while (prev !== runner.exec.mock.calls.length) {
-      prev = runner.exec.mock.calls.length;
+    const start = runner.exec.mock.calls.length;
+    const startedBy = Date.now() + 500;
+    while (runner.exec.mock.calls.length === start && Date.now() < startedBy) {
+      await new Promise(r => setTimeout(r, 5));
+    }
+    for (let quiet = 0, prev = -1; quiet < 3;) {
+      const now = runner.exec.mock.calls.length;
+      quiet = now === prev ? quiet + 1 : 0;
+      prev = now;
       await new Promise(r => setTimeout(r, 25));
     }
   }

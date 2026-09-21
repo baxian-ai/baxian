@@ -24,8 +24,16 @@ describe('buildLaunchCommand', () => {
 
   it('codex: bypass approvals by default', () => {
     expect(buildLaunchCommand(makeAgent({ runtime: 'codex' }))).toBe(
-      'codex --dangerously-bypass-approvals-and-sandbox',
+      'codex -c tui.vim_mode_default=false --dangerously-bypass-approvals-and-sandbox',
     );
+  });
+
+  it('codex: pins the composer out of vim mode, which no other runtime has', () => {
+    expect(buildLaunchCommand(makeAgent({ runtime: 'codex' }))).toContain('-c tui.vim_mode_default=false');
+    expect(buildLaunchCommand(makeAgent({ runtime: 'codex', yolo: false }))).toContain('-c tui.vim_mode_default=false');
+    for (const runtime of ['claude-code', 'opencode', 'qodercli'] as const) {
+      expect(buildLaunchCommand(makeAgent({ runtime }))).not.toContain('vim_mode_default');
+    }
   });
 
   it('claude-code with --model', () => {
@@ -36,7 +44,7 @@ describe('buildLaunchCommand', () => {
 
   it('codex with --model', () => {
     expect(buildLaunchCommand(makeAgent({ runtime: 'codex', model: 'o3' }))).toBe(
-      "codex --dangerously-bypass-approvals-and-sandbox --model 'o3'",
+      "codex -c tui.vim_mode_default=false --dangerously-bypass-approvals-and-sandbox --model 'o3'",
     );
   });
 
@@ -50,7 +58,7 @@ describe('buildLaunchCommand', () => {
     expect(
       buildLaunchCommand(makeAgent({ runtime: 'codex', addDirs: ['/a', '/b', '/c'] })),
     ).toBe(
-      "codex --dangerously-bypass-approvals-and-sandbox --add-dir '/a' --add-dir '/b' --add-dir '/c'",
+      "codex -c tui.vim_mode_default=false --dangerously-bypass-approvals-and-sandbox --add-dir '/a' --add-dir '/b' --add-dir '/c'",
     );
   });
 
@@ -69,7 +77,7 @@ describe('buildLaunchCommand', () => {
   it('shell-quotes model values containing single quotes (injection guard)', () => {
     const cmd = buildLaunchCommand(makeAgent({ runtime: 'codex', model: "evil'; rm -rf /;'" }));
     expect(cmd).toBe(
-      "codex --dangerously-bypass-approvals-and-sandbox --model 'evil'\\''; rm -rf /;'\\'''",
+      "codex -c tui.vim_mode_default=false --dangerously-bypass-approvals-and-sandbox --model 'evil'\\''; rm -rf /;'\\'''",
     );
     const modelArg = cmd.split(' --model ')[1];
     const stripped = modelArg.replace(/'\\''/g, '');
@@ -116,7 +124,7 @@ describe('buildLaunchCommand', () => {
   describe('yolo: false launches the runtime in its default permission mode', () => {
     it.each<[AgentRuntime, string]>([
       ['claude-code', 'env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude'],
-      ['codex', 'codex'],
+      ['codex', 'codex -c tui.vim_mode_default=false'],
       ['opencode', 'env OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 opencode'],
       ['qodercli', 'qodercli'],
     ])('%s drops the bypass flag', (runtime, expected) => {
@@ -145,7 +153,7 @@ describe('buildLaunchCommand', () => {
 describe('launchCommandIn', () => {
   it('prefixes a quoted cd so a reused shell re-resolves a stale cwd before launch', () => {
     expect(launchCommandIn('/home/u/.baxian/agents/qa-1/repo', makeAgent({ runtime: 'codex' }))).toBe(
-      "cd '/home/u/.baxian/agents/qa-1/repo' && codex --dangerously-bypass-approvals-and-sandbox",
+      "cd '/home/u/.baxian/agents/qa-1/repo' && codex -c tui.vim_mode_default=false --dangerously-bypass-approvals-and-sandbox",
     );
   });
 

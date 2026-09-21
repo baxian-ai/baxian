@@ -4,7 +4,9 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AgentCard, type TerminalMode } from './agent-card.tsx';
 import { api } from '../api.ts';
+import { KebabMenu, MenuItem } from './kebab-menu.tsx';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
+import { useAgentActions } from '../hooks/use-agent-actions.ts';
 import { useToast } from './toast.tsx';
 import { TaskStatusBadge, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { useT } from '../i18n/index.tsx';
@@ -39,8 +41,19 @@ export function AgentTeam({
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     : [];
 
-  const label = `Agent Team ${team.map(agent => agent.id).join(' / ')}`;
+  const teamIds = team.map(agent => agent.id).join(' / ');
+  const label = `Agent Team ${teamIds}`;
   const navigate = useNavigate();
+  const {
+    compact: handleCompact,
+    clear: handleClear,
+    remove: handleDelete,
+    compacting,
+    clearing,
+    deleting,
+    deleteError,
+    busy: actionBusy,
+  } = useAgentActions(projectId, team.map(agent => agent.id), onDeleted);
 
   const selectableTerminals = terminalMode === 'embedded-full';
   const { activeAgentId, activateAgentCard } = useActiveAgentCard({
@@ -60,7 +73,45 @@ export function AgentTeam({
   const showClaimable = !!dev && claimableTasks.length > 0;
   const showEmpty = activeTasks.length === 0 && !showClaimable;
   return (
-    <div role="group" aria-label={label} className="min-w-0">
+    <div role="group" aria-label={label} className="min-w-0 rounded-lg border border-og-100 bg-og-25 p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <span className="shrink-0 font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">
+          Agent Team
+        </span>
+        <span className="min-w-0 truncate font-mono text-xs text-og-700" title={teamIds}>{teamIds}</span>
+        <KebabMenu
+          ariaLabel={t.agents.teamActionsMenu(teamIds)}
+          className="ml-auto shrink-0"
+          autoFocusFirstItem
+          disabled={deleting}
+        >
+          {close => (
+            <>
+              <MenuItem
+                onClick={() => { close(); void handleCompact(); }}
+                disabled={actionBusy}
+                title={t.agents.teamCompactMenuItemTitle}
+              >
+                {compacting ? t.agents.compacting : t.agents.compact}
+              </MenuItem>
+              <MenuItem
+                onClick={() => { close(); void handleClear(); }}
+                disabled={actionBusy}
+                title={t.agents.teamClearMenuItemTitle}
+              >
+                {clearing ? t.agents.clearing : t.agents.clear}
+              </MenuItem>
+              <MenuItem
+                onClick={() => { close(); void handleDelete(); }}
+                disabled={actionBusy}
+              >
+                {deleting ? t.common.deleting : t.common.delete}
+              </MenuItem>
+            </>
+          )}
+        </KebabMenu>
+      </div>
+      {deleteError && <div className="mb-2 break-words text-xs text-accent">{deleteError}</div>}
       {showClaimable && dev && (
         <ClaimableList
           tasks={claimableTasks}

@@ -505,6 +505,8 @@ const COMPOSER_DIRTY_KEY_ATTEMPTS = 2;
 
 interface ComposerFrame {
   column: string;
+  row: string;
+  geometry: string;
   foreground: string;
 }
 
@@ -994,15 +996,62 @@ export class TmuxManager {
     );
   }
 
-  // 一行文本与回车在同一条守卫命令里排入:分两次守卫,前台在两者之间换了进程会只留半行在 composer(/exit 留到下次回车才生效)
-  async submitToRuntime(pane: PaneRef, runtime: AgentRuntimeKind, text: string): Promise<void> {
-    const outcome = await this.guardedForegroundWrite(
-      pane,
-      runtime,
-      [sendKeysCommand(pane.paneId, [text], true), sendKeysCommand(pane.paneId, ['Enter'])],
-    );
+  // 回车要等到草稿被读出来才发:紧跟文本的 CR 会被 codex 的粘贴突发检测当成草稿正文,两条相邻 exec 之间的几毫秒仍落在那个窗口里
+  async submitToRuntime(pane: PaneRef, runtime: AgentRuntimeKind, text: string, opts: WaitOpts = {}): Promise<void> {
+    const rest = await this.readComposerFrame(pane);
+    await this.submitWrite(pane, runtime, [sendKeysCommand(pane.paneId, [text], true)],
+      `the line ${JSON.stringify(text)} and Enter withheld`);
+    // 墙钟时间不算证据:runtime 被挂起时这些字节还没被读走,恢复后文本与回车仍会一起进来。
+    // 这里连行一起看:窄窗格里正文折行后列会回到原值,而多字符的命令一定会跨行或推进列
+    const drafted = (frame: ComposerFrame, base: ComposerFrame): boolean =>
+      frame.column !== base.column || frame.row !== base.row;
+    let landed: ComposerFrame | undefined;
+    try {
+      landed = await this.waitComposerFrameChange(pane, runtime, rest, opts, drafted);
+    } catch (err) {
+      // 正文那一写已经 applied:读帧失败照样要试着清掉它,否则残留会和下一次写拼在一起
+      const scrubbed = await this.scrubComposerLine(pane, runtime);
+      console.warn(
+        `[TmuxManager] submitToRuntime ${pane.paneId}: draft observation failed after the line landed `
+          + `(${scrubbed ? 'the line was scrubbed with C-u' : 'the line could not be scrubbed and may still be drafted'})`,
+        err,
+      );
+      throw err;
+    }
+    if (!landed) {
+      const scrubbed = await this.scrubComposerLine(pane, runtime);
+      throw new ReplNotReadyError(
+        pane.paneId,
+        runtime,
+        await this.captureForDiagnosis(pane, runtime),
+        `the line ${JSON.stringify(text)} never showed up in the composer (cursor stayed at ${rest.column},${rest.row} for ` +
+          `${opts.timeoutMs ?? COMPOSER_DIRTY_TIMEOUT_MS}ms); Enter withheld because ${runtime} may not have read the line yet` +
+          (scrubbed ? '; the line was scrubbed with C-u' : '; the line could not be scrubbed and may still be drafted'),
+      );
+    }
+    await this.submitWrite(pane, runtime, [sendKeysCommand(pane.paneId, ['Enter'])],
+      `the Enter for the line ${JSON.stringify(text)} withheld; the line stays in the composer`);
+  }
+
+  // C-u 删到行首:空 composer 上是空操作(C-c 在那里会直接退掉 codex),所以正文是否落地未知时也能安全清场;
+  // 正文若只是还排在输入队列里,C-u 跟在它后面,runtime 恢复时先吃正文再清行
+  async scrubComposerLine(pane: PaneRef, runtime: AgentRuntimeKind): Promise<boolean> {
+    try {
+      // 只认 applied:缺执行标记的 exit 0 同样是"不知道有没有发出去",不能据此宣称已清场
+      const outcome = await this.guardedForegroundWrite(pane, runtime, [sendKeysCommand(pane.paneId, ['C-u'])]);
+      if (outcome.kind === 'applied') return true;
+      console.warn(`[TmuxManager] scrubComposerLine ${pane.paneId}: C-u not confirmed (${outcome.kind})`);
+      return false;
+    } catch (err) {
+      console.warn(`[TmuxManager] scrubComposerLine ${pane.paneId}: C-u withheld`, err);
+      return false;
+    }
+  }
+
+  private async submitWrite(pane: PaneRef, runtime: AgentRuntimeKind, inner: string[], withheld: string): Promise<void> {
+    const outcome = await this.guardedForegroundWrite(pane, runtime, inner);
     if (outcome.kind === 'refused') {
-      throw foreignForegroundError(pane, runtime, outcome.foreground, `the line ${JSON.stringify(text)} and Enter withheld`);
+      throw foreignForegroundError(pane, runtime, outcome.foreground, withheld);
     }
     if (outcome.kind === 'uncertain') {
       throw new TmuxOutcomeUnknownError(`tmux submit to ${pane.paneId} outcome unknown: ${outcome.cause}; inspect the pane before retrying`);
@@ -1365,22 +1414,28 @@ export class TmuxManager {
 
   // 光标位移只证明"某个行编辑器"收下了字符:与前台进程同帧读取,runtime 退出后 shell 提示符造成的位移不算
   private async readComposerFrame(pane: PaneRef): Promise<ComposerFrame> {
-    const raw = await this.displayMessage(pane, '#{cursor_x}|#{pane_current_command}');
-    const [column = '', foreground = ''] = raw.trim().split('|');
-    return { column, foreground };
+    const raw = await this.displayMessage(pane, '#{cursor_x}|#{cursor_y}|#{pane_width}x#{pane_height}|#{pane_current_command}');
+    const [column = '', row = '', geometry = '', foreground = ''] = raw.trim().split('|');
+    return { column, row, geometry, foreground };
   }
 
+  // 默认只认列:行会随 runtime 自己的异步输出滚动,弄脏键据此发 C-c 会在空 composer 上把 codex 退掉
   private async waitComposerFrameChange(
     pane: PaneRef,
     runtime: AgentRuntimeKind,
     rest: ComposerFrame,
     opts: WaitOpts,
+    moved: (frame: ComposerFrame, base: ComposerFrame) => boolean = (frame, base) => frame.column !== base.column,
   ): Promise<ComposerFrame | undefined> {
     const deadline = Date.now() + (opts.timeoutMs ?? COMPOSER_DIRTY_TIMEOUT_MS);
     const interval = Math.max(opts.intervalMs ?? MIN_POLL_INTERVAL_MS, MIN_POLL_INTERVAL_MS);
+    let base = rest;
     while (true) {
       const frame = await this.readComposerFrame(pane);
-      if (frame.column !== rest.column || !hasReplProcTitle(frame.foreground, runtime)) return frame;
+      if (!hasReplProcTitle(frame.foreground, runtime)) return frame;
+      // 并发 resize 会重排整屏:光标相对旧基线的位移不再是"字符被收下"的证据,换基线重等
+      if (frame.geometry !== base.geometry) base = frame;
+      else if (moved(frame, base)) return frame;
       if (Date.now() >= deadline) return undefined;
       await sleep(interval);
     }

@@ -12,7 +12,7 @@ import { KebabMenu, MenuItem } from './kebab-menu.tsx';
 import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
 import { useConfirm } from './confirm-dialog.tsx';
-import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
+import { useAgentActions } from '../hooks/use-agent-actions.ts';
 import { PaneTerminal } from './pane-terminal.tsx';
 import { AgentPet } from './agent-pet.tsx';
 import { AgentPetConfigModal } from './agent-pet-config-modal.tsx';
@@ -159,11 +159,16 @@ export function AgentCard({
   const [stopError, setStopError] = useState<string | null>(null);
   const { show } = useToast();
   const confirmDialog = useConfirm();
-  const { flagDirty } = usePendingRestart();
-  const [deleting, setDeleting] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [compacting, setCompacting] = useState(false);
-  const [clearing, setClearing] = useState(false);
+  const {
+    compact: handleCompact,
+    clear: handleClear,
+    remove: handleDelete,
+    compacting,
+    clearing,
+    deleting,
+    deleteError,
+    busy: actionBusy,
+  } = useAgentActions(projectId, [agent.id], onDeleted);
   const [resuming, setResuming] = useState(false);
   const [retryingBootstrap, setRetryingBootstrap] = useState(false);
   const [petModalOpen, setPetModalOpen] = useState(false);
@@ -256,73 +261,6 @@ export function AgentCard({
     }
   };
 
-  const handleCompact = async () => {
-    setCompacting(true);
-    try {
-      await api.agents.compact(agent.id);
-      show({ kind: 'success', title: t.agents.compactSentTitle(agent.id) });
-    } catch (err) {
-      show({
-        kind: 'error',
-        title: t.agents.compactFailedTitle,
-        body: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setCompacting(false);
-    }
-  };
-
-  const handleClear = async () => {
-    if (!(await confirmDialog({ title: t.agents.clearConfirmTitle(agent.id), body: t.agents.clearConfirmBody, confirmLabel: t.agents.clearConfirmLabel }))) return;
-    setClearing(true);
-    try {
-      await api.agents.clear(agent.id);
-      show({ kind: 'success', title: t.agents.clearSentTitle(agent.id) });
-    } catch (err) {
-      show({
-        kind: 'error',
-        title: t.agents.clearFailedTitle,
-        body: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setClearing(false);
-    }
-  };
-
-  const handleDelete = async () => {
-    if (!(await confirmDialog({ title: t.agents.deleteConfirmTitle(agent.id), body: t.agents.deleteConfirmBody, confirmLabel: t.common.delete }))) return;
-    setDeleting(true);
-    setDeleteError(null);
-    try {
-      const result = await api.projects.deleteAgent(projectId, agent.id);
-      if (result?.restartRequired) flagDirty();
-      const removed = result?.removed ?? [agent.id];
-      const warningLines = [...(result?.warnings ?? [])];
-      if (removed.length > 1) {
-        const others = removed.filter(id => id !== agent.id).join(', ');
-        warningLines.unshift(t.agents.deletedWithTeamBody(others));
-      }
-      if (warningLines.length > 0) {
-        show({
-          kind: 'warn',
-          title: removed.length > 1
-            ? t.agents.deletedWithTeamTitle(agent.id)
-            : t.agents.deletedTitle(agent.id),
-          body: warningLines.join('\n'),
-        });
-      } else {
-        show({
-          kind: 'success',
-          title: t.agents.deletedTitle(agent.id),
-        });
-      }
-      onDeleted?.();
-    } catch (err) {
-      setDeleteError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setDeleting(false);
-    }
-  };
   const allowSelection = isSelectableEmbedded && !terminalDisabled && !isActiveSelected;
   const cardClassName = [
     'card relative flex h-full min-w-0 flex-col overflow-visible p-4',
@@ -549,28 +487,28 @@ export function AgentCard({
             <>
               <MenuItem
                 onClick={() => { close(); setPetModalOpen(true); }}
-                disabled={compacting || clearing || deleting}
+                disabled={actionBusy}
                 title={t.agents.agentPetMenuItemTitle}
               >
                 Agent Pet
               </MenuItem>
               <MenuItem
                 onClick={() => { close(); void handleCompact(); }}
-                disabled={compacting || clearing || deleting}
+                disabled={actionBusy}
                 title={t.agents.compactMenuItemTitle}
               >
                 {compacting ? t.agents.compacting : t.agents.compact}
               </MenuItem>
               <MenuItem
                 onClick={() => { close(); void handleClear(); }}
-                disabled={clearing || compacting || deleting}
+                disabled={actionBusy}
                 title={t.agents.clearMenuItemTitle}
               >
                 {clearing ? t.agents.clearing : t.agents.clear}
               </MenuItem>
               <MenuItem
                 onClick={() => { close(); void handleDelete(); }}
-                disabled={deleting || compacting || clearing}
+                disabled={actionBusy}
               >
                 {deleting ? t.common.deleting : t.common.delete}
               </MenuItem>

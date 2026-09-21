@@ -568,6 +568,71 @@ describe('fake runner: boundary semantics that must not be faked away', () => {
     expect(seen).toHaveLength(1);
     expect(runner.pastedPrompts).toEqual([]);
   });
+
+  // 回车要被当成提交而不是被吞掉,最少需要与文本隔开多远,各 runtime 不同(实测见 RUNTIME_PROFILES 的注释)。
+  // 把这条抹平,"文本与回车一起发"和"两条命令紧挨着发"就都测不出来了
+  const mergedSubmit = (paneId: string, text: string): string =>
+    `tmux if-shell -t '${paneId}' -F '1' 'send-keys -l -t ${paneId} -- '\\''${text}'\\'' ; send-keys -t ${paneId} -- '\\''Enter'\\''' ''`;
+
+  it.each([
+    ['codex', 'idle'],
+    ['opencode', 'idle'],
+    ['claude-code', 'working'],
+    ['qodercli', 'working'],
+  ] as const)('%s: an Enter sharing the command list with the text leaves the pane %s', async (runtime, phase) => {
+    const { runner } = setup({ agents: { 'dev-1': { runtime } } });
+
+    await runner.exec(mergedSubmit('%0', 'hello'));
+
+    expect(runner.sessions.pane('dev-1')).toMatchObject({ phase, composer: phase === 'idle' ? 'hello' : '' });
+  });
+
+  it.each([
+    ['codex', 'idle'],
+    ['opencode', 'working'],
+  ] as const)('%s: an Enter in its own command right after the text leaves the pane %s', async (runtime, phase) => {
+    const { runner, tmux } = setup({ agents: { 'dev-1': { runtime } } });
+
+    await tmux.sendKeysLiteral(DEV, 'hello', runtime);
+    await tmux.sendEnter(DEV, runtime);
+
+    expect(runner.sessions.pane('dev-1')!.phase).toBe(phase);
+  });
+
+  it.each([
+    ['codex', 'working'],
+    ['opencode', 'idle'],
+  ] as const)('%s: a bracketed paste carries its own end marker, so the Enter beside it leaves the pane %s', async (runtime, phase) => {
+    const { runner, tmux } = setup({ agents: { 'dev-1': { runtime } } });
+    const { buf } = await tmux.stagePromptBuffer('%0', 'hello', 'dev-1');
+
+    await runner.exec(`tmux if-shell -t '%0' -F '1' 'paste-buffer -b ${buf} -t %0 -d -p -r ; send-keys -t %0 -- '\\''Enter'\\''' ''`);
+
+    expect(runner.sessions.pane('dev-1')!.phase).toBe(phase);
+  });
+
+  it('a draft wide enough to wrap puts the cursor back on the baseline column, one row down', async () => {
+    const { runner, tmux } = setup();
+    const before = await tmux.displayMessage(DEV, '#{cursor_x}|#{cursor_y}');
+
+    await tmux.sendKeysLiteral(DEV, 'x'.repeat(80), 'claude-code');
+
+    expect(runner.sessions.pane('dev-1')!.composer).toHaveLength(80);
+    const after = await tmux.displayMessage(DEV, '#{cursor_x}|#{cursor_y}');
+    expect(after.split('|')[0]).toBe(before.split('|')[0]);
+    expect(Number(after.split('|')[1])).toBe(Number(before.split('|')[1]) + 1);
+  });
+
+  it.each(['codex', 'opencode'] as const)('%s: reading the draft between the text and the Enter submits it', async runtime => {
+    const { runner, tmux } = setup({ agents: { 'dev-1': { runtime } } });
+    const exitCommand = RUNTIME_PROFILES[runtime].exitCommand;
+
+    await tmux.sendKeysLiteral(DEV, exitCommand, runtime);
+    await tmux.displayMessage(DEV, '#{cursor_x}|#{pane_current_command}');
+    await tmux.sendEnter(DEV, runtime);
+
+    expect(runner.sessions.pane('dev-1')!.process).toBe('zsh');
+  });
 });
 
 describe('fake runner: compound load (injectPrompt)', () => {

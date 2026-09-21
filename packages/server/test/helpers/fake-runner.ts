@@ -122,6 +122,10 @@ interface RuntimeProfile {
   dialogAccepted: string | null;
   acceptCursor: RegExp | null;
   ctrlCQuitsEmptyComposer: boolean;
+  // 回车要被当成提交而不是被吞掉,最少得与正文隔开多远(实测 claude-code 2.1.278 / codex 0.155.1 / opencode 1.18.31 / qodercli 1.1.10):
+  // 键入的字符对 codex 要等到草稿被读出来(突发窗口比一次 exec 往返还长),对 opencode 要另起一条命令;括号粘贴自带结束标记,codex 同一条命令即可
+  enterAfterTyping: 'same-command' | 'next-command' | 'observed-draft';
+  enterAfterPaste: 'same-command' | 'next-command';
 }
 
 export const RUNTIME_PROFILES: Record<AgentRuntimeKind, RuntimeProfile> = {
@@ -136,6 +140,8 @@ export const RUNTIME_PROFILES: Record<AgentRuntimeKind, RuntimeProfile> = {
     dialogAccepted: 'Quick safety check\nDo you trust this folder?\n› 1. Yes, I trust this folder\n  2. No, exit\n',
     acceptCursor: /^[ \t]*[❯›>][ \t]*(?:\d+\.[ \t]*)?Yes, I trust this folder/m,
     ctrlCQuitsEmptyComposer: false,
+    enterAfterTyping: 'same-command',
+    enterAfterPaste: 'same-command',
   },
   codex: {
     process: 'codex',
@@ -148,6 +154,8 @@ export const RUNTIME_PROFILES: Record<AgentRuntimeKind, RuntimeProfile> = {
     dialogAccepted: null,
     acceptCursor: null,
     ctrlCQuitsEmptyComposer: true,
+    enterAfterTyping: 'observed-draft',
+    enterAfterPaste: 'same-command',
   },
   opencode: {
     process: 'opencode',
@@ -160,6 +168,8 @@ export const RUNTIME_PROFILES: Record<AgentRuntimeKind, RuntimeProfile> = {
     dialogAccepted: null,
     acceptCursor: null,
     ctrlCQuitsEmptyComposer: false,
+    enterAfterTyping: 'next-command',
+    enterAfterPaste: 'next-command',
   },
   qodercli: {
     process: 'qodercli',
@@ -172,8 +182,12 @@ export const RUNTIME_PROFILES: Record<AgentRuntimeKind, RuntimeProfile> = {
     dialogAccepted: null,
     acceptCursor: null,
     ctrlCQuitsEmptyComposer: false,
+    enterAfterTyping: 'same-command',
+    enterAfterPaste: 'same-command',
   },
 };
+
+const COMPOSER_WRAP_COLUMNS = 80;
 
 const SHELL_PROCESSES = new Set(['zsh', 'bash', 'sh', 'fish', 'dash', 'ash', 'ksh', 'mksh', 'tcsh', 'csh', 'nu', 'xonsh', 'pwsh']);
 
@@ -467,6 +481,8 @@ class TmuxModel {
   // 同一 server 上 session id 与 pane id 都必须全局唯一:显式指定、自动分配、new-session 共用登记表
   private readonly usedSessionIds = new Set<string>();
   private readonly usedPaneIds = new Set<string>();
+  private readonly draftTyped = new Map<string, { command: number; observed: boolean; pasted: boolean }>();
+  private command = 0;
 
   constructor(
     agents: Record<string, FakeRunnerAgent>,
@@ -664,8 +680,11 @@ class TmuxModel {
         case 'pane_current_command': return pane?.process ?? '';
         case 'pane_current_path': return session?.workdir ?? '';
         case 'pane_title': return pane?.title ?? '';
-        case 'pane_width': return '80';
-        case 'cursor_x': return String(2 + (pane?.composer.length ?? 0));
+        case 'pane_width': return String(COMPOSER_WRAP_COLUMNS);
+        case 'pane_height': return '40';
+        // composer 从第 2 列起排,窄窗格会折行:列回到原值而行推进,正是 submitToRuntime 要认的那种证据
+        case 'cursor_x': return String((2 + (pane?.composer.length ?? 0)) % COMPOSER_WRAP_COLUMNS);
+        case 'cursor_y': return String(10 + Math.floor((2 + (pane?.composer.length ?? 0)) / COMPOSER_WRAP_COLUMNS));
         case 'history_size': return '0';
         case 'window_width': return '200';
         case 'window_height': return '50';
@@ -782,13 +801,16 @@ class TmuxModel {
         const fmt = words[words.length - 1] ?? '';
         const local = scopeFor(arg('-t'));
         if (local.missing) return local.missing;
-        out.push(this.evaluateMessage(fmt, local.candidates[0]!));
+        const ctx = local.candidates[0]!;
+        if (ctx.pane) this.observeDraft(ctx.pane.id);
+        out.push(this.evaluateMessage(fmt, ctx));
         return null;
       }
       case 'capture-pane': {
         const target = arg('-t');
         const owner = target ? this.paneOwner(target) : (pane && session ? { session, pane } : null);
         if (!owner) return target ? this.paneMissing(target) : sessionAbsent('');
+        this.observeDraft(owner.pane.id);
         out.push(this.render(owner.pane, owner.session));
         return null;
       }
@@ -826,6 +848,7 @@ class TmuxModel {
         if (words.includes('-d')) this.staged.delete(buf);
         // 真实 paste-buffer 只在光标处插入,不清稿:遗漏 clear 或重复 paste 必须表现为脏稿
         owner.pane.composer += body;
+        this.draftTyped.set(owner.pane.id, { command: this.command, observed: false, pasted: true });
         this.pastedPrompts.push({ pane: owner.pane.id, body });
         return null;
       }
@@ -866,17 +889,34 @@ class TmuxModel {
     }
   }
 
+  // 一条 tmux 命令列表 = 一批输入;跨命令的读则要求客户端真的往返过一次,runtime 因此已经处理并渲染了草稿
+  beginCommand(): void {
+    this.command++;
+  }
+
+  observeDraft(paneId: string): void {
+    const typed = this.draftTyped.get(paneId);
+    if (typed && typed.command < this.command) typed.observed = true;
+  }
+
   private sendKeys(pane: PaneModel, session: SessionModel, literal: boolean, keys: string[], tweak: ProtocolTweak): void {
     const profile = RUNTIME_PROFILES[pane.runtime];
     if (literal) {
       if (pane.phase === 'dialog' || pane.phase === 'other') return;
       pane.composer += keys.join('');
+      this.draftTyped.set(pane.id, { command: this.command, observed: false, pasted: false });
       return;
     }
     for (const key of keys) {
       switch (key) {
         case 'Enter':
           this.enter(pane, session, tweak);
+          break;
+        // 实测 codex 0.155.1 / claude-code 2.1.278 / qodercli 1.1.10 / opencode 1.18.31:C-u 删到行首,空 composer 上是空操作
+        case 'C-u':
+          if (pane.phase === 'shell' || pane.phase === 'other' || pane.phase === 'dialog') break;
+          pane.composer = '';
+          this.draftTyped.delete(pane.id);
           break;
         case 'C-c':
           if (pane.phase === 'shell') { pane.composer = ''; break; }
@@ -886,6 +926,7 @@ class TmuxModel {
             break;
           }
           pane.composer = '';
+          this.draftTyped.delete(pane.id);
           this.settleIdle(pane, true);
           break;
         case 'Escape':
@@ -902,6 +943,14 @@ class TmuxModel {
           break;
       }
     }
+  }
+
+  private enterTooSoon(pane: PaneModel, profile: RuntimeProfile): boolean {
+    const draft = this.draftTyped.get(pane.id);
+    if (!draft) return false;
+    const needs = draft.pasted ? profile.enterAfterPaste : profile.enterAfterTyping;
+    if (needs === 'next-command') return draft.command === this.command;
+    return needs === 'observed-draft' && !draft.observed;
   }
 
   private enter(pane: PaneModel, session: SessionModel, tweak: ProtocolTweak): void {
@@ -926,9 +975,12 @@ class TmuxModel {
       return;
     }
     if (pane.phase === 'other') return;
+    // 回车来得太早就不是提交:草稿原样留着(真 codex 还会多一个换行,差别不影响"没提交"这个结论)
+    if (this.enterTooSoon(pane, profile)) return;
     if (pane.composer === '') return;
     const submitted = pane.composer;
     pane.composer = '';
+    this.draftTyped.delete(pane.id);
     if (submitted.trim() === profile.exitCommand) {
       this.becomeShell(pane);
       return;
@@ -1031,6 +1083,7 @@ export function fakeRunner(options: FakeRunnerOptions = {}): FakeRunner {
   };
 
   const protocol = (command: string, tweak: ProtocolTweak): ExecResult => {
+    model.beginCommand();
     const trimmed = command.trim();
     const cdMatch = /^cd (?:-P )?'((?:[^']|'\\'')*)'(?: 2>\/dev\/null)? && pwd -P$/.exec(trimmed);
     if (cdMatch) return complete({ stdout: `${cdMatch[1]!.replace(/'\\''/g, "'")}\n` });

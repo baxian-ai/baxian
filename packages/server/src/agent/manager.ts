@@ -249,6 +249,8 @@ export function buildLaunchCommand(agent: AgentRuntimeConfig): string {
       break;
     case 'codex':
       segments.push('codex');
+      // 用户全局开了 tui.vim_mode_default 时 Normal keymap 会吞掉清稿键、把斜杠命令当 vim 搜索,baxian 的键入式交互假设 Insert
+      segments.push('-c tui.vim_mode_default=false');
       if (yolo) segments.push('--dangerously-bypass-approvals-and-sandbox');
       break;
     case 'opencode':
@@ -4253,7 +4255,7 @@ export class AgentManager {
     }
     if (foreground === 'shell') return;
     await tmux.clearComposerDraft(pane, runtime);
-    // 退出文本与 Enter 是同一条守卫命令:到达前 runtime 已退到 shell 就整组不发(/exit 不会被 shell 当命令执行),前台是 vim 这类进程也不会只留半行在 composer
+    // 退出文本与 Enter 分两次守卫写:前台在两者之间换了进程,回车就不发,/exit 留在草稿里等下一次清稿,而不会打进 shell 或别的进程
     try {
       if (!await this.reachedRuntime(() => tmux.submitToRuntime(pane, runtime, REPL_EXIT_COMMAND[cfg.runtime]))) return;
     } catch (err) {
@@ -7767,22 +7769,50 @@ export class AgentManager {
       }
       await timed('readyAfterClear', () => waitReady('after composer clear'));
       await assertSessionUnchanged();
+      let clearedContext: string | null = null;
+      const restoreContextMarker = async (): Promise<void> => {
+        if (!clearedContext) return;
+        // 总预算此刻多半已耗尽,恢复要自带一条命令的额度,否则 deadline 类失败永远恢复不了标记
+        deadline = performance.now() + MANUAL_CONTEXT_COMMAND_TIMEOUT_MS;
+        try {
+          await this.setSessionOptions(tmux, agentId, pane.session, [[TASK_CONTEXT_SESSION_OPTION, clearedContext]]);
+        } catch (err) {
+          console.warn(
+            `[AgentManager] sendSlashCommand(${agentId}, ${command}) context marker could not be restored; ` +
+            'the next phase will resend the full task context:',
+            err,
+          );
+        }
+      };
       if (command === '/clear') {
-        await timed('contextMarker', () => this.setSessionOptions(
-          tmux,
-          agentId,
-          pane.session,
-          [[TASK_CONTEXT_SESSION_OPTION, '']],
-        ));
+        try {
+          await timed('contextMarker', async () => {
+            clearedContext = await tmux.getSessionOptionByRef(pane.session, agentId, TASK_CONTEXT_SESSION_OPTION);
+            await this.setSessionOptions(tmux, agentId, pane.session, [[TASK_CONTEXT_SESSION_OPTION, '']]);
+          });
+        } catch (err) {
+          // 清空写抛错不代表没落地:回包丢了而 tmux 服务端已经改过值,此时命令更是确定没提交
+          await restoreContextMarker();
+          throw err;
+        }
       }
       let submitError: TmuxOutcomeUnknownError | undefined;
       try {
         await timed('submit', () => tmux.submitToRuntime(pane, cfg.runtime, command));
         outcome = 'submitted';
       } catch (err) {
-        if (!(err instanceof TmuxOutcomeUnknownError)) throw err;
-        submitError = err;
-        outcome = 'unknown';
+        if (err instanceof TmuxOutcomeUnknownError) {
+          submitError = err;
+          outcome = 'unknown';
+        } else {
+          // 回车是最后一步,只有它结果未知时命令才可能真的执行过;其余失败都把回车扣下了,标记停在"已清空"会让下一次派单白发一整份上下文
+          await restoreContextMarker();
+          if (err instanceof ReplNotReadyError) {
+            console.warn(`[AgentManager] sendSlashCommand(${agentId}, ${command}) submission unconfirmed:`, err);
+            throw new ApiError(409, `Agent ${agentId} did not take ${command} into its composer: ${err.message}`);
+          }
+          throw err;
+        }
       }
       guardHandedOff = true;
       deadline = performance.now() + this.compactIdleWaitMs;
@@ -7799,7 +7829,10 @@ export class AgentManager {
     } catch (err) {
       if (!guardHandedOff && (err instanceof ExecNotStartedError
         || (err instanceof Error && isTransientNetworkFailure(err.message)))) {
-        throw new ApiError(409, `Agent ${agentId} could not prepare ${command} during ${stage}; ${command} was not submitted: ${err.message}`);
+        // submit 段的失败不是"还没开始写":那一行已经键入 composer,人得知道要去看一眼
+        throw new ApiError(409, stage === 'submit'
+          ? `Agent ${agentId} lost contact while submitting ${command}; ${command} was not submitted and its line may still be in the composer: ${err.message}`
+          : `Agent ${agentId} could not prepare ${command} during ${stage}; ${command} was not submitted: ${err.message}`);
       }
       throw err;
     } finally {

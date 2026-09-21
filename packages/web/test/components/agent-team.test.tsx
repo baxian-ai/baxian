@@ -18,11 +18,18 @@ import { AgentTeam } from '../../src/components/agent-team.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { ToastProvider } from '../../src/components/toast.tsx';
 import { makeAgent, makeTask } from '../helpers/fixtures.ts';
+import { expectToast } from '../helpers/toast.tsx';
 
 const tasksAdvanceMock = vi.mocked(api.tasks.advance);
+const compactMock = vi.mocked(api.agents.compact);
+const clearMock = vi.mocked(api.agents.clear);
+const deleteAgentMock = vi.mocked(api.projects.deleteAgent);
 
 beforeEach(() => {
   tasksAdvanceMock.mockReset();
+  compactMock.mockReset();
+  clearMock.mockReset();
+  deleteAgentMock.mockReset();
   navigateMock.mockReset();
 });
 
@@ -68,6 +75,7 @@ type RenderTeamOptions = {
   agentsLoaded?: boolean;
   agentsError?: boolean;
   terminalMode?: 'embedded-full';
+  onDeleted?: () => void;
 };
 
 function defaultAgentsById(): Map<string, AgentSnapshot> {
@@ -84,6 +92,7 @@ function renderTeam(tasks: TaskState[], options: RenderTeamOptions = {}): void {
     agentsLoaded = true,
     agentsError,
     terminalMode,
+    onDeleted,
   } = options;
   render(
     <MemoryRouter>
@@ -97,6 +106,7 @@ function renderTeam(tasks: TaskState[], options: RenderTeamOptions = {}): void {
             agentsError={agentsError}
             tasks={tasks}
             terminalMode={terminalMode}
+            onDeleted={onDeleted}
           />
         </ConfirmProvider>
       </ToastProvider>
@@ -431,5 +441,106 @@ describe('AgentTeam', () => {
     expect(screen.getAllByRole('link', { name: 'Terminal' }).map(link => link.getAttribute('href')))
       .toEqual(['/terminal/dev-1', '/terminal/qa-1']);
     expect(screen.queryByText('Agent status loading')).toBeNull();
+  });
+});
+
+describe('AgentTeam actions menu', () => {
+  function openTeamMenu(): void {
+    fireEvent.click(screen.getByRole('button', { name: 'Agent Team dev-1 / qa-1 actions menu' }));
+  }
+
+  async function clickTeamMenuItem(name: string): Promise<void> {
+    openTeamMenu();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('menuitem', { name }));
+    });
+  }
+
+  async function settleConfirmDialog(buttonName: string): Promise<void> {
+    const dialog = await screen.findByRole('dialog');
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: buttonName }));
+    });
+  }
+
+  it('shows the team identity and a menu with Compact, Clear and Delete', () => {
+    renderTeam([]);
+
+    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    expect(within(region).getByText('dev-1 / qa-1')).toBeTruthy();
+    openTeamMenu();
+    const items = screen.getAllByRole('menuitem');
+    expect(items.map(item => item.textContent)).toEqual(['Compact context', 'Clear context', 'Delete']);
+  });
+
+  it('sends /compact to every agent of the team', async () => {
+    compactMock.mockResolvedValue({ compacted: true });
+    renderTeam([]);
+
+    await clickTeamMenuItem('Compact context');
+
+    expect(compactMock.mock.calls.map(call => call[0])).toEqual(['dev-1', 'qa-1']);
+    await expectToast({ title: '/compact sent to Agent Team dev-1 / qa-1' });
+  });
+
+  it('sends /clear to every agent of the team after the user confirms', async () => {
+    clearMock.mockResolvedValue({ cleared: true });
+    renderTeam([]);
+
+    await clickTeamMenuItem('Clear context');
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Clear the context for Agent Team dev-1 / qa-1?')).toBeTruthy();
+    await settleConfirmDialog('Clear');
+
+    expect(clearMock.mock.calls.map(call => call[0])).toEqual(['dev-1', 'qa-1']);
+    await expectToast({ title: '/clear sent to Agent Team dev-1 / qa-1' });
+  });
+
+  it('does not send /clear when the user cancels', async () => {
+    renderTeam([]);
+
+    await clickTeamMenuItem('Clear context');
+    await settleConfirmDialog('Cancel');
+
+    expect(clearMock).not.toHaveBeenCalled();
+  });
+
+  it('reports which team member failed when only one agent rejects', async () => {
+    compactMock.mockImplementation(async (id: string) => {
+      if (id === 'qa-1') throw new Error('no live session');
+      return { compacted: true };
+    });
+    renderTeam([]);
+
+    await clickTeamMenuItem('Compact context');
+
+    expect(compactMock.mock.calls.map(call => call[0])).toEqual(['dev-1', 'qa-1']);
+    await expectToast({ title: 'Failed to compact context', body: 'qa-1: no live session' });
+  });
+
+  it('deletes the whole team with a single request and notifies the parent', async () => {
+    deleteAgentMock.mockResolvedValue({ removed: ['dev-1', 'qa-1'], restartRequired: false });
+    const onDeleted = vi.fn();
+    renderTeam([], { onDeleted });
+
+    await clickTeamMenuItem('Delete');
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Delete Agent Team dev-1 / qa-1?')).toBeTruthy();
+    await settleConfirmDialog('Delete');
+
+    expect(deleteAgentMock).toHaveBeenCalledTimes(1);
+    expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-1');
+    expect(onDeleted).toHaveBeenCalled();
+    await expectToast({ title: 'Agent Team dev-1 / qa-1 deleted' });
+  });
+
+  it('keeps the team on screen and shows the reason when the delete fails', async () => {
+    deleteAgentMock.mockRejectedValue(new Error('agent dev-1 is still active on task-1'));
+    renderTeam([]);
+
+    await clickTeamMenuItem('Delete');
+    await settleConfirmDialog('Delete');
+
+    expect(await screen.findByText('agent dev-1 is still active on task-1')).toBeTruthy();
   });
 });
