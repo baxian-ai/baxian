@@ -32,7 +32,7 @@ agent 本体是一个交互式 CLI——**Claude Code、Codex、OpenCode 或 Qod
 - **方案确认（可选）** —— 任务可以先产出方案再动手写码，方案同样经过 QA 评审；配置 `specApproval: "human"` 后，方案要等你批准才开始开发。
 - **本地与远程 agent** —— agent 可以跑在任何 SSH 可达的机器上，远端 tmux 会话由 baxian 代管。
 - **模型凭证不经 baxian** —— baxian 不保存、也不重复配置任何模型凭证；agent 用的就是各 CLI 已有的认证与模型配置。仓库访问（git 与所选平台的 CLI，GitHub 为 `gh`）另有要求，见环境要求。
-- **周边体验** —— 双语界面（English / 简体中文）、任务完成浏览器通知、向 agent 终端直接上传图片，以及可选的像素风 agent 宠物。
+- **周边体验** —— 双语界面（English / 简体中文）、任务完成浏览器通知，以及向 agent 终端直接上传图片。
 
 ## 工作流
 

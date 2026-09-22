@@ -249,6 +249,11 @@ export interface WaitOpts {
   intervalMs?: number;
 }
 
+// 前台退场只是退出类命令的成功状态,普通命令不能拿它当提交证据
+export interface SubmitOpts extends WaitOpts {
+  expectRuntimeExit?: boolean;
+}
+
 export interface WaitReplReadyOpts extends WaitOpts {
   failFastOnShell?: boolean;
   runtimeSeen?: boolean;
@@ -997,7 +1002,7 @@ export class TmuxManager {
   }
 
   // 回车要等到草稿被读出来才发:紧跟文本的 CR 会被 codex 的粘贴突发检测当成草稿正文,两条相邻 exec 之间的几毫秒仍落在那个窗口里
-  async submitToRuntime(pane: PaneRef, runtime: AgentRuntimeKind, text: string, opts: WaitOpts = {}): Promise<void> {
+  async submitToRuntime(pane: PaneRef, runtime: AgentRuntimeKind, text: string, opts: SubmitOpts = {}): Promise<void> {
     const rest = await this.readComposerFrame(pane);
     await this.submitWrite(pane, runtime, [sendKeysCommand(pane.paneId, [text], true)],
       `the line ${JSON.stringify(text)} and Enter withheld`);
@@ -1031,6 +1036,37 @@ export class TmuxManager {
     }
     await this.submitWrite(pane, runtime, [sendKeysCommand(pane.paneId, ['Enter'])],
       `the Enter for the line ${JSON.stringify(text)} withheld; the line stays in the composer`);
+    // 回车已经 applied:此后任何观测都证明不了它没执行,失败一律收口成结果未知
+    const unknownAfterEnter = async (why: string): Promise<never> => {
+      const scrubbed = await this.scrubComposerLine(pane, runtime);
+      throw new TmuxOutcomeUnknownError(
+        `tmux submit to ${pane.paneId} outcome unknown: the Enter for the line ${JSON.stringify(text)} was applied but ${why}; ` +
+          (scrubbed ? 'the line was scrubbed with C-u' : 'the line could not be scrubbed and may still be drafted') +
+          '; inspect the pane before retrying',
+      );
+    };
+    // resize 会把仍在 composer 里的草稿重排回旧静止列:列证据只在原 geometry、且草稿当初推动过列时成立
+    const restingColumn = (frame: ComposerFrame): boolean =>
+      frame.geometry === rest.geometry && frame.column === rest.column;
+    const columnCarriesDrainEvidence = landed.geometry === rest.geometry && landed.column !== rest.column;
+    let drained: ComposerFrame | undefined;
+    try {
+      drained = await this.waitComposerFrameChange(
+        pane, runtime, landed, opts,
+        frame => columnCarriesDrainEvidence && restingColumn(frame),
+      );
+    } catch (err) {
+      await unknownAfterEnter(`the composer could not be observed afterwards (${err instanceof Error ? err.message : String(err)})`);
+    }
+    if (drained && (opts.expectRuntimeExit || hasReplProcTitle(drained.foreground, runtime))) return;
+    if (drained) {
+      await unknownAfterEnter(`the pane foreground became ${JSON.stringify(drained.foreground)} instead of ${runtime} before the composer could be observed draining`);
+    }
+    await unknownAfterEnter(columnCarriesDrainEvidence
+      ? `the composer never drained back to the resting cursor (column ${rest.column} in ${rest.geometry}) within `
+        + `${opts.timeoutMs ?? COMPOSER_DIRTY_TIMEOUT_MS}ms; the line landed at ${landed.column},${landed.row}`
+      : `the draft landed at ${landed.column},${landed.row} in ${landed.geometry} without moving off the resting cursor `
+        + `(column ${rest.column} in ${rest.geometry}), so no drain evidence exists that a reflow could not fake`);
   }
 
   // C-u 删到行首:空 composer 上是空操作(C-c 在那里会直接退掉 codex),所以正文是否落地未知时也能安全清场;

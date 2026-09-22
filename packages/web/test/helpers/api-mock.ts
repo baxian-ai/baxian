@@ -31,13 +31,6 @@ export function createApiMock(): ApiModule {
         probe: vi.fn(),
         installTmux: vi.fn(),
         uploadImage: vi.fn(),
-        setPet: vi.fn(),
-      },
-      pets: {
-        list: vi.fn(),
-        create: vi.fn(),
-        remove: vi.fn(),
-        fetchSpritesheet: vi.fn(),
       },
       tasks: {
         list: vi.fn(),

@@ -32,7 +32,7 @@ An agent is an interactive CLI — **Claude Code, Codex, OpenCode, or Qoder CLI*
 - **Plan approval (optional)** — a task can start with a written plan instead of code. QA reviews the plan the same way, and with `specApproval: "human"` coding waits for your sign-off.
 - **Local & remote agents** — run agents on any machine reachable over SSH; baxian manages the remote tmux sessions for you.
 - **Model credentials stay in your CLIs** — baxian stores no model keys and configures none of its own; each agent uses whatever auth its CLI already has. Repository access (git plus your platform's CLI — `gh` for GitHub) is a separate prerequisite — see Requirements.
-- **Quality of life** — bilingual UI (English / 简体中文), browser notifications when tasks finish, image upload straight into an agent's terminal, and optional pixel-art agent pets.
+- **Quality of life** — bilingual UI (English / 简体中文), browser notifications when tasks finish, and image upload straight into an agent's terminal.
 
 ## The workflow
 

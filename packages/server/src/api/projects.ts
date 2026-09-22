@@ -287,18 +287,6 @@ class AgentRemovalTransaction {
           );
         }
       }
-      if (this.app.ctx.petStore) {
-        try {
-          await this.app.ctx.petStore.setAssignment(agentId, null);
-        } catch (err) {
-          const warning = `pet assignment cleanup for ${agentId} failed: ${err instanceof Error ? err.message : String(err)}`;
-          if (this.operation === 'PUT') warnings.push(warning);
-          this.app.log.warn(
-            { err, agentId },
-            this.operation === 'PUT' ? `PUT /agents ${warning}` : 'DELETE /agents petStore.setAssignment(null) failed',
-          );
-        }
-      }
     }
     return { restartRequired: switchResult.restartRequired, warnings };
   }

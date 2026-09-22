@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { useState } from 'react';
@@ -38,14 +39,14 @@ describe('ConfirmProvider / useConfirm', () => {
     renderHarness({ body: 'This action cannot be undone.' });
     expect(screen.getByText('Delete this item?')).toBeTruthy();
     expect(screen.getByText('This action cannot be undone.')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.confirm }));
     await screen.findByText('yes');
     expect(screen.queryByText('Delete this item?')).toBeNull();
   });
 
   it('resolves false on cancel and on Escape', async () => {
     renderHarness();
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.cancel }));
     await screen.findByText('no');
 
     fireEvent.click(screen.getByRole('button', { name: 'trigger' }));
@@ -56,9 +57,9 @@ describe('ConfirmProvider / useConfirm', () => {
   });
 
   it('uses a custom confirm label and initial focus stays on the safe side (close button)', async () => {
-    renderHarness({ confirmLabel: 'Delete' });
-    expect((document.activeElement as HTMLElement | null)?.getAttribute('aria-label')).toBe('Close');
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    renderHarness({ confirmLabel: 'Remove fixture' });
+    expect((document.activeElement as HTMLElement | null)?.getAttribute('aria-label')).toBe(enUS.common.close);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove fixture' }));
     await screen.findByText('yes');
   });
 });

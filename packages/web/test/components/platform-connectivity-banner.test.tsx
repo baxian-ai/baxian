@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { PollerSnapshot } from '../../src/shared/types.ts';
@@ -50,7 +51,7 @@ describe('PlatformConnectivityBanner', () => {
       snapshot({ repo: 'https://github.com/user/flaky.git', health: 'degraded', consecutiveFailures: 1 }),
     ];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform polling degraded/)).not.toBeNull();
+    expect(screen.getByText(enUS.banner.platformDegraded(pollersState.data![1].repo))).not.toBeNull();
     expect(screen.getByText(/user\/flaky/)).not.toBeNull();
   });
 
@@ -60,7 +61,7 @@ describe('PlatformConnectivityBanner', () => {
       snapshot({ repo: 'https://github.com/user/down.git', health: 'failed', consecutiveFailures: 4 }),
     ];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform unreachable/)).not.toBeNull();
+    expect(screen.getByText(enUS.banner.platformUnreachable(pollersState.data![1].repo))).not.toBeNull();
     expect(screen.getByText(/user\/down/)).not.toBeNull();
   });
 
@@ -71,7 +72,7 @@ describe('PlatformConnectivityBanner', () => {
       rateLimitedUntil: '2099-01-01T00:00:00.000Z',
     })];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform polling rate-limited/)).not.toBeNull();
+    expect(screen.getByText(enUS.banner.platformRateLimited(pollersState.data![0].repo, pollersState.data![0].rateLimitedUntil!))).not.toBeNull();
     expect(screen.getByText(/user\/throttled/)).not.toBeNull();
   });
 
@@ -94,7 +95,7 @@ describe('PlatformConnectivityBanner', () => {
       snapshot({ repo: 'https://github.com/user/down.git', health: 'failed', consecutiveFailures: 3 }),
     ];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform unreachable/)).not.toBeNull();
+    expect(screen.getByText(enUS.banner.platformUnreachable(pollersState.data![1].repo))).not.toBeNull();
     expect(screen.getByText(/user\/down/)).not.toBeNull();
   });
 
@@ -107,9 +108,9 @@ describe('PlatformConnectivityBanner', () => {
       lastErrorMessage: 'github-auth: GitHub CLI has no valid credentials for the user running baxian on this host.',
     })];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform access denied/)).not.toBeNull();
+    expect(screen.getByText(enUS.banner.platformAccessDenied(pollersState.data![0].repo, pollersState.data![0].lastErrorMessage))).not.toBeNull();
     expect(screen.getByText(/user\/locked/)).not.toBeNull();
-    expect(screen.queryByText(/Platform unreachable/)).toBeNull();
+    expect(screen.queryByText(enUS.banner.platformUnreachable(pollersState.data![0].repo))).toBeNull();
   });
 
   it('reports access denied as soon as a degraded poller is refused, before it reaches failed', () => {
@@ -120,8 +121,8 @@ describe('PlatformConnectivityBanner', () => {
       lastErrorClass: 'ACCESS_DENIED',
     })];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform access denied/)).not.toBeNull();
-    expect(screen.queryByText(/Platform polling degraded/)).toBeNull();
+    expect(screen.getByText(enUS.banner.platformAccessDenied(pollersState.data![0].repo, pollersState.data![0].lastErrorMessage))).not.toBeNull();
+    expect(screen.queryByText(enUS.banner.platformDegraded(pollersState.data![0].repo))).toBeNull();
   });
 
   it('prefers a refused poller over an earlier unreachable one so the manual fix is never masked', () => {
@@ -130,9 +131,9 @@ describe('PlatformConnectivityBanner', () => {
       snapshot({ repo: 'https://github.com/user/locked.git', health: 'failed', consecutiveFailures: 3, lastErrorClass: 'ACCESS_DENIED' }),
     ];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform access denied/)).not.toBeNull();
+    expect(screen.getByText(enUS.banner.platformAccessDenied(pollersState.data![1].repo, pollersState.data![1].lastErrorMessage))).not.toBeNull();
     expect(screen.getByText(/user\/locked/)).not.toBeNull();
-    expect(screen.queryByText(/Platform unreachable/)).toBeNull();
+    expect(screen.queryByText(enUS.banner.platformUnreachable(pollersState.data![1].repo))).toBeNull();
   });
 
   it('reports a not-found needing manual fix instead of self-healing unreachable when a failed poller keeps getting NOT_FOUND', () => {
@@ -144,9 +145,9 @@ describe('PlatformConnectivityBanner', () => {
       lastErrorMessage: 'read task 42: op prView failed (exit 1, class NOT_FOUND): gh: Not Found (HTTP 404)',
     })];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/not-found/i)).not.toBeNull();
+    expect(screen.getByText(enUS.banner.platformRepoNotFound(pollersState.data![0].repo))).not.toBeNull();
     expect(screen.getByText(/org\/private/)).not.toBeNull();
-    expect(screen.queryByText(/Platform unreachable/)).toBeNull();
+    expect(screen.queryByText(enUS.banner.platformUnreachable(pollersState.data![0].repo))).toBeNull();
   });
 
   it('keeps the self-healing degraded notice for a NOT_FOUND that has not yet reached failed', () => {
@@ -157,8 +158,8 @@ describe('PlatformConnectivityBanner', () => {
       lastErrorClass: 'NOT_FOUND',
     })];
     render(<PlatformConnectivityBanner />);
-    expect(screen.getByText(/Platform polling degraded/)).not.toBeNull();
-    expect(screen.queryByText(/not-found/i)).toBeNull();
+    expect(screen.getByText(enUS.banner.platformDegraded(pollersState.data![0].repo))).not.toBeNull();
+    expect(screen.queryByText(enUS.banner.platformRepoNotFound(pollersState.data![0].repo))).toBeNull();
   });
 
   it('shows the driver-supplied recovery instruction instead of a hard-coded platform command', () => {
@@ -170,7 +171,7 @@ describe('PlatformConnectivityBanner', () => {
       lastErrorMessage: 'corp-auth: run corp-cli login on the server host',
     })];
     render(<PlatformConnectivityBanner />);
-    const banner = screen.getByText(/Platform access denied/);
+    const banner = screen.getByText(enUS.banner.platformAccessDenied(pollersState.data![0].repo, pollersState.data![0].lastErrorMessage));
     expect(banner.textContent).toContain('corp-cli login on the server host');
     expect(banner.textContent).not.toContain('gh auth login');
   });
@@ -184,7 +185,7 @@ describe('PlatformConnectivityBanner', () => {
       }),
     ];
     render(<PlatformConnectivityBanner />);
-    const banner = screen.getByText(/Platform unreachable/).closest('div');
+    const banner = screen.getByText(enUS.banner.platformUnreachable(pollersState.data![0].repo)).closest('div');
     expect(banner?.getAttribute('title')).toContain('i/o timeout');
   });
 });

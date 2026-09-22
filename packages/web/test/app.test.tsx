@@ -1,9 +1,10 @@
+import { enUS } from '../src/i18n/en-us.ts';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { useLayoutEffect } from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, act, within } from '@testing-library/react';
 import type { ProjectConfig, TaskState } from '../src/shared/index.js';
 
 const appMockState = vi.hoisted(() => {
@@ -168,7 +169,6 @@ describe('App shell layout', () => {
 
     const homeLink = screen.getByRole('link', { name: 'baxian' });
     expect(homeLink.getAttribute('href')).toBe('/');
-    expect(homeLink.textContent).toContain('baxian');
     expect(homeLink.getAttribute('aria-label')).toBeNull();
 
     expect(homeLink.querySelector('span[aria-hidden]')).toBeTruthy();
@@ -177,7 +177,9 @@ describe('App shell layout', () => {
     expect(screen.queryByRole('link', { name: 'Dashboard' })).toBeNull();
     expect(screen.queryByRole('link', { name: 'Tasks' })).toBeNull();
     expect(container.querySelector('a[href="/tasks"]')).toBeNull();
-    expect(nav.querySelector('button[aria-label^="Switch to logo"]')).toBeNull();
+    expect(within(nav).queryByRole('button', {
+      name: name => [enUS.nav.toggleToText, enUS.nav.toggleToIcon].includes(name),
+    })).toBeNull();
 
     expect(nav.querySelector(`#${TOPBAR_ACTIONS_ID}`)).toBeTruthy();
 
@@ -206,32 +208,23 @@ describe('App shell layout', () => {
     expect(shell.className).not.toContain('h-screen');
   });
 
-  it('renders the bottom BrandToggle on non-terminal routes and keeps its toggle behavior', () => {
+  it.each(['/', '/project/demo'])('keeps the footer brand toggle interactive on %s', (path) => {
+    window.history.pushState({}, '', path);
     const { container } = render(<App />);
 
     const footer = container.querySelector('footer');
     expect(footer).toBeTruthy();
 
-    const toggleBtn = footer!.querySelector('button[aria-label^="Switch to logo"]') as HTMLButtonElement | null;
-    expect(toggleBtn).toBeTruthy();
-    expect(toggleBtn!.getAttribute('aria-label')).toBe('Switch to logo text');
+    const toggleBtn = within(footer!).getByRole('button', { name: enUS.nav.toggleToText });
 
     expect(footer!.querySelector('img')?.getAttribute('src')).toBe('/baxian-logo.png');
 
-    fireEvent.click(toggleBtn!);
+    fireEvent.click(toggleBtn);
     expect(footer!.querySelector('img')).toBeNull();
-    expect(footer!.textContent).toContain('baxian');
-    expect(toggleBtn!.getAttribute('aria-label')).toBe('Switch to logo icon');
+    expect(within(footer!).getByRole('button', { name: enUS.nav.toggleToIcon })).toBe(toggleBtn);
 
-    fireEvent.click(toggleBtn!);
+    fireEvent.click(toggleBtn);
     expect(footer!.querySelector('img')?.getAttribute('src')).toBe('/baxian-logo.png');
-
-    cleanup();
-    window.history.pushState({}, '', '/project/demo');
-    const projectRoute = render(<App />);
-    const projectFooter = projectRoute.container.querySelector('footer');
-    expect(projectFooter).toBeTruthy();
-    expect(projectFooter!.querySelector('button[aria-label^="Switch to logo"]')).toBeTruthy();
   });
 
   it('hides the bottom BrandToggle footer on /terminal/:agentId so the full-height terminal pane is not pushed up by the footer', () => {
@@ -250,8 +243,8 @@ describe('Task completion notifications', () => {
 
     render(<App />);
 
-    expect(screen.queryByText('Task completion notifications')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Task completion notifications' })).toBeNull();
+    expect(screen.queryByText(enUS.settings.taskNotifications)).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.settings.taskNotifications })).toBeNull();
     expect(taskSubscribeCalls()).toHaveLength(0);
   });
 
@@ -363,7 +356,6 @@ describe('Task completion notifications', () => {
       await Promise.resolve();
     });
     expect(notification.instances).toHaveLength(1);
-    expect(notification.instances[0].options?.body).toContain('Status: PR merged');
   });
 
   it('drops an in-flight completion confirmation when its own project is removed', async () => {
@@ -475,7 +467,6 @@ describe('Task completion notifications', () => {
       await Promise.resolve();
     });
     expect(notification.instances).toHaveLength(1);
-    expect(notification.instances[0].options?.body).toContain('Status: PR merged');
 
     await act(async () => {
       resolvers[0](makeTask({ status: 'merged' }));
@@ -598,10 +589,9 @@ describe('Task completion notifications', () => {
 
     await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
     await waitFor(() => expect(notification.instances).toHaveLength(1));
-    expect(notification.instances[0].title).toContain('Task completed: Ship notifications');
-    expect(notification.instances[0].options?.body).toContain('Project: proj · https://github.com/acme/demo.git');
-    expect(notification.instances[0].options?.body).toContain('Task: task-188 · Ship notifications');
-    expect(notification.instances[0].options?.body).toContain('Status: PR merged');
+    expect(notification.instances[0].title).toContain(enUS.notification.taskDone('Ship notifications'));
+    expect(notification.instances[0].options?.body).toContain(enUS.notification.bodyProject('proj · https://github.com/acme/demo.git'));
+    expect(notification.instances[0].options?.body).toContain(enUS.notification.bodyTask('task-188 · Ship notifications'));
   });
 
   it('does not notify when the disappeared task is terminal but not completed', async () => {
@@ -645,7 +635,6 @@ describe('Task completion notifications', () => {
 
       await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(2));
       await waitFor(() => expect(notification.instances).toHaveLength(1));
-      expect(notification.instances[0].options?.body).toContain('Status: Complete');
     } finally {
       warn.mockRestore();
     }

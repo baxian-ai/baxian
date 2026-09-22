@@ -129,15 +129,6 @@ describe('request contract per endpoint', () => {
       method: 'POST',
       body: { mode: 'remote', host },
     },
-    {
-      name: 'agents.setPet',
-      run: () => api.agents.setPet('dev-1', 'cat'),
-      url: '/api/agents/dev-1/pet',
-      method: 'PUT',
-      body: { petId: 'cat' },
-    },
-    { name: 'pets.list', run: () => api.pets.list(), url: '/api/pets' },
-    { name: 'pets.remove', run: () => api.pets.remove('p 1'), url: '/api/pets/p%201', method: 'DELETE' },
     { name: 'tasks.get', run: () => api.tasks.get('t-1'), url: '/api/tasks/t-1' },
     {
       name: 'tasks.update',
@@ -273,26 +264,6 @@ describe('request contract per endpoint', () => {
       }
     });
   }
-
-  it('pets.fetchSpritesheet returns the raw blob', async () => {
-    fetchSpy.mockImplementationOnce(
-      async () => new Response('png-bytes', { headers: { 'Content-Type': 'image/png' } }),
-    );
-    const blob = await api.pets.fetchSpritesheet('cat');
-    expect(lastCall(fetchSpy).url).toBe('/api/pets/cat/spritesheet');
-    expect(blob.size).toBe('png-bytes'.length);
-    expect(blob.type).toBe('image/png');
-  });
-
-  it('pets.create encodes the spritesheet file into the body', async () => {
-    const bytes = new Uint8Array([1, 2, 3]);
-    await api.pets.create({ id: 'cat' }, new File([bytes], 'cat.png'));
-    const { url, init } = lastCall(fetchSpy);
-    expect(url).toBe('/api/pets');
-    const body = JSON.parse(init.body as string) as { petJson: unknown; spritesheetBase64: string };
-    expect(body.petJson).toEqual({ id: 'cat' });
-    expect(body.spritesheetBase64).toBe(btoa(String.fromCharCode(...bytes)));
-  });
 });
 
 describe('response handling helpers', () => {
@@ -304,10 +275,11 @@ describe('response handling helpers', () => {
     await expect(api.tasks.update('t-1', { title: 'x' })).resolves.toBeUndefined();
   });
 
-  it('PUT resolves undefined on 204 and serializes null body fallback', async () => {
+  it('PUT resolves undefined on 204', async () => {
+    const agent = { id: 'qa-4', runtime: 'codex', role: 'qa', mode: 'local' } as const;
     fetchSpy.mockImplementationOnce(async () => new Response(null, { status: 204 }));
-    await expect(api.agents.setPet('dev-1', null)).resolves.toBeUndefined();
-    expect(lastCall(fetchSpy).init.body).toBe(JSON.stringify({ petId: null }));
+    await expect(api.projects.replaceAgent('p-1', 'qa-3', agent)).resolves.toBeUndefined();
+    expect(lastCall(fetchSpy).init.body).toBe(JSON.stringify(agent));
   });
 
   it('DELETE resolves undefined on 204 and parses a JSON body when present', async () => {

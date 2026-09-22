@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, act } from '@testing-library/react';
 import { ToastProvider, useToast } from '../../src/components/toast.tsx';
@@ -10,7 +11,7 @@ function Trigger({ technical = false }: { technical?: boolean }) {
       onClick={() => show(technical
         ? {
             kind: 'error',
-            title: 'Couldn’t start this step',
+            title: 'Test action failed',
             body: 'Refresh the page before trying again.',
             details: 'review agent returned conflict-409',
           }
@@ -46,7 +47,7 @@ describe('Toast layout (mobile)', () => {
   it('keeps raw action errors in collapsed technical details', () => {
     renderWithToast(true);
     expect(screen.getByText('Refresh the page before trying again.')).toBeTruthy();
-    const details = screen.getByText('Technical details').closest('details')!;
+    const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
     expect(details.hasAttribute('open')).toBe(false);
     expect(details.textContent).toContain('review agent returned conflict-409');
   });
@@ -79,7 +80,7 @@ describe('auto-dismiss pause on hover', () => {
       renderWithToast();
       const toast = screen.getByRole('status');
       fireEvent.mouseEnter(toast);
-      fireEvent.click(screen.getByRole('button', { name: 'Close notification' }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.toast.dismissAriaLabel }));
       expect(screen.queryByRole('status')).toBeNull();
       await act(async () => { vi.advanceTimersByTime(10_000); });
       expect(screen.queryByRole('status')).toBeNull();
@@ -95,7 +96,7 @@ describe('hover and focus hold the timer independently', () => {
     try {
       renderWithToast();
       const toast = screen.getByRole('status');
-      const closeBtn = screen.getByRole('button', { name: 'Close notification' });
+      const closeBtn = screen.getByRole('button', { name: enUS.toast.dismissAriaLabel });
 
       fireEvent.mouseEnter(toast);
       fireEvent.focus(closeBtn);
@@ -116,7 +117,7 @@ describe('hover and focus hold the timer independently', () => {
     try {
       renderWithToast();
       const toast = screen.getByRole('status');
-      const closeBtn = screen.getByRole('button', { name: 'Close notification' });
+      const closeBtn = screen.getByRole('button', { name: enUS.toast.dismissAriaLabel });
 
       fireEvent.focus(closeBtn);
       fireEvent.mouseEnter(toast);

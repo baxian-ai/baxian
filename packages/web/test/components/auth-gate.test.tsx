@@ -1,3 +1,5 @@
+import { zhCN } from '../../src/i18n/zh-cn.ts';
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { AuthGate } from '../../src/components/auth-gate.tsx';
@@ -45,21 +47,21 @@ describe('AuthGate', () => {
     render(<AuthGate><div>app-loaded</div></AuthGate>);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Sign in' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.auth.submit })).toBeTruthy();
     });
     expect(screen.queryByText('app-loaded')).toBeNull();
-    expect(screen.getByLabelText('Token')).toBeTruthy();
+    expect(screen.getByLabelText(enUS.auth.tokenLabel)).toBeTruthy();
   });
 
   it('blocks submit with empty token and shows inline validation', async () => {
     installFetch(vi.fn(async () => jsonResponse(401)));
 
     render(<AuthGate><div /></AuthGate>);
-    const submit = await screen.findByRole('button', { name: 'Sign in' });
+    const submit = await screen.findByRole('button', { name: enUS.auth.submit });
 
     fireEvent.click(submit);
 
-    expect(await screen.findByText('Please enter the access token')).toBeTruthy();
+    expect(await screen.findByText(enUS.auth.tokenRequired)).toBeTruthy();
   });
 
   it('saves token on successful login and renders children', async () => {
@@ -73,10 +75,10 @@ describe('AuthGate', () => {
     installFetch(fetchSpy);
 
     render(<AuthGate><div>app-loaded</div></AuthGate>);
-    const input = await screen.findByLabelText('Token');
+    const input = await screen.findByLabelText(enUS.auth.tokenLabel);
 
     fireEvent.change(input, { target: { value: 'good-token' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.auth.submit }));
 
     await waitFor(() => expect(screen.queryByText('app-loaded')).not.toBeNull());
     expect(localStorage.getItem('baxian.token')).toBe('good-token');
@@ -86,11 +88,11 @@ describe('AuthGate', () => {
     installFetch(vi.fn(async () => jsonResponse(401)));
 
     render(<AuthGate><div /></AuthGate>);
-    const input = await screen.findByLabelText('Token');
+    const input = await screen.findByLabelText(enUS.auth.tokenLabel);
     fireEvent.change(input, { target: { value: 'bad-token' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.auth.submit }));
 
-    await waitFor(() => expect(screen.getByText('Invalid token, please retry')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(enUS.auth.tokenInvalid)).toBeTruthy());
     expect(localStorage.getItem('baxian.token')).toBeNull();
   });
 
@@ -103,7 +105,7 @@ describe('AuthGate', () => {
     installFetch(fetchSpy);
 
     render(<AuthGate><div>app-loaded</div></AuthGate>);
-    const retry = await screen.findByRole('button', { name: 'Retry' });
+    const retry = await screen.findByRole('button', { name: enUS.common.retry });
     expect(screen.getByText('network down')).toBeTruthy();
 
     mode = 'ok';
@@ -122,7 +124,7 @@ describe('AuthGate', () => {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     });
 
-    expect(await screen.findByText('Session expired, please enter the token again')).toBeTruthy();
+    expect(await screen.findByText(enUS.auth.sessionExpired)).toBeTruthy();
     expect(screen.queryByText('app-loaded')).toBeNull();
   });
 
@@ -142,7 +144,7 @@ describe('AuthGate', () => {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     });
 
-    expect(await screen.findByText('登录已失效，请重新输入令牌')).toBeTruthy();
+    expect(await screen.findByText(zhCN.auth.sessionExpired)).toBeTruthy();
     expect(screen.queryByText('app-loaded')).toBeNull();
   });
 

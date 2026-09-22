@@ -47,13 +47,6 @@ export const TASK_CREATE_ROUTE_BODY_LIMIT = 32 * 1024 * 1024;
 export const TITLE_MAX_LEN = 200;
 export const MAX_CONFIG_BACKUPS = 7;
 
-export const PET_ATLAS_WIDTH = 1536;
-export const PET_ATLAS_HEIGHT = 1872;
-export const PET_DISPLAY_NAME_MAX = 80;
-export const PET_DESCRIPTION_MAX = 500;
-export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;
-export const PET_UPLOAD_ROUTE_BODY_LIMIT = 12 * 1024 * 1024;
-
 export const MAX_INLINE_CONTENT_BYTES = 10 * 1024;
 
 export const CONTROL_CHAR_RE = /\p{Cc}/u;

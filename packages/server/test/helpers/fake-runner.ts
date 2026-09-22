@@ -13,6 +13,8 @@ export interface ProtocolTweak {
   outcome?: ProtocolOutcome;
   titleOnSubmit?: 'unchanged';
   titleHold?: 'sticky';
+  // 补全弹窗/vim Normal 模式吃掉回车:按键送达了 tmux,行编辑器不当它是提交
+  enter?: 'swallowed';
 }
 
 type RunnerReply =
@@ -459,7 +461,7 @@ function matches(
 }
 
 function isTweak(reply: Partial<ExecResult> | ProtocolTweak): reply is ProtocolTweak {
-  return 'outcome' in reply || 'titleOnSubmit' in reply || 'titleHold' in reply;
+  return 'outcome' in reply || 'titleOnSubmit' in reply || 'titleHold' in reply || 'enter' in reply;
 }
 
 function complete(result: Partial<ExecResult>): ExecResult {
@@ -954,6 +956,7 @@ class TmuxModel {
   }
 
   private enter(pane: PaneModel, session: SessionModel, tweak: ProtocolTweak): void {
+    if (tweak.enter === 'swallowed') return;
     const profile = RUNTIME_PROFILES[pane.runtime];
     if (pane.phase === 'dialog') {
       if (pane.dialogSelectedYes) {

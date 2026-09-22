@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { BrandToggle } from '../../src/components/brand-toggle.tsx';
@@ -11,7 +12,7 @@ describe('BrandToggle', () => {
     expect(img.getAttribute('width')).toBe('20');
     expect(img.getAttribute('height')).toBe('24');
 
-    expect(screen.getByRole('button').getAttribute('aria-label')).toBe('Switch to logo text');
+    expect(screen.getByRole('button').getAttribute('aria-label')).toBe(enUS.nav.toggleToText);
   });
 
   it('clicking swaps the logo for the text variant and updates the aria-label', () => {
@@ -20,7 +21,7 @@ describe('BrandToggle', () => {
 
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.getByText('baxian')).not.toBeNull();
-    expect(screen.getByRole('button').getAttribute('aria-label')).toBe('Switch to logo icon');
+    expect(screen.getByRole('button').getAttribute('aria-label')).toBe(enUS.nav.toggleToIcon);
   });
 
   it('clicking again restores the logo image', () => {
@@ -30,6 +31,6 @@ describe('BrandToggle', () => {
     fireEvent.click(btn);
 
     expect(screen.getByRole('img', { name: 'baxian' }).getAttribute('src')).toBe('/baxian-logo.png');
-    expect(btn.getAttribute('aria-label')).toBe('Switch to logo text');
+    expect(btn.getAttribute('aria-label')).toBe(enUS.nav.toggleToText);
   });
 });

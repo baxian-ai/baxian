@@ -40,12 +40,47 @@ export function taskStatusLabel(input: TaskStatus | TaskStatusContext): string {
   return resolveTaskStatusLabel(getMessages(), input);
 }
 
+export function getTaskAttentionActions(
+  attention: NonNullable<TaskState['attention']>,
+  status: TaskStatus,
+): NonNullable<TaskState['attention']>['recommendedActions'] {
+  return attention.reason === 'bootstrap-marker-clear-failed'
+    || (attention.reason === 'dispatch-failed:ack_unknown' && status !== 'review')
+    ? attention.recommendedActions.filter(action => action !== 'advance')
+    : attention.recommendedActions;
+}
+
 export function getTaskAttentionCopy(
   messages: ReturnType<typeof getMessages>,
   attention: NonNullable<TaskState['attention']>,
-): { title: string; guidance: string } {
-  const { reason, recommendedActions } = attention;
-  const title = /confirm-merge|post-approve|merge/.test(reason)
+  status: TaskStatus,
+): { title: string; guidance: string; expandDetails?: boolean } {
+  const { reason } = attention;
+  const recommendedActions = getTaskAttentionActions(attention, status);
+  const recoveryCopy: Record<string, { title: string; guidance: string }> = {
+    'dirty-workdir': {
+      title: messages.taskDetail.attentionDirtyWorkdirTitle,
+      guidance: messages.taskDetail.attentionDirtyWorkdirGuidance,
+    },
+    'checkout-preparation-failed': {
+      title: messages.taskDetail.attentionCheckoutTitle,
+      guidance: messages.taskDetail.attentionCheckoutGuidance,
+    },
+    'restart-redispatch-failed': {
+      title: messages.taskDetail.attentionReplayTitle,
+      guidance: messages.taskDetail.attentionReplayGuidance,
+    },
+    'bootstrap-marker-clear-failed': {
+      title: messages.taskDetail.attentionBootstrapDeliveredTitle,
+      guidance: messages.taskDetail.attentionBootstrapDeliveredGuidance,
+    },
+    'dispatch-failed:ack_unknown': {
+      title: messages.taskDetail.attentionDeliveryUnknownTitle,
+      guidance: messages.taskDetail.attentionDeliveryUnknownGuidance,
+    },
+  };
+  const recovery = recoveryCopy[reason];
+  const title = recovery?.title ?? (/confirm-merge|post-approve|merge/.test(reason)
     ? messages.taskDetail.attentionMergeTitle
     : /review|verdict/.test(reason)
       ? messages.taskDetail.attentionReviewTitle
@@ -53,7 +88,7 @@ export function getTaskAttentionCopy(
         ? messages.taskDetail.attentionAgentTitle
         : /dispatch|delivery|pr-created/.test(reason)
           ? messages.taskDetail.attentionHandoffTitle
-          : messages.taskDetail.attentionDefaultTitle;
+          : messages.taskDetail.attentionDefaultTitle);
   const guidance = recommendedActions.includes('verdict')
     ? messages.taskDetail.attentionVerdictGuidance
     : recommendedActions.includes('advance')
@@ -61,7 +96,11 @@ export function getTaskAttentionCopy(
       : recommendedActions.includes('retry')
         ? messages.taskDetail.attentionRetryGuidance
         : messages.taskDetail.attentionCancelGuidance;
-  return { title, guidance };
+  return {
+    title,
+    guidance: recovery ? `${recovery.guidance} ${guidance}` : guidance,
+    ...(recovery ? { expandDetails: true } : {}),
+  };
 }
 
 export const STATUS_BADGE_COLORS: Record<TaskStatus, string> = {

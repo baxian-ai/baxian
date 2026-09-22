@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { useState, type FormEvent } from 'react';
@@ -11,7 +12,7 @@ describe('Modal', () => {
         <input aria-label="second" />
       </Modal>,
     );
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: enUS.common.close }));
   });
 
   it('does not steal focus when parent re-renders with a fresh inline onClose', () => {
@@ -61,7 +62,7 @@ describe('Modal', () => {
         <input />
       </Modal>,
     );
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.close }));
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
@@ -111,7 +112,7 @@ describe('Modal', () => {
     );
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(handler).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.close }));
     expect(handler).toHaveBeenCalledTimes(2);
   });
 
@@ -222,7 +223,7 @@ describe('Modal focus trap (visible elements)', () => {
       </Modal>,
     );
     return {
-      closeBtn: screen.getByRole('button', { name: 'Close' }),
+      closeBtn: screen.getByRole('button', { name: enUS.common.close }),
       lastInput: screen.getByLabelText('second'),
     };
   }

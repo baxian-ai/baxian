@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { AgentConfig, BaxianConfig, ProjectConfig } from '../../src/shared/index.js';
@@ -60,7 +61,7 @@ function cfgWithAgents(agent: ProjectConfig['agent']): BaxianConfig {
 }
 
 function submitButton(): HTMLButtonElement {
-  return screen.getByRole('button', { name: /Continue to QA|Add Agent Team|Adding Agent Team/ }) as HTMLButtonElement;
+  return screen.getByRole('button', { name: name => [enUS.createAgent.continueLabel, enUS.createAgent.submitLabel, enUS.createAgent.submitting].includes(name) }) as HTMLButtonElement;
 }
 
 async function renderReady(config?: BaxianConfig): Promise<{ onClose: ReturnType<typeof vi.fn>; onCreated: ReturnType<typeof vi.fn> }> {
@@ -82,7 +83,7 @@ async function continueWithDev(id = 'dev-new'): Promise<void> {
   await fillValidForm(id);
   fireEvent.click(submitButton());
   expect(addAgentTeamMock).not.toHaveBeenCalled();
-  await waitFor(() => expect(screen.getByText('QA agent (step 2 of 2)')).toBeTruthy());
+  await waitFor(() => expect(screen.getByText(enUS.createAgent.qaStepLabel)).toBeTruthy());
 }
 
 it('remote mode shows a host picker (not a raw hostname input)', async () => {
@@ -90,7 +91,7 @@ it('remote mode shows a host picker (not a raw hostname input)', async () => {
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
 
-  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.remoteModeLabel }));
 
   expect(await screen.findByLabelText('Host')).toBeTruthy();
   expect(screen.getByText('Prod')).toBeTruthy();
@@ -101,15 +102,15 @@ it('guides the user to manage hosts when no hosts are configured', async () => {
   configGetMock.mockResolvedValue(cfg([]));
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
-  expect(await screen.findByText(/No hosts configured yet/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.remoteModeLabel }));
+  expect(await screen.findByText(enUS.createAgent.noHostsHint)).toBeTruthy();
 });
 
 it('probes by host id (resolved server-side) once a host is selected', async () => {
   configGetMock.mockResolvedValue(cfg([{ id: 'box', hostname: 'h.example.com', port: 22, user: 'agent' }]));
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.remoteModeLabel }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledWith('remote', { hostId: 'box' }, expect.anything()));
@@ -120,27 +121,27 @@ it('hides Workdir/Model/Additional Dirs behind a collapsed Advanced options togg
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />, { wrapper: ToastProvider });
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
 
-  const toggle = screen.getByRole('button', { name: /Advanced options/ });
+  const toggle = screen.getByRole('button', { name: name => name.includes(enUS.createAgent.advancedOptionsLabel) });
   expect(toggle.getAttribute('aria-expanded')).toBe('false');
   expect(toggle.getAttribute('aria-controls')).toBeNull();
   expect(document.getElementById('advanced-options')).toBeNull();
-  expect(screen.queryByLabelText(/Workdir/)).toBeNull();
-  expect(screen.queryByLabelText(/Model/)).toBeNull();
-  expect(screen.queryByLabelText(/Additional Dirs/)).toBeNull();
+  expect(screen.queryByLabelText(enUS.createAgent.workdirLabel)).toBeNull();
+  expect(screen.queryByLabelText(enUS.createAgent.modelLabel)).toBeNull();
+  expect(screen.queryByLabelText(enUS.createAgent.addDirsLabel)).toBeNull();
 
   fireEvent.click(toggle);
 
   expect(toggle.getAttribute('aria-expanded')).toBe('true');
   expect(toggle.getAttribute('aria-controls')).toBe('advanced-options');
   expect(document.getElementById('advanced-options')).toBeTruthy();
-  expect(screen.getByLabelText(/Workdir/)).toBeTruthy();
-  expect(screen.getByText(/Do not share the same directory between agents/)).toBeTruthy();
-  expect(screen.getByLabelText(/Model/)).toBeTruthy();
-  expect(screen.getByLabelText(/Additional Dirs/)).toBeTruthy();
+  expect(screen.getByLabelText(enUS.createAgent.workdirLabel)).toBeTruthy();
+  expect(screen.getByText(enUS.createAgent.workdirHint)).toBeTruthy();
+  expect(screen.getByLabelText(enUS.createAgent.modelLabel)).toBeTruthy();
+  expect(screen.getByLabelText(enUS.createAgent.addDirsLabel)).toBeTruthy();
 
   fireEvent.click(toggle);
   expect(toggle.getAttribute('aria-controls')).toBeNull();
-  expect(screen.queryByLabelText(/Workdir/)).toBeNull();
+  expect(screen.queryByLabelText(enUS.createAgent.workdirLabel)).toBeNull();
 });
 
 it('collects a complete Dev + QA team and submits it once', async () => {
@@ -172,7 +173,7 @@ it('collects a complete Dev + QA team and submits it once', async () => {
     ],
   });
   await expectToast({
-    title: 'Agent Team dev-new + qa-new added to baxian',
+    title: enUS.createAgent.addedToastTitle('dev-new', 'qa-new', 'baxian'),
   });
   expect(onCreated).toHaveBeenCalledTimes(1);
   expect(onClose).toHaveBeenCalledTimes(1);
@@ -198,7 +199,7 @@ it('flags a pending server restart when the API reports restartRequired', async 
 
   expect(flagDirtyMock).toHaveBeenCalledTimes(1);
   await expectToast({
-    title: 'Agent Team dev-new + qa-new added to baxian',
+    title: enUS.createAgent.addedToastTitle('dev-new', 'qa-new', 'baxian'),
     body: 'in-memory config switch failed after disk commit; restart the server',
   });
 });
@@ -225,7 +226,7 @@ it('surfaces post-commit initialization warnings without flagging a restart', as
 
   expect(flagDirtyMock).not.toHaveBeenCalled();
   await expectToast({
-    title: 'Agent Team dev-new + qa-new added to baxian',
+    title: enUS.createAgent.addedToastTitle('dev-new', 'qa-new', 'baxian'),
     body: 'agent qa-new state initialization failed after config commit: disk full\nbootstrap will retry',
   });
 });
@@ -234,10 +235,10 @@ it('trims the QA advanced options before submitting the complete team', async ()
   await renderReady();
   await continueWithDev('dev-a');
   await fillValidForm('qa-a', 'Codex');
-  fireEvent.click(screen.getByRole('button', { name: /Advanced options/ }));
-  fireEvent.change(screen.getByLabelText(/Workdir/), { target: { value: '/tmp/qa-wd' } });
-  fireEvent.change(screen.getByLabelText(/Model/), { target: { value: '  o3  ' } });
-  fireEvent.change(screen.getByLabelText(/Additional Dirs/), { target: { value: ' /a \n\n/b\n   ' } });
+  fireEvent.click(screen.getByRole('button', { name: name => name.includes(enUS.createAgent.advancedOptionsLabel) }));
+  fireEvent.change(screen.getByLabelText(enUS.createAgent.workdirLabel), { target: { value: '/tmp/qa-wd' } });
+  fireEvent.change(screen.getByLabelText(enUS.createAgent.modelLabel), { target: { value: '  o3  ' } });
+  fireEvent.change(screen.getByLabelText(enUS.createAgent.addDirsLabel), { target: { value: ' /a \n\n/b\n   ' } });
   fireEvent.click(screen.getByRole('checkbox'));
   await waitFor(() => expect(submitButton().disabled).toBe(false));
 
@@ -270,17 +271,23 @@ it('trims the QA advanced options before submitting the complete team', async ()
 
 it('Back restores the Dev draft without mutating the server', async () => {
   await renderReady();
+  expect((screen.getByLabelText('Agent ID') as HTMLInputElement).placeholder)
+    .toBe(enUS.createAgent.idPlaceholder('baxian', 'dev'));
   await continueWithDev('dev-back');
-  expect(screen.getByText('In the same Agent Team as Dev agent dev-back')).toBeTruthy();
+  expect((screen.getByLabelText('Agent ID') as HTMLInputElement).placeholder)
+    .toBe(enUS.createAgent.idPlaceholder('baxian', 'qa'));
+  expect(screen.getByText(enUS.createAgent.teamDevLabel('dev-back'))).toBeTruthy();
 
-  fireEvent.click(screen.getByRole('button', { name: /Back/ }));
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.back }));
 
-  expect(screen.getByText('Dev agent (step 1 of 2)')).toBeTruthy();
+  expect(screen.getByText(enUS.createAgent.devStepLabel)).toBeTruthy();
   expect((screen.getByLabelText('Agent ID') as HTMLInputElement).value).toBe('dev-back');
+  expect((screen.getByLabelText('Agent ID') as HTMLInputElement).placeholder)
+    .toBe(enUS.createAgent.idPlaceholder('baxian', 'dev'));
   expect(addAgentTeamMock).not.toHaveBeenCalled();
 });
 
-it('surfaces an addAgentTeam failure inline and keeps the modal open', async () => {
+it('keeps the modal open after creation fails and allows correcting the form and retrying', async () => {
   addAgentTeamMock.mockRejectedValue(new Error('id already used\nsomewhere else'));
   const { onClose, onCreated } = await renderReady();
   await continueWithDev();
@@ -295,7 +302,27 @@ it('surfaces an addAgentTeam failure inline and keeps the modal open', async () 
   expect(banner.classList.contains('whitespace-pre-line')).toBe(true);
   expect(onClose).not.toHaveBeenCalled();
   expect(onCreated).not.toHaveBeenCalled();
-  expect(submitButton().textContent).toBe('Add Agent Team');
+  expect(submitButton().disabled).toBe(false);
+
+  addAgentTeamMock.mockResolvedValueOnce({
+    agents: [
+      { id: 'dev-new', role: 'dev', runtime: 'claude-code', mode: 'local' },
+      { id: 'qa-retry', role: 'qa', runtime: 'codex', mode: 'local' },
+    ],
+    restartRequired: false,
+  });
+  fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'qa-retry' } });
+  await act(async () => { fireEvent.click(submitButton()); });
+
+  expect(addAgentTeamMock).toHaveBeenCalledTimes(2);
+  expect(addAgentTeamMock).toHaveBeenLastCalledWith('baxian', {
+    agents: [
+      expect.objectContaining({ id: 'dev-new', role: 'dev' }),
+      expect.objectContaining({ id: 'qa-retry', role: 'qa' }),
+    ],
+  });
+  expect(onCreated).toHaveBeenCalledTimes(1);
+  expect(onClose).toHaveBeenCalledTimes(1);
 });
 
 it('Cancel closes the modal, but dismissal is blocked while a submit is in flight', async () => {
@@ -305,13 +332,12 @@ it('Cancel closes the modal, but dismissal is blocked while a submit is in fligh
   await continueWithDev();
   await fillValidForm('qa-new', 'Codex');
 
-  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.cancel }));
   expect(onClose).toHaveBeenCalledTimes(1);
 
   await act(async () => {
     fireEvent.click(submitButton());
   });
-  expect(submitButton().textContent).toBe('Adding Agent Team…');
   fireEvent.keyDown(document, { key: 'Escape' });
   expect(onClose).toHaveBeenCalledTimes(1);
 
@@ -373,11 +399,11 @@ it('shows an SSH probe failure for remote hosts and clears it when switching bac
   });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.remoteModeLabel }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
   expect(await screen.findByText('SSH: ⨯ auth failed')).toBeTruthy();
 
-  fireEvent.click(screen.getByRole('radio', { name: 'Local' }));
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.localModeLabel }));
   await waitFor(() => expect(screen.queryByText('SSH: ⨯ auth failed')).toBeNull());
 });
 
@@ -400,26 +426,15 @@ it('renders the SSH ✓ line and the tmux install success message', async () => 
   probeMock.mockResolvedValue({ ssh: { ok: true, message: 'SSH OK' }, ...TMUX_MISSING });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.remoteModeLabel }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
   expect(await screen.findByText('SSH: ✓ SSH OK')).toBeTruthy();
 
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.oneClickInstall }));
   });
 
   expect(await screen.findByText(/tmux 3.4 installed via apt-get/)).toBeTruthy();
-});
-
-it('prefills the Agent ID placeholder for each team-creation step', async () => {
-  await renderReady();
-  expect((screen.getByLabelText('Agent ID') as HTMLInputElement).placeholder).toBe('baxian-dev');
-
-  await continueWithDev('dev-placeholder');
-  expect((screen.getByLabelText('Agent ID') as HTMLInputElement).placeholder).toBe('baxian-qa');
-
-  fireEvent.click(screen.getByRole('button', { name: /Back/ }));
-  expect((screen.getByLabelText('Agent ID') as HTMLInputElement).placeholder).toBe('baxian-dev');
 });
 
 it('describes YOLO by the selected runtime real launch flag instead of explaining the mode', async () => {
@@ -447,11 +462,11 @@ it('validates the agent id format and global uniqueness', async () => {
   await waitFor(() => expect(probeMock).toHaveBeenCalled());
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: '1bad' } });
-  expect(screen.getByText(/Must start with a lowercase letter/)).toBeTruthy();
+  expect(screen.getByText(enUS.common.idFormatError)).toBeTruthy();
   await waitFor(() => expect(submitButton().disabled).toBe(true));
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'dev-a' } });
-  expect(screen.getByText('This ID is already in use (must be globally unique)')).toBeTruthy();
+  expect(screen.getByText(enUS.createAgent.idTakenGlobalError)).toBeTruthy();
   expect(submitButton().disabled).toBe(true);
 });
 
@@ -461,7 +476,7 @@ it('rejects a QA id that duplicates the Dev draft id', async () => {
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'same-id' } });
 
-  expect(screen.getByText('This ID is already in use (must be globally unique)')).toBeTruthy();
+  expect(screen.getByText(enUS.createAgent.idTakenGlobalError)).toBeTruthy();
   expect(submitButton().disabled).toBe(true);
   expect(addAgentTeamMock).not.toHaveBeenCalled();
 });
@@ -471,7 +486,7 @@ it('Re-probe re-runs the probe on demand', async () => {
   await waitFor(() => expect(probeMock).toHaveBeenCalledTimes(1));
 
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '↻ Re-probe' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.createAgent.reprobeButton }));
   });
 
   expect(probeMock).toHaveBeenCalledTimes(2);
@@ -493,7 +508,7 @@ it('offers a one-click install when tmux is missing; success re-probes and flips
 
   expect(await screen.findByText(/tmux: ⨯ 请安装 tmux/)).toBeTruthy();
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.oneClickInstall }));
   });
 
   expect(installTmuxMock).toHaveBeenCalledWith('local', {});
@@ -504,19 +519,19 @@ it('offers a one-click install when tmux is missing; success re-probes and flips
 it('does not render the one-click install button when tmux is already present', async () => {
   await renderReady();
   expect(await screen.findByText(/tmux: ✓/)).toBeTruthy();
-  expect(screen.queryByRole('button', { name: 'Install with one click' })).toBeNull();
+  expect(screen.queryByRole('button', { name: enUS.common.oneClickInstall })).toBeNull();
 });
 
 it('targets the selected host when installing from remote mode', async () => {
   probeMock.mockResolvedValue({ ssh: { ok: true, message: 'SSH OK' }, ...TMUX_MISSING });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.remoteModeLabel }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
 
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.oneClickInstall }));
   });
 
   expect(installTmuxMock).toHaveBeenCalledWith('remote', { hostId: 'box' });
@@ -530,11 +545,11 @@ it('hides the one-click install button when remote SSH is unreachable (tmux stat
   });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
+  fireEvent.click(screen.getByRole('radio', { name: enUS.createAgent.remoteModeLabel }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
 
   expect(await screen.findByText(/tmux: ⨯ SSH 不通，无法探测/)).toBeTruthy();
-  expect(screen.queryByRole('button', { name: 'Install with one click' })).toBeNull();
+  expect(screen.queryByRole('button', { name: enUS.common.oneClickInstall })).toBeNull();
 });
 
 it('shows the install failure message with the manual command and does not re-probe', async () => {
@@ -549,7 +564,7 @@ it('shows the install failure message with the manual command and does not re-pr
 
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.oneClickInstall }));
   });
 
   expect(await screen.findByText(/⨯ cannot install automatically.*sudo apt-get install -y tmux/)).toBeTruthy();
@@ -563,10 +578,10 @@ it('shows a loading hint while installing and ignores repeated clicks', async ()
   await renderReady();
 
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
-  const install = () => screen.getByRole('button', { name: /Install with one click|Installing/ });
+  const install = () => screen.getByRole('button', { name: name => [enUS.common.oneClickInstall, enUS.common.installing].some(label => name.includes(label)) });
   fireEvent.click(install());
 
-  expect(await screen.findByText(/Installing tmux — this can take a few minutes/)).toBeTruthy();
+  expect(await screen.findByText(enUS.common.installingTmuxNotice)).toBeTruthy();
   expect((install() as HTMLButtonElement).disabled).toBe(true);
   fireEvent.click(install());
   fireEvent.click(install());

@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 
@@ -24,23 +25,23 @@ describe('PendingRestartBanner', () => {
   it('pending: shows the dirty-change count and a restart button that triggers the restart', () => {
     Object.assign(pendingRestartValue, { phase: 'pending', count: 3 });
     render(<PendingRestartBanner />);
-    expect(screen.getByText(/3 config changes pending/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+    expect(screen.getByText(enUS.banner.pendingNotice(3))).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: enUS.banner.restartNow }));
     expect(triggerRestartMock).toHaveBeenCalledTimes(1);
   });
 
   it('restarting: shows progress text and offers no action buttons', () => {
     Object.assign(pendingRestartValue, { phase: 'restarting', count: 1 });
     render(<PendingRestartBanner />);
-    expect(screen.getByText(/Restarting/)).toBeTruthy();
+    expect(screen.getByText(enUS.banner.restarting)).toBeTruthy();
     expect(screen.queryByRole('button')).toBeNull();
   });
 
   it('failed: shows the error message and a retry button that re-triggers the restart', () => {
     Object.assign(pendingRestartValue, { phase: 'failed', count: 1, error: 'Restart timed out (30s with no recovery)' });
     render(<PendingRestartBanner />);
-    expect(screen.getByText(/Restart failed: Restart timed out \(30s with no recovery\)/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(screen.getByText(enUS.banner.restartFailed('Restart timed out (30s with no recovery)'))).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.retry }));
     expect(triggerRestartMock).toHaveBeenCalledTimes(1);
   });
 });

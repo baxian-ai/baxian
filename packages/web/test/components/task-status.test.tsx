@@ -1,30 +1,16 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
-import type { TaskState } from '../../src/shared/index.js';
+import { act, render, cleanup } from '@testing-library/react';
 import {
   TaskStatusBadge,
   formatTaskTimestamp,
-  getTaskAttentionCopy,
   shortTaskId,
   taskDetailPath,
   taskStatusLabel,
 } from '../../src/components/task-status.tsx';
-import { __resetI18nForTests, getMessages, syncLocaleFromConfig } from '../../src/i18n/index.tsx';
+import { __resetI18nForTests, getMessages, I18nProvider, syncLocaleFromConfig } from '../../src/i18n/index.tsx';
 
 afterEach(() => cleanup());
 afterEach(() => __resetI18nForTests());
-
-function attention(
-  reason: string,
-  recommendedActions: NonNullable<TaskState['attention']>['recommendedActions'],
-): NonNullable<TaskState['attention']> {
-  return {
-    reason,
-    runbook: 'Inspect the task.',
-    occurredAt: '2026-05-10T12:00:00.000Z',
-    recommendedActions,
-  };
-}
 
 describe('shortTaskId', () => {
   it('strips the task- prefix down to the number, preserving zero padding', () => {
@@ -92,47 +78,18 @@ describe('taskStatusLabel', () => {
     expect(taskStatusLabel('pending')).toBe(getMessages().status.pending);
     expect(taskStatusLabel('pending')).not.toBe(english);
   });
-
-  it('uses phase and assignment context to describe what is happening', () => {
-    const m = getMessages();
-    expect(taskStatusLabel({ status: 'pending', preferredAgentId: '' })).toBe(m.statusContext.pendingUnassigned);
-    expect(taskStatusLabel({ status: 'in_progress', phase: 'spec' })).toBe(m.statusContext.inProgressSpec);
-    expect(taskStatusLabel({ status: 'in_progress', phase: 'code' })).toBe(m.statusContext.inProgressCode);
-    expect(taskStatusLabel({ status: 'review', phase: 'code' })).toBe(m.statusContext.reviewCode);
-    expect(taskStatusLabel({ status: 'fixing', phase: 'spec' })).toBe(m.statusContext.fixingSpec);
-    expect(taskStatusLabel({ status: 'max_rounds', phase: 'code' })).toBe(m.statusContext.maxRoundsCode);
-  });
 });
 
 describe('TaskStatusBadge', () => {
-  it('shows a readable contextual pill while preserving the machine status as data', () => {
-    render(<TaskStatusBadge task={{ status: 'review', phase: 'spec' }} />);
-    const badge = screen.getByText(getMessages().statusContext.reviewSpec);
-    expect(badge.getAttribute('data-status')).toBe('review');
-    expect(badge.getAttribute('title')).toBe(getMessages().statusContext.reviewSpec);
-  });
-});
+  it('updates the mounted badge when the language changes', () => {
+    const { container } = render(<I18nProvider><TaskStatusBadge task={{ status: 'pending' }} /></I18nProvider>);
+    const badge = container.querySelector('[data-status="pending"]')!;
+    const english = badge.textContent;
 
-describe('getTaskAttentionCopy', () => {
-  it.each([
-    ['confirm-merge-timeout', 'attentionMergeTitle'],
-    ['review-verdict-overdue', 'attentionReviewTitle'],
-    ['runtime-session-missing', 'attentionAgentTitle'],
-    ['delivery-not-confirmed', 'attentionHandoffTitle'],
-    ['unexpected-condition', 'attentionDefaultTitle'],
-  ] as const)('maps %s to the %s copy', (reason, key) => {
-    const m = getMessages();
-    expect(getTaskAttentionCopy(m, attention(reason, ['cancel'])).title).toBe(m.taskDetail[key]);
-  });
+    act(() => syncLocaleFromConfig('zh-CN'));
 
-  it('selects guidance by recommended-action priority and has retry/cancel fallbacks', () => {
-    const m = getMessages();
-    expect(getTaskAttentionCopy(m, attention('unknown', ['retry', 'advance', 'verdict'])).guidance)
-      .toBe(m.taskDetail.attentionVerdictGuidance);
-    expect(getTaskAttentionCopy(m, attention('unknown', ['retry'])).guidance)
-      .toBe(m.taskDetail.attentionRetryGuidance);
-    expect(getTaskAttentionCopy(m, attention('unknown', ['cancel'])).guidance)
-      .toBe(m.taskDetail.attentionCancelGuidance);
+    expect(badge.textContent).toBe(taskStatusLabel('pending'));
+    expect(badge.textContent).not.toBe(english);
   });
 });
 

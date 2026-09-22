@@ -88,6 +88,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
   it.each([
     'agent_dialog_resolved_runtime',
     'signal-arm-failed:spec-done,pr-created',
+    'restart-redispatch-failed',
+    'bootstrap-marker-clear-failed',
   ])('resumeAgent REFUSES on awaitingPhase=%s + active task', async (phase) => {
     const t = await harness.seedTask({ status: 'in_progress' });
     await harness.seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: phase });
@@ -101,6 +103,172 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect((await harness.agentStore.get('dev-1'))?.taskId).toBe(t.id);
     expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
   });
+
+  it.each(['restart-redispatch-failed', 'bootstrap-marker-clear-failed'])('releases a %s hold once its task is cancelled', async (awaitingPhase) => {
+    const task = await harness.seedTask({ status: 'cancelled' });
+    await harness.seedAgent({
+      id: 'dev-1', taskId: task.id, paneId: '%0',
+      status: 'awaiting_human', awaitingPhase, bootstrappingTaskId: task.id,
+    });
+    await harness.acquireAgentLock('dev-1');
+
+    await expect(harness.manager.resumeAgent('dev-1')).resolves.toEqual({
+      resumed: true, releasedBinding: true,
+    });
+
+    expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(false);
+    await expectNoRedispatch(task.id);
+  });
+
+  it.each([undefined, 'code'] as const)('preserves delivered bootstrap evidence on Resume for phase=%s', async (phase) => {
+    const task = await harness.seedTask({ status: 'in_progress', phase, signalToken: 'delivered-token' });
+    await harness.seedAgent({
+      id: 'dev-1', taskId: task.id, paneId: '%0', bootstrappingTaskId: task.id,
+      status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+      awaitingReason: 'initial prompt was already delivered', awaitingSince: NOW, awaitingNonce: 'hold-1',
+    });
+    await harness.acquireAgentLock('dev-1');
+    const held = await harness.agentStore.get('dev-1');
+
+    await expect(harness.manager.resumeAgent('dev-1')).resolves.toMatchObject({
+      resumed: false, releasedBinding: false, reason: expect.stringContaining('already delivered'),
+    });
+    expect(await harness.agentStore.get('dev-1')).toEqual(held);
+    expect(await harness.lockManager.isLocked('dev-1')).toBe(true);
+    await expect(harness.manager.advanceTask(task.id)).rejects.toMatchObject({ status: 409 });
+    await harness.manager.redispatchTaskPromptAfterReplRestart('dev-1', task.id);
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect((await harness.taskStore.get(task.id))?.signalToken).toBe('delivered-token');
+    expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBe(task.id);
+  });
+
+  it.each(['spec-ready', 'review', 'fixing', 'approved', 'merge-ready', 'max_rounds'] as const)(
+    'clears a stale delivered-bootstrap hold after the task reaches %s without replaying', async (status) => {
+      const task = await harness.seedTask({ status, signalToken: 'advanced-token' });
+      await harness.seedAgent({
+        id: 'dev-1', taskId: task.id, paneId: '%0', bootstrappingTaskId: task.id,
+        status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+      });
+      const held = await harness.agentStore.get('dev-1');
+
+      await expect(harness.manager.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: true });
+
+      expect(await harness.agentStore.get('dev-1')).toMatchObject({ taskId: task.id, lockToken: held?.lockToken });
+      expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
+      expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+      expect(await harness.taskStore.get(task.id)).toEqual(task);
+      expect(harness.runner.pastedPrompts).toEqual([]);
+    },
+  );
+
+  it.each([
+    { status: 'spec-ready', phase: 'spec', nextPhase: 'code' },
+    { status: 'fixing', phase: 'spec', nextPhase: 'fix' },
+    { status: 'fixing', phase: 'code', nextPhase: 'fix' },
+  ] as const)('allows $status/$phase dispatch after clearing its stale bootstrap hold', async ({ status, phase, nextPhase }) => {
+    const task = await harness.seedTask({ status, phase, prNumber: 42, signalToken: 'advanced-token' });
+    await harness.seedAgent({
+      id: 'dev-1', taskId: task.id, paneId: '%0', bootstrappingTaskId: task.id,
+      status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+    });
+
+    await expect(harness.manager.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: true });
+    if (status === 'spec-ready') {
+      await expect(harness.manager.transitionToCodePhase(task.id)).resolves.toMatchObject({ status: 'in_progress', phase: 'code' });
+    } else {
+      await expect(harness.manager.dispatchGitFixToDev(task.id)).resolves.toBe(true);
+    }
+
+    expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining(`phase: ${nextPhase}`) }]);
+    expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
+    expect(harness.events.some(event => event.type === 'human.intervention'
+      && (event.data.phase === 'code-dev-acquire-failed' || event.data.phase === 'dev-acquire-failed-fix'))).toBe(false);
+  });
+
+  it('logs the task and reason when Resume is blocked by a replay failure', async () => {
+    const task = await harness.seedTask({ status: 'in_progress' });
+    await harness.seedAgent({
+      id: 'dev-1', taskId: task.id, status: 'awaiting_human',
+      awaitingPhase: 'restart-redispatch-failed',
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await harness.manager.resumeAgent('dev-1');
+
+    expect(result).toMatchObject({ resumed: false, releasedBinding: false });
+    expect(result.reason).toContain(task.id);
+    expect(result.reason).toContain('restart-redispatch-failed');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('dev-1'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(result.reason!));
+    await expectNoRedispatch(task.id);
+  });
+
+  it.each(['in_progress', 'fixing', 'approved'] as const)(
+    'keeps a replay failure held while the Dev prompt is still needed in %s', async (status) => {
+      const task = await harness.seedTask({ status, signalToken: 'held-token' });
+      await harness.seedAgent({
+        taskId: task.id, paneId: '%0', status: 'awaiting_human',
+        awaitingPhase: 'restart-redispatch-failed', bootstrappingTaskId: task.id,
+      });
+      const held = await harness.agentStore.get('dev-1');
+
+      await expect(harness.manager.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: false });
+
+      expect(await harness.agentStore.get('dev-1')).toEqual(held);
+      expect(await harness.taskStore.get(task.id)).toEqual(task);
+      expect(harness.runner.pastedPrompts).toEqual([]);
+    },
+  );
+
+  it.each(['spec-ready', 'review', 'merge-ready', 'max_rounds'] as const)(
+    'clears a stale replay failure when the task no longer needs that prompt in %s', async (status) => {
+      const task = await harness.seedTask({ status, signalToken: 'advanced-token' });
+      await harness.seedAgent({
+        taskId: task.id, paneId: '%0', status: 'awaiting_human',
+        awaitingPhase: 'restart-redispatch-failed',
+      });
+      const held = await harness.agentStore.get('dev-1');
+
+      await expect(harness.manager.resumeAgent('dev-1')).resolves.toEqual({ resumed: true, releasedBinding: false });
+
+      expect(await harness.agentStore.get('dev-1')).toMatchObject({ taskId: task.id, lockToken: held?.lockToken });
+      expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
+      expect(await harness.taskStore.get(task.id)).toEqual(task);
+      expect(harness.runner.pastedPrompts).toEqual([]);
+    },
+  );
+
+  it.each(['spec', 'code'] as const)(
+    'recovers QA Advance after fixing/%s moves to review with a stale Dev replay failure', async (phase) => {
+      const task = await harness.seedTask({
+        status: 'fixing', phase, prNumber: 42, signalToken: 'fix-token',
+        deliveryConfirmation: { phase, source: 'signal', at: NOW },
+      });
+      await harness.seedAgent({
+        taskId: task.id, paneId: '%0', status: 'awaiting_human',
+        awaitingPhase: 'restart-redispatch-failed',
+      });
+
+      await expect(harness.manager.advanceTask(task.id, { executor: 'qa' })).rejects.toMatchObject({
+        status: 500, message: expect.stringContaining('Cannot park dev'),
+      });
+      const review = await harness.taskStore.get(task.id);
+      expect(review).toMatchObject({ status: 'review', phase, reviewDispatch: { phase: 'pending' } });
+      expect(harness.runner.pastedPrompts).toEqual([]);
+
+      await expect(harness.manager.resumeAgent('dev-1')).resolves.toEqual({ resumed: true, releasedBinding: false });
+      expect(await harness.taskStore.get(task.id)).toEqual(review);
+      expect(harness.runner.pastedPrompts).toEqual([]);
+      await expect(harness.manager.advanceTask(task.id, { executor: 'qa' })).resolves.toMatchObject({ status: 'review' });
+
+      expect(harness.runner.pastedPrompts).toHaveLength(1);
+      expect(harness.runner.pastedPrompts[0]?.pane).toBe('%1');
+      expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
+      expect((await harness.taskStore.get(task.id))?.signalToken).toBe(review?.signalToken);
+    },
+  );
 
   it('resumeAgent ALLOWS release on awaitingPhase=agent_dialog_resolved_runtime (slowPoll detected REPL ready)', async () => {
     const t = await harness.seedTask({ status: 'failed' });
@@ -266,6 +434,45 @@ describe('AgentManager awaiting_human lifecycle', () => {
     }
     expect(await harness.lockManager.isLocked('qa-1')).toBe(!expectRelease);
   });
+
+  it.each(['spec-ready', 'review', 'merge-ready', 'max_rounds'] as const)(
+    'resumes an uncertain Dev delivery after the task reaches %s', async (status) => {
+      const task = await harness.seedTask({ status, phase: 'spec', prNumber: 42, signalToken: 'outcome-token' });
+      await harness.seedAgent({
+        taskId: task.id, paneId: '%0', status: 'awaiting_human',
+        awaitingPhase: 'dispatch-failed:ack_unknown', bootstrappingTaskId: task.id,
+      });
+      const held = await harness.agentStore.get('dev-1');
+
+      await expect(harness.manager.resumeAgent('dev-1')).resolves.toEqual({ resumed: true, releasedBinding: false });
+
+      expect(await harness.agentStore.get('dev-1')).toMatchObject({ taskId: task.id, lockToken: held?.lockToken });
+      expect((await harness.agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
+      expect((await harness.agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+      expect(await harness.taskStore.get(task.id)).toEqual(task);
+      expect(harness.runner.pastedPrompts).toEqual([]);
+      if (status === 'spec-ready') {
+        await expect(harness.manager.transitionToCodePhase(task.id)).resolves.toMatchObject({ status: 'in_progress', phase: 'code' });
+        expect(harness.runner.pastedPrompts).toEqual([{ pane: '%0', body: expect.stringContaining('phase: code') }]);
+      }
+    },
+  );
+
+  it.each(['in_progress', 'fixing', 'approved'] as const)(
+    'keeps an uncertain Dev delivery blocked while the task remains %s', async (status) => {
+      const task = await harness.seedTask({ status, signalToken: 'uncertain-token' });
+      await harness.seedAgent({
+        taskId: task.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      });
+      const held = await harness.agentStore.get('dev-1');
+
+      await expect(harness.manager.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: false });
+
+      expect(await harness.agentStore.get('dev-1')).toEqual(held);
+      expect(await harness.taskStore.get(task.id)).toEqual(task);
+      expect(harness.runner.pastedPrompts).toEqual([]);
+    },
+  );
 
   it('handleDialogPendingFromRuntime also releases partner agents on task fail (UI Retry path truly opens)', async () => {
     const t = await harness.seedTask({ id: 'task-partner-cleanup', status: 'in_progress', qaAgentId: 'qa-1' });

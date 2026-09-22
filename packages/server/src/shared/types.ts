@@ -163,17 +163,6 @@ export interface AgentSnapshot {
   latestBootstrapError?: AgentErrorSummary;
   reason?: string;
   message?: string;
-  petId?: string;
-}
-
-export type PetSpritesheetExt = 'png' | 'webp';
-
-export interface PetMeta {
-  id: string;
-  displayName: string;
-  description: string;
-  ext: PetSpritesheetExt;
-  createdAt: string;
 }
 
 export interface RemoteCleanupState {

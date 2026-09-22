@@ -143,7 +143,6 @@ export interface AgentSnapshot {
   latestBootstrapError?: AgentErrorSummary;
   reason?: string;
   message?: string;
-  petId?: string;
 }
 
 // awaiting_human/needInput 下残留的标记是恢复流程的凭据,不是在途证据
@@ -163,16 +162,6 @@ interface TaskAttention {
   runbook: string;
   occurredAt: string;
   recommendedActions: TaskOperation[];
-}
-
-type PetSpritesheetExt = 'png' | 'webp';
-
-export interface PetMeta {
-  id: string;
-  displayName: string;
-  description: string;
-  ext: PetSpritesheetExt;
-  createdAt: string;
 }
 
 export interface TaskState {

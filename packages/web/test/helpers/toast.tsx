@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { expect } from 'vitest';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 
@@ -21,7 +22,7 @@ export async function expectToast({ title, body, details }: ExpectedToast): Prom
     expect(within(toast).getByText(typeof body === 'string' ? body.replace(/\s+/g, ' ') : body)).toBeTruthy();
   }
   if (details !== undefined) {
-    const summary = within(toast).getByText('Technical details');
+    const summary = within(toast).getByText(enUS.common.technicalDetails);
     const block = summary.closest('details')!;
     expect(block.open).toBe(false);
     fireEvent.click(summary);

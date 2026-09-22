@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, cleanup, waitFor, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -27,11 +28,11 @@ const projectTasksState = {
 vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 
 vi.mock('../../src/components/create-task-modal.tsx', () => ({
-  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label="New task" /> : null),
+  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label={enUS.createTask.titleCreate} /> : null),
 }));
 
 vi.mock('../../src/components/create-agent-modal.tsx', () => ({
-  CreateAgentModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label="Add Agent Team" /> : null),
+  CreateAgentModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label={enUS.projectPage.addAgent} /> : null),
 }));
 
 import { api } from '../../src/api.ts';
@@ -72,13 +73,13 @@ function renderProjectPage() {
 }
 
 async function openProjectMenu(): Promise<void> {
-  fireEvent.click(await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ })));
+  fireEvent.click(await waitFor(() => screen.getByRole('button', { name: enUS.projectPage.menuAriaLabel('demo') })));
 }
 
 async function openDeleteDialog(): Promise<HTMLElement> {
   await openProjectMenu();
-  fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: 'Delete project…' })));
-  return waitFor(() => screen.getByRole('dialog', { name: 'Delete project' }));
+  fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: enUS.projectPage.deleteProjectMenuItem })));
+  return waitFor(() => screen.getByRole('dialog', { name: enUS.projectPage.deleteModalTitle }));
 }
 
 beforeEach(() => {
@@ -131,16 +132,16 @@ describe('Project header actions', () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
-    const taskBtn = within(topbarActions()).getByRole('button', { name: '+ New task' });
-    expect(screen.getAllByRole('button', { name: '+ New task' })).toHaveLength(1);
-    expect(screen.queryByRole('dialog', { name: 'New task' })).toBeNull();
+    const taskBtn = within(topbarActions()).getByRole('button', { name: enUS.projectPage.newTaskButton });
+    expect(screen.getAllByRole('button', { name: enUS.projectPage.newTaskButton })).toHaveLength(1);
+    expect(screen.queryByRole('dialog', { name: enUS.createTask.titleCreate })).toBeNull();
     fireEvent.click(taskBtn);
-    expect(await screen.findByRole('dialog', { name: 'New task' })).toBeTruthy();
+    expect(await screen.findByRole('dialog', { name: enUS.createTask.titleCreate })).toBeTruthy();
   });
 
   it('only sets aria-controls on the project three-dot menu while it is open', async () => {
     renderProjectPage();
-    const trigger = await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ }));
+    const trigger = await waitFor(() => screen.getByRole('button', { name: enUS.projectPage.menuAriaLabel('demo') }));
     expect(trigger.getAttribute('aria-controls')).toBeNull();
 
     fireEvent.click(trigger);
@@ -157,76 +158,76 @@ describe('Project header actions', () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
-    expect(screen.queryByRole('button', { name: /Add Agent Team/ })).toBeNull();
-    expect(within(topbarActions()).getByRole('button', { name: /Project demo actions menu/ })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.projectPage.addAgent })).toBeNull();
+    expect(within(topbarActions()).getByRole('button', { name: enUS.projectPage.menuAriaLabel('demo') })).toBeTruthy();
 
     await openProjectMenu();
-    const item = await screen.findByRole('menuitem', { name: 'Add Agent Team' });
+    const item = await screen.findByRole('menuitem', { name: enUS.projectPage.addAgent });
 
-    expect(screen.queryByRole('dialog', { name: 'Add Agent Team' })).toBeNull();
+    expect(screen.queryByRole('dialog', { name: enUS.projectPage.addAgent })).toBeNull();
     fireEvent.click(item);
-    expect(await screen.findByRole('dialog', { name: 'Add Agent Team' })).toBeTruthy();
+    expect(await screen.findByRole('dialog', { name: enUS.projectPage.addAgent })).toBeTruthy();
   });
 });
 
 describe('Project Task panel', () => {
   it('opens the Task panel by default and renders its title/close control outside the panel', async () => {
     renderProjectPage();
-    const panel = await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }));
+    const panel = await waitFor(() => screen.getByRole('complementary', { name: enUS.taskPanel.ariaLabel }));
     const heading = screen.getByRole('heading', { name: 'Tasks' });
     expect(screen.getByRole('heading', { name: 'Agents' })).toBeTruthy();
-    const closeBtn = screen.getByRole('button', { name: 'Close task panel' });
+    const closeBtn = screen.getByRole('button', { name: enUS.projectPage.closeTaskPanel });
     expect(panel.contains(heading)).toBe(false);
     expect(panel.contains(closeBtn)).toBe(false);
-    expect(screen.queryByRole('menuitem', { name: 'Show task panel' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: enUS.projectPage.showTaskPanel })).toBeNull();
   });
 
   it('closes via the header button and reopens from the three-dot menu', async () => {
     renderProjectPage();
-    await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }));
-    const menuBtn = screen.getByRole('button', { name: /Project demo actions menu/ });
+    await waitFor(() => screen.getByRole('complementary', { name: enUS.taskPanel.ariaLabel }));
+    const menuBtn = screen.getByRole('button', { name: enUS.projectPage.menuAriaLabel('demo') });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close task panel' }));
-    await waitFor(() => expect(screen.queryByRole('complementary', { name: 'Task panel' })).toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: enUS.projectPage.closeTaskPanel }));
+    await waitFor(() => expect(screen.queryByRole('complementary', { name: enUS.taskPanel.ariaLabel })).toBeNull());
     expect(document.activeElement).toBe(menuBtn);
 
     await openProjectMenu();
-    const reopen = await waitFor(() => screen.getByRole('menuitem', { name: 'Show task panel' }));
+    const reopen = await waitFor(() => screen.getByRole('menuitem', { name: enUS.projectPage.showTaskPanel }));
     fireEvent.click(reopen);
 
-    expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }))).toBeTruthy();
+    expect(await waitFor(() => screen.getByRole('complementary', { name: enUS.taskPanel.ariaLabel }))).toBeTruthy();
     expect(document.activeElement).toBe(menuBtn);
     await openProjectMenu();
-    expect(screen.queryByRole('menuitem', { name: 'Show task panel' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: enUS.projectPage.showTaskPanel })).toBeNull();
   });
 
   it('persists and restores the Task panel closed state', async () => {
     renderProjectPage();
-    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: 'Close task panel' })));
+    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: enUS.projectPage.closeTaskPanel })));
     await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('0'));
 
     cleanup();
     renderProjectPage();
-    await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ }));
-    expect(screen.queryByRole('complementary', { name: 'Task panel' })).toBeNull();
+    await waitFor(() => screen.getByRole('button', { name: enUS.projectPage.menuAriaLabel('demo') }));
+    expect(screen.queryByRole('complementary', { name: enUS.taskPanel.ariaLabel })).toBeNull();
 
     await openProjectMenu();
-    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: 'Show task panel' })));
+    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: enUS.projectPage.showTaskPanel })));
     await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('1'));
-    expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }))).toBeTruthy();
+    expect(await waitFor(() => screen.getByRole('complementary', { name: enUS.taskPanel.ariaLabel }))).toBeTruthy();
   });
 });
 
 describe('Project delete entry', () => {
   it('keeps delete inside the project menu, enabled when the project has no agents', async () => {
     renderProjectPage();
-    const menuButton = await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ }));
+    const menuButton = await waitFor(() => screen.getByRole('button', { name: enUS.projectPage.menuAriaLabel('demo') }));
 
     expect(screen.queryByRole('menuitem')).toBeNull();
-    expect(screen.queryByText('Delete project…')).toBeNull();
+    expect(screen.queryByText(enUS.projectPage.deleteProjectMenuItem)).toBeNull();
     fireEvent.click(menuButton);
 
-    const item = await waitFor(() => screen.getByRole('menuitem', { name: 'Delete project…' }));
+    const item = await waitFor(() => screen.getByRole('menuitem', { name: enUS.projectPage.deleteProjectMenuItem }));
     expect(item.hasAttribute('disabled')).toBe(false);
   });
 
@@ -239,30 +240,30 @@ describe('Project delete entry', () => {
     renderProjectPage();
 
     await openProjectMenu();
-    const item = await waitFor(() => screen.getByRole('menuitem', { name: 'Delete project…' }));
+    const item = await waitFor(() => screen.getByRole('menuitem', { name: enUS.projectPage.deleteProjectMenuItem }));
     expect((item as HTMLButtonElement).disabled).toBe(true);
-    expect(item.getAttribute('title')).toMatch(/Delete the project's 1 agent first/);
+    expect(item.getAttribute('title')).toBe(enUS.projectPage.deleteAgentsFirstHint(1));
   });
 
   it('validates exact project id before delete and resets confirmation on cancel', async () => {
     renderProjectPage();
     const dialog = await openDeleteDialog();
-    const confirm = within(dialog).getByRole('button', { name: 'Confirm delete' }) as HTMLButtonElement;
+    const confirm = within(dialog).getByRole('button', { name: enUS.projectPage.confirmDeleteButton }) as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
 
-    const input = within(dialog).getByLabelText('Enter the project ID to confirm deletion') as HTMLInputElement;
+    const input = within(dialog).getByLabelText(enUS.projectPage.confirmInputAriaLabel) as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'wrong' } });
     expect(confirm.disabled).toBe(true);
 
     fireEvent.change(input, { target: { value: 'demo' } });
     expect(confirm.disabled).toBe(false);
 
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: enUS.common.cancel }));
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Delete project' })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: enUS.projectPage.deleteModalTitle })).toBeNull());
 
     const reopened = await openDeleteDialog();
-    const reopenedInput = within(reopened).getByLabelText('Enter the project ID to confirm deletion') as HTMLInputElement;
+    const reopenedInput = within(reopened).getByLabelText(enUS.projectPage.confirmInputAriaLabel) as HTMLInputElement;
     expect(reopenedInput.value).toBe('');
   });
 
@@ -287,11 +288,11 @@ describe('Project delete entry', () => {
     );
 
     const dialog = await openDeleteDialog();
-    fireEvent.change(within(dialog).getByLabelText('Enter the project ID to confirm deletion'), {
+    fireEvent.change(within(dialog).getByLabelText(enUS.projectPage.confirmInputAriaLabel), {
       target: { value: 'demo' },
     });
     projectsListPayload = [];
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm delete' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: enUS.projectPage.confirmDeleteButton }));
 
     await waitFor(() => expect(projectsDelete).toHaveBeenCalledWith('demo'));
     await waitFor(() => expect(projectsList).toHaveBeenCalled());
@@ -304,10 +305,10 @@ describe('Project delete entry', () => {
     projectsDelete.mockRejectedValueOnce(new Error('boom — config locked'));
     renderProjectPage();
     const dialog = await openDeleteDialog();
-    fireEvent.change(within(dialog).getByLabelText('Enter the project ID to confirm deletion'), {
+    fireEvent.change(within(dialog).getByLabelText(enUS.projectPage.confirmInputAriaLabel), {
       target: { value: 'demo' },
     });
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm delete' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: enUS.projectPage.confirmDeleteButton }));
 
     await waitFor(() => expect(within(dialog).getByText(/boom — config locked/)).toBeTruthy());
     expect(screen.queryByRole('region', { name: 'location' })).toBeNull();

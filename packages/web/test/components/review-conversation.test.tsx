@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -12,7 +13,7 @@ describe('ReviewConversation', () => {
   it('renders the PR conversation for a task with a PR', () => {
     render(<ReviewConversation task={makeTask({ prNumber: 42 })} />);
 
-    expect(screen.getByRole('region', { name: 'Review records' })).toBeTruthy();
+    expect(screen.getByRole('region', { name: enUS.review.sectionTitle })).toBeTruthy();
     expect(screen.getByText('PR review entry')).toBeTruthy();
   });
 

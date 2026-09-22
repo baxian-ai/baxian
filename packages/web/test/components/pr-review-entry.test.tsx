@@ -1,5 +1,6 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { PrReviewConversation, TaskState } from '../../src/shared/index.js';
 
@@ -47,12 +48,12 @@ describe('PrReviewEntry', () => {
       ],
     } as PrReviewConversation);
     renderEntry(task());
-    expect(screen.getByText('Code review')).toBeTruthy();
-    expect(await screen.findByText('Round 1')).toBeTruthy();
-    expect(screen.getByText('Round 2')).toBeTruthy();
-    expect(screen.getByText('Inline comment')).toBeTruthy();
-    expect(screen.getByText('Comment')).toBeTruthy();
-    expect(screen.getAllByText('Review')).toHaveLength(2);
+    expect(screen.getByText(enUS.prReview.codeReviewHeading)).toBeTruthy();
+    expect(await screen.findByText(enUS.agents.round(1))).toBeTruthy();
+    expect(screen.getByText(enUS.agents.round(2))).toBeTruthy();
+    expect(screen.getByText(enUS.prReview.inlineComment)).toBeTruthy();
+    expect(screen.getByText(enUS.prReview.comment)).toBeTruthy();
+    expect(screen.getAllByText(enUS.review.reviewTurnLabel)).toHaveLength(2);
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
     expect(screen.getByText(/a.ts:12 · nit here/)).toBeTruthy();
@@ -68,8 +69,8 @@ describe('PrReviewEntry', () => {
 
     renderEntry(task({ phase: 'spec', specReviewRound: 1 }));
 
-    expect(await screen.findByText('Plan review')).toBeTruthy();
-    expect(screen.queryByText('Code review')).toBeNull();
+    expect(await screen.findByText(enUS.prReview.specReviewHeading)).toBeTruthy();
+    expect(screen.queryByText(enUS.prReview.codeReviewHeading)).toBeNull();
   });
 
   it('labels both sides when dev comments and QA reviews appear in the same timeline', async () => {
@@ -81,8 +82,8 @@ describe('PrReviewEntry', () => {
       ],
     } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText('Review agent')).toBeTruthy();
-    expect(screen.getByText('Development agent')).toBeTruthy();
+    expect(await screen.findByText(enUS.review.roleQa)).toBeTruthy();
+    expect(screen.getByText(enUS.review.roleDev)).toBeTruthy();
   });
 
   it('renders issue comments as dev-side comments and keeps the author visible', async () => {
@@ -91,11 +92,10 @@ describe('PrReviewEntry', () => {
       items: [{ kind: 'issue-comment', id: 'i1', author: 'human-reviewer', body: 'please recheck' }],
     } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText('In progress')).toBeTruthy();
-    expect(screen.getByText('Comment')).toBeTruthy();
-    expect(screen.getByText(/human-reviewer · please recheck/)).toBeTruthy();
-    expect(screen.getByText('Development agent')).toBeTruthy();
-    expect(screen.queryByText('Review agent')).toBeNull();
+    expect(await screen.findByText(/human-reviewer · please recheck/)).toBeTruthy();
+    expect(screen.getByText(enUS.prReview.comment)).toBeTruthy();
+    expect(screen.getByText(enUS.review.roleDev)).toBeTruthy();
+    expect(screen.queryByText(enUS.review.roleQa)).toBeNull();
   });
 
   it('keeps the author visible for inline replies', async () => {
@@ -114,9 +114,9 @@ describe('PrReviewEntry', () => {
       ],
     } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText('Response')).toBeTruthy();
+    expect(await screen.findByText(enUS.review.responseTurnLabel)).toBeTruthy();
     expect(screen.getByText(/human-reviewer · src\/a\.ts:42 · please recheck this line/)).toBeTruthy();
-    expect(screen.getByText('Development agent')).toBeTruthy();
+    expect(screen.getByText(enUS.review.roleDev)).toBeTruthy();
   });
 
   it('badges a token verdict carried by a non-review comment as the QA round verdict', async () => {
@@ -140,8 +140,8 @@ describe('PrReviewEntry', () => {
   it('says the history was truncated rather than "not started" for an empty truncated result', async () => {
     ghMock.mockResolvedValue({ available: true, prNumber: 7, truncated: true, items: [] } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText(/too many comments/)).toBeTruthy();
-    expect(screen.queryByText('Review has not started')).toBeNull();
+    expect(await screen.findByText(enUS.prReview.listTruncated)).toBeTruthy();
+    expect(screen.queryByText(enUS.review.notStarted)).toBeNull();
   });
 
   it('surfaces the server-side truncation notice in the compact entry', async () => {
@@ -152,7 +152,7 @@ describe('PrReviewEntry', () => {
       items: [{ kind: 'issue-comment', id: 'c1', author: 'dev', body: 'note' }],
     } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText(/too many comments/)).toBeTruthy();
+    expect(await screen.findByText(enUS.prReview.listTruncated)).toBeTruthy();
   });
 
   it('navigates to the review page anchored at the clicked record', async () => {
@@ -166,20 +166,20 @@ describe('PrReviewEntry', () => {
     } as PrReviewConversation);
     renderEntry(task({ id: 'task-42' }));
 
-    fireEvent.click((await screen.findByText('Comment')).closest('button')!);
+    fireEvent.click((await screen.findByText(enUS.prReview.comment)).closest('button')!);
     expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/pr-review#pr-issue-comment-c1');
 
-    fireEvent.click(screen.getByText('Inline comment').closest('button')!);
+    fireEvent.click(screen.getByText(enUS.prReview.inlineComment).closest('button')!);
     expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/pr-review#pr-review-comment-21');
 
-    fireEvent.click(screen.getByText('Review').closest('button')!);
+    fireEvent.click(screen.getByText(enUS.review.reviewTurnLabel).closest('button')!);
     expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/pr-review#pr-review-r1');
   });
 
   it('shows an empty hint when the PR has no review items', async () => {
     ghMock.mockResolvedValue({ available: true, items: [] } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText('Review has not started')).toBeTruthy();
+    expect(await screen.findByText(enUS.review.notStarted)).toBeTruthy();
   });
 
   it('renders an ongoing bucket when items arrive after the latest review', async () => {
@@ -191,9 +191,13 @@ describe('PrReviewEntry', () => {
       ],
     } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText('Round 1')).toBeTruthy();
-    expect(screen.getByText('In progress')).toBeTruthy();
-    expect(screen.getByText(/fix: follow-up/)).toBeTruthy();
+    const completed = (await screen.findByText(enUS.agents.round(1))).parentElement!;
+    expect(within(completed).getByRole('button', { name: /needs work/ })).toBeTruthy();
+    expect(within(completed).queryByRole('button', { name: /fix: follow-up/ })).toBeNull();
+    const ongoing = completed.nextElementSibling as HTMLElement;
+    const followUp = within(ongoing).getByRole('button', { name: /fix: follow-up/ });
+    fireEvent.click(followUp);
+    expect(navigateMock).toHaveBeenCalledWith('/tasks/task-9/pr-review#pr-issue-comment-c2');
   });
 
   it('shows a partial failure banner while rendering available items', async () => {
@@ -203,7 +207,7 @@ describe('PrReviewEntry', () => {
       items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
     } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText(/Some review records failed to fetch: reviews: rate limited/)).toBeTruthy();
+    expect(await screen.findByText(enUS.prReview.partialFetchFailed('reviews: rate limited'))).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
   });
 
@@ -299,18 +303,18 @@ describe('PrReviewEntry', () => {
   it('shows unavailable reasons and falls back unknown reasons to no-pr', async () => {
     ghMock.mockResolvedValueOnce({ available: false, reason: 'driver-unavailable', items: [] } as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText(/code-platform/i)).toBeTruthy();
+    expect(await screen.findByText(enUS.prReview.reasonDriverUnavailable)).toBeTruthy();
 
     cleanup();
     ghMock.mockResolvedValueOnce({ available: false, reason: 'unexpected', items: [] } as unknown as PrReviewConversation);
     renderEntry(task());
-    expect(await screen.findByText(/does not have a PR yet/)).toBeTruthy();
+    expect(await screen.findByText(enUS.prReview.reasonNoPr)).toBeTruthy();
   });
 
   it('shows a fetch failure when github review loading fails', async () => {
     ghMock.mockRejectedValue(new Error('gh failed'));
     renderEntry(task());
-    expect(await screen.findByText(/Failed to load review records: gh failed/)).toBeTruthy();
+    expect(await screen.findByText(enUS.review.loadFailed('gh failed'))).toBeTruthy();
   });
 
   it('shows freshness metadata and reloads through the manual refresh button', async () => {
@@ -330,10 +334,10 @@ describe('PrReviewEntry', () => {
     } as PrReviewConversation);
     renderEntry(task({ status: 'merged' }));
     expect(await screen.findByText(/before refresh/)).toBeTruthy();
-    expect(screen.getByText('Auto-refresh stopped')).toBeTruthy();
-    expect(screen.getByText(/Fetched at/)).toBeTruthy();
+    expect(screen.getByText(enUS.prReview.autoRefreshStopped)).toBeTruthy();
+    expect(screen.getByText(enUS.prReview.fetchedAtLabel('2026-07-29 08:00:00'))).toBeTruthy();
 
-    fireEvent.click(screen.getByText('Refresh'));
+    fireEvent.click(screen.getByText(enUS.prReview.refresh));
     expect(refreshMock).toHaveBeenCalledWith('task-9');
     expect(await screen.findByText(/after refresh/)).toBeTruthy();
   });

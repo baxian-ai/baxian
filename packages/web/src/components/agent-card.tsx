@@ -14,8 +14,6 @@ import { useToast } from './toast.tsx';
 import { useConfirm } from './confirm-dialog.tsx';
 import { useAgentActions } from '../hooks/use-agent-actions.ts';
 import { PaneTerminal } from './pane-terminal.tsx';
-import { AgentPet } from './agent-pet.tsx';
-import { AgentPetConfigModal } from './agent-pet-config-modal.tsx';
 import { agentRuntimeLabel, agentRuntimeTitle } from '../shared/index.js';
 import { useT, type Messages } from '../i18n/index.tsx';
 import { taskDetailPath } from './task-status.tsx';
@@ -31,25 +29,33 @@ const RUNTIME_BADGE_CLASSES: Record<AgentSnapshot['runtimeStatus'], string> = {
   error: 'pill pill-warn',
 };
 
-const AGENT_CARD_PET_HEIGHT = 72;
-
 export type AgentHoldRecovery = 'resume' | 'restart-runtime' | 'terminal' | 'task' | 'delete-agent';
 
 export function agentHoldRecovery(
   awaitingPhase: string | undefined,
   role: AgentRole,
   task?: Pick<TaskState, 'status'>,
+  hasBoundTask = task !== undefined,
 ): AgentHoldRecovery {
-  const activeTask = task !== undefined && TASK_ACTIVE_STATUS_SET.has(task.status);
+  const activeTask = task !== undefined ? TASK_ACTIVE_STATUS_SET.has(task.status) : hasBoundTask;
   if (awaitingPhase === 'greeting_failed') return 'restart-runtime';
   if (awaitingPhase === 'agent_dialog_pending') return 'terminal';
+  if (awaitingPhase === 'bootstrap-marker-clear-failed') {
+    return task?.status === 'in_progress' || (!task && hasBoundTask) ? 'task' : 'resume';
+  }
+  if (awaitingPhase === 'restart-redispatch-failed') {
+    const needsReplay = task ? ['in_progress', 'fixing', 'approved'].includes(task.status) : hasBoundTask;
+    return needsReplay ? 'task' : 'resume';
+  }
   if (activeTask && (awaitingPhase === 'agent_dialog_resolved_runtime'
     || awaitingPhase?.startsWith('signal-arm-failed'))) return 'task';
+  if (awaitingPhase === 'dispatch-failed:ack_unknown' && role === 'dev'
+    && task && ['spec-ready', 'review', 'merge-ready', 'max_rounds'].includes(task.status)) return 'resume';
   if (activeTask && (awaitingPhase === 'dispatch-failed:ack_unknown'
     || awaitingPhase === 'dev-wait-gate-failed-after-qa-started')) return 'task';
   if (activeTask
-    && task.status !== 'spec-ready'
-    && task.status !== 'max_rounds'
+    && task?.status !== 'spec-ready'
+    && task?.status !== 'max_rounds'
     && (awaitingPhase === 'dirty-workdir' || awaitingPhase === 'checkout-preparation-failed')
     && role === 'dev') return 'task';
   return 'resume';
@@ -171,20 +177,16 @@ export function AgentCard({
   } = useAgentActions(projectId, [agent.id], onDeleted);
   const [resuming, setResuming] = useState(false);
   const [retryingBootstrap, setRetryingBootstrap] = useState(false);
-  const [petModalOpen, setPetModalOpen] = useState(false);
 
   const taskId = agent.binding?.taskId;
   const boundTask = task?.id === taskId ? task : undefined;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
   const needInputAt = agent.binding?.needInput?.at;
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
-  const holdRecovery = agentHoldRecovery(agent.binding?.awaitingPhase, role, boundTask);
+  const holdRecovery = agentHoldRecovery(agent.binding?.awaitingPhase, role, boundTask, !!taskId);
   const isBootstrapping = isAgentBootstrapping(agent);
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
   const badge = resolveAgentBadge(agent, t.agents);
-  const petLabel = isBootstrapping
-    ? t.agents.bootstrappingBadge
-    : t.agents.runtimeStatus[agent.runtimeStatus];
   const showTerminalPreview = terminalMode === 'activity-preview' &&
     !bootstrapBlocksTerminal && (agent.runtimeStatus === 'working' || agent.runtimeStatus === 'pending');
   const showEmbeddedTerminal = terminalMode === 'embedded-full';
@@ -266,10 +268,7 @@ export function AgentCard({
     'card relative flex h-full min-w-0 flex-col overflow-visible p-4',
     isActiveSelected ? 'ring-2 ring-accent' : '',
   ].filter(Boolean).join(' ');
-  const headerClassName = [
-    'mb-3 flex items-start justify-between gap-2',
-    agent.petId ? 'pr-28' : '',
-  ].filter(Boolean).join(' ');
+  const headerClassName = 'mb-3 flex items-start justify-between gap-2';
   const terminalContainerClassName = [
     'mb-2 mt-3 h-80 min-h-0 overflow-hidden border border-hairline bg-surface',
     allowSelection ? 'cursor-pointer' : '',
@@ -288,24 +287,13 @@ export function AgentCard({
       className={cardClassName}
       data-agent-card={isSelectableEmbedded ? agent.id : undefined}
     >
-      {agent.petId && (
-        <div className="absolute -top-4 right-7 z-10">
-          <AgentPet
-            petId={agent.petId}
-            status={agent.runtimeStatus}
-            bootstrapping={isBootstrapping}
-            label={petLabel}
-            displayHeight={AGENT_CARD_PET_HEIGHT}
-          />
-        </div>
-      )}
       <div className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-xs font-medium tracking-[0.05em] text-og-500">
             {role === 'qa' ? 'QA' : 'Dev'}
           </span>
           <span
-            className="min-w-0 truncate whitespace-nowrap font-display text-sm font-semibold text-og-1000"
+            className="min-w-0 truncate whitespace-nowrap font-display text-xs text-og-1000"
             title={agentRuntimeTitle(agent.id, runtime, model)}
           >
             {agent.id}
@@ -319,17 +307,13 @@ export function AgentCard({
             </span>
           )}
         </div>
-        {(!agent.petId || badge.kind === 'alert' || badge.stale) && (
-          <>
-            <span
-              className={badge.stale ? `${badge.cls} pill--stale shrink-0` : `${badge.cls} shrink-0`}
-              title={badge.title}
-            >
-              {badge.label}
-            </span>
-            {badge.stale && <span className="sr-only">{badge.title}</span>}
-          </>
-        )}
+        <span
+          className={badge.stale ? `${badge.cls} pill--stale shrink-0` : `${badge.cls} shrink-0`}
+          title={badge.title}
+        >
+          {badge.label}
+        </span>
+        {badge.stale && <span className="sr-only">{badge.title}</span>}
       </div>
       {bootstrapBlocksTerminal && (
         <div className="mb-2 rounded-md border border-accent-soft bg-accent-soft/40 px-2.5 py-2 text-xs text-accent">
@@ -486,13 +470,6 @@ export function AgentCard({
           {close => (
             <>
               <MenuItem
-                onClick={() => { close(); setPetModalOpen(true); }}
-                disabled={actionBusy}
-                title={t.agents.agentPetMenuItemTitle}
-              >
-                Agent Pet
-              </MenuItem>
-              <MenuItem
                 onClick={() => { close(); void handleCompact(); }}
                 disabled={actionBusy}
                 title={t.agents.compactMenuItemTitle}
@@ -518,13 +495,6 @@ export function AgentCard({
       </div>
       {stopError && <div className="mt-1.5 break-words text-xs text-accent">{stopError}</div>}
       {deleteError && <div className="mt-1.5 break-words text-xs text-accent">{deleteError}</div>}
-      {petModalOpen && (
-        <AgentPetConfigModal
-          agentId={agent.id}
-          currentPetId={agent.petId ?? null}
-          onClose={() => setPetModalOpen(false)}
-        />
-      )}
     </div>
   );
 }

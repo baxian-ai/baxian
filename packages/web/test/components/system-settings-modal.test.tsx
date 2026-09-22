@@ -1,3 +1,5 @@
+import { zhCN } from '../../src/i18n/zh-cn.ts';
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
 import type { ReactElement } from 'react';
@@ -53,7 +55,7 @@ describe('SystemSettingsModal', () => {
   it('renders both language options with English selected by default when there is no I18nProvider', () => {
     renderModal();
 
-    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: enUS.settings.title })).toBeTruthy();
     const english = screen.getByRole('radio', { name: 'English' }) as HTMLInputElement;
     const chinese = screen.getByRole('radio', { name: '简体中文' }) as HTMLInputElement;
     expect(english.checked).toBe(true);
@@ -71,7 +73,7 @@ describe('SystemSettingsModal', () => {
     fireEvent.click(screen.getByRole('radio', { name: '简体中文' }));
 
     await waitFor(() => expect(configPatchMock).toHaveBeenCalledWith({ language: 'zh-CN' }));
-    await waitFor(() => expect(screen.getByRole('dialog', { name: '系统设置' })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole('dialog', { name: zhCN.settings.title })).toBeTruthy());
   });
 
   it('shows a "Failed to save language:" toast and keeps English selected when the PATCH rejects', async () => {
@@ -80,23 +82,23 @@ describe('SystemSettingsModal', () => {
 
     fireEvent.click(screen.getByRole('radio', { name: '简体中文' }));
 
-    await expectToast({ title: 'Failed to save language: boom' });
+    await expectToast({ title: enUS.settings.languageSaveFailed('boom') });
     expect((screen.getByRole('radio', { name: 'English' }) as HTMLInputElement).checked).toBe(true);
-    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: enUS.settings.title })).toBeTruthy();
   });
 
   describe('task notifications', () => {
     const STORAGE_KEY = 'baxian.taskNotifications.enabled';
 
     function getCheckbox(): HTMLInputElement {
-      return screen.getByRole('checkbox', { name: 'Task completion notifications' }) as HTMLInputElement;
+      return screen.getByRole('checkbox', { name: enUS.settings.taskNotifications }) as HTMLInputElement;
     }
 
     it('shows an enabled, checked checkbox when permission is granted', () => {
       installNotificationMock('granted');
       renderModal();
 
-      const checkbox = screen.getByRole('checkbox', { name: 'Task completion notifications' }) as HTMLInputElement;
+      const checkbox = screen.getByRole('checkbox', { name: enUS.settings.taskNotifications }) as HTMLInputElement;
       expect(checkbox.checked).toBe(true);
       expect(checkbox.disabled).toBe(false);
     });
@@ -105,17 +107,17 @@ describe('SystemSettingsModal', () => {
       installNotificationMock('denied');
       renderModal();
 
-      const checkbox = screen.getByRole('checkbox', { name: 'Task completion notifications' }) as HTMLInputElement;
+      const checkbox = screen.getByRole('checkbox', { name: enUS.settings.taskNotifications }) as HTMLInputElement;
       expect(checkbox.disabled).toBe(true);
-      expect(screen.getByText('Notifications are blocked by the browser')).toBeTruthy();
+      expect(screen.getByText(enUS.settings.taskNotificationsDenied)).toBeTruthy();
     });
 
     it('renders no notification checkbox or hint when the browser has no Notification API, while the language section still renders', () => {
       renderModal();
 
-      expect(screen.queryByRole('checkbox', { name: 'Task completion notifications' })).toBeNull();
-      expect(screen.queryByText('Notifications are blocked by the browser')).toBeNull();
-      expect(screen.queryByText('Notify via the browser when a task reaches done or merged')).toBeNull();
+      expect(screen.queryByRole('checkbox', { name: enUS.settings.taskNotifications })).toBeNull();
+      expect(screen.queryByText(enUS.settings.taskNotificationsDenied)).toBeNull();
+      expect(screen.queryByText(enUS.settings.taskNotificationsHint)).toBeNull();
       expect(screen.getByRole('radio', { name: 'English' })).toBeTruthy();
     });
 

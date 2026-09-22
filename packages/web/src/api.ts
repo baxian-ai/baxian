@@ -10,7 +10,6 @@ import type {
   MergeStrategy,
   SpecApprovalStrategy,
   PrReviewConversation,
-  PetMeta,
 } from './shared/index.js';
 
 const BASE = '/api';
@@ -227,19 +226,6 @@ export const api = {
       post<TmuxInstallResponse>('/agents/install-tmux', { mode, host: target.host, hostId: target.hostId }),
     uploadImage: async (id: string, file: File) =>
       post<{ path: string }>(`/agents/${enc(id)}/images`, { dataBase64: await fileToBase64(file) }),
-    setPet: (id: string, petId: string | null) =>
-      put<{ petId: string | null }>(`/agents/${enc(id)}/pet`, { petId }),
-  },
-  pets: {
-    list: () => get<PetMeta[]>('/pets'),
-    create: async (petJson: unknown, spritesheet: File) =>
-      post<PetMeta>('/pets', { petJson, spritesheetBase64: await fileToBase64(spritesheet) }),
-    remove: (id: string) => del(`/pets/${enc(id)}`),
-    fetchSpritesheet: async (id: string): Promise<Blob> => {
-      const res = await fetch(`${BASE}/pets/${enc(id)}/spritesheet`, { headers: authHeaders() });
-      if (!res.ok) await throwApiError(res);
-      return res.blob();
-    },
   },
   tasks: {
     list: async (projectId: string): Promise<TaskState[]> => {

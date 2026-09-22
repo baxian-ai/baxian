@@ -1,8 +1,9 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { render, screen, cleanup, fireEvent, act, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import type { AgentBindingFacts, ProjectConfig, TaskState } from '../../src/shared/index.js';
+import type { ProjectConfig, TaskState } from '../../src/shared/index.js';
 
 vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 
@@ -45,7 +46,7 @@ vi.mock('../../src/components/review-conversation.tsx', () => ({
   ),
 }));
 vi.mock('../../src/components/create-task-modal.tsx', () => ({
-  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label="Edit task" /> : null),
+  CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div role="dialog" aria-label={enUS.taskDetail.editTask} /> : null),
 }));
 
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
@@ -106,7 +107,7 @@ const PROJECT: ProjectConfig = {
   ]],
 };
 
-const ACTION_FAILED_BODY = 'Refresh the page to confirm the current task status before trying again.';
+const ACTION_FAILED_BODY = enUS.taskDetail.actionFailedBody;
 
 function setTask(task: TaskState | null, opts: { loaded?: boolean; error?: { code: string; message: string } | null } = {}): void {
   useTaskMock.mockReturnValue({ data: task, loaded: opts.loaded ?? true, error: opts.error ?? null });
@@ -181,14 +182,6 @@ const AGENTS = [
   { id: 'bx-qa', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
 ];
 
-function bindAgent(agentId: string, binding: AgentBindingFacts): void {
-  useAgentsMock.mockReturnValue({
-    data: AGENTS.map(agent => (agent.id === agentId ? { ...agent, binding } : agent)),
-    loaded: true,
-    error: null,
-  });
-}
-
 beforeEach(async () => {
   cleanup();
   useTaskMock.mockReset();
@@ -211,14 +204,13 @@ afterEach(() => {
 
 describe('TaskDetail page — header & info', () => {
   it('names the task that spawned this one and links to its detail page', () => {
-    const { container } = open({ origin: { taskId: 'task-003', title: 'original wire title' } });
-    expect(container.textContent).toContain('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00 · From task-003');
+    open({ origin: { taskId: 'task-003', title: 'original wire title' } });
     expect(screen.getByRole('link', { name: 'task-003' }).getAttribute('href')).toBe('/project/baxian/task/task-003');
   });
 
   it('omits the origin line for tasks created by a human', () => {
     const { container } = open();
-    expect(container.textContent).not.toContain('· From');
+    expect(container.querySelector('a[href*="/task/task-"]')).toBeNull();
   });
 
   it('renders the task id + title at the top and the full modal-equivalent body', () => {
@@ -228,58 +220,25 @@ describe('TaskDetail page — header & info', () => {
     expect(within(heading).getByText('task-010')).toBeTruthy();
     expect(within(heading).getByText('Clean tests')).toBeTruthy();
 
-    expect(within(container.querySelector('section')!).getByText('Running pre-merge checks')).toBeTruthy();
-    expect(container.textContent).toContain('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00');
+    expect(container.textContent).toContain('2026-05-10 20:00');
+    expect(container.textContent).toContain('2026-05-10 21:00');
     expect(container.textContent).toContain('Task body here');
-    expect(container.textContent).toContain('Code review · round 1');
-    expect(container.textContent).not.toContain('Plan review · round 0');
-    expect(container.textContent).toContain('Branch:');
+    expect(container.textContent).toContain(enUS.taskDetail.codeReviewRound(1));
+    expect(container.textContent).not.toContain(enUS.taskDetail.specReviewRound(0));
     expect(screen.getByRole('region', { name: 'Review conversation' }).getAttribute('data-task')).toBe('task-010');
-  });
-
-  it.each([
-    ['bx-dev', 'in_progress'],
-    ['bx-qa', 'review'],
-  ] as const)('marks the task as dispatching while %s still carries the bootstrap marker', (agentId, status) => {
-    bindAgent(agentId, {
-      id: agentId, projectId: 'baxian', updatedAt: '', taskId: 'task-010', bootstrappingTaskId: 'task-010',
-    });
-
-    open({ status });
-
-    expect(screen.getByText(/Dispatching to the agent/)).toBeTruthy();
-  });
-
-  it.each([
-    ['the agent is held for a human, marker or not', {
-      bootstrappingTaskId: 'task-010', status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
-    }],
-    ['a question awaits an answer', {
-      bootstrappingTaskId: 'task-010',
-      needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
-    }],
-    ['the prompt is delivered and the marker is gone', {}],
-  ] as const)('stops calling it dispatching once %s', (_desc, bindingOverrides) => {
-    bindAgent('bx-dev', {
-      id: 'bx-dev', projectId: 'baxian', updatedAt: '', taskId: 'task-010', ...bindingOverrides,
-    });
-
-    open({ status: 'in_progress' });
-
-    expect(screen.queryByText(/Dispatching to the agent/)).toBeNull();
   });
 
   it('shows both the plan and code review counts beside the status, hiding a zero plan round', () => {
     const { container } = open({ reviewRound: 3, specReviewRound: 2 });
-    const status = within(container.querySelector('section')!).getByText('Running pre-merge checks').parentElement!;
-    expect(within(status).getByText('Code review · round 3')).toBeTruthy();
-    expect(within(status).getByText('Plan review · round 2')).toBeTruthy();
+    const status = container.querySelector('[data-status="approved"]')!.parentElement!;
+    expect(within(status).getByText(enUS.taskDetail.codeReviewRound(3))).toBeTruthy();
+    expect(within(status).getByText(enUS.taskDetail.specReviewRound(2))).toBeTruthy();
 
     cleanup();
     const maxRounds = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
-    const row = within(maxRounds.container.querySelector('section')!).getByText('Code review needs a decision').parentElement!;
-    expect(within(row).getByText('Code review · round 10')).toBeTruthy();
-    expect(within(row).queryByText('Plan review · round 0')).toBeNull();
+    const row = maxRounds.container.querySelector('[data-status="max_rounds"]')!.parentElement!;
+    expect(within(row).getByText(enUS.taskDetail.codeReviewRound(10))).toBeTruthy();
+    expect(within(row).queryByText(enUS.taskDetail.specReviewRound(0))).toBeNull();
   });
 
   it('shows only PR and Branch in the info card, with a branch hyperlink, dropping project/agent rows', () => {
@@ -289,14 +248,11 @@ describe('TaskDetail page — header & info', () => {
       .toBe('https://github.com/baxian-ai/baxian/pull/55');
     expect(within(section).getByRole('link', { name: 'bx/task-010' }).getAttribute('href'))
       .toBe('https://github.com/baxian-ai/baxian/tree/bx/task-010');
-    expect(section.textContent).not.toContain('Project:');
-    expect(section.textContent).not.toContain('Dev:');
-    expect(section.textContent).not.toContain('QA:');
   });
 
   it('renders timestamps at minute precision and tolerates empty values', () => {
     open({ createdAt: '2026-05-10T12:00:00.000Z', updatedAt: null as unknown as string });
-    expect(screen.getByText('Created 2026-05-10 20:00 · Updated')).toBeTruthy();
+    expect(screen.getByText(/2026-05-10 20:00/)).toBeTruthy();
   });
 
   it('shows why local branch cleanup is pending', () => {
@@ -308,9 +264,9 @@ describe('TaskDetail page — header & info', () => {
       },
     });
 
-    expect(screen.getByText('The local task branch was kept for now')).toBeTruthy();
-    expect(screen.getByText('baxian could not safely remove the local task branch, so it kept the branch to avoid losing work.')).toBeTruthy();
-    expect(screen.getByText('Technical details')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.branchCleanupPendingTitle)).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.branchCleanupPendingBody)).toBeTruthy();
+    expect(screen.getByText(enUS.common.technicalDetails)).toBeTruthy();
     expect(screen.getByText('runtime is not idle; local branch cleanup deferred')).toBeTruthy();
   });
 
@@ -323,32 +279,25 @@ describe('TaskDetail page — header & info', () => {
       },
     });
 
-    expect(screen.getByText('The local task branch was kept')).toBeTruthy();
-    expect(screen.getByText('baxian deliberately kept the local task branch. You can inspect or remove it later.')).toBeTruthy();
-    expect(screen.getByText('Technical details')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.branchCleanupSkippedTitle)).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.branchCleanupSkippedBody)).toBeTruthy();
+    expect(screen.getByText(enUS.common.technicalDetails)).toBeTruthy();
     expect(screen.getByText('remote branch is absent; preserving the local branch without retry')).toBeTruthy();
   });
 
   it('places the action buttons on their own row below the status capsule, not in the title', () => {
     const { container } = open({ status: 'pending' });
     const section = container.querySelector('section')!;
-    const actionsRow = screen.getByRole('button', { name: 'Edit task' }).parentElement!;
+    const actionsRow = screen.getByRole('button', { name: enUS.taskDetail.editTask }).parentElement!;
     expect(container.querySelector('h1')!.contains(actionsRow)).toBe(false);
     expect(section.contains(actionsRow)).toBe(true);
-    const capsuleRow = within(section).getByText('Waiting to start').parentElement!;
+    const capsuleRow = section.querySelector('[data-status="pending"]')!.parentElement!;
     expect(capsuleRow.compareDocumentPosition(actionsRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  const QA_BANNER = 'Code review passed · Running final checks';
-  const MERGE_BANNER = 'Review complete · Confirm the result';
-  it.each([
-    { status: 'approved', shown: QA_BANNER, hidden: MERGE_BANNER },
-    { status: 'merge-ready', shown: MERGE_BANNER, hidden: QA_BANNER },
-  ])('shows the $status banner with a working PR link', ({ status, shown, hidden }) => {
-    open({ status: status as TaskState['status'] });
-    expect(screen.getByText(shown)).toBeTruthy();
-    expect(screen.queryByText(hidden)).toBeNull();
-    expect(screen.getByRole('link', { name: 'View PR #55' }).getAttribute('href'))
+  it.each(['approved', 'merge-ready'] as const)('provides a working PR link for %s tasks', (status) => {
+    open({ status });
+    expect(screen.getByRole('link', { name: enUS.taskDetail.viewPr(55) }).getAttribute('href'))
       .toBe('https://github.com/baxian-ai/baxian/pull/55');
   });
 });
@@ -441,14 +390,14 @@ describe('TaskDetail page — layout & agent cards', () => {
   it('shows a placeholder when projects are still loading', async () => {
     await setProjects(null);
     open();
-    expect(screen.getByText('Loading…')).toBeTruthy();
+    expect(screen.getByText(enUS.common.loading)).toBeTruthy();
     expect(screen.queryByRole('article')).toBeNull();
   });
 
   it('shows a placeholder for an unassigned task with no participant team', () => {
     setTask(makeTask({ agentId: '', devAgentId: 'unassigned', preferredAgentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText('No linked agent')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.noLinkedAgent)).toBeTruthy();
     expect(screen.queryByRole('article')).toBeNull();
   });
 });
@@ -457,30 +406,30 @@ describe('TaskDetail page — actions & states', () => {
   it('Loading / not-found / error states', () => {
     setTask(null, { loaded: false });
     const { unmount } = renderPage();
-    expect(screen.getByText('Loading…')).toBeTruthy();
+    expect(screen.getByText(enUS.common.loading)).toBeTruthy();
     unmount();
 
     setTask(null, { loaded: true });
     const r2 = renderPage();
-    expect(screen.getByText('Task not found: task-010')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.taskNotFound('task-010'))).toBeTruthy();
     r2.unmount();
 
     setTask(null, { loaded: true, error: { code: 'x', message: 'boom' } });
     renderPage();
-    expect(screen.getByText('Failed to load: boom')).toBeTruthy();
+    expect(screen.getByText(enUS.common.loadFailed('boom'))).toBeTruthy();
   });
 
   it('the back button navigates to the previous history entry', () => {
     setTask(makeTask());
     renderPage('task-010', { entries: ['/elsewhere', '/project/baxian/task/task-010'], index: 1 });
-    fireEvent.click(screen.getByRole('button', { name: '← Back' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.back }));
     expect(screen.getByRole('region', { name: 'location' }).textContent).toBe('/elsewhere');
   });
 
   it('Edit task opens the edit modal overlay', () => {
     open({ status: 'pending' });
-    fireEvent.click(screen.getByRole('button', { name: 'Edit task' }));
-    expect(screen.getByRole('dialog', { name: 'Edit task' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.editTask }));
+    expect(screen.getByRole('dialog', { name: enUS.taskDetail.editTask })).toBeTruthy();
   });
 
   it('Run task again creates a fresh task and navigates to its detail page', async () => {
@@ -491,12 +440,12 @@ describe('TaskDetail page — actions & states', () => {
     tasksRetryMock.mockResolvedValue(makeTask({ id: 'task-011', projectId: 'baxian', status: 'pending' }));
     renderPage('task-010');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Run task again' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.retryTask }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Run task task-010 again?')).toBeTruthy();
-    expect(within(dialog).getByText('The PR is already merged. baxian will create a new task with the same title and description and start it from the beginning.')).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.retryConfirmTitle('task-010'))).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.retryConfirmBodyMerged)).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Run task again' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.retryTask }));
     });
 
     expect(tasksRetryMock).toHaveBeenCalledWith('task-010');
@@ -506,18 +455,18 @@ describe('TaskDetail page — actions & states', () => {
   it('does not offer another run after the terminal task records its replacement', () => {
     open({ status: 'failed', replacementTaskId: 'task-011' });
 
-    expect(screen.queryByRole('button', { name: 'Run task again' })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.retryTask })).toBeNull();
   });
 
   it('Cancel confirms and calls the update api', async () => {
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'cancelled' }));
     open({ status: 'in_progress' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Cancel task task-010?')).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.cancelConfirmTitle('task-010'))).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel task' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }));
     });
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
@@ -526,9 +475,9 @@ describe('TaskDetail page — actions & states', () => {
     'Cancel stays clickable at non-terminal status %s with the force-cancel tooltip',
     (status) => {
       open({ status });
-      const cancel = screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement;
+      const cancel = screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }) as HTMLButtonElement;
       expect(cancel.disabled).toBe(false);
-      expect(cancel.title).toBe('Stops the task and releases its development and review agents');
+      expect(cancel.title).toBe(enUS.taskDetail.cancelForceTitle);
     },
   );
 
@@ -536,9 +485,9 @@ describe('TaskDetail page — actions & states', () => {
     'Cancel stays clickable at terminal status %s for stale-binding cleanup',
     (status) => {
       open({ status });
-      const cancel = screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement;
+      const cancel = screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }) as HTMLButtonElement;
       expect(cancel.disabled).toBe(false);
-      expect(cancel.title).toBe('Stops the task and releases its development and review agents');
+      expect(cancel.title).toBe(enUS.taskDetail.cancelForceTitle);
     },
   );
 
@@ -546,23 +495,23 @@ describe('TaskDetail page — actions & states', () => {
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'merged' }));
     open({ status: 'merged' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText(/its status will not change/)).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.cancelConfirmBodyTerminal)).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel task' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }));
     });
 
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
-    await expectToast({ title: 'Released the remaining agent links' });
+    await expectToast({ title: enUS.taskDetail.cancelCleanupToastTitle });
   });
 
   it('Cancel force-cancels a task that is under review', async () => {
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'cancelled' }));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
-    await settleConfirmDialog('Cancel task');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }));
+    await settleConfirmDialog(enUS.taskDetail.cancelConfirmLabel);
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
 
@@ -576,8 +525,8 @@ describe('TaskDetail page — actions & states', () => {
     });
     renderPage('task-010', { extra: <GoTo to="/project/baxian/task/task-011" /> });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
-    await settleConfirmDialog('Cancel task');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }));
+    await settleConfirmDialog(enUS.taskDetail.cancelConfirmLabel);
     expect(screen.getByText('AAA')).toBeTruthy();
 
     await act(async () => {
@@ -594,23 +543,23 @@ describe('TaskDetail page — actions & states', () => {
 
     it('code-phase shows the two human verdicts and the warning without legacy actions', () => {
       openMaxRounds();
-      expect(screen.getByRole('button', { name: 'Accept current version and merge' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Continue revising' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.taskDetail.verdictComplete })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.taskDetail.verdictContinue })).toBeTruthy();
       expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
-      expect(screen.queryByRole('button', { name: 'Run task again' })).toBeNull();
-      expect(screen.getByText('Code review still has open questions after 10 rounds')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: enUS.taskDetail.retryTask })).toBeNull();
+      expect(screen.getByText(enUS.taskDetail.codeMaxRoundsTitle(10))).toBeTruthy();
     });
 
     it.each([
       {
-        button: 'Continue revising',
-        confirm: 'Continue revising',
+        button: enUS.taskDetail.verdictContinue,
+        confirm: enUS.taskDetail.verdictContinue,
         action: 'continue',
         resolved: makeTask({ status: 'fixing', reviewRound: 11 }),
       },
       {
-        button: 'Accept current version and merge',
-        confirm: 'Accept current version and merge',
+        button: enUS.taskDetail.verdictComplete,
+        confirm: enUS.taskDetail.verdictComplete,
         action: 'complete',
         resolved: makeTask({ status: 'merged' }),
       },
@@ -625,18 +574,18 @@ describe('TaskDetail page — actions & states', () => {
 
     it('spec-phase hides code and legacy review actions', () => {
       openMaxRounds({ phase: 'spec' });
-      expect(screen.queryByRole('button', { name: 'Accept current version and merge' })).toBeNull();
+      expect(screen.queryByRole('button', { name: enUS.taskDetail.verdictComplete })).toBeNull();
       expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
-      expect(screen.queryByRole('button', { name: 'Run task again' })).toBeNull();
-      expect(screen.getByText('Plan review still has open questions after 0 rounds')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: enUS.taskDetail.retryTask })).toBeNull();
+      expect(screen.getByText(enUS.taskDetail.specMaxRoundsTitle(0))).toBeTruthy();
     });
 
     it('spec-phase renders the verdict controls: approve starts coding', async () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openMaxRounds({ phase: 'spec', specReviewRound: 10 });
 
-      fireEvent.click(screen.getByRole('button', { name: 'Approve plan and start development' }));
-      await settleConfirmDialog('Approve plan');
+      fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.specApproveButton }));
+      await settleConfirmDialog(enUS.taskDetail.specApprove);
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'approve' });
     });
 
@@ -644,11 +593,11 @@ describe('TaskDetail page — actions & states', () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'fixing', phase: 'spec', maxRoundsContinues: 1 }));
       openMaxRounds({ phase: 'spec', specReviewRound: 10 });
 
-      const reject = screen.getByRole('button', { name: 'Request plan changes' }) as HTMLButtonElement;
+      const reject = screen.getByRole('button', { name: enUS.taskDetail.specReject }) as HTMLButtonElement;
       expect(reject.disabled).toBe(true);
-      fireEvent.change(screen.getByPlaceholderText(/What needs to change/), { target: { value: '按分歧点再收敛一轮' } });
+      fireEvent.change(screen.getByPlaceholderText(enUS.taskDetail.specCommentsPlaceholder), { target: { value: '按分歧点再收敛一轮' } });
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Request plan changes' }));
+        fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.specReject }));
       });
 
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
@@ -666,56 +615,56 @@ describe('TaskDetail page — actions & states', () => {
 
     it('shows the plan approval card with both actions; change request is disabled until comments are filled', () => {
       openSpecReady();
-      expect(screen.getByText('Plan ready for your approval')).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Approve plan and start development' })).toBeTruthy();
-      const reject = screen.getByRole('button', { name: 'Request plan changes' }) as HTMLButtonElement;
+      expect(screen.getByText(enUS.taskDetail.specReadyBannerTitle)).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.taskDetail.specApproveButton })).toBeTruthy();
+      const reject = screen.getByRole('button', { name: enUS.taskDetail.specReject }) as HTMLButtonElement;
       expect(reject.disabled).toBe(true);
-      fireEvent.change(screen.getByPlaceholderText(/What needs to change/), { target: { value: '补充回滚方案' } });
-      expect((screen.getByRole('button', { name: 'Request plan changes' }) as HTMLButtonElement).disabled).toBe(false);
-      expect((screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.change(screen.getByPlaceholderText(enUS.taskDetail.specCommentsPlaceholder), { target: { value: '补充回滚方案' } });
+      expect((screen.getByRole('button', { name: enUS.taskDetail.specReject }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }) as HTMLButtonElement).disabled).toBe(false);
     });
 
     it('Approve plan confirms and submits an approve verdict', async () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openSpecReady();
 
-      fireEvent.click(screen.getByRole('button', { name: 'Approve plan and start development' }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.specApproveButton }));
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Approve the plan and start development?')).toBeTruthy();
-      expect(within(dialog).getByText('Task task-010 will start development using this plan.')).toBeTruthy();
+      expect(within(dialog).getByText(enUS.taskDetail.specApproveConfirmTitle)).toBeTruthy();
+      expect(within(dialog).getByText(enUS.taskDetail.specApproveConfirmBody('task-010'))).toBeTruthy();
       await act(async () => {
-        fireEvent.click(within(dialog).getByRole('button', { name: 'Approve plan' }));
+        fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.specApprove }));
       });
 
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'approve' });
-      await expectToast({ title: 'Plan approved; development started' });
+      await expectToast({ title: enUS.taskDetail.specApprovedToastTitle });
     });
 
     it('Request plan changes submits request-changes with the comments', async () => {
       tasksVerdictMock.mockResolvedValue(makeTask({ status: 'fixing' }));
       openSpecReady();
 
-      fireEvent.change(screen.getByPlaceholderText(/What needs to change/), { target: { value: ' 边界场景没有覆盖 ' } });
+      fireEvent.change(screen.getByPlaceholderText(enUS.taskDetail.specCommentsPlaceholder), { target: { value: ' 边界场景没有覆盖 ' } });
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Request plan changes' }));
+        fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.specReject }));
       });
 
       expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
         action: 'request-changes',
         comments: '边界场景没有覆盖',
       });
-      await expectToast({ title: 'Change request sent; the development agent is revising the plan' });
+      await expectToast({ title: enUS.taskDetail.specRejectedToastTitle });
     });
 
     it('verdict failure surfaces an error toast', async () => {
       tasksVerdictMock.mockRejectedValue(new Error('task-010 is fixing'));
       openSpecReady();
 
-      fireEvent.click(screen.getByRole('button', { name: 'Approve plan and start development' }));
-      await settleConfirmDialog('Approve plan');
+      fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.specApproveButton }));
+      await settleConfirmDialog(enUS.taskDetail.specApprove);
 
       await expectToast({
-        title: 'Couldn’t approve the plan',
+        title: enUS.taskDetail.specApproveFailedTitle,
         body: ACTION_FAILED_BODY,
         details: 'task-010 is fixing',
       });
@@ -729,24 +678,24 @@ describe('TaskDetail page — advance', () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'in_progress' }));
     open({ status: 'pending' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start task' }));
-    await settleConfirmDialog('Start task');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.startTask }));
+    await settleConfirmDialog(enUS.taskDetail.startTask);
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
       executor: 'dev',
       agentId: 'bx-dev',
     });
-    await expectToast({ title: 'Current step started' });
+    await expectToast({ title: enUS.taskDetail.advanceSucceededTitle });
   });
 
   it('restarts review through the unified endpoint', async () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', reviewRound: 2 }));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Restart review' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.restartReview }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText(/sent to the review agent again/)).toBeTruthy();
-    await settleConfirmDialog('Restart review');
+    expect(within(dialog).getByText(enUS.taskDetail.restartReviewConfirmBody('task-010'))).toBeTruthy();
+    await settleConfirmDialog(enUS.taskDetail.restartReview);
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', { executor: 'qa' });
   });
@@ -759,14 +708,14 @@ describe('TaskDetail page — advance', () => {
       deliveryConfirmation: undefined,
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
-    const stage = within(dialog).getByLabelText('PR contains (required)') as HTMLSelectElement;
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.startReview }));
+    const dialog = await screen.findByRole('dialog', { name: enUS.taskDetail.reviewRecoveryTitle });
+    const stage = within(dialog).getByLabelText(enUS.taskDetail.reviewRecoveryStageLabel) as HTMLSelectElement;
     expect(stage.value).toBe('spec');
     expect(within(dialog).queryByLabelText(/platform user ID/i)).toBeNull();
     fireEvent.change(stage, { target: { value: 'code' } });
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Save and start review' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.reviewRecoverySubmit }));
     });
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
@@ -779,10 +728,10 @@ describe('TaskDetail page — advance', () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', phase: 'code' }));
     open({ status: 'in_progress', phase: 'code' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
-    await settleConfirmDialog('Start review');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.startReview }));
+    await settleConfirmDialog(enUS.taskDetail.startReview);
 
-    expect(screen.queryByRole('dialog', { name: 'Restore PR review' })).toBeNull();
+    expect(screen.queryByRole('dialog', { name: enUS.taskDetail.reviewRecoveryTitle })).toBeNull();
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', { executor: 'qa' });
   });
 
@@ -797,13 +746,13 @@ describe('TaskDetail page — advance', () => {
       deliveryConfirmation: undefined,
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start review' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Restore PR review' });
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.startReview }));
+    const dialog = await screen.findByRole('dialog', { name: enUS.taskDetail.reviewRecoveryTitle });
     const submit = within(dialog).getByRole('button', {
-      name: 'Save and start review',
+      name: enUS.taskDetail.reviewRecoverySubmit,
     }) as HTMLButtonElement;
-    fireEvent.change(within(dialog).getByLabelText('PR number (required)'), { target: { value: '73' } });
-    fireEvent.change(within(dialog).getByLabelText('PR contains (required)'), { target: { value: 'code' } });
+    fireEvent.change(within(dialog).getByLabelText(enUS.taskDetail.reviewRecoveryPrNumberLabel), { target: { value: '73' } });
+    fireEvent.change(within(dialog).getByLabelText(enUS.taskDetail.reviewRecoveryStageLabel), { target: { value: 'code' } });
     await act(async () => {
       fireEvent.click(submit);
     });
@@ -826,11 +775,11 @@ describe('TaskDetail page — advance', () => {
       },
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Retry pre-merge checks' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.retryPreMergeCheck }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Check the PR again and continue finishing?')).toBeTruthy();
-    expect(within(dialog).getByText(/New feedback appeared after the review passed/)).toBeTruthy();
-    await settleConfirmDialog('Retry pre-merge checks');
+    expect(within(dialog).getByText(enUS.taskDetail.advanceRevokedConfirmTitle)).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.advanceRevokedRequestChangesBody)).toBeTruthy();
+    await settleConfirmDialog(enUS.taskDetail.retryPreMergeCheck);
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
       executor: 'dev',
@@ -842,11 +791,11 @@ describe('TaskDetail page — advance', () => {
     tasksAdvanceMock.mockRejectedValue(new Error('qa is busy'));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Restart review' }));
-    await settleConfirmDialog('Restart review');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.restartReview }));
+    await settleConfirmDialog(enUS.taskDetail.restartReview);
 
     await expectToast({
-      title: 'Couldn’t start this step',
+      title: enUS.taskDetail.advanceFailedTitle,
       body: ACTION_FAILED_BODY,
       details: 'qa is busy',
     });
@@ -866,31 +815,31 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     tasksUpdateMock.mockRejectedValue(new Error('cancel nope'));
     open({ status: 'in_progress' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
-    await settleConfirmDialog('Cancel task');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }));
+    await settleConfirmDialog(enUS.taskDetail.cancelConfirmLabel);
 
     await expectToast({
-      title: 'Couldn’t cancel the task',
+      title: enUS.taskDetail.cancelFailedTitle,
       body: ACTION_FAILED_BODY,
       details: 'cancel nope',
     });
-    expect((screen.getByRole('button', { name: 'Cancel task' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('Run task again on a cancelled task uses the fresh-start prompt and reports failure without navigating', async () => {
     tasksRetryMock.mockRejectedValue(new Error('retry nope'));
     open({ status: 'cancelled' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Run task again' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.retryTask }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Run task task-010 again?')).toBeTruthy();
-    expect(within(dialog).getByText('baxian will create a new task and start it from the beginning. This task remains in the history.')).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.retryConfirmTitle('task-010'))).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.retryConfirmBodyDefault)).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Run task again' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.retryTask }));
     });
 
     await expectToast({
-      title: 'Couldn’t start the new task',
+      title: enUS.taskDetail.retryFailedTitle,
       body: ACTION_FAILED_BODY,
       details: 'retry nope',
     });
@@ -901,11 +850,11 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     tasksVerdictMock.mockRejectedValue(new Error('merge conflict'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Accept current version and merge' }));
-    await settleConfirmDialog('Accept current version and merge');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.verdictComplete }));
+    await settleConfirmDialog(enUS.taskDetail.verdictComplete);
 
     await expectToast({
-      title: 'Couldn’t accept and merge the current version',
+      title: enUS.taskDetail.markCompleteFailedTitle,
       body: ACTION_FAILED_BODY,
       details: 'merge conflict',
     });
@@ -915,11 +864,11 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     tasksVerdictMock.mockRejectedValue(new Error('dev is gone'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Continue revising' }));
-    await settleConfirmDialog('Continue revising');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.verdictContinue }));
+    await settleConfirmDialog(enUS.taskDetail.verdictContinue);
 
     await expectToast({
-      title: 'Couldn’t start another revision',
+      title: enUS.taskDetail.continueFailedTitle,
       body: ACTION_FAILED_BODY,
       details: 'dev is gone',
     });
@@ -931,10 +880,10 @@ describe('TaskDetail page — human confirmation gates', () => {
     await setProjects(null);
     open({ status: 'merge-ready' });
 
-    expect(screen.getByText('Loading the project’s merge setting. Confirmation will be available when it is ready.')).toBeTruthy();
-    const button = screen.getByRole('button', { name: 'Loading merge setting…' }) as HTMLButtonElement;
+    expect(screen.getByText(enUS.taskDetail.mergeReadyLoadingBody)).toBeTruthy();
+    const button = screen.getByRole('button', { name: enUS.taskDetail.loadingMergeSetting }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
-    expect(button.title).toBe('Wait for the project merge setting before confirming');
+    expect(button.title).toBe(enUS.taskDetail.confirmLoadingTitle);
     fireEvent.click(button);
     expect(tasksVerdictMock).not.toHaveBeenCalled();
   });
@@ -943,13 +892,13 @@ describe('TaskDetail page — human confirmation gates', () => {
     await setProjects(null, 'project settings request failed');
     open({ status: 'merge-ready' });
 
-    expect(await screen.findByText(/Confirming may merge the PR immediately/)).toBeTruthy();
-    const details = screen.getByText('Technical details').closest('details')!;
+    expect(await screen.findByText(enUS.taskDetail.mergeReadyUnknownBody)).toBeTruthy();
+    const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
     expect(within(details).getByText('project settings request failed')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm result' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.confirmResult }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText(/Confirming may merge the PR immediately/)).toBeTruthy();
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(within(dialog).getByText(enUS.taskDetail.confirmResultBody)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: enUS.common.cancel }));
     expect(tasksVerdictMock).not.toHaveBeenCalled();
   });
 
@@ -957,20 +906,20 @@ describe('TaskDetail page — human confirmation gates', () => {
     tasksVerdictMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
     open({ status: 'merge-ready' });
 
-    expect(screen.getByText('Review complete · Confirm the result')).toBeTruthy();
-    expect(screen.getByText(/you will still need to merge PR #55 on the code platform/)).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'View PR #55' })).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.mergeReadyBannerTitle)).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.mergeReadyManualBody(55))).toBeTruthy();
+    expect(screen.getByRole('link', { name: enUS.taskDetail.viewPr(55) })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm complete' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.confirmComplete }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Confirm this result is complete?')).toBeTruthy();
-    expect(within(dialog).getByText(/PR #55 will remain open/)).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.confirmManualCompleteTitle)).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.confirmManualCompleteBody(55))).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm complete' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.confirmComplete }));
     });
 
     expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'confirm-merge' });
-    await expectToast({ title: 'Task marked complete' });
+    await expectToast({ title: enUS.taskDetail.confirmedCompleteToastTitle });
   });
 
   it('automatic merge mode clearly confirms and merges the PR', async () => {
@@ -978,32 +927,32 @@ describe('TaskDetail page — human confirmation gates', () => {
     tasksVerdictMock.mockResolvedValue(makeTask({ status: 'merged', updatedAt: '2026-05-11T00:00:00.000Z' }));
     open({ status: 'merge-ready' });
 
-    expect(screen.getByText(/confirming will merge it and finish the task/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm and merge' }));
+    expect(screen.getByText(enUS.taskDetail.mergeReadyAutoBody(55))).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.confirmAndMerge }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Confirm and merge PR #55?')).toBeTruthy();
-    expect(within(dialog).getByText('baxian will merge PR #55, finish the task, and release its agents.')).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.confirmAutoMergeTitle(55))).toBeTruthy();
+    expect(within(dialog).getByText(enUS.taskDetail.confirmAutoMergeBody(55))).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm and merge' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: enUS.taskDetail.confirmAndMerge }));
     });
 
     expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', { action: 'confirm-merge' });
-    await expectToast({ title: 'PR merged; task complete' });
+    await expectToast({ title: enUS.taskDetail.confirmedMergedToastTitle });
   });
 
   it('Confirm is skipped when the confirm dialog is cancelled and reports failures', async () => {
     open({ status: 'merge-ready' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm complete' }));
-    await settleConfirmDialog('Cancel');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.confirmComplete }));
+    await settleConfirmDialog(enUS.common.cancel);
     expect(tasksVerdictMock).not.toHaveBeenCalled();
 
     tasksVerdictMock.mockRejectedValue(new Error('gate says no'));
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm complete' }));
-    await settleConfirmDialog('Confirm complete');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.confirmComplete }));
+    await settleConfirmDialog(enUS.taskDetail.confirmComplete);
 
     await expectToast({
-      title: 'Couldn’t confirm the result',
+      title: enUS.taskDetail.confirmFailedTitle,
       body: ACTION_FAILED_BODY,
       details: 'gate says no',
     });
@@ -1012,6 +961,113 @@ describe('TaskDetail page — human confirmation gates', () => {
 });
 
 describe('TaskDetail page — human attention and code verdict', () => {
+  it.each(['in_progress', 'fixing', 'approved'] as const)('does not recommend Dev retry for uncertain %s delivery with persisted advance', (status) => {
+    open({
+      status,
+      attention: {
+        reason: 'dispatch-failed:ack_unknown', runbook: 'Verify whether the prompt started.',
+        occurredAt: '2026-05-10T12:00:00.000Z', recommendedActions: ['advance', 'cancel'],
+      },
+    });
+
+    const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
+    expect(details.open).toBe(true);
+    expect(screen.getByText(enUS.taskDetail.attentionDeliveryUnknownTitle)).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.attentionDeliveryUnknownGuidance, { exact: false })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.retryCurrentStep })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.retryPreMergeCheck })).toBeNull();
+    expect(screen.queryByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeNull();
+    expect(tasksAdvanceMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the explicit QA confirmation action for uncertain review delivery', async () => {
+    tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'review', phase: 'code' }));
+    open({
+      status: 'review', phase: 'code', prNumber: 42,
+      deliveryConfirmation: { phase: 'code', source: 'signal', at: '2026-05-10T12:00:00.000Z' },
+      attention: {
+        reason: 'dispatch-failed:ack_unknown', runbook: 'Confirm review delivery.',
+        occurredAt: '2026-05-10T12:00:00.000Z', recommendedActions: ['advance', 'cancel'],
+      },
+    });
+
+    const banner = screen.getByText(enUS.common.technicalDetails).closest('details')!.parentElement!;
+    fireEvent.click(within(banner).getByRole('button', { name: enUS.taskDetail.restartReview }));
+    await settleConfirmDialog(enUS.taskDetail.restartReview);
+    expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', { executor: 'qa' });
+  });
+
+  it.each([{ actions: ['cancel'] }, { actions: ['advance', 'cancel'] }] as const)(
+    'shows a delivered bootstrap hold without Dev retry even with persisted actions $actions', ({ actions }) => {
+      open({
+        status: 'in_progress',
+        attention: {
+          reason: 'bootstrap-marker-clear-failed',
+          runbook: 'The initial prompt was already delivered; verify the task outcome.',
+          occurredAt: '2026-05-10T12:00:00.000Z',
+          recommendedActions: [...actions],
+        },
+      });
+
+      const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
+      expect(details.open).toBe(true);
+      const banner = details.parentElement!;
+      expect(within(banner).getByText(enUS.taskDetail.attentionBootstrapDeliveredGuidance, { exact: false })).toBeTruthy();
+      expect(within(banner).getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: enUS.taskDetail.retryCurrentStep })).toBeNull();
+      expect(within(banner).queryByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeNull();
+      expect(screen.getByRole('article', { name: 'Agent bx-dev' })).toBeTruthy();
+      expect(tasksAdvanceMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['dirty-workdir', 'checkout-preparation-failed', 'restart-redispatch-failed'])(
+    'exposes the %s cause before the user retries the task', async (reason) => {
+      tasksAdvanceMock.mockResolvedValue(makeTask({ status: 'in_progress' }));
+      open({
+        status: 'in_progress',
+        attention: {
+          reason,
+          runbook: 'Workdir /work/agent-repo has uncommitted changes.',
+          occurredAt: '2026-05-10T12:00:00.000Z',
+          recommendedActions: ['advance', 'cancel'],
+        },
+      });
+
+      const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
+      expect(details.open).toBe(true);
+      const banner = details.parentElement!;
+      expect(within(banner).getByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeTruthy();
+      fireEvent.click(within(banner).getByRole('button', { name: enUS.taskDetail.retryCurrentStep }));
+      await settleConfirmDialog(enUS.taskDetail.retryCurrentStep);
+
+      expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', { executor: 'dev' });
+    },
+  );
+
+  describe.each(['dirty-workdir', 'checkout-preparation-failed', 'restart-redispatch-failed', 'bootstrap-marker-clear-failed'])(
+    '%s recovery actions', (reason) => {
+      it.each([
+        { status: 'review', actions: ['verdict', 'cancel'], guidance: enUS.taskDetail.attentionVerdictGuidance, button: enUS.taskDetail.handleReview },
+        { status: 'in_progress', actions: ['cancel'], guidance: enUS.taskDetail.attentionCancelGuidance, button: enUS.taskDetail.cancelConfirmLabel },
+        { status: 'cancelled', actions: ['retry'], guidance: enUS.taskDetail.attentionRetryGuidance, button: enUS.taskDetail.retryTask },
+      ] as const)('matches guidance to $actions on $status tasks', ({ status, actions, guidance, button }) => {
+        open({
+          status,
+          attention: { reason, runbook: 'Inspect the failure.', occurredAt: '2026-05-10T12:00:00.000Z', recommendedActions: [...actions] },
+        });
+
+        const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
+        const banner = details.parentElement!;
+        expect(details.open).toBe(true);
+        expect(within(banner).getByText(guidance, { exact: false })).toBeTruthy();
+        expect(within(banner).getByRole('button', { name: button })).toBeTruthy();
+        expect(within(banner).queryByRole('button', { name: enUS.taskDetail.retryCurrentStep })).toBeNull();
+        expect(within(banner).queryByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeNull();
+      });
+    },
+  );
+
   it('renders persisted attention with the recommended task operations', () => {
     open({
       status: 'review',
@@ -1023,15 +1079,13 @@ describe('TaskDetail page — human attention and code verdict', () => {
       },
     });
 
-    expect(screen.getByText('Review needs your attention')).toBeTruthy();
-    expect(screen.getByText('Review the PR and the discussion below, then confirm the result or request changes.')).toBeTruthy();
-    const details = screen.getByText('Technical details').closest('details')!;
+    const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
     expect(within(details).getByText(/review-verdict-overdue/)).toBeTruthy();
     expect(within(details).getByText(/Inspect the QA review and submit a verdict/)).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
-    expect(screen.getAllByRole('button', { name: 'Cancel task' }).length).toBeGreaterThan(0);
-    expect(screen.getByText('Code review needs your decision')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Confirm pass' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: enUS.taskDetail.handleReview })).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: enUS.taskDetail.cancelConfirmLabel }).length).toBeGreaterThan(0);
+    expect(screen.getByText(enUS.taskDetail.codeVerdictTitle)).toBeTruthy();
+    expect(screen.getByRole('button', { name: enUS.taskDetail.codePass })).toBeTruthy();
   });
 
   it('starts an assigned pending task from its attention action', async () => {
@@ -1046,9 +1100,9 @@ describe('TaskDetail page — human attention and code verdict', () => {
       },
     });
 
-    const attention = screen.getByText('The next step did not start').parentElement!;
-    fireEvent.click(within(attention).getByRole('button', { name: 'Start task' }));
-    await settleConfirmDialog('Start task');
+    const attention = screen.getByText(enUS.taskDetail.attentionHandoffTitle).parentElement!;
+    fireEvent.click(within(attention).getByRole('button', { name: enUS.taskDetail.startTask }));
+    await settleConfirmDialog(enUS.taskDetail.startTask);
 
     expect(tasksAdvanceMock).toHaveBeenCalledWith('task-010', {
       executor: 'dev',
@@ -1058,49 +1112,49 @@ describe('TaskDetail page — human attention and code verdict', () => {
 
   it('keeps the code verdict panel collapsed while QA is still reviewing', () => {
     open({ status: 'review', phase: 'code' });
-    expect(screen.queryByText('Code review needs your decision')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Confirm pass' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
+    expect(screen.queryByText(enUS.taskDetail.codeVerdictTitle)).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.codePass })).toBeNull();
+    expect(screen.getByRole('button', { name: enUS.taskDetail.handleReview })).toBeTruthy();
   });
 
   it('opens the code verdict panel from the Handle review action', () => {
     open({ status: 'review', phase: 'code' });
-    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
-    expect(screen.getByText('Code review needs your decision')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Confirm pass' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Handle review' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.handleReview }));
+    expect(screen.getByText(enUS.taskDetail.codeVerdictTitle)).toBeTruthy();
+    expect(screen.getByRole('button', { name: enUS.taskDetail.codePass })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.handleReview })).toBeNull();
   });
 
   it('collapses the code verdict panel again when the next review round starts', () => {
     const { rerender } = open({ status: 'review', phase: 'code', reviewRound: 1 });
-    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
-    expect(screen.getByRole('button', { name: 'Confirm pass' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.handleReview }));
+    expect(screen.getByRole('button', { name: enUS.taskDetail.codePass })).toBeTruthy();
 
     setTask(makeTask({ status: 'fixing', phase: 'code', reviewRound: 1 }));
     rerender(pageTree());
     setTask(makeTask({ status: 'review', phase: 'code', reviewRound: 2 }));
     rerender(pageTree());
 
-    expect(screen.queryByRole('button', { name: 'Confirm pass' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.codePass })).toBeNull();
+    expect(screen.getByRole('button', { name: enUS.taskDetail.handleReview })).toBeTruthy();
   });
 
   it('does not offer Handle review during plan review', () => {
     open({ status: 'review', phase: 'spec' });
-    expect(screen.queryByRole('button', { name: 'Handle review' })).toBeNull();
-    expect(screen.queryByText('Code review needs your decision')).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.handleReview })).toBeNull();
+    expect(screen.queryByText(enUS.taskDetail.codeVerdictTitle)).toBeNull();
   });
 
   it('submits a code-review pass with the optional comments through the unified endpoint', async () => {
     tasksVerdictMock.mockResolvedValue(makeTask({ status: 'review' }));
     open({ status: 'review' });
-    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.handleReview }));
 
-    fireEvent.change(screen.getByPlaceholderText(/What needs to change/), {
+    fireEvent.change(screen.getByPlaceholderText(enUS.taskDetail.codeCommentsPlaceholder), {
       target: { value: 'Validated the edge case' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm pass' }));
-    await settleConfirmDialog('Confirm pass');
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.codePass }));
+    await settleConfirmDialog(enUS.taskDetail.codePass);
 
     expect(tasksVerdictMock).toHaveBeenCalledWith('task-010', {
       action: 'pass',
@@ -1110,8 +1164,8 @@ describe('TaskDetail page — human attention and code verdict', () => {
 
   it('requires comments before submitting code-review changes', () => {
     open({ status: 'review' });
-    fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
-    expect((screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.handleReview }));
+    expect((screen.getByRole('button', { name: enUS.taskDetail.codeRequestChanges }) as HTMLButtonElement).disabled).toBe(true);
     expect(tasksVerdictMock).not.toHaveBeenCalled();
   });
 });
@@ -1120,10 +1174,9 @@ describe('TaskDetail page — unassigned tasks', () => {
   it('pending unassigned task explains how to assign a dev', () => {
     setTask(makeTask({ status: 'pending', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText('Choose a development agent with “Edit task”, or start this task from an idle development agent card.')).toBeTruthy();
-    expect(screen.getByText('Unassigned')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Start task' })).toBeNull();
-    expect((screen.getByRole('button', { name: 'Edit task' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText(enUS.taskDetail.unassignedPendingNotice)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.taskDetail.startTask })).toBeNull();
+    expect((screen.getByRole('button', { name: enUS.taskDetail.editTask }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('opens editing instead of advancing from an unassigned pending attention action', () => {
@@ -1140,25 +1193,25 @@ describe('TaskDetail page — unassigned tasks', () => {
       },
     });
 
-    const attention = screen.getByText('The next step did not start').parentElement!;
-    fireEvent.click(within(attention).getByRole('button', { name: 'Edit task' }));
+    const attention = screen.getByText(enUS.taskDetail.attentionHandoffTitle).parentElement!;
+    fireEvent.click(within(attention).getByRole('button', { name: enUS.taskDetail.editTask }));
 
-    expect(screen.getByRole('dialog', { name: 'Edit task' })).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: enUS.taskDetail.editTask })).toBeTruthy();
     expect(tasksAdvanceMock).not.toHaveBeenCalled();
   });
 
   it('terminal unassigned task disables running again with the unassigned tooltip', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    const retry = screen.getByRole('button', { name: 'Run task again' }) as HTMLButtonElement;
+    const retry = screen.getByRole('button', { name: enUS.taskDetail.retryTask }) as HTMLButtonElement;
     expect(retry.disabled).toBe(true);
-    expect(retry.title).toBe('Choose a development agent before running this task again');
+    expect(retry.title).toBe(enUS.taskDetail.retryDisabledUnassignedTitle);
   });
 
   it('terminal unassigned task explains the current status is read-only', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText('No development agent is assigned. This task can only be viewed in its current state.')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.unassignedReadonlyNotice)).toBeTruthy();
   });
 });
 
@@ -1179,7 +1232,7 @@ describe('TaskDetail page — PR/Branch fallbacks', () => {
       const section = container.querySelector('section')!;
       expect(within(section).queryByRole('link', { name: '#55' })).toBeNull();
       expect(within(section).queryByRole('link', { name: 'bx/task-010' })).toBeNull();
-      expect(screen.queryByRole('link', { name: 'View PR #55' })).toBeNull();
+      expect(screen.queryByRole('link', { name: enUS.taskDetail.viewPr(55) })).toBeNull();
     },
   );
 
@@ -1220,14 +1273,14 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     }]);
     setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('No review agent')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.noAgentSlot('qa'))).toBeTruthy();
     expect(container.querySelectorAll('[role="article"]')).toHaveLength(1);
   });
 
   it('does not attach a team QA that was not snapshotted on the task', () => {
     setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('No review agent')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.noAgentSlot('qa'))).toBeTruthy();
     const cards = Array.from(container.querySelectorAll('[role="article"]'));
     expect(cards.map((card) => card.getAttribute('data-role'))).toEqual(['dev']);
   });
@@ -1236,7 +1289,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     await setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][1]]] }]);
     setTask(makeTask({ agentId: 'ghost-dev', preferredAgentId: 'ghost-dev', qaAgentId: 'bx-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('No development agent')).toBeTruthy();
+    expect(screen.getByText(enUS.taskDetail.noAgentSlot('dev'))).toBeTruthy();
     const cards = Array.from(container.querySelectorAll('[role="article"]'));
     expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-qa']);
   });

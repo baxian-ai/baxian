@@ -21,10 +21,6 @@ export interface AgentSnapshotCtx {
     latestBootstrapByAgent: () => Promise<Map<string, ErrorRecord>>;
     toSummary: (record: ErrorRecord) => AgentErrorSummary;
   };
-  petStore?: {
-    listAssignments: () => Promise<Record<string, string>>;
-    getAssignment: (agentId: string) => Promise<string | null>;
-  };
 }
 
 const WORKING_TASK_STATUSES = new Set<TaskState['status']>(['in_progress', 'fixing']);
@@ -38,7 +34,6 @@ export function agentSnapshot(
   tmuxObservation: TmuxSessionObservation,
   task: TaskState | undefined,
   latestBootstrapError?: AgentErrorSummary,
-  petId?: string,
 ): AgentSnapshot {
   const runtimeStatus = deriveRuntimeStatus(binding, tmuxObservation, task);
   const suppressPendingIdle = shouldGatePendingIdle(tmuxObservation, task, binding?.id);
@@ -55,7 +50,6 @@ export function agentSnapshot(
     ...(showBootstrapError ? { latestBootstrapError } : {}),
     ...(!suppressPendingIdle && tmuxObservation.reason ? { reason: tmuxObservation.reason } : {}),
     ...(!suppressPendingIdle && tmuxObservation.message ? { message: tmuxObservation.message } : {}),
-    ...(petId ? { petId } : {}),
   };
 }
 
@@ -148,31 +142,10 @@ async function loadLatestBootstrapByAgent(
   }
 }
 
-async function loadPetAssignments(ctx: AgentSnapshotCtx): Promise<Record<string, string>> {
-  if (!ctx.petStore) return {};
-  try {
-    return await ctx.petStore.listAssignments();
-  } catch (err) {
-    console.warn('[snapshot] failed to load pet assignments:', err);
-    return {};
-  }
-}
-
-async function loadPetAssignment(ctx: AgentSnapshotCtx, agentId: string): Promise<string | undefined> {
-  if (!ctx.petStore) return undefined;
-  try {
-    return (await ctx.petStore.getAssignment(agentId)) ?? undefined;
-  } catch (err) {
-    console.warn(`[snapshot] failed to load pet assignment for ${agentId}:`, err);
-    return undefined;
-  }
-}
-
 export async function buildAllAgentSnapshots(ctx: AgentSnapshotCtx): Promise<AgentSnapshot[]> {
-  const [bindings, bootstrapErrorsByAgent, petAssignments] = await Promise.all([
+  const [bindings, bootstrapErrorsByAgent] = await Promise.all([
     ctx.agentStore.list(),
     loadLatestBootstrapByAgent(ctx),
-    loadPetAssignments(ctx),
   ]);
   const bindingByAgentId = new Map(bindings.map((s) => [s.id, s]));
   return Promise.all(ctx.agentManager.listAgents().map(async (configured) => {
@@ -184,7 +157,6 @@ export async function buildAllAgentSnapshots(ctx: AgentSnapshotCtx): Promise<Age
       ctx.tmuxSessionStatusStore.get(configured.id),
       task ?? undefined,
       bootstrapErrorsByAgent.get(configured.id),
-      petAssignments[configured.id],
     );
   }));
 }
@@ -195,10 +167,9 @@ export async function buildAgentSnapshotById(
 ): Promise<AgentSnapshot | null> {
   const configured = ctx.agentManager.getAgentConfig(id);
   if (!configured) return null;
-  const [binding, latestBootstrapError, petId] = await Promise.all([
+  const [binding, latestBootstrapError] = await Promise.all([
     ctx.agentStore.get(id),
     loadLatestBootstrapError(ctx, id),
-    loadPetAssignment(ctx, id),
   ]);
   const task = binding?.taskId ? await ctx.taskStore.get(binding.taskId) : null;
   return agentSnapshot(
@@ -207,6 +178,5 @@ export async function buildAgentSnapshotById(
     ctx.tmuxSessionStatusStore.get(id),
     task ?? undefined,
     latestBootstrapError,
-    petId,
   );
 }

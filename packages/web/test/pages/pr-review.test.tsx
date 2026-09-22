@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
@@ -49,11 +50,11 @@ describe('PrReviewPage', () => {
     ghMock.mockResolvedValue(data);
     renderAt('/tasks/task-1/pr-review');
 
-    expect((await screen.findByText('View PR #7')).getAttribute('href'))
+    expect((await screen.findByText(enUS.taskDetail.viewPr(7))).getAttribute('href'))
       .toBe('https://github.com/user/repo/pull/7');
     expect(screen.getByText('My Task')).toBeTruthy();
-    expect(screen.getByText('Round 1')).toBeTruthy();
-    expect(screen.getByText('Round 2')).toBeTruthy();
+    expect(screen.getByText(enUS.agents.round(1))).toBeTruthy();
+    expect(screen.getByText(enUS.agents.round(2))).toBeTruthy();
     expect(screen.getByText('a.ts:12')).toBeTruthy();
     expect(screen.getByText('nit')).toBeTruthy();
     expect(screen.getByText('fix: thing')).toBeTruthy();
@@ -83,8 +84,8 @@ describe('PrReviewPage', () => {
 
     renderAt('/tasks/task-1/pr-review');
 
-    expect(await screen.findByText('Plan review')).toBeTruthy();
-    expect(screen.queryByText('Code review')).toBeNull();
+    expect(await screen.findByText(enUS.prReview.specReviewHeading)).toBeTruthy();
+    expect(screen.queryByText(enUS.prReview.codeReviewHeading)).toBeNull();
   });
 
   it('does not create a link for a non-HTTP PR URL supplied by the API', async () => {
@@ -99,7 +100,7 @@ describe('PrReviewPage', () => {
     renderAt('/tasks/task-1/pr-review');
 
     await screen.findByText('loaded comment');
-    expect(screen.queryByRole('link', { name: 'View PR #7' })).toBeNull();
+    expect(screen.queryByRole('link', { name: enUS.taskDetail.viewPr(7) })).toBeNull();
   });
 
   it('renders a ghost placeholder for author-less comments, replies, and reviews', async () => {
@@ -114,7 +115,7 @@ describe('PrReviewPage', () => {
     } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
     expect(await screen.findByText('orphan comment')).toBeTruthy();
-    expect(screen.getAllByText('ghost (deleted account)')).toHaveLength(3);
+    expect(screen.getAllByText(enUS.prReview.ghostAuthor)).toHaveLength(3);
   });
 
   it('anchors every item card with a stable DOM id', async () => {
@@ -239,20 +240,20 @@ describe('PrReviewPage', () => {
   it('reports truncation instead of an empty review state when the budget dropped everything', async () => {
     ghMock.mockResolvedValue({ available: true, prNumber: 7, truncated: true, items: [] } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
-    expect(await screen.findByText(/too many comments/)).toBeTruthy();
-    expect(screen.queryByText('Review has not started')).toBeNull();
+    expect(await screen.findByText(enUS.prReview.listTruncated)).toBeTruthy();
+    expect(screen.queryByText(enUS.review.notStarted)).toBeNull();
   });
 
   it('shows a reason message when records are unavailable', async () => {
     ghMock.mockResolvedValue({ available: false, reason: 'no-pr', items: [] } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
-    expect(await screen.findByText(/does not have a PR yet/)).toBeTruthy();
+    expect(await screen.findByText(enUS.prReview.reasonNoPr)).toBeTruthy();
   });
 
   it('shows an empty state when the conversation has no items', async () => {
     ghMock.mockResolvedValue({ available: true, prNumber: 7, items: [] } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
-    expect(await screen.findByText('Review has not started')).toBeTruthy();
+    expect(await screen.findByText(enUS.review.notStarted)).toBeTruthy();
   });
 
   it('shows a degradation hint (not "Review has not started") when all sources failed with no items', async () => {
@@ -263,8 +264,8 @@ describe('PrReviewPage', () => {
       items: [],
     } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
-    expect(await screen.findByText(/Failed to fetch review records: reviews: gh: not found/)).toBeTruthy();
-    expect(screen.queryByText('Review has not started')).toBeNull();
+    expect(await screen.findByText(enUS.prReview.fetchFailed('reviews: gh: not found'))).toBeTruthy();
+    expect(screen.queryByText(enUS.review.notStarted)).toBeNull();
   });
 
   it('shows a partial-failure banner but still renders fetched items', async () => {
@@ -275,13 +276,13 @@ describe('PrReviewPage', () => {
       items: [{ kind: 'issue-comment', id: 'c1', body: 'fix', createdAt: '2026-06-01T10:00:00Z' }],
     } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
-    expect(await screen.findByText(/Some review records failed to fetch/)).toBeTruthy();
+    expect(await screen.findByText(enUS.prReview.partialFetchFailed('reviews: rate limited'))).toBeTruthy();
     expect(screen.getByText('fix')).toBeTruthy();
   });
 
   it('renders a load error', async () => {
     ghMock.mockRejectedValue(new Error('network down'));
     renderAt('/tasks/task-1/pr-review');
-    expect(await screen.findByText(/Failed to load review records: network down/)).toBeTruthy();
+    expect(await screen.findByText(enUS.review.loadFailed('network down'))).toBeTruthy();
   });
 });

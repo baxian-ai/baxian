@@ -810,6 +810,64 @@ describe('manual context command latency and failure boundaries', () => {
     }
   });
 
+  // 回车送到 tmux 不等于被 runtime 收下:补全弹窗/vim Normal 模式会吃掉它
+  it.each(['compactAgent', 'clearAgent'] as const)('%s reports a swallowed Enter as unknown instead of success', async method => {
+    const command = method === 'compactAgent' ? '/compact' : '/clear';
+    useRunner({
+      agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } },
+      rules: [{ match: cmd => cmd.includes("'Enter'"), reply: { enter: 'swallowed' } }],
+    });
+    await seedLiveAgent('qa-1', '%1');
+
+    await expect(harness.manager[method]('qa-1')).rejects.toMatchObject({
+      status: 504,
+      message: expect.stringContaining(`${command} execution outcome unknown`),
+    });
+
+    // runtime 没进 working = 命令没被收下;草稿被 C-u 清掉,不会和下一次写拼在一起
+    expect(runner.sessions.pane('qa-1')).toMatchObject({ phase: 'idle', composer: '' });
+    expect(cmds().filter(cmd => isLiteral(cmd, command))).toHaveLength(1);
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe(method === 'clearAgent' ? '' : 'task-7');
+
+    await waitGuardFree('qa-1');
+  }, 15_000);
+
+  // 回车已经 applied:读帧断线不能按"确定未提交"收尾,/clear 可能真的执行了
+  it('keeps a dropped read after the applied Enter as unknown, and leaves the context marker cleared', async () => {
+    let entered = false;
+    useRunner({
+      agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } },
+      rules: [{ match: cmd => entered && cmd.includes('cursor_x'), reply: () => { throw new Error('ssh: connection reset'); } }],
+    });
+    onExec = cmd => { if (cmd.includes("'Enter'")) entered = true; };
+    await seedLiveAgent('qa-1', '%1');
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 504,
+      message: expect.stringContaining('/clear execution outcome unknown'),
+    });
+
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('');
+  }, 15_000);
+
+  // runtime 在消费回车之前换了前台:/clear 的下场无从判定,标记不能还原
+  it('reports a foreground change after the applied Enter as unknown, and leaves the context marker cleared', async () => {
+    let entered = false;
+    useRunner({ agents: { 'qa-1': { options: { [CONTEXT_OPTION]: 'task-7' } } } });
+    onExec = cmd => {
+      if (cmd.includes("'Enter'")) { entered = true; return; }
+      if (entered && cmd.includes('cursor_x')) runner.sessions.setProcess('qa-1', 'vim');
+    };
+    await seedLiveAgent('qa-1', '%1');
+
+    await expect(harness.manager.clearAgent('qa-1')).rejects.toMatchObject({
+      status: 504,
+      message: expect.stringContaining('/clear execution outcome unknown'),
+    });
+
+    expect(runner.sessions.option('qa-1', CONTEXT_OPTION)).toBe('');
+  }, 15_000);
+
   it.each(['applied-lost', 'not-applied-lost'] as const)('reports %s submission as unknown without resending, retaining the guard during observation', async outcome => {
     useRunner({ rules: [{ match: cmd => isLiteral(cmd, '/clear'), reply: { outcome } }] });
     await seedLiveAgent('qa-1', '%1');

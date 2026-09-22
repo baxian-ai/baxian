@@ -513,6 +513,36 @@ function cancelPhaseDowngrades(prev: string | undefined, next: string): boolean 
 
 const REGREET_REQUIRED_HOLD_PHASES = new Set<string>(['greeting_failed']);
 
+const TASK_REPLAY_FAILED_RUNBOOK =
+  'Resolve the cause, then retry the current step from the task page. '
+  + 'If the task branch was never created, cancel the task and run it again. '
+  + 'Resume does not resend the task prompt.';
+
+const DELIVERED_BOOTSTRAP_RUNBOOK =
+  'The initial prompt was already delivered; replaying would dispatch the task twice. '
+  + 'Verify the task outcome in the terminal, or cancel the task.';
+
+const PROMPT_MAYBE_RUNNING_PHASES = new Set([
+  'dispatch-failed:ack_unknown',
+  'dev-wait-gate-failed-after-qa-started',
+]);
+
+function taskReplayFailure(error: unknown): { phase: string; reason: string } {
+  const dirty = error instanceof DirtyWorkdirError;
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof DispatchTerminalError && error.reason === 'ack_unknown') {
+    return {
+      phase: 'dispatch-failed:ack_unknown',
+      reason: `Task prompt delivery requires verification: ${message}. The prompt may already be running. Verify the task outcome in the terminal, or cancel the task.`,
+    };
+  }
+  const preparation = dirty ? 'Save the Workdir changes by committing or stashing them first. ' : '';
+  return {
+    phase: dirty ? 'dirty-workdir' : 'restart-redispatch-failed',
+    reason: `Task prompt replay failed: ${message}. ${preparation}${TASK_REPLAY_FAILED_RUNBOOK}`,
+  };
+}
+
 const RECOVERY_FAILED_AGENT_RUNBOOK =
   'Fix the agent Workdir (or wait for the transient failure to clear), then Resume the agent.';
 const RECOVERY_FAILED_TASK_RUNBOOK =
@@ -3433,18 +3463,29 @@ export class AgentManager {
         return { resumed: false, releasedBinding: false, reason };
       }
       const boundTask = state.taskId ? await this.taskStore.get(state.taskId) : null;
-      const PROMPT_MAYBE_RUNNING_PHASES = new Set([
-        'dispatch-failed:ack_unknown',
-        'dev-wait-gate-failed-after-qa-started',
-      ]);
+      if (boundTask && (
+        (state.awaitingPhase === 'restart-redispatch-failed'
+          && (boundTask.status === 'in_progress' || boundTask.status === 'fixing' || boundTask.status === 'approved'))
+        || (state.awaitingPhase === 'bootstrap-marker-clear-failed' && boundTask.status === 'in_progress')
+      )) {
+        const runbook = state.awaitingPhase === 'bootstrap-marker-clear-failed'
+          ? DELIVERED_BOOTSTRAP_RUNBOOK : TASK_REPLAY_FAILED_RUNBOOK;
+        const reason = `Resume is blocked for active task ${boundTask.id} (${state.awaitingPhase}). ${runbook}`;
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
+      }
       if (
         state.awaitingPhase != null
         && PROMPT_MAYBE_RUNNING_PHASES.has(state.awaitingPhase)
         && boundTask && ACTIVE_TASK_STATUSES.has(boundTask.status)
+        && !(state.awaitingPhase === 'dispatch-failed:ack_unknown'
+          && boundTask.devAgentId === agentId && boundTask.qaAgentId !== agentId
+          && ['spec-ready', 'review', 'merge-ready', 'max_rounds'].includes(boundTask.status))
       ) {
         const uncertainRecovery = state.awaitingPhase === 'dispatch-failed:ack_unknown'
+          && boundTask.status === 'review' && boundTask.qaAgentId === agentId
           ? ' Confirm the uncertain review dispatch as not delivered, cancel the task,'
-          : ` Cancel task ${state.taskId}`;
+          : ` Verify the task outcome in the terminal, cancel task ${state.taskId},`;
         const reason = `Prompt may still be running (${state.awaitingPhase}); Resume is blocked until the task outcome arrives.${uncertainRecovery} or DELETE the agent to recover.`;
         console.warn(`[AgentManager] resumeAgent: agent ${agentId} — ${reason}`);
         return { resumed: false, releasedBinding: false, reason };
@@ -4257,7 +4298,9 @@ export class AgentManager {
     await tmux.clearComposerDraft(pane, runtime);
     // 退出文本与 Enter 分两次守卫写:前台在两者之间换了进程,回车就不发,/exit 留在草稿里等下一次清稿,而不会打进 shell 或别的进程
     try {
-      if (!await this.reachedRuntime(() => tmux.submitToRuntime(pane, runtime, REPL_EXIT_COMMAND[cfg.runtime]))) return;
+      if (!await this.reachedRuntime(() => tmux.submitToRuntime(
+        pane, runtime, REPL_EXIT_COMMAND[cfg.runtime], { expectRuntimeExit: true },
+      ))) return;
     } catch (err) {
       if (!(err instanceof TmuxOutcomeUnknownError)) throw err;
       console.warn(`[AgentManager] restart-repl: exit outcome unknown for ${cfg.id}; checking for shell before relaunch`, err);
@@ -4461,7 +4504,7 @@ export class AgentManager {
     expectedKinds: readonly PhaseSignalKind[];
     rotateUnderTaskLock: (newToken: string) => Promise<boolean>;
     stillCurrent: (newToken: string) => Promise<boolean>;
-    holdFailure: (newToken: string, reason: string) => Promise<boolean>;
+    holdFailure: (newToken: string, phase: string, reason: string) => Promise<boolean>;
     continueWith: (
       newToken: string,
       fence: Pick<ContinueSessionOpts, 'armBeforeInject' | 'guardBeforeInject'>,
@@ -4501,10 +4544,8 @@ export class AgentManager {
       releaseClaimOnce();
       if (!armed) retireOldOnce();
       if (!(await args.stillCurrent(newToken))) return false;
-      const held = await args.holdFailure(
-        newToken,
-        `REPL restarted but replaying the task prompt failed: ${err.message}. Resume to retry, or cancel the task.`,
-      );
+      const failure = taskReplayFailure(err);
+      const held = await args.holdFailure(newToken, failure.phase, failure.reason);
       if (held) return true;
       if (!(await args.stillCurrent(newToken))) return false;
       throw err;
@@ -4560,7 +4601,15 @@ export class AgentManager {
 
       const resumed = await args.continueWith(newToken, fence);
       if (resumed) {
-        await args.afterDelivered?.(newToken);
+        try {
+          await args.afterDelivered?.(newToken);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new DispatchTerminalError(
+            'ack_unknown',
+            `The prompt for task ${taskId} was already delivered, but saving its delivery status failed: ${message}`,
+          );
+        }
         return true;
       }
       releaseClaimOnce();
@@ -4618,6 +4667,9 @@ export class AgentManager {
       );
 
     try {
+      const mapped = this.mapTaskStateToExpectedWatcher(task);
+      if (entryHold.phase && PROMPT_MAYBE_RUNNING_PHASES.has(entryHold.phase)
+        && ((task.status === 'approved' && agent.role === 'dev') || mapped?.agentId === agentId)) return true;
       if (task.status === 'approved' && agent.role === 'dev') {
         return await this.replayApprovedHolderAfterReplRestart(
           agentId,
@@ -4627,12 +4679,11 @@ export class AgentManager {
         );
       }
 
-      const mapped = this.mapTaskStateToExpectedWatcher(task);
       if (!mapped || mapped.agentId !== agentId) return false;
       if (!task.signalToken) {
         return await holdReplayFailure(
           'restart-redispatch-failed',
-          'REPL restarted mid-pass but the task has no signal token to replay the prompt with; cancel the task or re-dispatch it.',
+          'The task has no signal token to replay its prompt with; cancel the task and run it again.',
         );
       }
       const signalToken = task.signalToken;
@@ -4661,10 +4712,10 @@ export class AgentManager {
           return true;
         },
         stillCurrent: taskStillCurrent,
-        holdFailure: (newToken, reason) => this.holdReplayFailureIfCurrent(
+        holdFailure: (newToken, phase, reason) => this.holdReplayFailureIfCurrent(
           agentId,
           { ...task, signalToken: newToken },
-          'restart-redispatch-failed',
+          phase,
           reason,
           entryHold,
         ),
@@ -4682,8 +4733,8 @@ export class AgentManager {
       ): Promise<boolean> => {
         if (entryHold.phase === 'bootstrap-marker-clear-failed') {
           return holdReplayFailure(
-            'restart-redispatch-failed',
-            'REPL restarted while the initial prompt was already delivered (its bootstrap marker clear had failed); replaying would dispatch the task twice. Resume and verify the Workdir, or cancel the task.',
+            'bootstrap-marker-clear-failed',
+            DELIVERED_BOOTSTRAP_RUNBOOK,
           );
         }
         const bindingBefore = await this.agentStore.get(agentId);
@@ -4732,11 +4783,8 @@ export class AgentManager {
 
       return false;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (await holdReplayFailure(
-        'restart-redispatch-failed',
-        `REPL restarted but replaying the task prompt failed: ${message}. Resume to retry, or cancel the task.`,
-      )) {
+      const failure = taskReplayFailure(err);
+      if (await holdReplayFailure(failure.phase, failure.reason)) {
         return true;
       }
       throw err;
@@ -4817,10 +4865,10 @@ export class AgentManager {
         return true;
       },
       stillCurrent: completionStillCurrent,
-      holdFailure: (newToken, reason) => this.holdReplayFailureIfCurrent(
+      holdFailure: (newToken, phase, reason) => this.holdReplayFailureIfCurrent(
         agentId,
         task,
-        'restart-redispatch-failed',
+        phase,
         reason,
         entryHold,
         async (fresh) => episodeMatches(fresh) && completionTokenMatches(fresh, newToken),
@@ -5134,6 +5182,10 @@ export class AgentManager {
         recommendedActions = ['verdict', 'cancel'];
       } else {
         recommendedActions = ['advance', 'cancel'];
+      }
+      if (reason === 'bootstrap-marker-clear-failed'
+        || (reason === 'dispatch-failed:ack_unknown' && task.status !== 'review')) {
+        recommendedActions = recommendedActions.filter(action => action !== 'advance');
       }
       if (task.attention
         && Date.parse(task.attention.occurredAt) > Date.parse(occurredAt)) return;
@@ -8640,8 +8692,7 @@ export class AgentManager {
         await this.markAwaitingHuman(
           agentId,
           'bootstrap-marker-clear-failed',
-          'Prompt was delivered but clearing the in-flight bootstrap marker failed; held so recovery does ' +
-            'not re-dispatch an already-running task. Verify the agent via web terminal, then Resume.',
+          `Clearing the in-flight bootstrap marker failed. ${DELIVERED_BOOTSTRAP_RUNBOOK}`,
           { expectedTaskId: taskId },
         ).catch((holdErr) => {
           console.warn(`[AgentManager] startSession: hold after marker-clear failure for task=${taskId} failed:`, holdErr);
@@ -9343,6 +9394,7 @@ export class AgentManager {
       !state.taskId
       || state.bootstrappingTaskId !== state.taskId
       || state.awaitingPhase === 'bootstrap-marker-clear-failed'
+      || (state.awaitingPhase !== undefined && PROMPT_MAYBE_RUNNING_PHASES.has(state.awaitingPhase))
     ) {
       return false;
     }
@@ -9493,8 +9545,7 @@ export class AgentManager {
       await this.markAwaitingHuman(
         agentId,
         'bootstrap-marker-clear-failed',
-        'Prompt was replayed but clearing the in-flight bootstrap marker failed; held so recovery does ' +
-          'not roll back an already-running task. Verify the agent via web terminal, then Resume.',
+        `Clearing the in-flight bootstrap marker failed. ${DELIVERED_BOOTSTRAP_RUNBOOK}`,
         { expectedTaskId: taskId },
       ).catch((holdErr) => {
         console.warn(`[AgentManager] replay: hold after marker-clear failure for task=${taskId} failed:`, holdErr);
@@ -9675,9 +9726,11 @@ export class AgentManager {
           return {
             ...withBinding,
             status: 'awaiting_human' as const,
+            ...(latest.bootstrappingTaskId !== undefined ? { bootstrappingTaskId: latest.bootstrappingTaskId } : {}),
             ...(latest.awaitingPhase !== undefined ? { awaitingPhase: latest.awaitingPhase } : {}),
             ...(latest.awaitingReason !== undefined ? { awaitingReason: latest.awaitingReason } : {}),
             ...(latest.awaitingSince !== undefined ? { awaitingSince: latest.awaitingSince } : {}),
+            ...(latest.awaitingNonce !== undefined ? { awaitingNonce: latest.awaitingNonce } : {}),
           };
         });
         if (state.taskId && !shouldReleaseBinding && !cancelHold) {
@@ -10431,6 +10484,23 @@ export class AgentManager {
     }
   }
 
+  private async replayDevTaskForAdvance(task: TaskState): Promise<TaskState> {
+    const taskId = task.id;
+    if (!task.devAgentId) throw new ApiError(409, `Task ${taskId} has no Dev participant`);
+    const entryBinding = await this.agentStore.get(task.devAgentId);
+    if (entryBinding?.taskId === taskId && entryBinding.status === 'awaiting_human'
+      && entryBinding.awaitingPhase && PROMPT_MAYBE_RUNNING_PHASES.has(entryBinding.awaitingPhase)) {
+      throw new ApiError(409, `Task ${taskId}: Prompt may still be running (${entryBinding.awaitingPhase}). Verify the outcome in the terminal, or cancel the task.`);
+    }
+    const replayed = await this.redispatchTaskPromptAfterReplRestart(task.devAgentId, taskId);
+    if (!replayed) throw new ApiError(409, `Task ${taskId} changed or its Dev prompt could not be replayed`);
+    const binding = await this.agentStore.get(task.devAgentId);
+    if (binding?.taskId === taskId && binding.status === 'awaiting_human') {
+      throw new ApiError(409, `Task ${taskId} is blocked (${binding.awaitingPhase ?? 'awaiting_human'}): ${binding.awaitingReason ?? 'Inspect the task and its agent before retrying.'}`);
+    }
+    return (await this.taskStore.get(taskId)) ?? task;
+  }
+
   async advanceTask(taskId: string, opts: AdvanceTaskOptions = {}): Promise<TaskState> {
     let task = await this.taskStore.get(taskId);
     if (!task) throw new ApiError(404, `Task ${taskId} not found`);
@@ -10458,10 +10528,7 @@ export class AgentManager {
         'Review cannot advance to Dev without a request-changes verdict',
       );
     } else if (task.status === 'in_progress' || task.status === 'fixing') {
-      if (!task.devAgentId) throw new ApiError(409, `Task ${taskId} has no Dev participant`);
-      const replayed = await this.redispatchTaskPromptAfterReplRestart(task.devAgentId, taskId);
-      if (!replayed) throw new ApiError(409, `Task ${taskId} changed or its Dev prompt could not be replayed`);
-      updated = (await this.taskStore.get(taskId)) ?? task;
+      updated = await this.replayDevTaskForAdvance(task);
     } else if (task.status === 'approved') {
       if (!task.devAgentId) throw new ApiError(409, `Task ${taskId} has no Dev participant`);
       if (task.postApproveRevoked) {
@@ -10473,9 +10540,7 @@ export class AgentManager {
         }
         task = await this.restoreRevokedPostApprove(task);
       }
-      const replayed = await this.redispatchTaskPromptAfterReplRestart(task.devAgentId, taskId);
-      if (!replayed) throw new ApiError(409, `Task ${taskId} changed or its post-approve prompt could not be replayed`);
-      updated = (await this.taskStore.get(taskId)) ?? task;
+      updated = await this.replayDevTaskForAdvance(task);
     } else {
       throw new ApiError(409, `Task ${taskId} cannot be advanced from ${task.status}`);
     }

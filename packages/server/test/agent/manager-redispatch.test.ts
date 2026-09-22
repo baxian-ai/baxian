@@ -1,8 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { BranchManager } from '../../src/agent/branch.js';
+import { BranchManager, DirtyWorkdirError } from '../../src/agent/branch.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
 import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
 import { buildPhaseSignal, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
+import { registerEventHandlers } from '../../src/event/handlers.js';
 import type { AgentBindingFacts, AgentConfig, TaskState } from '../../src/shared/index.js';
 import type { FakeRunnerOptions } from '../helpers/fake-runner.js';
 import { createManagerSuiteRunner, useManagerSuiteHarness, workdirsOf } from '../helpers/manager-harness.js';
@@ -67,12 +68,119 @@ function watchedManager(opts: {
 }
 
 describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
+  it.each([
+    { status: 'in_progress', phase: undefined, kind: 'spec-done', eventType: 'spec.ready' },
+    { status: 'in_progress', phase: 'code', kind: 'pr-created', eventType: 'pr.created' },
+    { status: 'fixing', phase: 'code', kind: 'pr-fixed', eventType: 'pr.fix.submitted' },
+    { status: 'approved', phase: 'code', kind: 'pr-merge-ready', eventType: 'pr.updated' },
+  ] as const)('preserves uncertain $status/$phase delivery after a transient post-Enter failure', async ({ kind, eventType, ...task }) => {
+    let entered = false;
+    let dropped = false;
+    const runner = suiteRunner({
+      onExec: command => {
+        if (runner.pastedPrompts.length > 0 && /send-keys -t %0 (?:-- )?\S*Enter/.test(command)) entered = true;
+        if (entered && !dropped && command.includes('capture-pane')) {
+          dropped = true;
+          throw new Error('one-off SSH capture failure after Enter');
+        }
+      },
+    });
+    const { m, post } = watchedManager({ runner });
+    const taskId = 'task-replay-unknown';
+    await seedHolder(taskId, {
+      ...task, signalToken: 'initial-token',
+      ...(task.status === 'approved' ? {
+        postApproveGeneration: 'feedfeedfeed', postApproveHeadSha: SHA1,
+        postApproveToken: 'initial-post-token', postApprovePhase: 'installed',
+      } : {}),
+    }, task.phase === undefined ? { bootstrappingTaskId: taskId } : {});
+
+    await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', taskId)).resolves.toBe(true);
+
+    expect(dropped).toBe(true);
+    expect(runner.pastedPrompts).toHaveLength(1);
+    const held = await binding();
+    const afterReplay = await harness.taskStore.get(taskId);
+    expect(held).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown' });
+    if (task.phase === undefined) expect(held?.bootstrappingTaskId).toBe(taskId);
+    expect(held?.awaitingReason).toContain('one-off SSH capture failure after Enter');
+    expect(held?.awaitingReason).not.toContain('retry the current step');
+
+    const resumed = await m.resumeAgent('dev-1');
+    expect(resumed).toMatchObject({ resumed: false, reason: expect.stringContaining('terminal') });
+    expect(resumed.reason).not.toContain('uncertain review dispatch');
+    await expect(m.advanceTask(taskId)).rejects.toMatchObject({ status: 409, message: expect.stringContaining('Prompt may still be running') });
+
+    expect(await binding()).toEqual(held);
+    expect(await harness.taskStore.get(taskId)).toEqual(afterReplay);
+    expect(runner.pastedPrompts).toHaveLength(1);
+    const token = task.status === 'approved' ? afterReplay!.postApproveToken! : afterReplay!.signalToken!;
+    post('dev-1', frame(kind, token));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: eventType, taskId, agentId: 'dev-1' }),
+    ]));
+  });
+
+  it.each([
+    { phase: undefined, kind: 'spec-done', reviewPhase: 'spec' },
+    { phase: 'code', kind: 'pr-created', reviewPhase: 'code' },
+  ] as const)('allows recovery after late $kind proves an uncertain Dev prompt advanced', async ({ phase, kind, reviewPhase }) => {
+    let entered = false;
+    let dropped = false;
+    const runner = suiteRunner({
+      onExec: command => {
+        if (runner.pastedPrompts.length > 0 && /send-keys -t %0 (?:-- )?\S*Enter/.test(command)) entered = true;
+        if (entered && !dropped && command.includes('capture-pane')) {
+          dropped = true;
+          throw new Error('one-off SSH capture failure after Enter');
+        }
+      },
+    });
+    const { m, post } = watchedManager({ runner });
+    const taskId = 'task-late-outcome';
+    vi.spyOn(m, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, prUrl: 'https://github.com/user/repo/pull/7', headSha: SHA1,
+      branch: `bx/${taskId}`, targetBranch: 'main',
+    });
+    registerEventHandlers(harness.eventBus, m);
+    await seedHolder(taskId, { phase, signalToken: 'initial-token' }, { bootstrappingTaskId: taskId });
+    await m.redispatchTaskPromptAfterReplRestart('dev-1', taskId);
+    const held = await binding();
+    expect(held?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
+    expect(runner.pastedPrompts).toHaveLength(1);
+    await expect(m.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: false });
+
+    post('dev-1', frame(kind, (await harness.taskStore.get(taskId))!.signalToken!));
+    await vi.waitFor(() => expect(harness.events.some(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-dispatch-failed')).toBe(true));
+    const advanced = await harness.taskStore.get(taskId);
+    expect(advanced).toMatchObject({ status: 'review', phase: reviewPhase, reviewDispatch: { phase: 'pending' } });
+
+    await expect(m.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: true, releasedBinding: false });
+    expect((await harness.taskStore.get(taskId))?.signalToken).toBe(advanced?.signalToken);
+    expect(runner.pastedPrompts).toHaveLength(1);
+    await expect(m.advanceTask(taskId, { executor: 'qa' })).resolves.toMatchObject({ status: 'review' });
+    expect(runner.pastedPrompts).toHaveLength(2);
+    expect(runner.pastedPrompts[1]?.pane).toBe('%1');
+    expect((await binding())?.awaitingPhase).toBeUndefined();
+  });
+
   async function rotatedTaskToken(taskId: string, oldToken: string): Promise<string> {
     const token = (await harness.taskStore.get(taskId))?.signalToken;
     expect(token).toEqual(expect.any(String));
     expect(token).not.toBe(oldToken);
     return token!;
   }
+
+  it.each(['spec-ready', 'merge-ready', 'max_rounds'] as const)('does not replay a task awaiting a %s decision', async (status) => {
+    await seedHolder('task-human-gate', { status, signalToken: 'gate-token' });
+
+    expect(await harness.manager.redispatchTaskPromptAfterReplRestart('dev-1', 'task-human-gate')).toBe(false);
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect((await harness.taskStore.get('task-human-gate'))?.signalToken).toBe('gate-token');
+    expect((await binding())?.awaitingPhase).toBeUndefined();
+  });
 
   it.each([
     ['spec-done', 'spec.ready'],
@@ -245,6 +353,40 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     )).toBe(true);
   });
 
+  it('preserves a dirty bootstrap hold on Resume and delivers through Advance after the workdir is fixed', async () => {
+    const taskId = 'task-dirty-bootstrap';
+    const m = harness.manager;
+    await seedHolder(taskId, { signalToken: 'dirty-bootstrap-token' }, { bootstrappingTaskId: taskId });
+    const error = new DirtyWorkdirError((await binding())!.workdir!);
+    vi.mocked(BranchManager.prototype.assertClean).mockRejectedValueOnce(error);
+
+    await expect(m.advanceTask(taskId)).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining(error.message),
+    });
+    expect(harness.events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+
+    const held = await binding();
+    expect(held).toMatchObject({
+      status: 'awaiting_human',
+      awaitingPhase: 'dirty-workdir',
+      bootstrappingTaskId: taskId,
+    });
+    expect(held?.awaitingReason).toContain(error.message);
+    expect(held?.awaitingReason).toMatch(/commit.*stash/);
+    expect(harness.runner.pastedPrompts).toEqual([]);
+
+    await expect(m.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: false, releasedBinding: false });
+    expect(await binding()).toEqual(held);
+    expect(harness.runner.pastedPrompts).toEqual([]);
+
+    await m.advanceTask(taskId);
+
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
+    expect((await binding())?.status).toBeUndefined();
+    expect((await binding())?.bootstrappingTaskId).toBeUndefined();
+    expect(harness.events.some(e => e.type === 'session.started' && e.taskId === taskId)).toBe(true);
+  });
+
   it('keeps the bootstrap marker and holds the rotated pass when the replay is not delivered', async () => {
     let handedOff = false;
     // 会话探测期间绑定换手(lockToken 被继任者改写):continueSession 在 ensure 之后放弃投递
@@ -295,9 +437,9 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     }
   });
 
-  it('does not replay a delivered bootstrap held on a failed marker clear', async () => {
+  it.each([undefined, 'code'] as const)('does not replay a delivered bootstrap after repeated retries (phase=%s)', async (phase) => {
     const m = harness.manager;
-    await seedHolder('task-boot-delivered', { signalToken: 'boot-token-3' }, {
+    await seedHolder('task-boot-delivered', { phase, signalToken: 'boot-token-3' }, {
       bootstrappingTaskId: 'task-boot-delivered',
       status: 'awaiting_human',
       awaitingPhase: 'bootstrap-marker-clear-failed',
@@ -305,13 +447,17 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       awaitingSince: NOW,
     });
 
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-boot-delivered')).toBe(true);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-boot-delivered')).toBe(true);
+    }
 
     expect(harness.runner.pastedPrompts).toEqual([]);
     expect(harness.runner.exec.mock.calls.some(c => (c[0] as string).includes('tmux'))).toBe(false);
     const state = await binding();
     expect(state?.status).toBe('awaiting_human');
-    expect(state?.awaitingPhase).toBe('restart-redispatch-failed');
+    expect(state?.awaitingPhase).toBe('bootstrap-marker-clear-failed');
+    expect(state?.bootstrappingTaskId).toBe('task-boot-delivered');
+    expect((await harness.taskStore.get('task-boot-delivered'))?.signalToken).toBe('boot-token-3');
     expect(state?.awaitingReason).toMatch(/already delivered/);
   });
 
@@ -366,6 +512,53 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     post('dev-1', buildPhaseSignal('pr-merge-ready', task!.postApproveToken!));
     await vi.waitFor(() => expect(signalEvents()).toEqual([
       expect.objectContaining({ type: 'pr.updated', taskId: 'task-postapprove-git-restart' }),
+    ]));
+  });
+
+  it.each([false, true])('does not replay a delivered post-approve prompt when its delivery write fails (persisted=%s)', async (persisted) => {
+    const taskId = 'task-delivered-write-failed';
+    const { m, post } = watchedManager();
+    await seedHolder(taskId, {
+      status: 'approved', phase: 'code', signalToken: 'task-token',
+      postApproveGeneration: 'feedfeedfeed', postApproveHeadSha: SHA1,
+      postApproveToken: 'old-post-token', postApprovePhase: 'installed', pendingRedispatch: true,
+    });
+    let failed = false;
+    const realSet = harness.taskStore.set.bind(harness.taskStore);
+    vi.spyOn(harness.taskStore, 'set').mockImplementation(async task => {
+      if (!failed && task.id === taskId && task.postApprovePhase === 'delivered') {
+        failed = true;
+        if (persisted) await realSet(task);
+        throw new Error('one-off delivery persistence failure');
+      }
+      return realSet(task);
+    });
+
+    await expect(m.advanceTask(taskId)).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('one-off delivery persistence failure'),
+    });
+    expect(failed).toBe(true);
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
+    const afterDelivery = await harness.taskStore.get(taskId);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(m.advanceTask(taskId)).rejects.toMatchObject({ status: 409 });
+      await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', taskId)).resolves.toBe(true);
+    }
+    await expect(m.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: false });
+
+    expect(await binding()).toMatchObject({
+      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      awaitingReason: expect.stringContaining('already delivered'),
+    });
+    expect(await harness.taskStore.get(taskId)).toEqual(afterDelivery);
+    expect(afterDelivery?.postApproveToken).not.toBe('old-post-token');
+    expect(afterDelivery?.postApprovePhase).toBe(persisted ? 'delivered' : 'installed');
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
+    expect(harness.events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+    post('dev-1', buildPhaseSignal('pr-merge-ready', afterDelivery!.postApproveToken!));
+    await vi.waitFor(() => expect(signalEvents()).toEqual([
+      expect.objectContaining({ type: 'pr.updated', taskId }),
     ]));
   });
 
@@ -486,9 +679,13 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect(state?.awaitingReason).toBe('successor hold');
   });
 
-  it('escalates an own-generation arm failure into the recoverable hold path', async () => {
+  it.each([
+    { status: 'in_progress', phase: undefined },
+    { status: 'in_progress', phase: 'code' },
+    { status: 'fixing', phase: 'code' },
+  ] as const)('keeps a $status/$phase transport failure separate from workdir cleanup', async (task) => {
     const { m } = watchedManager({ onSubscribe: async () => { throw new Error('subscribe transport down'); } });
-    await seedHolder('task-arm-fail', { signalToken: 'arm-fail-1' });
+    await seedHolder('task-arm-fail', { ...task, signalToken: 'arm-fail-1' });
 
     await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-arm-fail')).resolves.toBe(true);
 
@@ -497,6 +694,8 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect(held?.status).toBe('awaiting_human');
     expect(held?.awaitingPhase).toBe('restart-redispatch-failed');
     expect(held?.awaitingReason).toMatch(/failed to arm/);
+    expect(held?.awaitingReason).not.toMatch(/commit|stash/i);
+    expect(BranchManager.prototype.assertClean).not.toHaveBeenCalled();
   });
 
   it('a post-clear replay throw is held on the live generation, not the stale entry hold', async () => {
@@ -512,7 +711,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     const held = await binding();
     expect(held?.status).toBe('awaiting_human');
     expect(held?.awaitingPhase).toBe('restart-redispatch-failed');
-    expect(held?.awaitingReason).toMatch(/replaying the task prompt failed/);
     expect(held?.awaitingSince).not.toBe(NOW);
   });
 
@@ -614,6 +812,147 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
 });
 
 describe('AgentManager.advanceTask', () => {
+  it.each(([
+    { status: 'in_progress', phase: undefined },
+    { status: 'in_progress', phase: 'code' },
+    { status: 'fixing', phase: 'code' },
+    { status: 'approved', phase: 'code' },
+  ] as const).flatMap(task => (['watcher', 'paste'] as const).map(failure => ({ ...task, failure }))))('reports $status/$phase $failure failures without auditing success', async ({ failure, ...task }) => {
+    const taskId = `task-advance-${failure}`;
+    const runner = suiteRunner(failure === 'paste'
+      ? { rules: [{ match: 'paste-buffer', reply: { outcome: 'refused' } }] }
+      : {});
+    const { m } = watchedManager({
+      runner,
+      ...(failure === 'watcher' ? { onSubscribe: async () => { throw new Error('subscribe transport down'); } } : {}),
+    });
+    await seedHolder(taskId, {
+      ...task, signalToken: 'advance-old-token',
+      ...(task.status === 'approved' ? {
+        postApproveGeneration: 'feedfeedfeed', postApproveHeadSha: SHA1,
+        postApproveToken: 'advance-post-token', postApprovePhase: 'installed',
+      } : {}),
+    }, {
+      status: 'awaiting_human', awaitingPhase: 'restart-redispatch-failed',
+      awaitingReason: 'old failure', awaitingSince: NOW, awaitingNonce: 'old-hold',
+    });
+
+    await expect(m.advanceTask(taskId)).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('Task prompt replay failed'),
+    });
+
+    const held = await binding();
+    expect(held).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'restart-redispatch-failed' });
+    expect(held?.awaitingNonce).not.toBe('old-hold');
+    expect(held?.awaitingReason).not.toBe('old failure');
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(harness.events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+  });
+
+  it('reports an approved task with an incomplete completion episode as blocked', async () => {
+    await seedHolder('task-advance-incomplete', { status: 'approved', signalToken: 'task-token' });
+
+    await expect(harness.manager.advanceTask('task-advance-incomplete')).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('no complete post-approve episode'),
+    });
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect(harness.events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+  });
+
+  it('surfaces a successor hold without overwriting it or auditing Advance success', async () => {
+    const taskId = 'task-advance-successor-hold';
+    const { m } = watchedManager({
+      onSubscribe: async () => {
+        await harness.manager.markAwaitingHuman('dev-1', 'successor-hold', 'Inspect the successor hold');
+        throw new Error('subscribe transport down');
+      },
+    });
+    await seedHolder(taskId, { phase: 'code', signalToken: 'entry-token' });
+
+    await expect(m.advanceTask(taskId)).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('Inspect the successor hold'),
+    });
+
+    expect(await binding()).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'successor-hold' });
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect(harness.events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+  });
+
+  it.each(['dispatch-failed:ack_unknown', 'dev-wait-gate-failed-after-qa-started'])('does not replay an uncertain %s delivery via Dev Advance', async (awaitingPhase) => {
+    const taskId = 'task-advance-uncertain';
+    await seedHolder(taskId, { phase: 'code', signalToken: 'uncertain-token' }, {
+      status: 'awaiting_human', awaitingPhase, awaitingReason: 'delivery is uncertain', awaitingNonce: 'uncertain-hold',
+    });
+    const held = await binding();
+
+    await expect(harness.manager.advanceTask(taskId)).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('Prompt may still be running'),
+    });
+    await expect(harness.manager.redispatchTaskPromptAfterReplRestart('dev-1', taskId)).resolves.toBe(true);
+
+    expect(await binding()).toEqual(held);
+    expect((await harness.taskStore.get(taskId))?.signalToken).toBe('uncertain-token');
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect(harness.events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+  });
+
+  it.each(['dirty-workdir', 'restart-redispatch-failed'].flatMap(reason =>
+    (['in_progress', 'approved'] as const).map(status => ({ reason, status })),
+  ))('invalidates old $reason attention on successful $status replay', async ({ reason, status }) => {
+    const taskId = `task-attention-${status}`;
+    await seedHolder(taskId, {
+      status, phase: 'code', signalToken: 'attention-task-token',
+      ...(status === 'approved' ? {
+        postApproveGeneration: 'feedfeedfeed', postApproveHeadSha: SHA1,
+        postApproveToken: 'attention-post-token', postApprovePhase: 'installed',
+      } : {}),
+    }, { status: 'awaiting_human', awaitingPhase: reason, awaitingSince: NOW });
+    await harness.manager.recordTaskAttention({
+      id: '', type: 'human.intervention', timestamp: NOW, projectId: 'proj', agentId: 'dev-1', taskId,
+      data: { phase: reason, reason: 'retry the current step' },
+    });
+    expect((await harness.taskStore.get(taskId))?.attention?.reason).toBe(reason);
+
+    const result = await harness.manager.advanceTask(taskId);
+
+    expect(result.attention).toBeUndefined();
+    if (status === 'approved') {
+      expect(result.signalToken).toBe('attention-task-token');
+      expect(result.postApproveToken).not.toBe('attention-post-token');
+    } else {
+      expect(result.signalToken).not.toBe('attention-task-token');
+    }
+    expect((await harness.taskStore.get(taskId))?.attention).toBeUndefined();
+    expect((await binding())?.status).toBeUndefined();
+    expect(harness.events.filter(event => event.type === 'task.updated' && event.taskId === taskId
+      && event.data.operation === 'advance')).toHaveLength(1);
+    expect(harness.runner.pastedPrompts).toHaveLength(1);
+  });
+
+  it.each([undefined, 'code'] as const)('rejects Dev Advance when the initial %s prompt was already delivered', async (phase) => {
+    const taskId = 'task-advance-delivered';
+    await seedHolder(taskId, { phase, signalToken: 'delivered-token' }, {
+      status: 'awaiting_human',
+      awaitingPhase: 'bootstrap-marker-clear-failed',
+      bootstrappingTaskId: taskId,
+    });
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await expect(harness.manager.advanceTask(taskId)).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('already delivered'),
+      });
+    }
+
+    expect(harness.runner.pastedPrompts).toEqual([]);
+    expect((await harness.taskStore.get(taskId))?.signalToken).toBe('delivered-token');
+    expect(await binding()).toMatchObject({
+      awaitingPhase: 'bootstrap-marker-clear-failed', bootstrappingTaskId: taskId,
+    });
+    expect(harness.events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+  });
+
   async function seedRevokedTask(id: string): Promise<void> {
     await harness.seedTask({
       id,

@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, screen, waitFor } from '@testing-library/react';
 import { ImageUploadButton } from '../../src/components/image-upload-button.tsx';
@@ -24,7 +25,7 @@ afterEach(() => vi.restoreAllMocks());
 describe('ImageUploadButton', () => {
   it('renders an upload button', () => {
     renderButton();
-    expect(screen.getByRole('button', { name: /Upload image/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: enUS.imageUpload.uploadAriaLabel })).toBeTruthy();
   });
 
   it('uploads the chosen file and shows a success toast', async () => {
@@ -35,7 +36,7 @@ describe('ImageUploadButton', () => {
     fireEvent.change(fileInput(container), { target: { files: [file] } });
 
     await waitFor(() => expect(spy).toHaveBeenCalledWith('dev-1', file));
-    expect(await screen.findByText(/Image inserted/)).toBeTruthy();
+    expect(await screen.findByText(enUS.imageUpload.insertedTitle)).toBeTruthy();
   });
 
   it('shows an error toast when upload fails (no silent failure)', async () => {
@@ -44,7 +45,7 @@ describe('ImageUploadButton', () => {
 
     fireEvent.change(fileInput(container), { target: { files: [pngFile()] } });
 
-    expect(await screen.findByText(/Failed to upload image/)).toBeTruthy();
+    expect(await screen.findByText(enUS.imageUpload.uploadFailedTitle)).toBeTruthy();
   });
 
   it('rejects an oversized file client-side without calling the API', async () => {
@@ -55,7 +56,7 @@ describe('ImageUploadButton', () => {
 
     fireEvent.change(fileInput(container), { target: { files: [big] } });
 
-    expect(await screen.findByText(/Image too large/)).toBeTruthy();
+    expect(await screen.findByText(enUS.createTask.imageTooLargeToastTitle)).toBeTruthy();
     expect(spy).not.toHaveBeenCalled();
   });
 
@@ -69,7 +70,7 @@ describe('ImageUploadButton', () => {
     fireEvent.change(fileInput(container), { target: { files: [pngFile()] } });
 
     await waitFor(() =>
-      expect((screen.getByRole('button', { name: /Upload image/ }) as HTMLButtonElement).disabled).toBe(true),
+      expect((screen.getByRole('button', { name: enUS.imageUpload.uploadAriaLabel }) as HTMLButtonElement).disabled).toBe(true),
     );
     resolveUpload({ path: '/tmp/baxian/upload/dev-1/x.png' });
   });

@@ -73,10 +73,10 @@ export function AgentTeam({
   const showClaimable = !!dev && claimableTasks.length > 0;
   const showEmpty = activeTasks.length === 0 && !showClaimable;
   return (
-    <div role="group" aria-label={label} className="min-w-0 rounded-lg border border-og-100 bg-og-25 p-3">
+    <div role="group" aria-label={label} className="min-w-0 rounded-lg border border-og-100 bg-og-25/60 p-3">
       <div className="mb-2 flex items-center gap-2">
         <span className="shrink-0 font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">
-          Agent Team
+          Team
         </span>
         <span className="min-w-0 truncate font-mono text-xs text-og-700" title={teamIds}>{teamIds}</span>
         <KebabMenu

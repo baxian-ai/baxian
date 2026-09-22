@@ -699,6 +699,45 @@ describe('recover()', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
+  it.each([
+    { phase: undefined, hold: 'dispatch-failed:ack_unknown', freshRuntime: false },
+    { phase: 'code', hold: 'dispatch-failed:ack_unknown', freshRuntime: false },
+    { phase: undefined, hold: 'dispatch-failed:ack_unknown', freshRuntime: true },
+    { phase: 'code', hold: 'dispatch-failed:ack_unknown', freshRuntime: true },
+    { phase: undefined, hold: 'dev-wait-gate-failed-after-qa-started', freshRuntime: false },
+    { phase: 'code', hold: 'dev-wait-gate-failed-after-qa-started', freshRuntime: false },
+  ] as const)('preserves an uncertain bootstrap across process recovery: $phase / $hold / fresh=$freshRuntime', async ({ phase, hold, freshRuntime }) => {
+    const task = await seedRecoveryTask({
+      id: 'task-uncertain-bootstrap', phase, signalToken: 'uncertain-token',
+      ...(phase === 'code' ? { specReviewRound: 1 } : {}),
+    });
+    await seedAgent({
+      id: 'dev-1', taskId: task.id, paneId: '%0', bootstrappingTaskId: task.id,
+      status: 'awaiting_human', awaitingPhase: hold, awaitingReason: 'Enter sent; acknowledgement unavailable',
+      awaitingSince: NOW, awaitingNonce: 'uncertain-hold',
+    });
+    const held = await agentStore.get('dev-1');
+    if (freshRuntime) runner.sessions.drop('dev-1');
+
+    for (let restart = 0; restart < 2; restart += 1) {
+      manager = createManager();
+      await manager.recover();
+
+      expect(await taskStore.get(task.id)).toEqual(task);
+      expect(await agentStore.get('dev-1')).toMatchObject({
+        taskId: task.id, bootstrappingTaskId: task.id, lockToken: held?.lockToken,
+        status: 'awaiting_human', awaitingPhase: hold, awaitingReason: held?.awaitingReason,
+        awaitingSince: NOW, awaitingNonce: 'uncertain-hold',
+      });
+      expect(await lockManager.isLocked('dev-1')).toBe(true);
+      await expect(manager.resumeAgent('dev-1')).resolves.toMatchObject({ resumed: false });
+      await expect(manager.advanceTask(task.id)).rejects.toMatchObject({ status: 409 });
+      await expect(manager.redispatchTaskPromptAfterReplRestart('dev-1', task.id)).resolves.toBe(true);
+    }
+    expect(runner.pastedPrompts).toEqual([]);
+    expect(events.filter(event => event.type === 'session.started')).toEqual([]);
+  });
+
   it('clears unsafe runtime facts but preserves the binding lock when recovery cannot validate the session', async () => {
     await runRecovery({
       agents: [{ id: 'dev-1', taskId: 'task-1', paneId: '%0', creationToken: 'tok' }],

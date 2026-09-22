@@ -395,6 +395,27 @@ describe('POST /api/tasks', () => {
 });
 
 describe('POST /api/tasks/:id/advance', () => {
+  it.each([
+    { status: 'in_progress', reason: 'no signal token' },
+    { status: 'approved', reason: 'no complete post-approve episode' },
+  ] as const)('returns the $status replay hold reason without resetting recovery budgets', async ({ status, reason }) => {
+    await seedTask(app.ctx.taskStore, { id: 'task-001', status, signalToken: undefined });
+    await app.ctx.agentStore.set({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-001', paneId: '%0', updatedAt: new Date().toISOString(),
+    });
+    const resetTask = vi.fn();
+    app.ctx.dispatchReconciler = { resetTask, stop: vi.fn() } as never;
+
+    const response = await post('/api/tasks/task-001/advance', { executor: 'dev' });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toContain(reason);
+    expect((await app.ctx.agentStore.get('dev-1'))?.awaitingPhase).toBe('restart-redispatch-failed');
+    expect(resetTask).not.toHaveBeenCalled();
+    const events = await app.ctx.eventLog.readDate(new Date().toISOString().slice(0, 10));
+    expect(events.some(event => event.type === 'task.updated' && event.data.operation === 'advance')).toBe(false);
+  });
+
   it('forwards an explicit QA delivery recovery and trims human inputs', async () => {
     const updated = makeTask({ id: 'task-001', status: 'review', phase: 'spec' });
     const spy = vi.spyOn(app.ctx.agentManager, 'advanceTask').mockResolvedValue(updated);

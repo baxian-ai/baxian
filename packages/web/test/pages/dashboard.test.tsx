@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, cleanup, screen, within, fireEvent, act, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -11,7 +12,7 @@ vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts'))
 
 vi.mock('../../src/components/create-agent-modal.tsx', () => ({
   CreateAgentModal: ({ open, projectId }: { open: boolean; projectId: string }) =>
-    open ? <div role="dialog" aria-label="Add Agent Team">agent:{projectId}</div> : null,
+    open ? <div role="dialog" aria-label={enUS.projectPage.addAgent}>agent:{projectId}</div> : null,
 }));
 
 const agentsHookState = {
@@ -75,7 +76,7 @@ function demoProject(agent: ProjectConfig['agent'] = []): ProjectConfig {
 }
 
 async function findMoreActions(): Promise<HTMLElement> {
-  return screen.findByRole('button', { name: 'More actions' });
+  return screen.findByRole('button', { name: enUS.dashboard.moreActions });
 }
 
 beforeEach(() => {
@@ -139,7 +140,7 @@ describe('Dashboard layout', () => {
     const idLink = within(heading).getByRole('link', { name: 'demo' });
     expect(idLink.getAttribute('href')).toBe('/project/demo');
 
-    const detailsLink = screen.getByRole('link', { name: /Details/ });
+    const detailsLink = screen.getByRole('link', { name: enUS.dashboard.detailsAriaLabel('demo') });
     expect(detailsLink.getAttribute('href')).toBe('/project/demo');
     expect(detailsLink.getAttribute('aria-label')).toMatch(/demo/);
 
@@ -154,8 +155,8 @@ describe('Dashboard layout', () => {
     ]);
     renderDashboard();
 
-    const alphaDetails = await screen.findByRole('link', { name: /Details.*alpha/ });
-    const betaDetails = screen.getByRole('link', { name: /Details.*beta/ });
+    const alphaDetails = await screen.findByRole('link', { name: enUS.dashboard.detailsAriaLabel('alpha') });
+    const betaDetails = screen.getByRole('link', { name: enUS.dashboard.detailsAriaLabel('beta') });
     expect(alphaDetails.getAttribute('href')).toBe('/project/alpha');
     expect(betaDetails.getAttribute('href')).toBe('/project/beta');
     expect(alphaDetails).not.toBe(betaDetails);
@@ -190,13 +191,13 @@ describe('Dashboard layout', () => {
     renderDashboard();
 
     await screen.findByRole('heading', { level: 2, name: 'demo' });
-    const taskBtn = screen.getByRole('button', { name: '+ New task' });
+    const taskBtn = screen.getByRole('button', { name: enUS.dashboard.newTask });
     expect(topbarActions().contains(taskBtn)).toBe(true);
 
-    expect(screen.queryByRole('button', { name: 'New project' })).toBeNull();
-    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.dashboard.newProject })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: enUS.dashboard.newProject })).toBeNull();
 
-    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
+    const moreTrigger = screen.getByRole('button', { name: enUS.dashboard.moreActions });
     expect(moreTrigger.getAttribute('aria-haspopup')).toBe('menu');
     expect(moreTrigger.getAttribute('aria-expanded')).toBe('false');
 
@@ -213,12 +214,12 @@ describe('Dashboard layout', () => {
     seed([]);
     renderDashboard();
 
-    const taskBtn = await within(topbarActions()).findByRole('button', { name: '+ New task' }) as HTMLButtonElement;
+    const taskBtn = await within(topbarActions()).findByRole('button', { name: enUS.dashboard.newTask }) as HTMLButtonElement;
     expect(taskBtn.disabled).toBe(true);
     expect(taskBtn.getAttribute('title')).toBeNull();
-    expect(taskBtn.parentElement?.getAttribute('title')).toBe('Create a project first');
+    expect(taskBtn.parentElement?.getAttribute('title')).toBe(enUS.dashboard.createProjectFirst);
     // jsdom cannot tell sr-only text from visible text: keep the token so the hint never renders twice
-    const hint = within(topbarActions()).getByText('Create a project first');
+    const hint = within(topbarActions()).getByText(enUS.dashboard.createProjectFirst);
     expect(hint.className.split(/\s+/)).toContain('sr-only');
   });
 
@@ -246,11 +247,11 @@ describe('Dashboard layout', () => {
     fireEvent.click(moreTrigger);
 
     expect(moreTrigger.getAttribute('aria-expanded')).toBe('true');
-    const createProjectItem = screen.getByRole('menuitem', { name: 'New project' });
+    const createProjectItem = screen.getByRole('menuitem', { name: enUS.dashboard.newProject });
     fireEvent.click(createProjectItem);
 
-    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
-    expect(screen.getByRole('dialog', { name: 'New project' })).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: enUS.dashboard.newProject })).toBeNull();
+    expect(screen.getByRole('dialog', { name: enUS.createProject.title })).toBeTruthy();
   });
 
   it('kebab menuitem opens without stealing focus', async () => {
@@ -259,8 +260,7 @@ describe('Dashboard layout', () => {
 
     fireEvent.click(await findMoreActions());
 
-    const item = screen.getByRole('menuitem', { name: 'New project' });
-    expect(item.textContent).toBe('New project');
+    const item = screen.getByRole('menuitem', { name: enUS.dashboard.newProject });
     expect(document.activeElement).not.toBe(item);
   });
 
@@ -270,15 +270,15 @@ describe('Dashboard layout', () => {
 
     const moreTrigger = await findMoreActions();
     fireEvent.click(moreTrigger);
-    expect(screen.getByRole('menuitem', { name: 'New project' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: enUS.dashboard.newProject })).toBeTruthy();
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: enUS.dashboard.newProject })).toBeNull();
     expect(document.activeElement).toBe(moreTrigger);
 
     fireEvent.click(moreTrigger);
-    expect(screen.getByRole('menuitem', { name: 'New project' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: enUS.dashboard.newProject })).toBeTruthy();
     fireEvent.mouseDown(document.body);
-    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: enUS.dashboard.newProject })).toBeNull();
   });
 
   it('exposes a "Settings" menuitem that opens the SystemSettingsModal', async () => {
@@ -286,10 +286,10 @@ describe('Dashboard layout', () => {
     renderDashboard();
 
     fireEvent.click(await findMoreActions());
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: enUS.settings.entry }));
 
-    expect(screen.queryByRole('menuitem', { name: 'Settings' })).toBeNull();
-    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: enUS.settings.entry })).toBeNull();
+    expect(screen.getByRole('dialog', { name: enUS.settings.title })).toBeTruthy();
   });
 
   it('surfaces a per-project task-feed error so a broken realtime+REST feed is not silently empty', async () => {
@@ -299,7 +299,7 @@ describe('Dashboard layout', () => {
 
     renderDashboard();
 
-    expect(await screen.findByText(/Failed to load tasks: realtime down/)).toBeTruthy();
+    expect(await screen.findByText(enUS.dashboard.tasksLoadFailed('realtime down'))).toBeTruthy();
   });
 
   it('agent cards render the embedded terminal up front (no need to wait for the agent to start working)', async () => {
@@ -323,32 +323,32 @@ describe('Dashboard "Project created" follow-up modal', () => {
     renderDashboard();
 
     fireEvent.click(await findMoreActions());
-    fireEvent.click(screen.getByRole('menuitem', { name: 'New project' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: enUS.dashboard.newProject }));
 
-    const createDialog = screen.getByRole('dialog', { name: 'New project' });
-    fireEvent.change(within(createDialog).getByLabelText('Project ID'), { target: { value: 'newproj' } });
-    fireEvent.change(within(createDialog).getByLabelText('Git repository URL'), { target: { value: 'https://github.com/o/r.git' } });
+    const createDialog = screen.getByRole('dialog', { name: enUS.createProject.title });
+    fireEvent.change(within(createDialog).getByLabelText(enUS.createProject.idLabel), { target: { value: 'newproj' } });
+    fireEvent.change(within(createDialog).getByLabelText(enUS.createProject.repoLabel), { target: { value: 'https://github.com/o/r.git' } });
     await act(async () => {
-      fireEvent.click(within(createDialog).getByRole('button', { name: 'Create' }));
+      fireEvent.click(within(createDialog).getByRole('button', { name: enUS.common.create }));
     });
 
-    return screen.findByRole('dialog', { name: 'Project created' });
+    return screen.findByRole('dialog', { name: enUS.dashboard.projectCreatedTitle });
   }
 
   it('offers both follow-ups and "Continue adding an Agent Team" enters the add-agent flow for the new project', async () => {
     const dialog = await reachContinueDialog();
 
-    expect(within(dialog).getByRole('button', { name: 'Later' })).toBeTruthy();
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Continue adding an Agent Team' }));
-    expect(screen.getByRole('dialog', { name: 'Add Agent Team' }).textContent).toContain('newproj');
+    expect(within(dialog).getByRole('button', { name: enUS.dashboard.later })).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: enUS.dashboard.continueAddingAgent }));
+    expect(screen.getByRole('dialog', { name: enUS.projectPage.addAgent }).textContent).toContain('newproj');
   });
 
   it('"Later" closes the follow-up modal without entering the add-agent flow', async () => {
     const dialog = await reachContinueDialog();
 
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Later' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: enUS.dashboard.later }));
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Project created' })).toBeNull());
-    expect(screen.queryByRole('dialog', { name: 'Add Agent Team' })).toBeNull();
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: enUS.dashboard.projectCreatedTitle })).toBeNull());
+    expect(screen.queryByRole('dialog', { name: enUS.projectPage.addAgent })).toBeNull();
   });
 });

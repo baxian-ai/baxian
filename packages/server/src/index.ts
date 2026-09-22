@@ -11,7 +11,6 @@ import { initStateDir } from './state/init.js';
 import { AgentStore } from './state/agent-store.js';
 import { TaskStore } from './state/task-store.js';
 import { ErrorRecordStore } from './state/error-record-store.js';
-import { PetStore } from './state/pet-store.js';
 import { LockManager } from './state/lock.js';
 import { ProcessLock, ProcessLockError } from './state/process-lock.js';
 import { EventBus } from './event/bus.js';
@@ -153,7 +152,6 @@ export async function startServer(home?: string): Promise<void> {
     const agentStore = new AgentStore(`${stateDir}/state/agents`);
     const taskStore = new TaskStore(`${stateDir}/state/tasks`);
     const errorRecordStore = new ErrorRecordStore(`${stateDir}/state/errors`);
-    const petStore = new PetStore(`${stateDir}/state/pets`);
     const lockManager = new LockManager(`${stateDir}/locks`);
     const eventLog = new EventLog(`${stateDir}/events`);
     const eventBus = new EventBus(eventLog);
@@ -216,12 +214,11 @@ export async function startServer(home?: string): Promise<void> {
     await agentManager.setupRecoveredSpecSignals();
     paneStreamerManager.startupScan((config.project ?? []).flatMap((p) => (p.agent ?? []).flat()));
 
-    const snapshotCtx = { agentManager, agentStore, taskStore, tmuxSessionStatusStore, errorRecordStore, petStore };
+    const snapshotCtx = { agentManager, agentStore, taskStore, tmuxSessionStatusStore, errorRecordStore };
     const eventPublisher = new EventPublisher(eventBroker, snapshotCtx, taskStore);
     agentStore.onChange((kind, id) => eventPublisher.publishAgentChange(kind, id));
     tmuxSessionStatusStore.onChange((kind, id) => eventPublisher.publishAgentChange(kind, id));
     taskStore.onChange((kind, id) => eventPublisher.publishTaskChange(kind, id));
-    petStore.onChange((id) => eventPublisher.publishAgentChange('set', id));
 
     const onBootstrapAgentAffected = (ids: string[]) => {
       for (const id of ids) eventPublisher.publishAgentChange('set', id);
@@ -310,7 +307,6 @@ export async function startServer(home?: string): Promise<void> {
         paneStreamerManager,
         eventBroker,
         errorRecordStore,
-        petStore,
         prConversationCache,
       },
       {

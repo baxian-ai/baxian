@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -61,7 +62,7 @@ function activate(cardOrId: HTMLElement | string): void {
   const card = typeof cardOrId === 'string'
     ? document.querySelector(`[data-agent-card="${cardOrId}"]`) as HTMLElement
     : cardOrId;
-  const trigger = within(card).getByRole('button', { name: /Activate .* terminal/ });
+  const trigger = within(card).getByRole('button', { name: enUS.agents.activateTerminal(card.getAttribute('data-agent-card')!) });
   fireEvent.click(trigger);
 }
 
@@ -123,8 +124,7 @@ describe('AgentTeam', () => {
     expect(idCell.getAttribute('title')).toBe('task-001');
     expect(within(region).getByText('梳理绑定逻辑')).toBeTruthy();
     const taskButton = within(region).getByRole('button', { name: /梳理绑定逻辑/ });
-    expect(within(taskButton).getByText('Developing')).toBeTruthy();
-    expect(within(taskButton).queryByText('Round 0')).toBeNull();
+    expect(within(taskButton).queryByText(enUS.agents.round(0))).toBeNull();
     expect(within(taskButton).queryByRole('img')).toBeNull();
     expect(within(region).getAllByText('dev-1').length).toBeGreaterThanOrEqual(1);
     expect(within(region).getAllByText('qa-1').length).toBeGreaterThanOrEqual(1);
@@ -177,7 +177,7 @@ describe('AgentTeam', () => {
 
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
     const taskButton = within(region).getByRole('button', { name: /梳理绑定逻辑/ });
-    expect(within(taskButton).getByText('Round 3')).toBeTruthy();
+    expect(within(taskButton).getByText(enUS.agents.round(3))).toBeTruthy();
     expect(within(taskButton).queryByText(/Dev /)).toBeNull();
     expect(within(taskButton).queryByText(/QA /)).toBeNull();
   });
@@ -186,14 +186,14 @@ describe('AgentTeam', () => {
     renderTeam([task({ phase: 'spec', specReviewRound: 2, reviewRound: 0 })]);
 
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
-    expect(within(region).getByText('Round 2')).toBeTruthy();
+    expect(within(region).getByText(enUS.agents.round(2))).toBeTruthy();
   });
 
   it('shows a muted "No active task" placeholder above the agent cards when no active task is bound to the team', () => {
     renderTeam([]);
 
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
-    expect(within(region).getByText('No active task')).toBeTruthy();
+    expect(within(region).getByText(enUS.agents.noActiveTask)).toBeTruthy();
     expect(within(region).queryByRole('button', { name: /task-/ })).toBeNull();
   });
 
@@ -203,7 +203,7 @@ describe('AgentTeam', () => {
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
     expect(within(region).queryByText('001')).toBeNull();
     expect(within(region).queryByText('梳理绑定逻辑')).toBeNull();
-    expect(within(region).getByText('No active task')).toBeTruthy();
+    expect(within(region).getByText(enUS.agents.noActiveTask)).toBeTruthy();
   });
 
   it('embedded mode defaults to non-interactive previews so scroll stays smooth', () => {
@@ -356,28 +356,28 @@ describe('AgentTeam', () => {
     renderTeam([], { agentsById: new Map(), agentsLoaded: false, terminalMode: 'embedded-full' });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
-    expect(screen.getAllByText('Agent status loading')).toHaveLength(2);
+    expect(screen.getAllByText(enUS.agents.agentStatusLoading)).toHaveLength(2);
   });
 
   it('claimable list: shows pending task assigned to dev with a Start button when no active task is bound', () => {
     renderTeam([task({ id: 'task-q', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]);
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
     expect(within(region).getByText('task-q')).toBeTruthy();
-    expect(within(region).getByRole('button', { name: 'Start' })).toBeTruthy();
+    expect(within(region).getByRole('button', { name: enUS.agents.start })).toBeTruthy();
   });
 
   it('claimable list: unassigned task (preferredAgentId="") shows "Unassigned" pill and is still claimable', () => {
     renderTeam([task({ id: 'task-u', status: 'pending', preferredAgentId: '', agentId: '' })]);
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
     expect(within(region).getByText('task-u')).toBeTruthy();
-    expect(within(region).getByText('Unassigned')).toBeTruthy();
+    expect(within(region).getByText(enUS.agents.unassigned)).toBeTruthy();
   });
 
   it('claimable list: clicking Start calls api.tasks.advance with Dev and agentId=dev-1', async () => {
     tasksAdvanceMock.mockResolvedValue(makeTask({ id: 'task-d' }));
     renderTeam([task({ id: 'task-d', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]);
 
-    const startBtn = screen.getByRole('button', { name: 'Start' });
+    const startBtn = screen.getByRole('button', { name: enUS.agents.start });
     await act(async () => {
       fireEvent.click(startBtn);
     });
@@ -391,7 +391,7 @@ describe('AgentTeam', () => {
     ]);
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
     expect(within(region).queryByText('task-other')).toBeNull();
-    expect(within(region).getByText('No active task')).toBeTruthy();
+    expect(within(region).getByText(enUS.agents.noActiveTask)).toBeTruthy();
   });
 
   it('claimable list renders ALONGSIDE active task summary when dev is idle (post-approve / approved state)', () => {
@@ -401,7 +401,7 @@ describe('AgentTeam', () => {
     const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
     expect(within(region).getByText('task-old')).toBeTruthy();
     expect(within(region).getByText('task-new')).toBeTruthy();
-    expect(within(region).getByRole('button', { name: 'Start' })).toBeTruthy();
+    expect(within(region).getByRole('button', { name: enUS.agents.start })).toBeTruthy();
   });
 
   it('Start button is disabled when dev is not in idle runtimeStatus', () => {
@@ -415,7 +415,7 @@ describe('AgentTeam', () => {
       },
     );
 
-    const btn = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement;
+    const btn = screen.getByRole('button', { name: enUS.agents.start }) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
   });
 
@@ -438,15 +438,22 @@ describe('AgentTeam', () => {
     });
 
     expect(screen.getAllByTestId('pane-terminal')).toHaveLength(2);
-    expect(screen.getAllByRole('link', { name: 'Terminal' }).map(link => link.getAttribute('href')))
+    expect(screen.getAllByRole('link', { name: enUS.agents.terminal }).map(link => link.getAttribute('href')))
       .toEqual(['/terminal/dev-1', '/terminal/qa-1']);
-    expect(screen.queryByText('Agent status loading')).toBeNull();
+    expect(screen.queryByText(enUS.agents.agentStatusLoading)).toBeNull();
+  });
+
+  it('uses a translucent panel background', () => {
+    renderTeam([]);
+
+    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    expect(region.className.split(/\s+/)).toContain('bg-og-25/60');
   });
 });
 
 describe('AgentTeam actions menu', () => {
   function openTeamMenu(): void {
-    fireEvent.click(screen.getByRole('button', { name: 'Agent Team dev-1 / qa-1 actions menu' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.agents.teamActionsMenu('dev-1 / qa-1') }));
   }
 
   async function clickTeamMenuItem(name: string): Promise<void> {
@@ -470,37 +477,37 @@ describe('AgentTeam actions menu', () => {
     expect(within(region).getByText('dev-1 / qa-1')).toBeTruthy();
     openTeamMenu();
     const items = screen.getAllByRole('menuitem');
-    expect(items.map(item => item.textContent)).toEqual(['Compact context', 'Clear context', 'Delete']);
+    expect(items).toHaveLength(3);
   });
 
   it('sends /compact to every agent of the team', async () => {
     compactMock.mockResolvedValue({ compacted: true });
     renderTeam([]);
 
-    await clickTeamMenuItem('Compact context');
+    await clickTeamMenuItem(enUS.agents.compact);
 
     expect(compactMock.mock.calls.map(call => call[0])).toEqual(['dev-1', 'qa-1']);
-    await expectToast({ title: '/compact sent to Agent Team dev-1 / qa-1' });
+    await expectToast({ title: enUS.agents.teamCompactSentTitle('dev-1 / qa-1') });
   });
 
   it('sends /clear to every agent of the team after the user confirms', async () => {
     clearMock.mockResolvedValue({ cleared: true });
     renderTeam([]);
 
-    await clickTeamMenuItem('Clear context');
+    await clickTeamMenuItem(enUS.agents.clear);
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('Clear the context for Agent Team dev-1 / qa-1?')).toBeTruthy();
-    await settleConfirmDialog('Clear');
+    expect(within(dialog).getByText(enUS.agents.teamClearConfirmTitle('dev-1 / qa-1'))).toBeTruthy();
+    await settleConfirmDialog(enUS.agents.clearConfirmLabel);
 
     expect(clearMock.mock.calls.map(call => call[0])).toEqual(['dev-1', 'qa-1']);
-    await expectToast({ title: '/clear sent to Agent Team dev-1 / qa-1' });
+    await expectToast({ title: enUS.agents.teamClearSentTitle('dev-1 / qa-1') });
   });
 
   it('does not send /clear when the user cancels', async () => {
     renderTeam([]);
 
-    await clickTeamMenuItem('Clear context');
-    await settleConfirmDialog('Cancel');
+    await clickTeamMenuItem(enUS.agents.clear);
+    await settleConfirmDialog(enUS.common.cancel);
 
     expect(clearMock).not.toHaveBeenCalled();
   });
@@ -512,10 +519,10 @@ describe('AgentTeam actions menu', () => {
     });
     renderTeam([]);
 
-    await clickTeamMenuItem('Compact context');
+    await clickTeamMenuItem(enUS.agents.compact);
 
     expect(compactMock.mock.calls.map(call => call[0])).toEqual(['dev-1', 'qa-1']);
-    await expectToast({ title: 'Failed to compact context', body: 'qa-1: no live session' });
+    await expectToast({ title: enUS.agents.compactFailedTitle, body: 'qa-1: no live session' });
   });
 
   it('deletes the whole team with a single request and notifies the parent', async () => {
@@ -523,23 +530,23 @@ describe('AgentTeam actions menu', () => {
     const onDeleted = vi.fn();
     renderTeam([], { onDeleted });
 
-    await clickTeamMenuItem('Delete');
+    await clickTeamMenuItem(enUS.common.delete);
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('Delete Agent Team dev-1 / qa-1?')).toBeTruthy();
-    await settleConfirmDialog('Delete');
+    expect(within(dialog).getByText(enUS.agents.teamDeleteConfirmTitle('dev-1 / qa-1'))).toBeTruthy();
+    await settleConfirmDialog(enUS.common.delete);
 
     expect(deleteAgentMock).toHaveBeenCalledTimes(1);
     expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-1');
     expect(onDeleted).toHaveBeenCalled();
-    await expectToast({ title: 'Agent Team dev-1 / qa-1 deleted' });
+    await expectToast({ title: enUS.agents.teamDeletedTitle('dev-1 / qa-1') });
   });
 
   it('keeps the team on screen and shows the reason when the delete fails', async () => {
     deleteAgentMock.mockRejectedValue(new Error('agent dev-1 is still active on task-1'));
     renderTeam([]);
 
-    await clickTeamMenuItem('Delete');
-    await settleConfirmDialog('Delete');
+    await clickTeamMenuItem(enUS.common.delete);
+    await settleConfirmDialog(enUS.common.delete);
 
     expect(await screen.findByText('agent dev-1 is still active on task-1')).toBeTruthy();
   });

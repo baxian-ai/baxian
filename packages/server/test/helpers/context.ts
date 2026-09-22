@@ -1,5 +1,4 @@
 import { join } from 'node:path';
-import { PetStore } from '../../src/state/pet-store.js';
 import { TmuxSessionStatusStore } from '../../src/agent/tmux-probe-poller.js';
 import type { AppContext } from '../../src/app.js';
 import { createManagerHarness } from './manager-harness.js';
@@ -36,7 +35,6 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
     deps: { platformRunner },
   });
   const tmuxSessionStatusStore = new TmuxSessionStatusStore();
-  const petStore = new PetStore(join(tempDir, 'state', 'pets'));
 
   return {
     config,
@@ -47,6 +45,5 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
     eventBus: harness.eventBus,
     eventLog: harness.eventLog,
     tmuxSessionStatusStore,
-    petStore,
   };
 }

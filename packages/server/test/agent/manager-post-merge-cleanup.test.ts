@@ -164,8 +164,8 @@ describe('AgentManager post-merge release', () => {
     guard.delete('dev-1');
     await vi.waitFor(async () => {
       expect((await harness.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+      expect(guard.has('dev-1')).toBe(false);
     });
-    expect(guard.has('dev-1')).toBe(false);
   });
 
   it('never force-deletes a local branch during post-merge release', async () => {

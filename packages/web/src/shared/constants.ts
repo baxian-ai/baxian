@@ -55,8 +55,3 @@ export function safeExternalHref(value: string | undefined): string | null {
     return null;
   }
 }
-
-export const PET_ATLAS_WIDTH = 1536;
-export const PET_ATLAS_HEIGHT = 1872;
-export const PET_CELL_WIDTH = 192;
-export const PET_CELL_HEIGHT = 208;

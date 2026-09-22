@@ -8,7 +8,7 @@ import { Modal } from '../components/modal.tsx';
 import { ReviewConversation } from '../components/review-conversation.tsx';
 import { useToast } from '../components/toast.tsx';
 import { useConfirm } from '../components/confirm-dialog.tsx';
-import { TaskStatusBadge, formatTaskTimestamp, getTaskAttentionCopy, taskDetailPath } from '../components/task-status.tsx';
+import { TaskStatusBadge, formatTaskTimestamp, getTaskAttentionActions, getTaskAttentionCopy, taskDetailPath } from '../components/task-status.tsx';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
@@ -45,10 +45,10 @@ function isCodeReviewing(task: TaskState): boolean {
   return task.status === 'review' && !isSpecStagePhase(task.phase);
 }
 
-function TechnicalDetails({ children }: { children: ReactNode }) {
+function TechnicalDetails({ children, open }: { children: ReactNode; open?: boolean }) {
   const t = useT();
   return (
-    <details className="mt-2 text-xs text-og-500">
+    <details open={open} className="mt-2 text-xs text-og-500">
       <summary className="cursor-pointer select-none text-accent">{t.common.technicalDetails}</summary>
       <div className="mt-1 whitespace-pre-wrap break-words font-mono">{children}</div>
     </details>
@@ -523,7 +523,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const showSpecMaxRounds = task.status === 'max_rounds' && isSpecStagePhase(task.phase);
     const prHref = safeExternalHref(task.prUrl);
     const branchUrl = branchTreeUrl(prHref ?? undefined, task.branch ?? '');
-    const attentionCopy = task.attention ? getTaskAttentionCopy(t, task.attention) : null;
+    const attentionCopy = task.attention ? getTaskAttentionCopy(t, task.attention, task.status) : null;
     const dispatching = (agents ?? []).some(agent => isAgentDispatching(agent, task.id));
 
     return (
@@ -584,7 +584,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             <div className="mt-1 text-og-700">{attentionCopy.guidance}</div>
             <div className="mt-1 text-xs text-og-500">{formatTaskTimestamp(task.attention.occurredAt)}</div>
             <div className="mt-3 flex flex-wrap gap-2">{renderAttentionActions(task)}</div>
-            <TechnicalDetails>{`${task.attention.reason}\n${task.attention.runbook}`}</TechnicalDetails>
+            <TechnicalDetails open={attentionCopy.expandDetails}>{`${task.attention.reason}\n${task.attention.runbook}`}</TechnicalDetails>
           </div>
         )}
 
@@ -785,7 +785,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   }
 
   function renderAttentionActions(currentTask: TaskState) {
-    return currentTask.attention?.recommendedActions.map(action => {
+    if (!currentTask.attention) return null;
+    return getTaskAttentionActions(currentTask.attention, currentTask.status).map(action => {
       if (action === 'advance') {
         return (
           <button
@@ -881,6 +882,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const retryEnabled = terminal && !!task.preferredAgentId;
     const isUnassigned = task.preferredAgentId === '';
     const advanceEnabled = ['pending', 'in_progress', 'fixing', 'review', 'approved'].includes(task.status)
+      && task.attention?.reason !== 'bootstrap-marker-clear-failed'
+      && (task.attention?.reason !== 'dispatch-failed:ack_unknown' || task.status === 'review')
       && !(task.status === 'pending' && isUnassigned);
     const qaAdvanceEnabled = (task.status === 'in_progress' || task.status === 'fixing')
       && task.qaAgentId !== undefined;

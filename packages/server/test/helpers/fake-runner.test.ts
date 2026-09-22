@@ -718,7 +718,8 @@ describe('fake runner: clear and exit keys', () => {
     expect(plain.runner.sessions.pane(pane.claim)!.phase).toBe('working');
     expect(plain.runner.sessions.pane(pane.claim)!.process).not.toBe('zsh');
     const exits = setup();
-    await exits.tmux.submitToRuntime(pane, runtime, exitCommand);
+    // 退出类命令的成功状态就是 runtime 离开前台,提交确认必须知道这一点
+    await exits.tmux.submitToRuntime(pane, runtime, exitCommand, { expectRuntimeExit: true });
     expect(exits.runner.sessions.pane(pane.claim)!.process).toBe('zsh');
     expect(exits.runner.sessions.pane(pane.claim)!.title).toBe('zsh');
   });

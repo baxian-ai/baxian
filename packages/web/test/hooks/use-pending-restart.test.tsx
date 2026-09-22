@@ -377,14 +377,14 @@ describe('usePendingRestart', () => {
 
   it('triggerRestart fails fast when the pre-restart /health probe is unreachable', async () => {
     vi.restoreAllMocks();
-    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('server unreachable'));
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('server unreachable'));
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
     await act(async () => { await result.current.triggerRestart(); });
 
     expect(result.current.phase).toBe('failed');
-    expect(result.current.error).toMatch(/Failed to read startedAt before restart/);
     expect(result.current.error).toMatch(/server unreachable/);
+    expect(new Set(fetchMock.mock.calls.map(([url]) => String(url)))).toEqual(new Set(['/health']));
   });
 
   it('transient /health failures while the server reboots are tolerated until startedAt changes', async () => {

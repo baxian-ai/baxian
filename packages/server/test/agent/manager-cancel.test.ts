@@ -569,7 +569,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
 });
 
 describe('cancelTask: ESC, liveness probe and composer clearing', () => {
-  const STUCK_COMPOSER = 'Title: 优化 Agent Pet 样式\n  1. Agent Pet 再放大一点点\n  2. ...';
+  const STUCK_COMPOSER = 'Title: 优化任务面板样式\n  1. 状态徽章再放大一点点\n  2. ...';
   const BUSY_LOOKING_COMPOSER = '排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt';
   const LONG_COMPOSER = 'pasted diagnostics line\n'.repeat(14);
   const NODE_HUMAN_SESSION = 'running diagnostics…\n> \n';

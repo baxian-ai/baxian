@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { HostConfig } from '../../src/shared/index.js';
@@ -47,14 +48,14 @@ beforeEach(() => {
 
 it('shows an empty state when no hosts are configured', async () => {
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  expect(await screen.findByText(/No hosts configured yet/)).toBeTruthy();
+  expect(await screen.findByText(enUS.hostMgmt.emptyState)).toBeTruthy();
 });
 
 it('lists configured hosts with a password indicator', async () => {
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
   expect(await screen.findByText('Prod')).toBeTruthy();
-  expect(screen.getByText(/Password saved/)).toBeTruthy();
+  expect(screen.getByText(enUS.hostMgmt.passwordSavedIndicator, { exact: false })).toBeTruthy();
 });
 
 it('shows a portless host with no :port suffix (not :22), reflecting that ~/.ssh/config decides the port', async () => {
@@ -66,25 +67,25 @@ it('shows a portless host with no :port suffix (not :22), reflecting that ~/.ssh
 
 it('add flow: shows the password warning and creates a host on save', async () => {
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
 
-  expect(screen.getByText(/plaintext/)).toBeTruthy();
+  expect(screen.getByText(enUS.hostMgmt.plaintextWarningStrong)).toBeTruthy();
 
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
 
   await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
   expect(createMock.mock.calls[0][0]).toMatchObject({ hostname: 'h.example.com' });
   expect(createMock.mock.calls[0][0]).not.toHaveProperty('port');
-  await expectToast({ title: 'Host h-example-com added' });
+  await expectToast({ title: enUS.hostMgmt.createdToastTitle('h-example-com') });
 });
 
 it('port is optional: a blank port keeps Save enabled and sends NO port (so ~/.ssh/config Port is honored)', async () => {
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
 
-  const save = screen.getByRole('button', { name: 'Save' });
+  const save = screen.getByRole('button', { name: enUS.common.save });
   expect(save.hasAttribute('disabled')).toBe(false);
   fireEvent.click(save);
 
@@ -94,15 +95,15 @@ it('port is optional: a blank port keeps Save enabled and sends NO port (so ~/.s
 
 it('a provided port flows through; an out-of-range one blocks Save', async () => {
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
 
-  fireEvent.change(screen.getByLabelText('Port (optional)'), { target: { value: '70000' } });
-  expect(screen.getByText(/Port must be 1–65535/)).toBeTruthy();
-  expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true);
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.portLabel), { target: { value: '70000' } });
+  expect(screen.getByText(enUS.hostMgmt.portRangeError)).toBeTruthy();
+  expect(screen.getByRole('button', { name: enUS.common.save }).hasAttribute('disabled')).toBe(true);
 
-  fireEvent.change(screen.getByLabelText('Port (optional)'), { target: { value: '2200' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.portLabel), { target: { value: '2200' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
 
   await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
   expect(createMock.mock.calls[0][0]).toMatchObject({ hostname: 'h.example.com', port: 2200 });
@@ -110,9 +111,9 @@ it('a provided port flows through; an out-of-range one blocks Save', async () =>
 
 it('"Test connection" probes the inline host and renders SSH + tmux status', async () => {
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   expect(await screen.findByText('SSH: ✓ SSH OK')).toBeTruthy();
   expect(screen.getByText('tmux: ✓ /usr/bin/tmux')).toBeTruthy();
@@ -126,23 +127,23 @@ it('renders an SSH failure and offers no tmux install button when SSH is down', 
     runtimes: PROBE_OK.runtimes,
   });
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'bad.host' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'bad.host' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   expect(await screen.findByText(/SSH: ⨯ SSH 不通/)).toBeTruthy();
   expect(screen.getByText(/tmux: ⨯ SSH 不通，无法探测/)).toBeTruthy();
-  expect(screen.queryByRole('button', { name: 'Install with one click' })).toBeNull();
+  expect(screen.queryByRole('button', { name: enUS.common.oneClickInstall })).toBeNull();
 });
 
 it('carries the typed password into the inline probe host', async () => {
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.change(screen.getByLabelText('Username (optional)'), { target: { value: 'agent' } });
-  fireEvent.change(screen.getByLabelText('Port (optional)'), { target: { value: '2200' } });
-  fireEvent.change(screen.getByLabelText('Password (optional)'), { target: { value: 'sekret' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.userLabel), { target: { value: 'agent' } });
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.portLabel), { target: { value: '2200' } });
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.passwordLabel), { target: { value: 'sekret' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledWith('remote', {
     host: { hostname: 'h.example.com', user: 'agent', port: 2200, password: 'sekret' },
@@ -152,8 +153,8 @@ it('carries the typed password into the inline probe host', async () => {
 it('edit with unchanged connection fields probes by hostId so the stored password is reused', async () => {
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Edit'));
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.common.edit));
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledWith('remote', { hostId: 'box' }, expect.anything()));
 });
@@ -161,9 +162,9 @@ it('edit with unchanged connection fields probes by hostId so the stored passwor
 it('edit with a changed hostname probes the inline host instead of the stored one', async () => {
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Edit'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'new.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.common.edit));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'new.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledWith('remote', {
     host: { hostname: 'new.example.com', user: 'agent', port: 2222 },
@@ -173,13 +174,13 @@ it('edit with a changed hostname probes the inline host instead of the stored on
 it('tmux missing: one-click install installs, refreshes the tmux row from the response, and shows the result', async () => {
   probeMock.mockResolvedValue(PROBE_TMUX_MISSING);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   expect(await screen.findByText(/tmux: ⨯ 请安装 tmux/)).toBeTruthy();
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.oneClickInstall }));
   });
 
   expect(installTmuxMock).toHaveBeenCalledWith('remote', { host: { hostname: 'h.example.com' } });
@@ -196,13 +197,13 @@ it('install failure keeps the tmux row red and surfaces the manual command', asy
     tmux: { ok: false, message: '请安装 tmux' },
   });
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.oneClickInstall }));
   });
 
   expect(await screen.findByText(/⨯ cannot install automatically.*sudo apt-get install -y tmux/)).toBeTruthy();
@@ -214,15 +215,15 @@ it('shows a loading hint while installing and ignores repeated clicks', async ()
   let resolveInstall: ((value: Awaited<ReturnType<typeof api.agents.installTmux>>) => void) | undefined;
   installTmuxMock.mockReturnValue(new Promise((resolve) => { resolveInstall = resolve; }));
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
-  const install = () => screen.getByRole('button', { name: /Install with one click|Installing/ });
+  const install = () => screen.getByRole('button', { name: name => [enUS.common.oneClickInstall, enUS.common.installing].some(label => name.includes(label)) });
   fireEvent.click(install());
 
-  expect(await screen.findByText(/Installing tmux — this can take a few minutes/)).toBeTruthy();
+  expect(await screen.findByText(enUS.common.installingTmuxNotice)).toBeTruthy();
   expect((install() as HTMLButtonElement).disabled).toBe(true);
   fireEvent.click(install());
   fireEvent.click(install());
@@ -243,9 +244,9 @@ it('shows a loading hint while installing and ignores repeated clicks', async ()
 it('closing the modal aborts the in-flight probe controller', async () => {
   probeMock.mockReturnValue(new Promise(() => {}));
   const { rerender } = render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledTimes(1));
   const options = probeMock.mock.calls[0][2];
@@ -259,37 +260,37 @@ it('closing the modal aborts the in-flight probe controller', async () => {
 it('editing a connection field aborts the in-flight probe and re-enables the button', async () => {
   probeMock.mockReturnValue(new Promise(() => {}));
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledTimes(1));
-  expect(screen.getByRole('button', { name: 'Testing…' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: enUS.hostMgmt.testing })).toBeTruthy();
   const options = probeMock.mock.calls[0][2];
 
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h2.example.com' } });
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h2.example.com' } });
 
   expect(options?.signal?.aborted).toBe(true);
-  expect(await screen.findByRole('button', { name: 'Test connection' })).toBeTruthy();
+  expect(await screen.findByRole('button', { name: enUS.hostMgmt.testConnection })).toBeTruthy();
 });
 
 it('editing a connection field clears the previous probe result', async () => {
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h.example.com' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.hostMgmt.testConnection }));
   expect(await screen.findByText('SSH: ✓ SSH OK')).toBeTruthy();
 
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h2.example.com' } });
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h2.example.com' } });
   await waitFor(() => expect(screen.queryByText('SSH: ✓ SSH OK')).toBeNull());
 });
 
 it('surfaces a connectivity-gate error from create (does not silently swallow)', async () => {
   createMock.mockRejectedValue(new Error('SSH 不通\n检查地址 / 端口 / 密码或 key 认证'));
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('+ Add host'));
-  fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.click(await screen.findByText(enUS.hostMgmt.addHostButton));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.addressLabel), { target: { value: 'h' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
   const banner = await screen.findByText(/SSH 不通/);
   expect(banner.textContent).toBe('SSH 不通\n检查地址 / 端口 / 密码或 key 认证');
   expect(banner.classList.contains('whitespace-pre-line')).toBe(true);
@@ -298,18 +299,18 @@ it('surfaces a connectivity-gate error from create (does not silently swallow)',
 it('deletes a host', async () => {
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Delete'));
+  fireEvent.click(await screen.findByText(enUS.common.delete));
   await waitFor(() => expect(deleteMock).toHaveBeenCalledWith('box'));
-  await expectToast({ title: 'Host box deleted' });
+  await expectToast({ title: enUS.hostMgmt.deletedToastTitle('box') });
 });
 
 it('edit: clearing alias/user sends explicit empty strings so PATCH can clear them', async () => {
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Edit'));
-  fireEvent.change(screen.getByLabelText('Alias (optional)'), { target: { value: '' } });
-  fireEvent.change(screen.getByLabelText('Username (optional)'), { target: { value: '' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.click(await screen.findByText(enUS.common.edit));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.aliasLabel), { target: { value: '' } });
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.userLabel), { target: { value: '' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
 
   await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
   expect(updateMock.mock.calls[0][0]).toBe('box');
@@ -319,9 +320,9 @@ it('edit: clearing alias/user sends explicit empty strings so PATCH can clear th
 it('edit: clearing the port field sends port: null so the server can drop a wrongly-saved 22', async () => {
   listMock.mockResolvedValue([{ id: 'box', hostname: 'h.example.com', port: 2222, user: 'agent' } as HostConfig]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Edit'));
-  fireEvent.change(screen.getByLabelText('Port (optional)'), { target: { value: '' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.click(await screen.findByText(enUS.common.edit));
+  fireEvent.change(screen.getByLabelText(enUS.hostMgmt.portLabel), { target: { value: '' } });
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
 
   await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
   expect(updateMock.mock.calls[0][1]).toMatchObject({ port: null });
@@ -330,8 +331,8 @@ it('edit: clearing the port field sends port: null so the server can drop a wron
 it('edit: an unchanged prefilled port is sent as its number (not cleared)', async () => {
   listMock.mockResolvedValue([{ id: 'box', hostname: 'h.example.com', port: 2222, user: 'agent' } as HostConfig]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Edit'));
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.click(await screen.findByText(enUS.common.edit));
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
 
   await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
   expect(updateMock.mock.calls[0][1]).toMatchObject({ port: 2222 });
@@ -340,9 +341,9 @@ it('edit: an unchanged prefilled port is sent as its number (not cleared)', asyn
 it('edit: "clear saved password" checkbox sends password: "" so the server can drop it', async () => {
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Edit'));
-  fireEvent.click(screen.getByRole('checkbox', { name: /Clear the saved password/ }));
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.click(await screen.findByText(enUS.common.edit));
+  fireEvent.click(screen.getByRole('checkbox', { name: enUS.hostMgmt.clearPasswordLabel }));
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
 
   await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
   expect(updateMock.mock.calls[0][1]).toMatchObject({ password: '' });
@@ -351,8 +352,8 @@ it('edit: "clear saved password" checkbox sends password: "" so the server can d
 it('edit: omitting the password (no clear) does NOT send a password field (keep current)', async () => {
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />, { wrapper: ToastProvider });
-  fireEvent.click(await screen.findByText('Edit'));
-  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  fireEvent.click(await screen.findByText(enUS.common.edit));
+  fireEvent.click(screen.getByRole('button', { name: enUS.common.save }));
 
   await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
   expect(updateMock.mock.calls[0][1]).not.toHaveProperty('password');

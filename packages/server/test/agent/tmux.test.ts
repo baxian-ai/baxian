@@ -685,6 +685,11 @@ describe('TmuxManager', () => {
     let pinnedColumn = false;
     let wrapsToNextRow = false;
     let resizesUnderUs = false;
+    let swallowsEnter = false;
+    let exitsOnEnter = false;
+    let driftsRowOnEnter = false;
+    let resizesOnEnter = false;
+    let reflowsOnEnter = false;
     let failReadAfterWrite: number | null = null;
     const submitReplies = (foreground: string, ...writes: Array<{ stdout?: string; stderr?: string; exitCode?: number } | Error>): void => {
       const queue = [...writes];
@@ -693,13 +698,14 @@ describe('TmuxManager', () => {
       let geometry = '120x40';
       let written = false;
       let readsAfterWrite = 0;
+      let live = foreground;
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('cursor_x')) {
           if (failReadAfterWrite !== null && written) {
             readsAfterWrite += 1;
             if (readsAfterWrite === failReadAfterWrite) throw new Error('ssh: connection reset by peer');
           }
-          return { stdout: okHeader(`${column}|${row}|${geometry}|${foreground}`), stderr: '', exitCode: 0 };
+          return { stdout: okHeader(`${column}|${row}|${geometry}|${live}`), stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) return { stdout: okBody('› Ask Codex to do anything'), stderr: '', exitCode: 0 };
         if (cmd.includes('send-keys -l')) {
@@ -707,6 +713,19 @@ describe('TmuxManager', () => {
           if (resizesUnderUs) { row = '9'; geometry = '120x10'; }
           else if (wrapsToNextRow) row = '31';
           else if (!pinnedColumn) column = '9';
+        }
+        // 回车被收下 = 草稿离开 composer,光标回到静止列;被吃掉则只有异步输出或 reflow 会动
+        if (cmd.includes("'Enter'")) {
+          if (swallowsEnter) {
+            if (driftsRowOnEnter) row = '32';
+            // 窗格缩窄,仍留在 composer 里的草稿被重排回旧静止列
+            if (reflowsOnEnter) { column = '2'; geometry = '8x40'; }
+          } else if (exitsOnEnter) live = 'zsh';
+          else {
+            column = '2';
+            row = '30';
+            if (resizesOnEnter) geometry = '80x40';
+          }
         }
         const next = queue.shift() ?? { stdout: 'BX_RUNTIME_OK\n' };
         if (next instanceof Error) throw next;
@@ -778,13 +797,14 @@ describe('TmuxManager', () => {
     });
 
     // 8 列窗格里 /quit 折到下一行,列回到基线值:只比列会把已经渲染出来的草稿判成没进 composer
-    it('accepts a draft that wrapped to the next row with the column back at the baseline', async () => {
+    it('accepts a draft that wrapped to the next row with the column back at the baseline, but cannot confirm its submission', async () => {
       wrapsToNextRow = true;
       submitReplies('codex');
-      await tmux.submitToRuntime(PANE, 'codex', '/quit', { timeoutMs: 300, intervalMs: 50 });
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/quit', { timeoutMs: 300, intervalMs: 50 }).catch(e => e);
       wrapsToNextRow = false;
-      expect(writesSent()).toHaveLength(2);
+      // 落地判据认这一格,回车照发;排空判据却没有列证据可用,只能收口成未知
       expect(writesSent()[1]).toContain('Enter');
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
     });
 
     // 并发 resize 会重排整屏:光标相对旧基线的位移与"文本被收下"无关,不能拿它当提交证据
@@ -835,6 +855,87 @@ describe('TmuxManager', () => {
       expect(err).toBeInstanceOf(ReplNotReadyError);
       expect((err as Error).message).toMatch(/the Enter for the line "\/quit" withheld; the line stays in the composer/);
       expect(writesSent()).toHaveLength(2);
+    });
+
+    // 补全弹窗/vim Normal 模式吃掉回车:按键 applied,草稿原样留着
+    it('reports an applied Enter that never drained the composer as unknown, and scrubs the line', async () => {
+      swallowsEnter = true;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/clear', { timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      swallowsEnter = false;
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/the Enter for the line "\/clear" was applied but the composer never drained back to the resting cursor \(column 2 in 120x40\)/);
+      expect((err as Error).message).toMatch(/the line landed at 9,30.*the line was scrubbed with C-u.*inspect the pane before retrying/);
+      expect(writesSent().map(c => c.includes("'/clear'") ? 'line' : c.includes('C-u') ? 'scrub' : c.includes('Enter') ? 'enter' : 'other'))
+        .toEqual(['line', 'enter', 'scrub']);
+    });
+
+    // 折行草稿停在静止列上:行号不管动没动都不能替列作证
+    it.each([false, true])('does not confirm a wrapped draft whose Enter was swallowed (row drifts afterwards: %s)', async drifts => {
+      wrapsToNextRow = true;
+      swallowsEnter = true;
+      driftsRowOnEnter = drifts;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/quit', { timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      wrapsToNextRow = false;
+      swallowsEnter = false;
+      driftsRowOnEnter = false;
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/landed at 2,31 in 120x40 without moving off the resting cursor \(column 2 in 120x40\), so no drain evidence exists that a reflow could not fake/);
+      expect(writesSent().map(c => c.includes("'/quit'") ? 'line' : c.includes('C-u') ? 'scrub' : c.includes('Enter') ? 'enter' : 'other'))
+        .toEqual(['line', 'enter', 'scrub']);
+    });
+
+    // 回车已经 applied:此后读不到东西也证明不了它没执行
+    it('keeps a dropped read after the applied Enter as an unknown outcome', async () => {
+      failReadAfterWrite = 2;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/clear', { timeoutMs: 400, intervalMs: 20 }).catch(e => e);
+      failReadAfterWrite = null;
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/was applied but the composer could not be observed afterwards \(ssh: connection reset by peer\)/);
+      expect(writesSent().map(c => c.includes("'/clear'") ? 'line' : c.includes('C-u') ? 'scrub' : c.includes('Enter') ? 'enter' : 'other'))
+        .toEqual(['line', 'enter', 'scrub']);
+    });
+
+    // runtime 在消费回车之前换了前台:普通命令的下场无从判定
+    it('does not take a foreground change after a plain command as proof of submission', async () => {
+      exitsOnEnter = true;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/clear', { timeoutMs: 120, intervalMs: 50 }).catch(e => e);
+      exitsOnEnter = false;
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/the pane foreground became "zsh" instead of codex before the composer could be observed draining/);
+    });
+
+    // 宁可把 resize 后的真实成功误报成未知,也不能让重排回静止列的草稿静默成功
+    it.each([
+      ['a still-drafted line reflowed onto the old resting column', true],
+      ['a genuinely drained composer', false],
+    ])('reports a resize between the Enter and the first read as unknown: %s', async (_label, swallowed) => {
+      swallowsEnter = swallowed;
+      reflowsOnEnter = swallowed;
+      resizesOnEnter = !swallowed;
+      submitReplies('codex');
+      const err = await tmux.submitToRuntime(PANE, 'codex', '/clear', { timeoutMs: 200, intervalMs: 20 }).catch(e => e);
+      swallowsEnter = false;
+      reflowsOnEnter = false;
+      resizesOnEnter = false;
+      expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/never drained back to the resting cursor \(column 2 in 120x40\)/);
+    });
+
+    // /exit 提交后 runtime 自己退场:光标不再是 composer 的证据
+    it('takes the runtime leaving the foreground as a drained composer', async () => {
+      exitsOnEnter = true;
+      submitReplies('claude');
+      await expect(tmux.submitToRuntime(PANE, 'claude-code', '/exit', { timeoutMs: 120, intervalMs: 50, expectRuntimeExit: true })).resolves.toBeUndefined();
+      exitsOnEnter = false;
+      expect(writesSent().some(c => c.includes('C-u'))).toBe(false);
+      // 确认这一格确实被看过:回车之后仍有一次读帧,退场是被读出来的而不是没查
+      const sent = runner.exec.mock.calls.map(c => String(c[0]));
+      const enterIdx = sent.findIndex(c => c.includes("'Enter'"));
+      expect(sent.slice(enterIdx + 1).some(c => c.includes('cursor_x'))).toBe(true);
     });
   });
 

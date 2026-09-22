@@ -1,3 +1,5 @@
+import { zhCN } from '../../src/i18n/zh-cn.ts';
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, act } from '@testing-library/react';
 import {
@@ -41,20 +43,20 @@ function Probe() {
 describe('useT', () => {
   it('renders English without any provider (default context)', () => {
     render(<Probe />);
-    expect(screen.getByText('Settings')).toBeTruthy();
+    expect(screen.getByText(enUS.settings.entry)).toBeTruthy();
   });
 
   it('follows the locale synced from config inside the provider', () => {
     syncLocaleFromConfig('zh-CN');
     render(<I18nProvider><Probe /></I18nProvider>);
-    expect(screen.getByText('系统设置')).toBeTruthy();
+    expect(screen.getByText(zhCN.settings.entry)).toBeTruthy();
   });
 
   it('re-renders subscribers when the locale changes after mount', () => {
     render(<I18nProvider><Probe /></I18nProvider>);
-    expect(screen.getByText('Settings')).toBeTruthy();
+    expect(screen.getByText(enUS.settings.entry)).toBeTruthy();
     act(() => syncLocaleFromConfig('zh-CN'));
-    expect(screen.getByText('系统设置')).toBeTruthy();
+    expect(screen.getByText(zhCN.settings.entry)).toBeTruthy();
   });
 });
 
@@ -94,9 +96,9 @@ describe('setLocale', () => {
 
 describe('getMessages', () => {
   it('returns the dictionary for the current module-level locale', () => {
-    expect(getMessages().settings.entry).toBe('Settings');
+    expect(getMessages().settings.entry).toBe(enUS.settings.entry);
     syncLocaleFromConfig('zh-CN');
-    expect(getMessages().settings.entry).toBe('系统设置');
+    expect(getMessages().settings.entry).toBe(zhCN.settings.entry);
   });
 });
 
@@ -113,7 +115,7 @@ describe('provider side effects', () => {
     act(() => {
       window.dispatchEvent(new StorageEvent('storage', { key: 'baxian.language', newValue: 'zh-CN' }));
     });
-    expect(screen.getByText('系统设置')).toBeTruthy();
+    expect(screen.getByText(zhCN.settings.entry)).toBeTruthy();
   });
 });
 

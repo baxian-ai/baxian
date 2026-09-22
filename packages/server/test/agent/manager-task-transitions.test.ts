@@ -1118,6 +1118,34 @@ describe('AgentManager.recordTaskAttention', () => {
     data: { phase },
   });
 
+  it.each([
+    { status: 'in_progress', actions: ['cancel'] },
+    { status: 'fixing', actions: ['cancel'] },
+    { status: 'approved', actions: ['cancel'] },
+    { status: 'review', actions: ['advance', 'verdict', 'cancel'] },
+    { status: 'cancelled', actions: ['retry'] },
+  ] as const)('keeps uncertain $status delivery actions safe without hiding QA confirmation', async ({ status, actions }) => {
+    const task = await harness.seedTask({ status, phase: 'code', agentId: 'dev-1' });
+
+    await harness.manager.recordTaskAttention(intervention(task.id, 'dispatch-failed:ack_unknown'));
+
+    expect((await harness.taskStore.get(task.id))?.attention?.recommendedActions).toEqual(actions);
+  });
+
+  it.each([
+    { status: 'in_progress', actions: ['cancel'] },
+    { status: 'cancelled', actions: ['retry'] },
+    { status: 'merge-ready', actions: ['verdict', 'cancel'] },
+  ] as const)('does not recommend replaying a delivered bootstrap on a $status task', async ({ status, actions }) => {
+    const task = await harness.seedTask({ status, agentId: 'dev-1' });
+
+    await harness.manager.recordTaskAttention(intervention(task.id, 'bootstrap-marker-clear-failed'));
+
+    expect((await harness.taskStore.get(task.id))?.attention).toMatchObject({
+      reason: 'bootstrap-marker-clear-failed', recommendedActions: [...actions],
+    });
+  });
+
   it('ignores terminal audit phases so opening or closing the agent terminal never flags the task', async () => {
     for (const phase of ['attach', 'detach', 'input', 'close']) {
       const id = `task-terminal-${phase}`;

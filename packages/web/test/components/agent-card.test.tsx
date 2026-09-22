@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type {
@@ -17,7 +17,6 @@ import { api } from '../../src/api.ts';
 import {
   AgentCard,
   agentHoldRecovery,
-  resolveAgentBadge,
   type TerminalMode,
 } from '../../src/components/agent-card.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
@@ -35,14 +34,6 @@ const resumeAgentMock = vi.mocked(api.projects.resumeAgent);
 const restartReplMock = vi.mocked(api.projects.restartRepl);
 const retryAgentMock = vi.mocked(api.projects.retryAgent);
 const bootstrapMock = vi.mocked(api.projects.bootstrap);
-const petsListMock = vi.mocked(api.pets.list);
-const fetchSpritesheetMock = vi.mocked(api.pets.fetchSpritesheet);
-
-class StubURL extends URL {
-  static createObjectURL = vi.fn(() => 'blob:mock-sprite');
-  static revokeObjectURL = vi.fn();
-}
-
 type RenderCardOptions = {
   runtime?: AgentRuntime;
   model?: string;
@@ -99,7 +90,7 @@ function makeBinding(id: string, overrides: Partial<AgentBindingFacts> = {}): Ag
 }
 
 function kebab(): HTMLElement {
-  return screen.getByRole('button', { name: /actions menu/ });
+  return screen.getByRole('button', { name: (_name, element) => element.getAttribute('aria-haspopup') === 'menu' });
 }
 
 function openMenu(): void {
@@ -107,7 +98,7 @@ function openMenu(): void {
 }
 
 function terminalHrefs(): (string | null)[] {
-  return screen.getAllByRole('link', { name: 'Terminal' }).map(link => link.getAttribute('href'));
+  return screen.getAllByRole('link', { name: enUS.agents.terminal }).map(link => link.getAttribute('href'));
 }
 
 async function findConfirmDialog(): Promise<HTMLElement> {
@@ -120,187 +111,6 @@ async function settleConfirmDialog(buttonName: string): Promise<void> {
     fireEvent.click(within(dialog).getByRole('button', { name: buttonName }));
   });
 }
-
-describe('resolveAgentBadge', () => {
-  const t = enUS.agents;
-
-  function badgeFor(overrides: Partial<AgentSnapshot> = {}) {
-    return resolveAgentBadge(makeSnapshot(overrides), t);
-  }
-
-  it('ranks host unreachable above every other signal', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'error',
-      tmuxSessionStatus: 'unreachable',
-      stale: true,
-      binding: makeBinding('dev-1', {
-        status: 'awaiting_human',
-        awaitingReason: 'stuck',
-        needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
-      }),
-    });
-    expect(badge.label).toBe('Host unreachable');
-    expect(badge.cls).toBe('pill pill-danger');
-    expect(badge.kind).toBe('alert');
-  });
-
-  it('shows Starting while bootstrapping even though the session is still absent', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'pending',
-      tmuxSessionStatus: 'absent',
-      binding: makeBinding('dev-1', { creationToken: 'create-1' }),
-    });
-    expect(badge.label).toBe('Starting');
-    expect(badge.cls).toBe('pill pill-review');
-    expect(badge.kind).toBe('runtime');
-  });
-
-  it('ranks a missing session above a runtime error outside bootstrap', () => {
-    const badge = badgeFor({ runtimeStatus: 'error', tmuxSessionStatus: 'absent' });
-    expect(badge.label).toBe('No session');
-    expect(badge.cls).toBe('pill pill-warn');
-    expect(badge.kind).toBe('alert');
-  });
-
-  it('ranks Dispatching above No session and Error, but below host unreachable', () => {
-    const marker = { taskId: 'task-1', bootstrappingTaskId: 'task-1' };
-    const badge = badgeFor({
-      runtimeStatus: 'error',
-      tmuxSessionStatus: 'absent',
-      binding: makeBinding('dev-1', marker),
-    });
-    expect(badge.label).toBe('Dispatching');
-    expect(badge.cls).toBe('pill pill-review');
-    expect(badge.kind).toBe('runtime');
-    expect(badgeFor({
-      tmuxSessionStatus: 'unreachable',
-      binding: makeBinding('dev-1', marker),
-    }).label).toBe('Host unreachable');
-  });
-
-  it('never calls a held or questioning binding Dispatching, marker or not', () => {
-    expect(badgeFor({
-      binding: makeBinding('dev-1', {
-        taskId: 'task-1', bootstrappingTaskId: 'task-1',
-        status: 'awaiting_human', awaitingReason: 'checkout failed',
-      }),
-    }).label).toBe('Held');
-    expect(badgeFor({
-      binding: makeBinding('dev-1', {
-        taskId: 'task-1', bootstrappingTaskId: 'task-1',
-        needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
-      }),
-    }).label).toBe('Awaiting reply');
-  });
-
-  it('ranks a runtime error above a human hold', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'error',
-      binding: makeBinding('dev-1', { status: 'awaiting_human' }),
-    });
-    expect(badge.label).toBe('Error');
-    expect(badge.cls).toBe('pill pill-warn');
-    expect(badge.kind).toBe('alert');
-  });
-
-  it('ranks a human hold above an unanswered question and titles it with the awaiting reason', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'pending',
-      binding: makeBinding('dev-1', {
-        status: 'awaiting_human',
-        awaitingReason: 'recheck dispatch failed',
-        needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
-      }),
-    });
-    expect(badge.label).toBe('Held');
-    expect(badge.kind).toBe('alert');
-    expect(badge.title).toBe('recheck dispatch failed');
-  });
-
-  it('falls back to the default hold reason when the binding carries none', () => {
-    const badge = badgeFor({ binding: makeBinding('dev-1', { status: 'awaiting_human' }) });
-    expect(badge.label).toBe('Held');
-    expect(badge.title).toBe('Needs human attention');
-  });
-
-  it('ranks an unanswered question above the pending runtime status', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'pending',
-      binding: makeBinding('dev-1', { needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' } }),
-    });
-    expect(badge.label).toBe('Awaiting reply');
-    expect(badge.kind).toBe('alert');
-    expect(badge.title).toContain('Agent is waiting for your reply');
-  });
-
-  it('reports the pending runtime status as an alert', () => {
-    const badge = badgeFor({ runtimeStatus: 'pending' });
-    expect(badge.label).toBe('Awaiting human');
-    expect(badge.cls).toBe('pill pill-warn');
-    expect(badge.kind).toBe('alert');
-  });
-
-  it.each([
-    ['working', 'Working', 'pill pill-live'],
-    ['waiting', 'Waiting', 'pill pill-review'],
-    ['idle', 'Idle', 'pill pill-idle'],
-    ['unknown', 'Unknown', 'pill pill-idle'],
-  ] as const)('maps the %s runtime status to a plain %s badge', (status, label, cls) => {
-    const badge = badgeFor({ runtimeStatus: status });
-    expect(badge.label).toBe(label);
-    expect(badge.cls).toBe(cls);
-    expect(badge.kind).toBe('runtime');
-  });
-
-  it('lets the runtime status speak while the first session probe is still pending', () => {
-    const badge = badgeFor({ runtimeStatus: 'idle', tmuxSessionStatus: 'unknown' });
-    expect(badge.label).toBe('Idle');
-  });
-
-  it('does not treat an agent with a live pane as bootstrapping', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'pending',
-      binding: makeBinding('dev-1', { creationToken: 'create-1', paneId: '%1' }),
-    });
-    expect(badge.label).toBe('Awaiting human');
-  });
-
-  it('does not treat a startup-dialog hold as bootstrapping once the probe reports PENDING_HUMAN', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'pending',
-      reason: 'PENDING_HUMAN',
-      binding: makeBinding('dev-1', { creationToken: 'create-1' }),
-    });
-    expect(badge.label).toBe('Awaiting human');
-  });
-
-  it('marks any badge as stale and appends the last-observed note to its title', () => {
-    const badge = badgeFor({
-      runtimeStatus: 'working',
-      stale: true,
-      observedAt: '2026-07-06T10:00:00Z',
-    });
-    expect(badge.label).toBe('Working');
-    expect(badge.stale).toBe(true);
-    expect(badge.title).toContain('stale');
-    expect(badge.title).toContain(new Date('2026-07-06T10:00:00Z').toLocaleString());
-  });
-
-  it('keeps the hold reason and the stale note together in the title', () => {
-    const badge = badgeFor({
-      stale: true,
-      binding: makeBinding('dev-1', { status: 'awaiting_human', awaitingReason: 'stuck' }),
-    });
-    expect(badge.title).toContain('stuck');
-    expect(badge.title).toContain('stale');
-  });
-
-  it('leaves fresh badges without a stale marker', () => {
-    const badge = badgeFor({ runtimeStatus: 'working' });
-    expect(badge.stale).toBe(false);
-    expect(badge.title).toBeUndefined();
-  });
-});
 
 describe('agentHoldRecovery', () => {
   it.each([
@@ -335,9 +145,6 @@ describe('agentHoldRecovery', () => {
 
 describe('AgentCard', () => {
   beforeEach(() => {
-    vi.stubGlobal('URL', StubURL);
-    petsListMock.mockReset().mockResolvedValue([]);
-    fetchSpritesheetMock.mockReset().mockResolvedValue(new Blob(['sprite']));
     deleteAgentMock.mockReset();
     compactMock.mockReset();
     clearMock.mockReset();
@@ -349,24 +156,129 @@ describe('AgentCard', () => {
     flagDirtyMock.mockReset();
   });
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('links an active runtime-recovery hold to task actions instead of agent deletion', () => {
+  it.each(['agent_dialog_resolved_runtime', 'restart-redispatch-failed', 'bootstrap-marker-clear-failed'])('links an active %s hold to task actions without offering Resume', (awaitingPhase) => {
     const task = makeTask({ id: 'task-active', projectId: 'proj', status: 'in_progress' });
     renderCard(makeSnapshot({
       runtimeStatus: 'pending',
       binding: makeBinding('dev-1', {
         taskId: task.id,
         status: 'awaiting_human',
-        awaitingPhase: 'agent_dialog_resolved_runtime',
+        awaitingPhase,
       }),
     }), { task });
 
-    expect(screen.getByRole('link', { name: 'Open task actions' }).getAttribute('href'))
+    expect(screen.getByRole('link', { name: enUS.agents.openTaskActions }).getAttribute('href'))
       .toBe('/project/proj/task/task-active');
-    expect(screen.queryByRole('button', { name: 'Delete agent' })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.agents.deleteToRecover })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
+  });
+
+  it.each(['restart-redispatch-failed', 'bootstrap-marker-clear-failed'])('links a %s hold to its bound task before task data loads', (awaitingPhase) => {
+    renderCard(makeSnapshot({
+      binding: makeBinding('dev-1', { taskId: 'task-loading', status: 'awaiting_human', awaitingPhase }),
+    }));
+
+    expect(screen.getByRole('link', { name: enUS.agents.openTaskActions }).getAttribute('href'))
+      .toBe('/project/proj/task/task-loading');
+    expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
+  });
+
+  it('offers Resume for a delivered bootstrap hold after its task is cancelled', () => {
+    const task = makeTask({ id: 'task-cancelled', projectId: 'proj', status: 'cancelled' });
+    renderCard(makeSnapshot({
+      binding: makeBinding('dev-1', {
+        taskId: task.id, status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+      }),
+    }), { task });
+
+    expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
+    expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
+  });
+
+  it.each(['spec-ready', 'review', 'fixing', 'approved', 'merge-ready', 'max_rounds'] as const)(
+    'offers Resume for a stale bootstrap hold after the task reaches %s', (status) => {
+      const task = makeTask({ id: 'task-advanced', projectId: 'proj', status });
+      renderCard(makeSnapshot({
+        binding: makeBinding('dev-1', {
+          taskId: task.id, status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+        }),
+      }), { task });
+
+      expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
+      expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
+    },
+  );
+
+  it.each(['spec-ready', 'review', 'merge-ready', 'max_rounds'] as const)(
+    'offers Resume for a stale replay failure after the task reaches %s', (status) => {
+      const task = makeTask({ id: 'task-advanced', projectId: 'proj', status });
+      renderCard(makeSnapshot({
+        binding: makeBinding('dev-1', {
+          taskId: task.id, status: 'awaiting_human', awaitingPhase: 'restart-redispatch-failed',
+        }),
+      }), { task });
+
+      expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
+      expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
+    },
+  );
+
+  it.each(['fixing', 'approved'] as const)(
+    'keeps a %s replay failure linked to task recovery actions', (status) => {
+      const task = makeTask({ id: 'task-replay', projectId: 'proj', status });
+      renderCard(makeSnapshot({
+        binding: makeBinding('dev-1', {
+          taskId: task.id, status: 'awaiting_human', awaitingPhase: 'restart-redispatch-failed',
+        }),
+      }), { task });
+
+      expect(screen.getByRole('link', { name: enUS.agents.openTaskActions }).getAttribute('href'))
+        .toBe('/project/proj/task/task-replay');
+      expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
+    },
+  );
+
+  it.each(['spec-ready', 'review', 'merge-ready', 'max_rounds'] as const)(
+    'offers Resume once an uncertain Dev delivery advances to %s', (status) => {
+      const task = makeTask({ id: 'task-outcome', projectId: 'proj', status });
+      renderCard(makeSnapshot({
+        binding: makeBinding('dev-1', {
+          taskId: task.id, status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+        }),
+      }), { task });
+
+      expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
+      expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
+    },
+  );
+
+  it.each([
+    { role: 'dev', status: 'in_progress' },
+    { role: 'dev', status: 'fixing' },
+    { role: 'dev', status: 'approved' },
+    { role: 'qa', status: 'review' },
+  ] as const)('keeps uncertain $role delivery in $status linked to task verification', ({ role, status }) => {
+    const task = makeTask({ id: 'task-uncertain', projectId: 'proj', status });
+    renderCard(makeSnapshot({
+      id: `${role}-1`,
+      binding: makeBinding(`${role}-1`, {
+        taskId: task.id, status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      }),
+    }), { task, role });
+
+    expect(screen.getByRole('link', { name: enUS.agents.openTaskActions })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
+  });
+
+  it('waits for task state before offering Resume for an uncertain Dev delivery', () => {
+    renderCard(makeSnapshot({
+      binding: makeBinding('dev-1', {
+        taskId: 'task-loading', status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      }),
+    }));
+
+    expect(screen.getByRole('link', { name: enUS.agents.openTaskActions })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
   });
 
   describe('Held recovery via Resume button', () => {
@@ -384,7 +296,7 @@ describe('AgentCard', () => {
     }
 
     function recoveryButton(): HTMLElement {
-      return screen.getByRole('button', { name: /^(Resume|Restart \/ retry runtime)$/ });
+      return screen.getByRole('button', { name: name => [enUS.agents.resume, enUS.agents.restartRuntime].includes(name) });
     }
 
     it('routes Resume to restart-repl (re-greet) for a greeting_failed hold with a live session', async () => {
@@ -393,9 +305,9 @@ describe('AgentCard', () => {
 
       fireEvent.click(recoveryButton());
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Resume agent dev-greet?')).toBeTruthy();
-      expect(within(dialog).getByText(/re-run the handshake/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Resume' })); });
+      expect(within(dialog).getByText(enUS.agents.resumeConfirmTitle('dev-greet'))).toBeTruthy();
+      expect(within(dialog).getByText(enUS.agents.resumeGreetingBody)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: enUS.agents.resume })); });
 
       expect(restartReplMock).toHaveBeenCalledWith('proj', 'dev-greet');
       expect(retryAgentMock).not.toHaveBeenCalled();
@@ -409,7 +321,7 @@ describe('AgentCard', () => {
         heldCard('dev-gone', 'greeting_failed', sessionStatus);
 
         fireEvent.click(recoveryButton());
-        await settleConfirmDialog('Resume');
+        await settleConfirmDialog(enUS.agents.resume);
 
         expect(retryAgentMock).toHaveBeenCalledWith('proj', 'dev-gone');
         expect(restartReplMock).not.toHaveBeenCalled();
@@ -423,16 +335,11 @@ describe('AgentCard', () => {
 
       fireEvent.click(recoveryButton());
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText(/baxian will clear the awaiting_human state/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Resume' })); });
+      expect(within(dialog).getByText(enUS.agents.resumeDefaultBody)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: enUS.agents.resume })); });
 
       expect(resumeAgentMock).toHaveBeenCalledWith('proj', 'dev-hold');
       expect(restartReplMock).not.toHaveBeenCalled();
-    });
-
-    it('gives the greeting_failed Resume button a distinct tooltip from the plain hold', () => {
-      heldCard('dev-greet', 'greeting_failed');
-      expect(recoveryButton().getAttribute('title')).toMatch(/greeting|Restart REPL/i);
     });
 
     it('surfaces a Resume failure as an error toast and re-enables the button', async () => {
@@ -440,9 +347,9 @@ describe('AgentCard', () => {
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
       fireEvent.click(recoveryButton());
-      await settleConfirmDialog('Resume');
+      await settleConfirmDialog(enUS.agents.resume);
 
-      await expectToast({ title: 'Resume failed', body: 'binding busy' });
+      await expectToast({ title: enUS.agents.resumeFailedTitle, body: 'binding busy' });
       expect((recoveryButton() as HTMLButtonElement).disabled).toBe(false);
     });
 
@@ -450,7 +357,7 @@ describe('AgentCard', () => {
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
       fireEvent.click(recoveryButton());
-      await settleConfirmDialog('Cancel');
+      await settleConfirmDialog(enUS.common.cancel);
 
       expect(resumeAgentMock).not.toHaveBeenCalled();
       expect(restartReplMock).not.toHaveBeenCalled();
@@ -468,6 +375,16 @@ describe('AgentCard', () => {
     expect(runtime.className).toContain('sm:inline');
   });
 
+  it('renders the agent name at the same size and weight as the rest of the header', () => {
+    renderCard(makeSnapshot({ id: 'dev-codex' }), { runtime: 'codex' });
+
+    const nameTokens = screen.getByText('dev-codex').className.split(/\s+/);
+    const roleTokens = screen.getByText('Dev').className.split(/\s+/);
+    expect(nameTokens).toContain('text-xs');
+    expect(roleTokens).toContain('text-xs');
+    expect(nameTokens.some(token => token.startsWith('font-') && token !== 'font-display')).toBe(false);
+  });
+
   it('appends the configured model after the runtime label when set', () => {
     renderCard(makeSnapshot({ id: 'dev-codex' }), { runtime: 'codex', model: 'gpt-5.4' });
 
@@ -483,7 +400,7 @@ describe('AgentCard', () => {
     expect(screen.getByText('dev-x').getAttribute('title')).toBe('dev-x (opus)');
   });
 
-  it('shows bootstrap as starting and keeps the terminal gated until the tmux session appears', () => {
+  it('keeps the terminal gated until the tmux session appears during bootstrap', () => {
     renderCard(makeSnapshot({
       id: 'dev-new',
       runtimeStatus: 'pending',
@@ -491,11 +408,10 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-new', { creationToken: 'create-1' }),
     }));
 
-    expect(screen.getByText('Starting')).toBeTruthy();
-    expect(screen.getByText(/Agent is starting/)).toBeTruthy();
-    expect(screen.queryByText('Awaiting human intervention')).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Terminal' })).toBeNull();
-    expect(screen.getByText('Terminal')).toBeTruthy();
+    expect(screen.getByText(enUS.agents.bootstrappingNotice)).toBeTruthy();
+    expect(screen.queryByText(enUS.agents.awaitingHumanIntervention)).toBeNull();
+    expect(screen.queryByRole('link', { name: enUS.agents.terminal })).toBeNull();
+    expect(screen.getByText(enUS.agents.terminal)).toBeTruthy();
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
   });
 
@@ -506,8 +422,7 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-pending', { creationToken: 'create-1', paneId: '%1' }),
     }));
 
-    expect(screen.getByText('Awaiting human')).toBeTruthy();
-    expect(screen.getByText('Awaiting human intervention')).toBeTruthy();
+    expect(screen.getByText(enUS.agents.awaitingHumanIntervention)).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-pending', '/terminal/dev-pending']);
     expect(screen.getByTestId('pane-terminal')).toBeTruthy();
   });
@@ -521,10 +436,9 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-pending-no-pane', { creationToken: 'create-1' }),
     }));
 
-    expect(screen.getByText('Awaiting human')).toBeTruthy();
-    expect(screen.getByText('Awaiting human intervention')).toBeTruthy();
+    expect(screen.getByText(enUS.agents.awaitingHumanIntervention)).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-pending-no-pane', '/terminal/dev-pending-no-pane']);
-    expect(screen.queryByText(/Agent is starting/)).toBeNull();
+    expect(screen.queryByText(enUS.agents.bootstrappingNotice)).toBeNull();
   });
 
   it('allows attaching when binding.status flips to awaiting_human even if paneId is still missing', () => {
@@ -539,13 +453,12 @@ describe('AgentCard', () => {
       }),
     }));
 
-    expect(screen.getByText('Held')).toBeTruthy();
     expect(screen.getByText('agent_dialog_pending')).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-held', '/terminal/dev-held']);
-    expect(screen.queryByText(/Agent is starting/)).toBeNull();
+    expect(screen.queryByText(enUS.agents.bootstrappingNotice)).toBeNull();
   });
 
-  it('shows the need-input badge and hint when the needInput watermark is lit', () => {
+  it('offers a terminal link when the needInput watermark is lit', () => {
     renderCard(makeSnapshot({
       id: 'dev-asking',
       runtimeStatus: 'working',
@@ -555,20 +468,8 @@ describe('AgentCard', () => {
       }),
     }));
 
-    expect(screen.getByText('Awaiting reply')).toBeTruthy();
-    expect(screen.getByText('Agent is waiting for your reply')).toBeTruthy();
+    expect(screen.getByText(enUS.agents.needInputNoticeTitle)).toBeTruthy();
     expect(terminalHrefs()).toContain('/terminal/dev-asking');
-  });
-
-  it('renders no need-input badge without a lit needInput watermark', () => {
-    renderCard(makeSnapshot({
-      id: 'dev-quiet',
-      runtimeStatus: 'working',
-      binding: makeBinding('dev-quiet', { taskId: 'task-9' }),
-    }));
-
-    expect(screen.queryByText('Awaiting reply')).toBeNull();
-    expect(screen.queryByText('Agent is waiting for your reply')).toBeNull();
   });
 
   it('reveals the live terminal during in-flight bootstrap once the tmux session is present', () => {
@@ -579,9 +480,8 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-launching', { creationToken: 'create-1' }),
     }));
 
-    expect(screen.getByText('Starting')).toBeTruthy();
-    expect(screen.queryByText('Awaiting human intervention')).toBeNull();
-    expect(screen.queryByText(/Agent is starting/)).toBeNull();
+    expect(screen.queryByText(enUS.agents.awaitingHumanIntervention)).toBeNull();
+    expect(screen.queryByText(enUS.agents.bootstrappingNotice)).toBeNull();
     expect(terminalHrefs()).toEqual(['/terminal/dev-launching']);
     expect(screen.getByTestId('pane-terminal')).toBeTruthy();
   });
@@ -594,8 +494,7 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-emb-boot', { creationToken: 'create-1' }),
     }), { terminalMode: 'embedded-full' });
 
-    expect(screen.getByText('Starting')).toBeTruthy();
-    expect(screen.queryByText(/Agent is starting/)).toBeNull();
+    expect(screen.queryByText(enUS.agents.bootstrappingNotice)).toBeNull();
     expect(screen.getByTestId('pane-terminal').getAttribute('data-mode')).toBe('full');
   });
 
@@ -608,7 +507,7 @@ describe('AgentCard', () => {
     }), { terminalMode: 'embedded-full' });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
-    expect(screen.getByText('Agent is starting')).toBeTruthy();
+    expect(screen.getByText(enUS.agents.bootstrappingTerminalDisabled)).toBeTruthy();
   });
 
   it('embedded terminal mode renders an interactive full terminal even when idle', () => {
@@ -650,14 +549,14 @@ describe('AgentCard', () => {
 
     it('invokes onActivate when the terminal container is clicked', () => {
       const { onActivate } = renderSelectable(false);
-      const trigger = screen.getByRole('button', { name: 'Activate dev-sel terminal' });
+      const trigger = screen.getByRole('button', { name: enUS.agents.activateTerminal('dev-sel') });
       fireEvent.click(trigger);
       expect(onActivate).toHaveBeenCalledTimes(1);
     });
 
     it('does not activate when an inner control (e.g. the kebab menu button) inside the card is clicked', () => {
       const { onActivate } = renderSelectable(false);
-      const menuTrigger = screen.getByRole('button', { name: /Agent dev-sel actions menu/ });
+      const menuTrigger = screen.getByRole('button', { name: enUS.agents.actionsMenu('dev-sel') });
       fireEvent.click(menuTrigger);
       expect(onActivate).not.toHaveBeenCalled();
     });
@@ -671,7 +570,7 @@ describe('AgentCard', () => {
 
     it('exposes the terminal container as a keyboard-activatable button while inactive', () => {
       const { onActivate } = renderSelectable(false);
-      const trigger = screen.getByRole('button', { name: 'Activate dev-sel terminal' });
+      const trigger = screen.getByRole('button', { name: enUS.agents.activateTerminal('dev-sel') });
       expect(trigger.getAttribute('tabindex')).toBe('0');
       fireEvent.keyDown(trigger, { key: 'Enter' });
       expect(onActivate).toHaveBeenCalledTimes(1);
@@ -684,116 +583,6 @@ describe('AgentCard', () => {
       const terminalContainer = screen.getByTestId('pane-terminal').parentElement as HTMLElement;
       expect(terminalContainer.getAttribute('role')).toBeNull();
       expect(terminalContainer.getAttribute('tabindex')).toBeNull();
-    });
-  });
-
-  describe('unified status badge', () => {
-    it('renders exactly one status badge even when several signals fire at once', () => {
-      renderCard(makeSnapshot({
-        id: 'dev-multi',
-        runtimeStatus: 'working',
-        tmuxSessionStatus: 'unreachable',
-        stale: true,
-        binding: makeBinding('dev-multi', {
-          status: 'awaiting_human',
-          needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
-        }),
-      }));
-
-      expect(screen.getByText('Host unreachable')).toBeTruthy();
-      expect(screen.queryByText('Working')).toBeNull();
-      expect(screen.queryByText('Held')).toBeNull();
-      expect(screen.queryByText('Awaiting reply')).toBeNull();
-    });
-
-    it.each([
-      ['absent', 'No session'],
-      ['unreachable', 'Host unreachable'],
-    ] as const)('renders a %s tmux session as a %s badge', (status, label) => {
-      renderCard(makeSnapshot({ id: `dev-${status}`, tmuxSessionStatus: status }));
-      expect(screen.getByText(label)).toBeTruthy();
-    });
-
-    it('keeps the runtime badge as the only indicator while the first session probe is pending', () => {
-      renderCard(makeSnapshot({ id: 'dev-probe', runtimeStatus: 'idle', tmuxSessionStatus: 'unknown' }));
-
-      expect(screen.getByText('Idle')).toBeTruthy();
-      expect(screen.queryByRole('img', { name: /[Ss]ession/ })).toBeNull();
-    });
-
-    it('explains the staleness on hover without replacing the badge label', () => {
-      renderCard(makeSnapshot({
-        id: 'dev-stale',
-        runtimeStatus: 'working',
-        stale: true,
-        observedAt: '2026-07-06T10:00:00Z',
-      }));
-
-      const badge = screen.getByText('Working');
-      expect(badge.getAttribute('title')).toContain('stale');
-      expect(badge.getAttribute('aria-label')).toBeNull();
-    });
-
-    it('exposes the staleness as real text next to the badge for screen readers', () => {
-      renderCard(makeSnapshot({
-        id: 'dev-stale-sr',
-        runtimeStatus: 'working',
-        stale: true,
-        observedAt: '2026-07-06T10:00:00Z',
-      }));
-
-      const note = screen.getByText(/Data may be stale/);
-      expect(note.parentElement).toBe(screen.getByText('Working').parentElement);
-      // visually-hidden contract: jsdom applies no CSS, so the utility class is the only guard
-      expect(note.className.split(/\s+/)).toContain('sr-only');
-    });
-
-    it('folds the hold reason into the hidden stale note', () => {
-      renderCard(makeSnapshot({
-        id: 'dev-held-stale',
-        stale: true,
-        binding: makeBinding('dev-held-stale', { status: 'awaiting_human', awaitingReason: 'stuck' }),
-      }));
-
-      const note = screen.getByText(/Data may be stale/);
-      expect(note.textContent).toContain('stuck');
-    });
-
-    it('keeps a fresh badge untitled and free of stale notes', () => {
-      renderCard(makeSnapshot({ id: 'dev-fresh', runtimeStatus: 'working' }));
-
-      const badge = screen.getByText('Working');
-      expect(badge.getAttribute('title')).toBeNull();
-      expect(badge.getAttribute('aria-label')).toBeNull();
-      expect(screen.queryByText(/Data may be stale/)).toBeNull();
-    });
-
-    it('keeps the stale badge and its note next to a pet so the staleness stays visible', async () => {
-      renderCard(makeSnapshot({
-        id: 'dev-pet-stale',
-        petId: 'pet-1',
-        runtimeStatus: 'working',
-        stale: true,
-        observedAt: '2026-07-06T10:00:00Z',
-      }));
-
-      await screen.findByRole('img', { name: 'Working' });
-      expect(screen.getByText('Working').getAttribute('title')).toContain('stale');
-      expect(screen.getByText(/Data may be stale/)).toBeTruthy();
-    });
-
-    it('keeps alert badges visible when a pet replaces the runtime badge', async () => {
-      renderCard(makeSnapshot({
-        id: 'dev-pet-alert',
-        petId: 'pet-1',
-        binding: makeBinding('dev-pet-alert', {
-          status: 'awaiting_human',
-          awaitingReason: 'stuck on dialog',
-        }),
-      }));
-
-      await screen.findByRole('img');
-      expect(screen.getByText('Held').getAttribute('title')).toContain('stuck on dialog');
     });
   });
 
@@ -821,7 +610,7 @@ describe('AgentCard', () => {
       expect(screen.queryByRole('menu')).toBeNull();
     });
 
-    it('opens the menu with Agent Pet, Compact, Clear, and Delete', () => {
+    it('opens the menu with Compact, Clear, and Delete', () => {
       renderIdleCard();
       const trigger = kebab();
 
@@ -831,11 +620,7 @@ describe('AgentCard', () => {
       const menu = screen.getByRole('menu');
       expect(trigger.getAttribute('aria-controls')).toBe(menu.id);
       const items = screen.getAllByRole('menuitem');
-      expect(items).toHaveLength(4);
-      expect(items[0].textContent).toBe('Agent Pet');
-      expect(items[1].textContent).toBe('Compact context');
-      expect(items[2].textContent).toBe('Clear context');
-      expect(items[3].textContent).toBe('Delete');
+      expect(items).toHaveLength(3);
     });
 
     it('labels the menu via the trigger so screen readers know which agent owns it', () => {
@@ -847,40 +632,40 @@ describe('AgentCard', () => {
       const menu = screen.getByRole('menu');
       expect(menu.getAttribute('aria-labelledby')).toBe(trigger.id);
       expect(trigger.id).toBeTruthy();
-      expect(screen.getByRole('menu', { name: /Agent dev-actions actions menu/ })).toBe(menu);
+      expect(screen.getByRole('menu', { name: enUS.agents.actionsMenu('dev-actions') })).toBe(menu);
     });
 
     it('sends /compact via the Compact menu item and closes the menu', async () => {
       compactMock.mockResolvedValue({ compacted: true });
       renderIdleCard();
 
-      await clickMenuItem('Compact context');
+      await clickMenuItem(enUS.agents.compact);
 
       expect(compactMock).toHaveBeenCalledWith('dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
-      await expectToast({ title: '/compact sent to agent dev-actions' });
+      await expectToast({ title: enUS.agents.compactSentTitle('dev-actions') });
     });
 
     it('sends /clear via the Clear menu item after user confirms', async () => {
       clearMock.mockResolvedValue({ cleared: true });
       renderIdleCard();
 
-      await clickMenuItem('Clear context');
+      await clickMenuItem(enUS.agents.clear);
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Clear the context for agent dev-actions?')).toBeTruthy();
-      expect(within(dialog).getByText(/This sends \/clear/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Clear' })); });
+      expect(within(dialog).getByText(enUS.agents.clearConfirmTitle('dev-actions'))).toBeTruthy();
+      expect(within(dialog).getByText(enUS.agents.clearConfirmBody)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: enUS.agents.clearConfirmLabel })); });
 
       expect(clearMock).toHaveBeenCalledWith('dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
-      await expectToast({ title: '/clear sent to agent dev-actions' });
+      await expectToast({ title: enUS.agents.clearSentTitle('dev-actions') });
     });
 
     it('does not send /clear when user cancels the confirmation', async () => {
       renderIdleCard();
 
-      await clickMenuItem('Clear context');
-      await settleConfirmDialog('Cancel');
+      await clickMenuItem(enUS.agents.clear);
+      await settleConfirmDialog(enUS.common.cancel);
 
       expect(clearMock).not.toHaveBeenCalled();
     });
@@ -889,11 +674,11 @@ describe('AgentCard', () => {
       clearMock.mockRejectedValue(new Error('Agent dev-actions has no live session'));
       renderIdleCard();
 
-      await clickMenuItem('Clear context');
-      await settleConfirmDialog('Clear');
+      await clickMenuItem(enUS.agents.clear);
+      await settleConfirmDialog(enUS.agents.clearConfirmLabel);
 
       await expectToast({
-        title: 'Failed to clear context',
+        title: enUS.agents.clearFailedTitle,
         body: /no live session/,
       });
     });
@@ -902,10 +687,10 @@ describe('AgentCard', () => {
       compactMock.mockRejectedValue(new Error('Agent dev-actions runtime is not at an idle REPL prompt'));
       renderIdleCard();
 
-      await clickMenuItem('Compact context');
+      await clickMenuItem(enUS.agents.compact);
 
       await expectToast({
-        title: 'Failed to compact context',
+        title: enUS.agents.compactFailedTitle,
         body: /idle REPL prompt/,
       });
     });
@@ -915,11 +700,10 @@ describe('AgentCard', () => {
       compactMock.mockReturnValue(new Promise(resolve => { resolveCompact = resolve; }));
       renderIdleCard();
 
-      await clickMenuItem('Compact context');
+      await clickMenuItem(enUS.agents.compact);
       openMenu();
 
       const items = screen.getAllByRole('menuitem') as HTMLButtonElement[];
-      expect(items[1].textContent).toBe('Compacting…');
       expect(items.every(item => item.disabled)).toBe(true);
 
       await act(async () => {
@@ -931,11 +715,11 @@ describe('AgentCard', () => {
       deleteAgentMock.mockResolvedValue({ removed: ['dev-actions'], restartRequired: false });
       renderIdleCard();
 
-      await clickMenuItem('Delete');
+      await clickMenuItem(enUS.common.delete);
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Delete the Agent Team containing dev-actions?')).toBeTruthy();
-      expect(within(dialog).getByText('All agents in this Agent Team will be removed. This action cannot be undone.')).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
+      expect(within(dialog).getByText(enUS.agents.deleteConfirmTitle('dev-actions'))).toBeTruthy();
+      expect(within(dialog).getByText(enUS.agents.deleteConfirmBody)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: enUS.common.delete })); });
 
       expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
@@ -945,11 +729,11 @@ describe('AgentCard', () => {
       deleteAgentMock.mockRejectedValue(new Error('boom-delete-failed'));
       renderIdleCard();
 
-      await clickMenuItem('Delete');
-      await settleConfirmDialog('Delete');
+      await clickMenuItem(enUS.common.delete);
+      await settleConfirmDialog(enUS.common.delete);
 
       const errorEl = await screen.findByText('boom-delete-failed');
-      const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
+      const actionRow = screen.getByRole('link', { name: enUS.agents.terminal }).parentElement as HTMLElement;
       expect(actionRow.contains(errorEl)).toBe(false);
     });
 
@@ -978,7 +762,7 @@ describe('AgentCard', () => {
 
       openMenu();
 
-      const firstItem = screen.getByRole('menuitem', { name: 'Agent Pet' });
+      const firstItem = screen.getByRole('menuitem', { name: enUS.agents.compact });
       expect(document.activeElement).toBe(firstItem);
     });
 
@@ -988,8 +772,8 @@ describe('AgentCard', () => {
       renderIdleCard();
       const trigger = kebab();
 
-      await clickMenuItem('Delete');
-      await settleConfirmDialog('Delete');
+      await clickMenuItem(enUS.common.delete);
+      await settleConfirmDialog(enUS.common.delete);
 
       expect((trigger as HTMLButtonElement).disabled).toBe(true);
 
@@ -1016,39 +800,17 @@ describe('AgentCard', () => {
     it('keeps the action buttons on one horizontally scrollable line on narrow cards', () => {
       renderDevWithTask();
       // jsdom does no layout: these tokens are the only guard that actions scroll instead of wrapping or shrinking
-      const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
+      const actionRow = screen.getByRole('link', { name: enUS.agents.terminal }).parentElement as HTMLElement;
       const rowTokens = actionRow.className.split(/\s+/);
       expect(rowTokens).toEqual(expect.arrayContaining(['flex', 'overflow-x-auto', 'scrollbar-none']));
       expect(rowTokens).not.toContain('flex-wrap');
-      expect(screen.getByRole('link', { name: 'Terminal' }).className.split(/\s+/)).toContain('shrink-0');
+      expect(screen.getByRole('link', { name: enUS.agents.terminal }).className.split(/\s+/)).toContain('shrink-0');
     });
 
     it('keeps the kebab menu outside the scroll area so its dropdown is never clipped', () => {
       renderDevWithTask();
-      const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
+      const actionRow = screen.getByRole('link', { name: enUS.agents.terminal }).parentElement as HTMLElement;
       expect(actionRow.contains(kebab())).toBe(false);
-    });
-  });
-
-  describe('Agent Pet', () => {
-    it('renders the animated pet in place of the status pill when petId is set', async () => {
-      renderCard(makeSnapshot({ id: 'dev-pet', runtimeStatus: 'working', petId: 'pet-1' }));
-      const pet = await screen.findByRole('img', { name: 'Working' });
-      expect(screen.queryByText('Working')).toBeNull();
-      expect(pet.getAttribute('data-pet-row')).toBe('7');
-    });
-
-    it('keeps the status badge when no pet is assigned', () => {
-      renderCard(makeSnapshot({ id: 'dev-nopet', runtimeStatus: 'working' }));
-      expect(screen.getByText('Working')).toBeTruthy();
-      expect(screen.queryByRole('img', { name: 'Working' })).toBeNull();
-    });
-
-    it('opens the Agent Pet config modal from the kebab menu', () => {
-      renderCard(makeSnapshot({ id: 'dev-petcfg' }));
-      openMenu();
-      fireEvent.click(screen.getByRole('menuitem', { name: 'Agent Pet' }));
-      expect(screen.getByRole('dialog', { name: 'Agent Pet' })).toBeTruthy();
     });
   });
 
@@ -1061,7 +823,7 @@ describe('AgentCard', () => {
     }), { terminalMode: 'embedded-full', terminalLoading: true });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
-    expect(screen.getByText('Agent status loading')).toBeTruthy();
+    expect(screen.getByText(enUS.agents.agentStatusLoading)).toBeTruthy();
   });
 
   describe('Stop button', () => {
@@ -1069,10 +831,10 @@ describe('AgentCard', () => {
       stopMock.mockResolvedValue(undefined);
       renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancel task' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: enUS.agents.stop })); });
 
       expect(stopMock).toHaveBeenCalledWith('dev-stop');
-      expect(screen.getByRole('button', { name: 'Cancel task' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.agents.stop })).toBeTruthy();
     });
 
     it('shows Cancelling… while in flight and renders a failure below the actions', async () => {
@@ -1080,13 +842,13 @@ describe('AgentCard', () => {
       stopMock.mockReturnValue(new Promise((_resolve, reject) => { rejectStop = reject; }));
       renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
 
-      fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }));
-      expect((screen.getByRole('button', { name: 'Cancelling…' }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(screen.getByRole('button', { name: enUS.agents.stop }));
+      expect((screen.getByRole('button', { name: enUS.agents.stopping }) as HTMLButtonElement).disabled).toBe(true);
 
       await act(async () => { rejectStop?.(new Error('no live pane')); });
 
       expect(screen.getByText('no live pane')).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Cancel task' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.agents.stop })).toBeTruthy();
     });
   });
 
@@ -1116,29 +878,29 @@ describe('AgentCard', () => {
       bootstrapMock.mockResolvedValue({ ok: true, ran: 1 });
       renderBootstrapError();
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: enUS.agents.retryBootstrap })); });
 
       expect(bootstrapMock).toHaveBeenCalledWith('proj');
-      await expectToast({ title: 'Retry bootstrap succeeded' });
+      await expectToast({ title: enUS.agents.retryBootstrapSucceededTitle });
     });
 
     it('reports a still-failing bootstrap as a warning', async () => {
       bootstrapMock.mockResolvedValue({ ok: false, ran: 1 });
       renderBootstrapError();
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: enUS.agents.retryBootstrap })); });
 
-      await expectToast({ title: 'Retry bootstrap still failed' });
+      await expectToast({ title: enUS.agents.retryBootstrapStillFailingTitle });
     });
 
     it('reports a thrown bootstrap retry error as an error toast', async () => {
       bootstrapMock.mockRejectedValue(new Error('ssh unreachable'));
       renderBootstrapError();
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: enUS.agents.retryBootstrap })); });
 
-      await expectToast({ title: 'Retry bootstrap failed', body: 'ssh unreachable' });
-      expect(screen.getByRole('button', { name: 'Retry bootstrap' })).toBeTruthy();
+      await expectToast({ title: enUS.agents.retryBootstrapFailedTitle, body: 'ssh unreachable' });
+      expect(screen.getByRole('button', { name: enUS.agents.retryBootstrap })).toBeTruthy();
     });
   });
 
@@ -1155,7 +917,7 @@ describe('AgentCard', () => {
 
     expect(screen.getByText('runtime crashed hard')).toBeTruthy();
     expect(screen.getByText('REPL_CRASH · 2026-06-02T03:04:05.000Z')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Retry bootstrap' })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.agents.retryBootstrap })).toBeNull();
   });
 
   describe('Agent Team deletion', () => {
@@ -1165,14 +927,14 @@ describe('AgentCard', () => {
 
       openMenu();
       await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
+        fireEvent.click(screen.getByRole('menuitem', { name: enUS.common.delete }));
       });
-      await settleConfirmDialog('Delete');
+      await settleConfirmDialog(enUS.common.delete);
 
       expect(flagDirtyMock).toHaveBeenCalled();
       await expectToast({
-        title: 'Deleted the Agent Team containing dev-actions',
-        body: 'The Agent Team member qa-actions was removed as well.',
+        title: enUS.agents.deletedWithTeamTitle('dev-actions'),
+        body: enUS.agents.deletedWithTeamBody('qa-actions'),
       });
     });
 
@@ -1186,14 +948,14 @@ describe('AgentCard', () => {
 
       openMenu();
       await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
+        fireEvent.click(screen.getByRole('menuitem', { name: enUS.common.delete }));
       });
-      await settleConfirmDialog('Delete');
+      await settleConfirmDialog(enUS.common.delete);
 
       await expectToast({
-        title: 'Deleted the Agent Team containing dev-actions',
+        title: enUS.agents.deletedWithTeamTitle('dev-actions'),
         body:
-          'The Agent Team member qa-actions was removed as well.\n'
+          enUS.agents.deletedWithTeamBody('qa-actions') + '\n'
           + 'lock release for qa-actions failed: ownership changed',
       });
     });

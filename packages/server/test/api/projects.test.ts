@@ -1135,16 +1135,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(await errorRecordStore.latestForAgent('dev-1')).toMatchObject({ agentId: 'dev-1' });
   });
 
-  it('clears the deleted agent\'s pet assignment (so a recreate with same id starts clean)', async () => {
-    await projectWithDev('petdel', 'petdel-dev');
-    const pet = await app.ctx.petStore!.create({
-      displayName: 'P', description: '', spritesheet: { bytes: Buffer.from('x'), ext: 'webp' },
-    });
-    await app.ctx.petStore!.setAssignment('petdel-dev', pet.id);
-    await del('/api/projects/petdel/agents/petdel-dev');
-    expect(await app.ctx.petStore!.getAssignment('petdel-dev')).toBeNull();
-  });
-
   it('removes the teamed dev together with its qa', async () => {
     await projectWithDev('da2', 'da2-dev');
 
@@ -1247,29 +1237,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     const firstResp = await first;
     expect(firstResp.statusCode).toBe(200);
     expect(cleanupSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it('concurrent DELETE + PUT pet: PUT is 409 while deletion is in flight, no stale assignment', async () => {
-    await projectWithDev('da-petrace', 'da-petrace-dev');
-    await seedAgent('da-petrace-dev', 'da-petrace', {
-      paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-    });
-    const pet = await app.ctx.petStore!.create({
-      displayName: 'P', description: '', spritesheet: { bytes: Buffer.from('x'), ext: 'webp' },
-    });
-
-    let resolveCleanup: () => void = () => undefined;
-    const gate = new Promise<void>((resolve) => { resolveCleanup = resolve; });
-    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockImplementation(async () => { await gate; });
-
-    const deleting = del('/api/projects/da-petrace/agents/da-petrace-dev');
-    await new Promise((r) => setTimeout(r, 20));
-    const putResp = await put('/api/agents/da-petrace-dev/pet', { petId: pet.id });
-    expect(putResp.statusCode).toBe(409);
-
-    resolveCleanup();
-    expect((await deleting).statusCode).toBe(200);
-    expect(await app.ctx.petStore!.getAssignment('da-petrace-dev')).toBeNull();
   });
 
   it('awaiting_human with a foreign lock: DELETE refuses to steal ownership', async () => {
@@ -1749,10 +1716,9 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(JSON.parse(recreate.body).error).toMatch(/being deleted|diverged/);
   });
 
-  it('post-commit best-effort cleanup failures (purge / pet unassign) do not block deletion', async () => {
+  it('post-commit best-effort cleanup failure (error-history purge) does not block deletion', async () => {
     await projectWithDev('be1', 'be1-dev');
     app.ctx.errorRecordStore = { purgeAgent: vi.fn().mockRejectedValue(new Error('io')) } as never;
-    vi.spyOn(app.ctx.petStore!, 'setAssignment').mockRejectedValue(new Error('io'));
 
     const response = await del('/api/projects/be1/agents/be1-dev');
     expect(response.statusCode).toBe(200);
@@ -1901,6 +1867,21 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 });
 
 describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
+  it('rejects direct Resume of a delivered bootstrap and preserves its binding', async () => {
+    await seedTask('task-delivered-resume', 'proj', { status: 'in_progress', signalToken: 'delivered-token' });
+    await seedAgent('dev-1', 'proj', {
+      taskId: 'task-delivered-resume', bootstrappingTaskId: 'task-delivered-resume',
+      status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+    });
+    const held = await app.ctx.agentStore.get('dev-1');
+
+    const response = await post('/api/projects/proj/agents/dev-1/resume');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body)).toMatchObject({ resumed: false, error: expect.stringContaining('already delivered') });
+    expect(await app.ctx.agentStore.get('dev-1')).toEqual(held);
+  });
+
   it('awaiting_human agent: the hold is cleared + 200', async () => {
     await seedAgent('dev-1', 'proj', { status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
 
@@ -1968,6 +1949,33 @@ describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
 });
 
 describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
+  it.each(['in_progress', 'approved'] as const)('preserves uncertain %s delivery through the real post-restart recovery path', async (status) => {
+    const taskId = 'task-restart-uncertain';
+    await seedTask(taskId, 'proj', {
+      preferredAgentId: 'dev-1', status, signalToken: 'task-token', branch: `bx/${taskId}`,
+      ...(status === 'approved' ? {
+        postApproveGeneration: 'feedfeedfeed', postApproveHeadSha: 'a'.repeat(40),
+        postApproveToken: 'post-token', postApprovePhase: 'installed',
+      } : {}),
+    });
+    await seedAgent('dev-1', 'proj', {
+      taskId, paneId: '%0', status: 'awaiting_human',
+      awaitingPhase: 'dispatch-failed:ack_unknown', awaitingReason: 'Verify the delivered prompt',
+    });
+    await app.ctx.lockManager.acquire('dev-1', taskId);
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    const before = await app.ctx.taskStore.get(taskId);
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    expect(await app.ctx.agentStore.get('dev-1')).toMatchObject({
+      taskId, status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      awaitingReason: 'Verify the delivered prompt',
+    });
+    expect(await app.ctx.taskStore.get(taskId)).toEqual(before);
+  });
+
   it('happy path: restarts the REPL of the addressed agent, answers 200 and leaves it unlocked', async () => {
     // tmux boundary: the restart itself is stubbed, so the call is the only observable effect of this endpoint
     const restart = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();

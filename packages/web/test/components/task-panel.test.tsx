@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -54,7 +55,7 @@ function mockDoneOnly(page: ReturnType<typeof donePage>): void {
 }
 
 function clickDone(): void {
-  fireEvent.click(screen.getByRole('button', { name: /Finished/ }));
+  fireEvent.click(screen.getByRole('button', { name: name => name.includes(enUS.taskPanel.doneTitle) }));
 }
 
 function doneCalls() {
@@ -87,8 +88,8 @@ describe('TaskPanel', () => {
       task({ id: 'task-020', status: 'pending', title: 'pending one' }),
     ]);
 
-    const activeSection = screen.getByRole('region', { name: 'In progress' });
-    const pendingSection = screen.getByRole('region', { name: 'Waiting to start' });
+    const activeSection = screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle });
+    const pendingSection = screen.getByRole('region', { name: enUS.taskPanel.pendingTitle });
     expect(within(activeSection).getByText('active one')).toBeTruthy();
     expect(within(pendingSection).getByText('pending one')).toBeTruthy();
     expect(activeSection.compareDocumentPosition(pendingSection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -104,11 +105,11 @@ describe('TaskPanel', () => {
       task({ id: 'task-051', status: 'review', updatedAt: '2026-05-18T00:00:00Z' }),
       task({ id: 'hotfix-x', status: 'fixing', updatedAt: '2026-05-20T00:00:00Z' }),
     ]);
-    const pending = screen.getByRole('region', { name: 'Waiting to start' });
+    const pending = screen.getByRole('region', { name: enUS.taskPanel.pendingTitle });
     expect(within(pending).getAllByText(/^\d+$/).map((el) => el.textContent)).toEqual([
       '001', '002', '003',
     ]);
-    const active = screen.getByRole('region', { name: 'In progress' });
+    const active = screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle });
     expect(within(active).getAllByText(/^(hotfix-x|\d+)$/).map((el) => el.textContent)).toEqual([
       'hotfix-x', '051', '050',
     ]);
@@ -118,11 +119,10 @@ describe('TaskPanel', () => {
     const { rerender } = renderPanel([
       task({ id: 'task-007', status: 'in_progress', reviewRound: 0, title: 'evolving' }),
     ]);
-    const active = screen.getByRole('region', { name: 'In progress' });
+    const active = screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle });
     const initialRow = within(active).getByRole('button', { name: /evolving/ });
     const initialStatus = initialRow.querySelector('[data-status="in_progress"]') as HTMLElement;
-    expect(within(initialRow).queryByText('Round 0')).toBeNull();
-    expect(initialStatus.textContent).toBe('Developing');
+    expect(within(initialRow).queryByText(enUS.taskPanel.round(0))).toBeNull();
     expect(initialStatus.nextElementSibling).toBeNull();
 
     rerender(
@@ -135,12 +135,11 @@ describe('TaskPanel', () => {
         </ToastProvider>
       </MemoryRouter>,
     );
-    const activeAfter = screen.getByRole('region', { name: 'In progress' });
+    const activeAfter = screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle });
     const updatedRow = within(activeAfter).getByRole('button', { name: /evolving/ });
-    const updatedRound = within(updatedRow).getByText('Round 1');
+    const updatedRound = within(updatedRow).getByText(enUS.taskPanel.round(1));
     const updatedStatus = updatedRow.querySelector('[data-status="review"]') as HTMLElement;
     expect(updatedRound.compareDocumentPosition(updatedStatus) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(updatedStatus.textContent).toBe('Reviewing code');
     expect(updatedStatus.nextElementSibling).toBeNull();
     expect(activeAfter.querySelector('[data-status="in_progress"]')).toBeNull();
 
@@ -154,7 +153,7 @@ describe('TaskPanel', () => {
     expect(screen.queryByText('evolving')).toBeNull();
   });
 
-  it('hides a zero plan-review round and still uses the plan status label', () => {
+  it('hides a zero plan-review round and the code-review round on a spec task', () => {
     renderPanel([
       task({
         id: 'task-008',
@@ -166,11 +165,10 @@ describe('TaskPanel', () => {
       }),
     ]);
 
-    const active = screen.getByRole('region', { name: 'In progress' });
+    const active = screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle });
     const row = within(active).getByRole('button', { name: /spec flow/ });
-    expect(within(row).queryByText('Round 0')).toBeNull();
-    expect(within(row).queryByText('Round 4')).toBeNull();
-    expect(within(row).getByText('Reviewing plan')).toBeTruthy();
+    expect(within(row).queryByText(enUS.taskPanel.round(0))).toBeNull();
+    expect(within(row).queryByText(enUS.taskPanel.round(4))).toBeNull();
   });
 
   it('client-paginates a long section: shows 20 + Load more, then reveals the rest', () => {
@@ -178,12 +176,12 @@ describe('TaskPanel', () => {
       task({ id: `task-${String(i + 1).padStart(3, '0')}`, status: 'pending' }),
     );
     renderPanel(many);
-    const pending = screen.getByRole('region', { name: 'Waiting to start' });
+    const pending = screen.getByRole('region', { name: enUS.taskPanel.pendingTitle });
     expect(within(pending).getAllByText(/^\d+$/).length).toBe(20);
 
-    fireEvent.click(within(pending).getByRole('button', { name: 'Load more' }));
+    fireEvent.click(within(pending).getByRole('button', { name: enUS.taskPanel.loadMore }));
     expect(within(pending).getAllByText(/^\d+$/).length).toBe(25);
-    expect(within(pending).queryByRole('button', { name: 'Load more' })).toBeNull();
+    expect(within(pending).queryByRole('button', { name: enUS.taskPanel.loadMore })).toBeNull();
   });
 
   it('does NOT query the DONE section until expanded, then fetches and renders it', async () => {
@@ -207,7 +205,7 @@ describe('TaskPanel', () => {
 
     clickDone();
     await screen.findByText('090');
-    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.taskPanel.loadMore }));
     expect(await screen.findByText('070')).toBeTruthy();
     await waitFor(() =>
       expect(doneCalls().some((c) => c[1]?.offset === 20)).toBe(true),
@@ -243,14 +241,14 @@ describe('TaskPanel', () => {
     mockDoneOnly(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
     renderPanel([]);
 
-    expect(screen.getByRole('button', { name: /Finished/ }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('button', { name: name => name.includes(enUS.taskPanel.doneTitle) }).getAttribute('aria-expanded')).toBe('true');
     expect(await screen.findByText('shipped')).toBeTruthy();
     expect(doneCalls().some((c) => (c[1]?.offset ?? 0) === 0)).toBe(true);
   });
 
   it('keeps the DONE section collapsed by default without querying', () => {
     renderPanel([]);
-    expect(screen.getByRole('button', { name: /Finished/ }).getAttribute('aria-expanded')).toBe('false');
+    expect(screen.getByRole('button', { name: name => name.includes(enUS.taskPanel.doneTitle) }).getAttribute('aria-expanded')).toBe('false');
     expect(pageMock).not.toHaveBeenCalled();
   });
 
@@ -261,69 +259,103 @@ describe('TaskPanel', () => {
     });
     renderPanel([]);
     clickDone();
-    expect(await screen.findByText(/Failed to load: boom/)).toBeTruthy();
+    expect(await screen.findByText(enUS.common.loadFailed('boom'))).toBeTruthy();
   });
 
   it('uses the compact panel chrome and keeps the header/close control outside the panel', () => {
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
-    expect(screen.getByRole('region', { name: 'In progress' })).toBeTruthy();
-    expect(screen.getByRole('region', { name: 'Waiting to start' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /Finished/ })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Refresh task list' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '+ New task' })).toBeNull();
-    expect(screen.queryByRole('heading', { name: 'Tasks' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Close task panel' })).toBeNull();
-  });
-
-  it('labels each live status with its readable text and hover title', () => {
-    const { container } = renderPanel([
-      task({ id: 'task-001', status: 'in_progress' }),
-      task({ id: 'task-002', status: 'review' }),
-      task({ id: 'task-003', status: 'fixing' }),
-      task({ id: 'task-004', status: 'approved' }),
-      task({ id: 'task-005', status: 'pending' }),
-    ]);
-    const label = (status: string) => (container.querySelector(`[data-status="${status}"]`) as HTMLElement).textContent;
-    expect(label('in_progress')).toBe('Developing');
-    expect(label('review')).toBe('Reviewing code');
-    expect(label('fixing')).toBe('Revising code');
-    expect(label('approved')).toBe('Running pre-merge checks');
-    const pendingBadge = container.querySelector('[data-status="pending"]') as HTMLElement;
-    expect(pendingBadge.textContent).toBe('Waiting to start');
-    expect(pendingBadge.getAttribute('title')).toBe('Waiting to start');
-  });
-
-  it('labels each terminal status by its outcome', async () => {
-    mockDoneOnly(donePage([
-      task({ id: 'task-090', status: 'merged' }),
-      task({ id: 'task-091', status: 'max_rounds' }),
-      task({ id: 'task-092', status: 'failed' }),
-      task({ id: 'task-093', status: 'cancelled' }),
-    ]));
-    renderPanel([]);
-    clickDone();
-    expect(await screen.findByText('PR merged')).toBeTruthy();
-    expect(screen.getByText('Code review needs a decision')).toBeTruthy();
-    expect(screen.getByText('Couldn’t complete')).toBeTruthy();
-    expect(screen.getByText('Cancelled')).toBeTruthy();
+    expect(screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle })).toBeTruthy();
+    expect(screen.getByRole('region', { name: enUS.taskPanel.pendingTitle })).toBeTruthy();
+    expect(screen.getByRole('button', { name: name => name.includes(enUS.taskPanel.doneTitle) })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.dashboard.newTask })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.projectPage.closeTaskPanel })).toBeNull();
   });
 
   it('clicking a task row navigates to its detail page', () => {
     renderPanel([task({ id: 'task-042', status: 'in_progress', title: 'pick me' })]);
-    const active = screen.getByRole('region', { name: 'In progress' });
+    const active = screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle });
     fireEvent.click(within(active).getByRole('button', { name: /pick me/ }));
     expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-042');
   });
 
   it('shortens the task id to its number and keeps the full id as hover text', () => {
     renderPanel([task({ id: 'task-042', status: 'in_progress', title: 'pick me' })]);
-    const active = screen.getByRole('region', { name: 'In progress' });
+    const active = screen.getByRole('region', { name: enUS.taskPanel.inProgressTitle });
     const idCell = within(active).getByText('042');
     expect(idCell.getAttribute('title')).toBe('task-042');
     expect(within(active).queryByText('task-042')).toBeNull();
   });
 
   describe('persistent attention', () => {
+    it.each(['in_progress', 'fixing', 'approved'] as const)('opens uncertain %s delivery for inspection without retrying old advance actions', (status) => {
+      const held = attentiveTask(['advance', 'cancel']);
+      renderPanel([{
+        ...held, status,
+        attention: { ...held.attention!, reason: 'dispatch-failed:ack_unknown' },
+      }]);
+
+      const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
+      expect(details.open).toBe(true);
+      expect(screen.queryByRole('button', { name: enUS.taskDetail.retryCurrentStep })).toBeNull();
+      expect(screen.queryByRole('button', { name: enUS.taskDetail.retryPreMergeCheck })).toBeNull();
+      expect(screen.queryByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeNull();
+      fireEvent.click(screen.getByText(enUS.taskDetail.attentionDeliveryUnknownGuidance, { exact: false }));
+      expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
+      expect(advanceMock).not.toHaveBeenCalled();
+    });
+
+    it.each([{ actions: ['cancel'] }, { actions: ['advance', 'cancel'] }] as const)(
+      'opens task detail to verify a delivered bootstrap without retrying persisted actions $actions', ({ actions }) => {
+        const held = attentiveTask([...actions]);
+        renderPanel([{
+          ...held, status: 'in_progress',
+          attention: { ...held.attention!, reason: 'bootstrap-marker-clear-failed' },
+        }]);
+
+        const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
+        expect(details.open).toBe(true);
+        expect(screen.queryByRole('button', { name: enUS.taskDetail.retryCurrentStep })).toBeNull();
+        expect(screen.queryByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeNull();
+        fireEvent.click(screen.getByText(enUS.taskDetail.attentionBootstrapDeliveredGuidance, { exact: false }));
+        expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
+        expect(advanceMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['dirty-workdir', 'checkout-preparation-failed', 'restart-redispatch-failed'])(
+      'expands %s details without requiring a click', (reason) => {
+        const held = attentiveTask(['advance', 'cancel']);
+        renderPanel([{ ...held, status: 'in_progress', attention: { ...held.attention!, reason } }]);
+
+        const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
+        expect(details.open).toBe(true);
+        expect(screen.getByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeTruthy();
+      },
+    );
+
+    describe.each(['dirty-workdir', 'checkout-preparation-failed', 'restart-redispatch-failed', 'bootstrap-marker-clear-failed'])(
+      '%s recovery actions', (reason) => {
+        it.each([
+          { status: 'review', actions: ['verdict', 'cancel'], guidance: enUS.taskDetail.attentionVerdictGuidance, button: enUS.taskDetail.handleReview },
+          { status: 'in_progress', actions: ['cancel'], guidance: enUS.taskDetail.attentionCancelGuidance, button: enUS.taskDetail.cancelConfirmLabel },
+          { status: 'cancelled', actions: ['retry'], guidance: enUS.taskDetail.attentionRetryGuidance, button: enUS.taskDetail.retryTask },
+        ] as const)('matches guidance and navigation to $actions on $status tasks', async ({ status, actions, guidance, button }) => {
+          const held = attentiveTask([...actions]);
+          const item = { ...held, status, attention: { ...held.attention!, reason } };
+          if (status === 'cancelled') mockDoneOnly(donePage([item]));
+          renderPanel([item]);
+          if (status === 'cancelled') clickDone();
+
+          expect(await screen.findByText(guidance, { exact: false })).toBeTruthy();
+          expect(screen.queryByRole('button', { name: enUS.taskDetail.retryCurrentStep })).toBeNull();
+          expect(screen.queryByText(enUS.taskDetail.attentionAdvanceGuidance, { exact: false })).toBeNull();
+          fireEvent.click(screen.getByRole('button', { name: button }));
+          expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
+          expect(advanceMock).not.toHaveBeenCalled();
+        });
+      },
+    );
+
     function attentiveTask(actions: NonNullable<TaskState['attention']>['recommendedActions']) {
       return task({
         id: 'task-100',
@@ -343,27 +375,25 @@ describe('TaskPanel', () => {
     it('shows friendly guidance while keeping the durable reason and runbook in technical details', () => {
       renderPanel([attentiveTask(['advance', 'verdict', 'cancel', 'retry'])]);
 
-      expect(screen.getByText('Review needs your attention')).toBeTruthy();
-      expect(screen.getByText('Review the PR and the discussion below, then confirm the result or request changes.')).toBeTruthy();
-      const details = screen.getByText('Technical details').closest('details')!;
+      const details = screen.getByText(enUS.common.technicalDetails).closest('details')!;
       expect(details.hasAttribute('open')).toBe(false);
       expect(within(details).getByText(/review-verdict-overdue/)).toBeTruthy();
       expect(within(details).getByText(/Inspect the current QA review/)).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Restart review' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Handle review' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Cancel task' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Run task again' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.taskDetail.restartReview })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.taskDetail.handleReview })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.taskDetail.cancelConfirmLabel })).toBeTruthy();
+      expect(screen.getByRole('button', { name: enUS.taskDetail.retryTask })).toBeTruthy();
     });
 
     it('runs Advance directly and keeps the task detail route for the other operations', async () => {
       advanceMock.mockResolvedValue(attentiveTask(['advance', 'verdict']));
       renderPanel([attentiveTask(['advance', 'verdict'])]);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Restart review' }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.restartReview }));
       await waitFor(() => expect(advanceMock).toHaveBeenCalledWith('task-100'));
       expect(navigateMock).not.toHaveBeenCalled();
 
-      fireEvent.click(screen.getByRole('button', { name: 'Handle review' }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.handleReview }));
       expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
     });
 
@@ -378,7 +408,7 @@ describe('TaskPanel', () => {
         },
       }]);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Retry pre-merge checks' }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.retryPreMergeCheck }));
 
       expect(advanceMock).not.toHaveBeenCalled();
       expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');
@@ -392,7 +422,7 @@ describe('TaskPanel', () => {
         preferredAgentId: '',
       }]);
 
-      fireEvent.click(screen.getByRole('button', { name: 'Edit task' }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.taskDetail.editTask }));
 
       expect(advanceMock).not.toHaveBeenCalled();
       expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-100');

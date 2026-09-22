@@ -18,10 +18,8 @@ import type { PaneStreamerManager } from './agent/pane-streamer-manager.js';
 import type { RestartCoordinator } from './lifecycle/restart.js';
 import type { EventBroker } from './event/broker.js';
 import type { ErrorRecordStore } from './state/error-record-store.js';
-import type { PetStore } from './state/pet-store.js';
 import type { PrConversationCache } from './platform/pr-conversation-cache.js';
 import { agentRoutes } from './api/agents.js';
-import { petRoutes } from './api/pets.js';
 import { taskRoutes } from './api/tasks.js';
 import { eventRoutes } from './api/events.js';
 import { configRoutes } from './api/config.js';
@@ -55,7 +53,6 @@ export interface AppContext {
   restartCoordinator?: RestartCoordinator;
   eventBroker?: EventBroker;
   errorRecordStore?: ErrorRecordStore;
-  petStore?: PetStore;
   prConversationCache?: PrConversationCache;
 }
 
@@ -193,7 +190,6 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
 
   app.get('/health', async () => ({ status: 'ok', startedAt }));
   await app.register(agentRoutes, { prefix: '/api' });
-  await app.register(petRoutes, { prefix: '/api' });
   await app.register(taskRoutes, { prefix: '/api' });
   await app.register(eventRoutes, { prefix: '/api' });
   await app.register(configRoutes, { prefix: '/api' });

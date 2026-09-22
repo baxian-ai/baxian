@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ComponentProps } from 'react';
@@ -121,15 +122,15 @@ function titleInput(): HTMLInputElement {
 }
 
 function descriptionInput(): HTMLTextAreaElement {
-  return screen.getByLabelText('Description (optional)') as HTMLTextAreaElement;
+  return screen.getByLabelText(enUS.createTask.descriptionLabel) as HTMLTextAreaElement;
 }
 
 function devSelect(): HTMLSelectElement {
-  return screen.getByLabelText('Target agent') as HTMLSelectElement;
+  return screen.getByLabelText(enUS.createTask.targetAgentLabel) as HTMLSelectElement;
 }
 
 function restoreHint(): HTMLElement | null {
-  return screen.queryByText('Restored your last unsaved draft');
+  return screen.queryByText(enUS.createTask.draftRestoredNotice);
 }
 
 beforeEach(() => {
@@ -162,7 +163,7 @@ describe('CreateTaskModal — draft persistence', () => {
 
     expect(titleInput().value).toBe('half-typed title');
     expect(descriptionInput().value).toBe('half-typed body');
-    expect(screen.getByText('Restored your last unsaved draft')).toBeTruthy();
+    expect(screen.getByText(enUS.createTask.draftRestoredNotice)).toBeTruthy();
   });
 
   it('writes each input change to localStorage synchronously (no debounce) so even an immediate close right after typing never drops the last keystrokes', async () => {
@@ -203,14 +204,14 @@ describe('CreateTaskModal — draft persistence', () => {
     await mountModal();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.common.create }));
     });
     await waitFor(() => {
       expect(tasksCreateMock).toHaveBeenCalledTimes(1);
     });
 
     expect(localStorage.getItem(DRAFT_KEY_GLOBAL)).toBeNull();
-    await expectToast({ title: 'Task created' });
+    await expectToast({ title: enUS.createTask.createdToastTitle });
   });
 
   it('"Discard" button removes the saved draft and resets the form to blank', async () => {
@@ -222,7 +223,7 @@ describe('CreateTaskModal — draft persistence', () => {
     });
     await mountModal();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.createTask.discardDraftButton }));
 
     expect(titleInput().value).toBe('');
     expect(descriptionInput().value).toBe('');
@@ -287,7 +288,7 @@ describe('CreateTaskModal — draft persistence', () => {
 
     expect(titleInput().value).toBe('strict title');
     expect(descriptionInput().value).toBe('strict body');
-    expect(screen.getByText('Restored your last unsaved draft')).toBeTruthy();
+    expect(screen.getByText(enUS.createTask.draftRestoredNotice)).toBeTruthy();
 
     const persisted = readDraft(DRAFT_KEY_GLOBAL);
     expect(persisted.title).toBe('strict title');
@@ -306,7 +307,7 @@ describe('CreateTaskModal — draft persistence', () => {
 
     expect(titleInput().value).toBe('dashboard title');
     expect(descriptionInput().value).toBe('dashboard body');
-    expect(screen.getByText('Restored your last unsaved draft')).toBeTruthy();
+    expect(screen.getByText(enUS.createTask.draftRestoredNotice)).toBeTruthy();
 
     expect(localStorage.getItem(DRAFT_KEY_GLOBAL)).toBeNull();
     const migrated = readDraft(DRAFT_KEY_BAXIAN);
@@ -452,7 +453,7 @@ describe('CreateTaskModal — images', () => {
     await mountModal({ projectId: 'baxian' });
     await act(async () => { fireEvent.change(fileInput(), { target: { files: [png('a.png')] } }); });
     expect(screen.getByText('a.png')).toBeTruthy();
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Remove image a.png/ })); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: enUS.createTask.removeImageAriaLabel('a.png') })); });
     expect(screen.queryByText('a.png')).toBeNull();
   });
 
@@ -461,7 +462,7 @@ describe('CreateTaskModal — images', () => {
     fireEvent.change(titleInput(), { target: { value: '按图实现' } });
     fireEvent.change(descriptionInput(), { target: { value: '见附图' } });
     await act(async () => { fireEvent.change(fileInput(), { target: { files: [png('shot.png')] } }); });
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create' })); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: enUS.common.create })); });
     await waitFor(() => expect(tasksCreateMock).toHaveBeenCalledTimes(1));
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
       images: [{ dataBase64: 'QkFTRTY0', filename: 'shot.png' }],
@@ -510,14 +511,14 @@ describe('CreateTaskModal — images', () => {
 
     await act(async () => { fireEvent.change(fileInput(), { target: { files: [oversized, png('ok.png')] } }); });
 
-    await expectToast({ title: IMAGE_TOO_LARGE_TITLE, body: /^big\.png exceeds \d+ MiB$/ });
+    await expectToast({ title: IMAGE_TOO_LARGE_TITLE, body: enUS.createTask.imageTooLargeToastBody('big.png', IMAGE_UPLOAD_MAX_BYTES / 1024 / 1024) });
     expect(screen.queryByText('big.png')).toBeNull();
     expect(screen.getByText('ok.png')).toBeTruthy();
   });
 
   it('edit mode has no image control', async () => {
     await mountModal({ mode: 'edit', task: makeTask() });
-    expect(screen.queryByRole('button', { name: /Add images/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.createTask.addImagesButton })).toBeNull();
   });
 });
 
@@ -536,7 +537,7 @@ describe('CreateTaskModal — Dev agent defaults to the first available dev', ()
 
     const select = devSelect();
     expect(select.value).toBe('bx-dev-1');
-    expect(select.querySelector('option')?.textContent).toContain('Not assigned yet');
+    expect(select.querySelector('option')?.textContent).toContain(enUS.createTask.notAssignedOption);
   });
 
   it('submits the defaulted first dev when the user does not change the select', async () => {
@@ -545,7 +546,7 @@ describe('CreateTaskModal — Dev agent defaults to the first available dev', ()
 
     fireEvent.change(titleInput(), { target: { value: '默认 dev' } });
     fireEvent.change(descriptionInput(), { target: { value: '不改 dev 选择' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.create }));
     await flushApi();
 
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -559,8 +560,8 @@ describe('CreateTaskModal — Dev agent defaults to the first available dev', ()
     await mountModal({ projectId: 'baxian' });
 
     fireEvent.change(titleInput(), { target: { value: '只填标题' } });
-    expect((screen.getByRole('button', { name: 'Create' }) as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    expect((screen.getByRole('button', { name: enUS.common.create }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.create }));
     await flushApi();
 
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -582,7 +583,7 @@ describe('CreateTaskModal — Dev agent defaults to the first available dev', ()
 
     fireEvent.change(titleInput(), { target: { value: '未指定任务' } });
     fireEvent.change(descriptionInput(), { target: { value: '稍后再选 dev' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.common.create }));
     await flushApi();
 
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({

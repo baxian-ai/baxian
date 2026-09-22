@@ -1,3 +1,4 @@
+import { enUS } from '../../src/i18n/en-us.ts';
 import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from 'vitest';
 import { render, cleanup, act, fireEvent, screen } from '@testing-library/react';
 import { ToastProvider } from '../../src/components/toast.tsx';
@@ -746,14 +747,14 @@ describe('PaneTerminal', () => {
 
   it('arrowKeys prop defaults off — no virtual key pad rendered', async () => {
     await renderPane({ mode: 'full', interactive: true });
-    expect(screen.queryByRole('group', { name: /Terminal keys/ })).toBeNull();
+    expect(screen.queryByRole('group', { name: enUS.terminal.keyPadAriaLabel })).toBeNull();
   });
 
   it('arrowKeys prop renders the key pad and clicking an arrow forwards its CSI sequence as terminal input', async () => {
     const { ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true, arrowKeys: true });
     const before = ws.sent.length;
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.up) }));
     });
     expect(inputsSince(ws, before)).toContainEqual({ op: 'input', subscriberId: sid, data: '\x1b[A' });
   });
@@ -779,14 +780,14 @@ describe('PaneTerminal', () => {
     const { term, ws } = await mountWithHandshake({ mode: 'full', interactive: true, arrowKeys: true });
     const before1 = ws.sent.length;
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.up) }));
     });
     expect(ws.sent.slice(before1).map((s) => JSON.parse(s).data)).toContain('\x1b[A');
 
     term.modes.applicationCursorKeysMode = true;
     const before2 = ws.sent.length;
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.up) }));
     });
     expect(ws.sent.slice(before2).map((s) => JSON.parse(s).data)).toContain('\x1bOA');
   });
@@ -796,9 +797,9 @@ describe('PaneTerminal', () => {
     const previewSid = sentMessages(ws1).find((m) => m.op === 'subscribe' && m.mode === 'preview')!.subscriberId!;
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
-      fireEvent.click(screen.getByRole('button', { name: /Down arrow key/ }));
-      fireEvent.click(screen.getByRole('button', { name: /Right arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.up) }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.down) }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.right) }));
       await flushMacrotask();
     });
     const { ws2, fullSid } = await activateFullSubscription();
@@ -814,7 +815,7 @@ describe('PaneTerminal', () => {
     const before = ws.sent.length;
     await act(async () => {
       term.onDataCallback!('\x1b[24;80Rhello');
-      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.up) }));
     });
     const inputs = inputsSince(ws, before)
       .filter((m) => m.op === 'input')
@@ -827,7 +828,7 @@ describe('PaneTerminal', () => {
     expect(sentMessages(ws1).find((m) => m.op === 'subscribe')?.mode).toBe('preview');
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Down arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.arrowAriaLabel(enUS.terminal.arrowLabel.down) }));
       await flushMacrotask();
     });
     expect(fakeTerminals.length).toBeGreaterThan(1);
@@ -862,11 +863,11 @@ describe('PaneTerminal', () => {
     await act(async () => {
       ws.deliver({ type: 'session_gone', agentId: 'dev-1' });
     });
-    expect(container.textContent).toContain('Session ended');
+    expect(container.textContent).toContain(enUS.terminal.sessionEnded);
     await act(async () => {
       rerender(<PaneTerminal agentId="dev-2" mode="full" interactive />);
     });
-    expect(container.textContent).not.toContain('Session ended');
+    expect(container.textContent).not.toContain(enUS.terminal.sessionEnded);
   });
 });
 
@@ -875,7 +876,7 @@ describe('PaneTerminal image upload bar', () => {
     const { _resetPaneStreamClientForTest } = await import('../../src/stores/pane-stream-store.ts');
     await renderPane({ mode: 'full', interactive: true, arrowKeys: true });
     await flushMacrotask();
-    expect(screen.getByRole('button', { name: /Upload image/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: enUS.imageUpload.uploadAriaLabel })).toBeTruthy();
     _resetPaneStreamClientForTest(null);
   });
 
@@ -883,7 +884,7 @@ describe('PaneTerminal image upload bar', () => {
     const { _resetPaneStreamClientForTest } = await import('../../src/stores/pane-stream-store.ts');
     await renderPane({ mode: 'preview', interactive: false });
     await flushMacrotask();
-    expect(screen.queryByRole('button', { name: /Upload image/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.imageUpload.uploadAriaLabel })).toBeNull();
     _resetPaneStreamClientForTest(null);
   });
 });
@@ -893,20 +894,20 @@ describe('PaneTerminal control bar layout', () => {
     await renderPane({ mode: 'full', interactive: true, arrowKeys: true });
     await flushMacrotask();
 
-    const keypad = screen.getByRole('group', { name: /Terminal keys/ });
+    const keypad = screen.getByRole('group', { name: enUS.terminal.keyPadAriaLabel });
     const bar = keypad.parentElement!;
     expect(bar.className).toContain('grid');
     expect(bar.className).toContain('grid-cols-[1fr_auto_1fr]');
     expect(bar.className).toMatch(/\bgap(-x)?-2\b/);
     expect(keypad.className).not.toContain('flex-1');
-    expect(screen.getByRole('button', { name: /Upload image/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: enUS.imageUpload.uploadAriaLabel })).toBeTruthy();
   });
 
   it('hides the whole bar (upload + key pad) when arrow keys are disabled', async () => {
     await renderPane({ mode: 'full', interactive: true });
     await flushMacrotask();
-    expect(screen.queryByRole('button', { name: /Upload image/ })).toBeNull();
-    expect(screen.queryByRole('group', { name: /Terminal keys/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: enUS.imageUpload.uploadAriaLabel })).toBeNull();
+    expect(screen.queryByRole('group', { name: enUS.terminal.keyPadAriaLabel })).toBeNull();
   });
 });
 

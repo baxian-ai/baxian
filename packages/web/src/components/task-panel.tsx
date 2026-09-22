@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api.ts';
-import { TaskStatusBadge, getTaskAttentionCopy, shortTaskId, taskDetailPath } from './task-status.tsx';
+import { TaskStatusBadge, getTaskAttentionActions, getTaskAttentionCopy, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { useT } from '../i18n/index.tsx';
 import { useToast } from './toast.tsx';
 import {
@@ -244,7 +244,7 @@ function TaskRow({ task }: { task: TaskState }) {
         : task.status === 'approved'
           ? t.taskDetail.retryPreMergeCheck
           : t.taskDetail.retryCurrentStep;
-  const attentionCopy = task.attention ? getTaskAttentionCopy(t, task.attention) : null;
+  const attentionCopy = task.attention ? getTaskAttentionCopy(t, task.attention, task.status) : null;
   const openTask = () => navigate(taskDetailPath(task.projectId, task.id));
   const advance = async () => {
     if (isUnassignedPending
@@ -289,7 +289,7 @@ function TaskRow({ task }: { task: TaskState }) {
             <span className="mt-0.5 block text-og-700">{attentionCopy.guidance}</span>
           </button>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
-            {task.attention.recommendedActions.map(action => (
+            {getTaskAttentionActions(task.attention, task.status).map(action => (
               <button
                 key={action}
                 type="button"
@@ -307,7 +307,7 @@ function TaskRow({ task }: { task: TaskState }) {
               </button>
             ))}
           </div>
-          <details className="mt-1.5 text-og-500">
+          <details open={attentionCopy.expandDetails} className="mt-1.5 text-og-500">
             <summary className="cursor-pointer select-none text-accent">{t.common.technicalDetails}</summary>
             <div className="mt-1 whitespace-pre-wrap break-words font-mono">
               {task.attention.reason}{'\n'}{task.attention.runbook}
