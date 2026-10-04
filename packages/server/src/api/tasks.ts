@@ -277,6 +277,28 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  app.get<{ Params: { id: string; agentId: string } }>(
+    '/tasks/:id/agents/:agentId/untracked-files',
+    async request => app.ctx.agentManager.getUntrackedFiles(request.params.id, request.params.agentId),
+  );
+
+  app.post<{ Params: { id: string; agentId: string }; Body: { action?: unknown; token?: unknown } }>(
+    '/tasks/:id/agents/:agentId/untracked-files',
+    async (request, reply) => {
+      const body = request.body;
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || (body.action !== 'keep' && body.action !== 'discard' && body.action !== 'continue')
+        || typeof body.token !== 'string' || !/^[a-f0-9]{64}$/.test(body.token)) {
+        return reply.status(400).send({ error: 'action (keep, discard or continue) and a file-list token are required' });
+      }
+      const task = await app.ctx.agentManager.resolveUntrackedFiles(
+        request.params.id, request.params.agentId, body.action, body.token,
+      );
+      app.ctx.dispatchReconciler?.resetTask(task.id);
+      return reply.send(task);
+    },
+  );
+
   app.post<{ Params: { id: string } }>('/tasks/:id/retry', async (request, reply) => {
     const source = await app.ctx.agentManager.getTask(request.params.id);
     if (!source) throw new ApiError(404, 'Task not found');

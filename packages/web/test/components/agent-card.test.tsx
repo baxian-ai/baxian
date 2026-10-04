@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type {
   AgentBindingFacts,
@@ -156,6 +156,43 @@ describe('AgentCard', () => {
     flagDirtyMock.mockReset();
   });
 
+  it('shows untracked-file decisions in the held QA card and hides the generic Resume action', async () => {
+    vi.mocked(api.tasks.untrackedFiles).mockResolvedValueOnce({
+      agentId: 'qa-1', host: 'remote-mac', workdir: '/work/qa', token: 'a'.repeat(64),
+      files: [{ path: 'test-results/desktop.png', size: 1, kind: 'file' }], trackedChanges: false,
+    });
+    const task = makeTask({ status: 'review' });
+    renderCard(makeSnapshot({
+      id: 'qa-1', binding: makeBinding('qa-1', {
+        taskId: task.id, status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      }),
+    }), { role: 'qa', task });
+    expect(await screen.findByRole('button', { name: enUS.untrackedFiles.keep })).toBeTruthy();
+    expect(screen.getByText('test-results/desktop.png')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
+    expect(resumeAgentMock).not.toHaveBeenCalled();
+  });
+
+  it('offers file continuation instead of Resume when an eligible hold has no pending files', async () => {
+    vi.mocked(api.tasks.untrackedFiles).mockResolvedValueOnce({
+      agentId: 'qa-1', host: 'remote-mac', workdir: '/work/qa', token: 'b'.repeat(64),
+      files: [], trackedChanges: false,
+    });
+    const task = makeTask({ status: 'review' });
+    renderCard(makeSnapshot({
+      id: 'qa-1', binding: makeBinding('qa-1', {
+        taskId: task.id, status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      }),
+    }), { role: 'qa', task });
+    const proceed = await screen.findByRole('button', { name: enUS.untrackedFiles.continue });
+    expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
+    await act(async () => { fireEvent.click(proceed); });
+    expect(api.tasks.resolveUntrackedFiles).toHaveBeenCalledWith(task.id, 'qa-1', {
+      action: 'continue', token: 'b'.repeat(64),
+    });
+    expect(resumeAgentMock).not.toHaveBeenCalled();
+  });
+
   it.each(['agent_dialog_resolved_runtime', 'restart-redispatch-failed', 'bootstrap-marker-clear-failed'])('links an active %s hold to task actions without offering Resume', (awaitingPhase) => {
     const task = makeTask({ id: 'task-active', projectId: 'proj', status: 'in_progress' });
     renderCard(makeSnapshot({
@@ -183,7 +220,7 @@ describe('AgentCard', () => {
     expect(screen.queryByRole('button', { name: enUS.agents.resume })).toBeNull();
   });
 
-  it('offers Resume for a delivered bootstrap hold after its task is cancelled', () => {
+  it('offers Resume for a delivered bootstrap hold after its task is cancelled', async () => {
     const task = makeTask({ id: 'task-cancelled', projectId: 'proj', status: 'cancelled' });
     renderCard(makeSnapshot({
       binding: makeBinding('dev-1', {
@@ -191,12 +228,13 @@ describe('AgentCard', () => {
       }),
     }), { task });
 
+    await waitFor(() => expect(screen.queryByText(enUS.untrackedFiles.loading)).toBeNull());
     expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
     expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
   });
 
   it.each(['spec-ready', 'review', 'fixing', 'approved', 'merge-ready', 'max_rounds'] as const)(
-    'offers Resume for a stale bootstrap hold after the task reaches %s', (status) => {
+    'offers Resume for a stale bootstrap hold after the task reaches %s', async (status) => {
       const task = makeTask({ id: 'task-advanced', projectId: 'proj', status });
       renderCard(makeSnapshot({
         binding: makeBinding('dev-1', {
@@ -204,13 +242,14 @@ describe('AgentCard', () => {
         }),
       }), { task });
 
+      await waitFor(() => expect(screen.queryByText(enUS.untrackedFiles.loading)).toBeNull());
       expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
       expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
     },
   );
 
   it.each(['spec-ready', 'review', 'merge-ready', 'max_rounds'] as const)(
-    'offers Resume for a stale replay failure after the task reaches %s', (status) => {
+    'offers Resume for a stale replay failure after the task reaches %s', async (status) => {
       const task = makeTask({ id: 'task-advanced', projectId: 'proj', status });
       renderCard(makeSnapshot({
         binding: makeBinding('dev-1', {
@@ -218,6 +257,7 @@ describe('AgentCard', () => {
         }),
       }), { task });
 
+      await waitFor(() => expect(screen.queryByText(enUS.untrackedFiles.loading)).toBeNull());
       expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
       expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
     },
@@ -239,7 +279,7 @@ describe('AgentCard', () => {
   );
 
   it.each(['spec-ready', 'review', 'merge-ready', 'max_rounds'] as const)(
-    'offers Resume once an uncertain Dev delivery advances to %s', (status) => {
+    'offers Resume once an uncertain Dev delivery advances to %s', async (status) => {
       const task = makeTask({ id: 'task-outcome', projectId: 'proj', status });
       renderCard(makeSnapshot({
         binding: makeBinding('dev-1', {
@@ -247,6 +287,7 @@ describe('AgentCard', () => {
         }),
       }), { task });
 
+      await waitFor(() => expect(screen.queryByText(enUS.untrackedFiles.loading)).toBeNull());
       expect(screen.getByRole('button', { name: enUS.agents.resume })).toBeTruthy();
       expect(screen.queryByRole('link', { name: enUS.agents.openTaskActions })).toBeNull();
     },

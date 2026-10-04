@@ -1,8 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { join, normalize } from 'node:path';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { createSignalToken, PASSIVE_VERDICT_WATCH } from './phase-signal.js';
 import { tmuxInstallHint } from './preflight.js';
 import type {
@@ -27,6 +27,7 @@ import type {
 import {
   BRANCH_PREFIX,
   isValidBranchName,
+  retainedUntrackedFilesWithinLimit,
   PHASE_EXPECTED_STATUS,
   PHASE_REQUIRES_AGENT_BOUND_TO_TASK,
   TASK_TERMINAL_STATUSES as TERMINAL_STATUSES,
@@ -108,6 +109,7 @@ import {
   isAutoDeletableTaskBranch,
 } from './branch.js';
 import { RepoStore, createRepoStoreCache, type RepoStoreCache } from './repo-store.js';
+import { inspectUntrackedFiles } from './untracked-files.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import {
   PhaseSignalWatcher,
@@ -451,9 +453,10 @@ export function canDispatchWithBinding(binding: AgentBindingFacts | null | undef
   return !binding?.taskId && !binding?.creationToken && binding?.status !== 'awaiting_human';
 }
 
+const CHECKOUT_PREPARATION_HOLD_PHASES = new Set(['checkout-preparation-failed', 'dirty-workdir']);
+
 const RECOVERABLE_QA_DISPATCH_HOLD_PHASES = new Set<string>([
-  'checkout-preparation-failed',
-  'dirty-workdir',
+  ...CHECKOUT_PREPARATION_HOLD_PHASES,
   'branch-cleanup-pending',
 ]);
 
@@ -2523,7 +2526,7 @@ export class AgentManager {
             }
           }
           if (cfg.role === 'dev' && boundTask) {
-            const branches = new BranchManager(runner);
+            const branches = this.taskBranchManager(runner, agentId, expectedTaskId);
             const cleanup = await branches.cleanupTaskBranch(releaseWorkdir, this.cleanupIdentityFor(boundTask), () => this.assertTaskGeneration(
               agentId,
               expectedTaskId,
@@ -2533,7 +2536,7 @@ export class AgentManager {
             await this.persistBranchCleanupOutcome(boundTask, agentId, cleanup);
             if (cleanup.status !== 'deleted') await branches.parkOnDefaultDetached(releaseWorkdir);
           } else {
-            await new BranchManager(runner).parkOnDefaultDetached(releaseWorkdir);
+            await this.taskBranchManager(runner, agentId, expectedTaskId).parkOnDefaultDetached(releaseWorkdir);
           }
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
         } catch (err) {
@@ -2769,7 +2772,7 @@ export class AgentManager {
         }
         if (!(await this.lockManager.isOwner(cfg.id, owner, token))) continue;
         for (const task of targets) {
-          const cleanup = await branches.cleanupTaskBranch(workdir, this.cleanupIdentityFor(task), () => this.assertTaskLockOwner(cfg.id, owner, token));
+          const cleanup = await this.taskBranchManager(runner, cfg.id, task.id).cleanupTaskBranch(workdir, this.cleanupIdentityFor(task), () => this.assertTaskLockOwner(cfg.id, owner, token));
           cleanupResults.push({ task, cleanup });
         }
       } catch (err) {
@@ -7224,6 +7227,200 @@ export class AgentManager {
     });
   }
 
+  private untrackedFilesHost(agent: AgentConfig): string {
+    return hostGroupKey(agent.mode, resolveAgentHost(this.config.host, agent.host));
+  }
+
+  private taskBranchManager(runner: CommandRunner, agentId: string, taskId: string): BranchManager {
+    return new BranchManager(runner, async workdir => {
+      const agent = this.getAgentConfig(agentId);
+      const task = await this.taskStore.get(taskId);
+      return task?.retainedUntrackedFiles?.find(entry => entry.agentId === agentId
+        && entry.workdir === workdir && agent && entry.host === this.untrackedFilesHost(agent))?.pathsBase64 ?? [];
+    });
+  }
+
+  private supportsUntrackedFiles(binding: AgentBindingFacts | null, agent: AgentConfig | undefined): boolean {
+    return binding?.status === 'awaiting_human' && !!agent
+      && (RECOVERABLE_QA_DISPATCH_HOLD_PHASES.has(binding.awaitingPhase ?? '')
+        || (agent.role === 'dev' && binding.awaitingPhase === 'restart-redispatch-failed'));
+  }
+
+  private async untrackedFilesContext(taskId: string, agentId: string) {
+    const task = await this.taskStore.get(taskId);
+    const binding = await this.agentStore.get(agentId);
+    const agent = this.getAgentConfig(agentId);
+    if (!task || !agent || binding?.taskId !== taskId || !binding.workdir || agent.projectId !== task.projectId) {
+      throw new ApiError(409, 'Task or agent binding changed; refresh the task');
+    }
+    if (this.isDeletionInFlight(agentId) || this.cancelCleanupInFlight.has(taskId)) {
+      throw new ApiError(409, 'Task cancellation or agent removal is in progress; wait for it to finish');
+    }
+    if (this.compactInFlight.has(agentId) || this.maintenanceInFlight.has(agentId)) {
+      throw new ApiError(409, 'Agent maintenance is in progress; refresh the file list when it finishes');
+    }
+    if (this.resolveWorkdir(agent, binding) !== binding.workdir) throw new ApiError(409, 'Agent working directory changed; check its configuration');
+    if (task.reviewDispatch?.phase === 'uncertain' || task.reviewDispatch?.phase === 'claimed') {
+      throw new ApiError(409, 'Review delivery is pending or uncertain; verify its outcome before handling files');
+    }
+    if (!this.supportsUntrackedFiles(binding, agent)) throw new ApiError(409, 'This agent hold cannot be resumed by handling files');
+    const claim = await this.lockManager.claimOf(agentId);
+    if (claim?.taskId !== taskId || (binding.lockToken && binding.lockToken !== claim.token)) {
+      throw new ApiError(409, 'Agent ownership changed; refresh the task');
+    }
+    const host = this.untrackedFilesHost(agent);
+    const retained = task.retainedUntrackedFiles?.find(entry => entry.agentId === agentId
+      && entry.workdir === binding.workdir && entry.host === host)?.pathsBase64 ?? [];
+    let recovery: 'qa' | 'dev' | 'release';
+    if (agent.role === 'qa' && task.status === 'review') {
+      if (task.qaAgentId !== agentId || !task.phase || task.deliveryConfirmation?.phase !== task.phase || !task.prNumber) {
+        throw new ApiError(409, 'Review delivery must be verified in the task before handling files');
+      }
+      recovery = 'qa';
+    } else if (binding.awaitingPhase === 'branch-cleanup-pending' || agent.role === 'qa'
+      || task.status === 'review' || TERMINAL_STATUSES.includes(task.status)) {
+      recovery = 'release';
+    } else if (['in_progress', 'fixing', 'approved'].includes(task.status)) {
+      if (task.status === 'approved' && task.postApproveRevoked) throw new ApiError(409, 'Post-approval work was revoked; confirm recovery in the task before handling files');
+      recovery = 'dev';
+    } else {
+      throw new ApiError(409, `Task cannot continue from ${task.status}; use the task actions before handling files`);
+    }
+    const devFallback = task.branchLocalCleaned?.remoteTipSha
+      ?? (binding.bootstrappingTaskId === taskId && CHECKOUT_PREPARATION_HOLD_PHASES.has(binding.awaitingPhase ?? '') ? 'origin/HEAD' : undefined);
+    const targetRefs = recovery === 'release' ? ['origin/HEAD'] : recovery === 'qa'
+      ? ['origin/HEAD', task.reviewHeadAnchorSha ?? task.latestHeadSha ?? `refs/remotes/origin/${task.branch}`]
+      : [[`refs/heads/${task.branch}`, ...(devFallback ? [devFallback] : [])]];
+    return { task, binding: { ...binding, lockToken: claim.token }, agent, host, retained, recovery, targetRefs,
+      workdir: binding.workdir, runner: this.createRunnerFor(agent) };
+  }
+
+  private untrackedFilesToken(
+    context: Awaited<ReturnType<AgentManager['untrackedFilesContext']>>,
+    fingerprint: string,
+  ): string {
+    return createHash('sha256').update(JSON.stringify({
+      taskId: context.task.id, generation: taskAttentionGeneration(context.task),
+      head: context.task.reviewHeadAnchorSha, latestHead: context.task.latestHeadSha,
+      branch: context.task.branch, agentId: context.agent.id, host: context.host,
+      workdir: context.workdir, lockToken: context.binding.lockToken,
+      hold: context.binding.awaitingPhase, nonce: context.binding.awaitingNonce,
+      pane: context.binding.paneId, creation: context.binding.creationToken,
+      bootstrap: context.binding.bootstrappingTaskId, reviewDispatch: context.task.reviewDispatch,
+      branchLocalCleaned: context.task.branchLocalCleaned, recovery: context.recovery,
+      runtime: context.agent.runtime, fingerprint, retained: context.retained,
+    })).digest('hex');
+  }
+
+  private retainedUntrackedSelection(context: Awaited<ReturnType<AgentManager['untrackedFilesContext']>>, pathsBase64: string[]) {
+    return [
+      ...(context.task.retainedUntrackedFiles ?? []).filter(entry => entry.agentId !== context.agent.id
+        || entry.workdir !== context.workdir || entry.host !== context.host),
+      { agentId: context.agent.id, host: context.host, workdir: context.workdir, pathsBase64: [...new Set([...context.retained, ...pathsBase64])] },
+    ];
+  }
+
+  async getUntrackedFiles(taskId: string, agentId: string) {
+    if (!this.supportsUntrackedFiles(await this.agentStore.get(agentId), this.getAgentConfig(agentId))) return null;
+    const context = await this.untrackedFilesContext(taskId, agentId);
+    const snapshot = await inspectUntrackedFiles(context.runner, context.workdir, undefined, context.targetRefs);
+    return this.withTaskLock(async () => {
+      const fresh = await this.untrackedFilesContext(taskId, agentId);
+      if (this.untrackedFilesToken(context, snapshot.fingerprint) !== this.untrackedFilesToken(fresh, snapshot.fingerprint)) {
+        throw new ApiError(409, 'Task changed during file inspection; refresh the file list');
+      }
+      const files = snapshot.files.filter(file => !fresh.retained.includes(file.pathBase64));
+      const pending = new Set(files.map(file => file.pathBase64));
+      return {
+        agentId, host: fresh.agent.mode === 'remote' ? fresh.agent.host! : hostname(),
+        workdir: fresh.workdir, token: this.untrackedFilesToken(fresh, snapshot.fingerprint), files,
+        trackedChanges: snapshot.trackedChanges, conflicts: snapshot.conflicts,
+        manualCleanupRequired: snapshot.conflicts.some(file => !pending.has(file.pathBase64)),
+        keepLimitExceeded: !retainedUntrackedFilesWithinLimit(this.retainedUntrackedSelection(fresh, [...pending])),
+      };
+    });
+  }
+
+  async resolveUntrackedFiles(taskId: string, agentId: string, action: 'keep' | 'discard' | 'continue', token: string): Promise<TaskState> {
+    let filesHandled = false;
+    try {
+      const current = await this.untrackedFilesContext(taskId, agentId);
+      const tmux = new TmuxManager(current.runner);
+      const runtime = await this.inspectReleaseRuntime(tmux, agentId, agentRuntimeKindFor(current.agent));
+      if (runtime.kind === 'hold') throw new ApiError(409, runtime.reason);
+      if (runtime.kind === 'pane') {
+        await this.waitForReplPromptReady(tmux, runtime.pane, current.agent.runtime, this.cleanComposerWaitMs, { stableIdle: true });
+      }
+      const snapshot = await inspectUntrackedFiles(current.runner, current.workdir, undefined, current.targetRefs);
+      const prepared = await this.withTaskLock(async () => {
+        let context = await this.untrackedFilesContext(taskId, agentId);
+        if (this.untrackedFilesToken(context, snapshot.fingerprint) !== token) {
+          throw new ApiError(409, 'Files or task changed; refresh the list and choose again');
+        }
+        if (this.agentOperationQueues.has(agentId)) throw new ApiError(409, 'Agent operation is in progress; refresh the list when it finishes');
+        const pathsBase64 = snapshot.files.filter(file => !context.retained.includes(file.pathBase64)).map(file => file.pathBase64);
+        if (snapshot.conflicts.some(file => action === 'keep' || !pathsBase64.includes(file.pathBase64))) {
+          throw new ApiError(409, 'Checkout would overwrite local files; move, rename or remove the conflicting files in the terminal');
+        }
+        if (action === 'continue' && pathsBase64.length > 0) throw new ApiError(409, 'Untracked files need a decision; refresh the list and choose Keep or Discard');
+        if (action !== 'continue' && pathsBase64.length === 0) throw new ApiError(409, 'No untracked files remain to handle; refresh the list and continue the task');
+        if (snapshot.trackedChanges) throw new ApiError(409, 'Tracked changes must be saved before continuing');
+        if (action === 'keep') {
+          const retainedUntrackedFiles = this.retainedUntrackedSelection(context, pathsBase64);
+          if (!retainedUntrackedFilesWithinLimit(retainedUntrackedFiles)) throw new ApiError(409, 'Retained file limit exceeded (1000 paths or 64 KiB per task); reduce the list in the terminal or discard the listed files');
+          await this.taskStore.set({ ...context.task, retainedUntrackedFiles, updatedAt: new Date().toISOString() });
+          filesHandled = true;
+          context = await this.untrackedFilesContext(taskId, agentId);
+        }
+        // Register the agent lease before releasing the task lock; never reacquire the task lock inside it.
+        const processing = this.outsideTaskMutationScope(() => this.withAgentOperationLease(agentId, async () => {
+          if (action !== 'discard') return;
+          await inspectUntrackedFiles(context.runner, context.workdir, { fingerprint: snapshot.fingerprint, pathsBase64 }, context.targetRefs);
+          filesHandled = true;
+        }));
+        return { context, pathsBase64, processing };
+      });
+      await prepared.processing;
+      return await this.withTaskLock(async () => {
+        const context = await this.withAgentOperationLease(agentId, async () => {
+          const refreshed = await this.untrackedFilesContext(taskId, agentId);
+          if (this.untrackedFilesToken(refreshed, snapshot.fingerprint) !== this.untrackedFilesToken(prepared.context, snapshot.fingerprint)) {
+            throw new ApiError(409, 'Task changed during file handling; refresh the task before continuing');
+          }
+          await this.auditHumanTaskOperation(refreshed.task, 'advance', `untracked-files:${action}`, undefined, { agentId, pathsBase64: prepared.pathsBase64 });
+          if (refreshed.recovery === 'dev' && refreshed.binding.bootstrappingTaskId === taskId
+            && refreshed.task.branch && CHECKOUT_PREPARATION_HOLD_PHASES.has(refreshed.binding.awaitingPhase ?? '')) {
+            await this.taskBranchManager(refreshed.runner, agentId, taskId).switchToTaskBranch(
+              refreshed.workdir, taskId, refreshed.task.branch, refreshed.task.branchCreatedByBaxian === true,
+              refreshed.task.branchLocalCleaned ? { restorableRemoteTip: refreshed.task.branchLocalCleaned.remoteTipSha } : {},
+            );
+            if (refreshed.task.branchLocalCleaned) await this.clearBranchLocalCleaned(taskId);
+          }
+          return refreshed;
+        });
+        if (context.recovery === 'qa') {
+          return this.dispatchReviewToQa(taskId, { fromStatus: ['review'], expectedTask: taskGenerationGuard(context.task) });
+        }
+        if (context.recovery === 'release') {
+          const released = await this.releaseAgentForTask(agentId, taskId, 'idle', {
+            allowAwaitingHuman: true, expectedTask: taskGenerationGuard(context.task),
+            expectedLockToken: context.binding.lockToken,
+            expectedHold: { phase: context.binding.awaitingPhase, since: context.binding.awaitingSince, nonce: context.binding.awaitingNonce },
+          });
+          if (!released) throw new ApiError(409, 'Workdir release is still blocked; inspect the task');
+          await this.emitIntervention(context.task.projectId, agentId, taskId, { phase: 'resumed', previousPhase: context.binding.awaitingPhase });
+        } else {
+          await this.advanceTask(taskId, { executor: 'dev', agentId });
+        }
+        return (await this.taskStore.get(taskId))!;
+      });
+    } catch (error) {
+      if (!filesHandled) throw error;
+      throw new ApiError(error instanceof ApiError ? error.status : 500,
+        `${action === 'keep' ? 'Files were kept' : 'Listed files were discarded'}, but continuing the task failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private createRunnerFor(agent: AgentConfig): CommandRunner {
     if (this.runnerFactory) {
       return this.runnerFactory(agent);
@@ -8445,7 +8642,7 @@ export class AgentManager {
 
     const runner = this.createRunnerFor(agent);
     const tmux = new TmuxManager(runner);
-    const branchManager = new BranchManager(runner);
+    const branchManager = this.taskBranchManager(runner, agentId, taskId);
     const lockState = await this.agentStore.get(agentId);
     if (!lockState || lockState.taskId !== taskId || lockState.lockToken !== lockToken) return false;
     await assertOwner();
@@ -9167,7 +9364,7 @@ export class AgentManager {
       return false;
     }
     if (agent.role === 'dev' && task.branch) {
-      const branches = new BranchManager(runner);
+      const branches = this.taskBranchManager(runner, agentId, taskId);
       if (!opts.allowDirtyWorkdir) await branches.assertClean(verifiedWorkdir);
       const actualRef = await branches.currentRef(verifiedWorkdir);
       if (actualRef !== `refs/heads/${task.branch}`) {

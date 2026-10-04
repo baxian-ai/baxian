@@ -10,6 +10,7 @@ import type {
   MergeStrategy,
   SpecApprovalStrategy,
   PrReviewConversation,
+  UntrackedFilesReport,
 } from './shared/index.js';
 
 const BASE = '/api';
@@ -228,6 +229,10 @@ export const api = {
       post<{ path: string }>(`/agents/${enc(id)}/images`, { dataBase64: await fileToBase64(file) }),
   },
   tasks: {
+    untrackedFiles: (id: string, agentId: string) =>
+      get<UntrackedFilesReport | null>(`/tasks/${enc(id)}/agents/${enc(agentId)}/untracked-files`),
+    resolveUntrackedFiles: (id: string, agentId: string, body: { action: 'keep' | 'discard' | 'continue'; token: string }) =>
+      post<TaskState>(`/tasks/${enc(id)}/agents/${enc(agentId)}/untracked-files`, body),
     list: async (projectId: string): Promise<TaskState[]> => {
       const byId = new Map<string, TaskState>();
       for (const category of ['active', 'pending'] as const) {

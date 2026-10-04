@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { TaskAttentionGeneration, TaskPhase, TaskState, TaskStatus } from '../shared/index.js';
 import {
   effectiveTaskReviewRound,
+  retainedUntrackedFilesWithinLimit,
   isRecord,
   mapWithConcurrency,
   FS_READ_CONCURRENCY,
@@ -30,7 +31,7 @@ const TASK_FIELDS = [
   'agentId', 'devAgentId', 'qaAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'remoteCleanup', 'branchLocalCleaned', 'latestHeadSha', 'reviewHeadAnchorSha',
   'reviewDispatchedAt', 'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'reviewRound', 'reviewRoundPending', 'specReviewRound', 'phase', 'deliveryConfirmation', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
-  'maxRoundsContinues',
+  'maxRoundsContinues', 'retainedUntrackedFiles',
   'postApproveRevoked', 'postApproveHeadSha', 'attention',
   'passToken', 'failToken', 'postApproveToken', 'postApproveGeneration', 'postApprovePhase', 'reviewDispatch', 'platformBinding', 'baseBranch',
   'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'replacementTaskId', 'origin', 'pendingRedispatch', 'redispatchCount',
@@ -130,6 +131,16 @@ function validateRemoteCleanup(raw: Record<string, unknown>): void {
 }
 
 function validateTask(raw: Record<string, unknown>): void {
+  if (raw.retainedUntrackedFiles !== undefined) {
+    if (!Array.isArray(raw.retainedUntrackedFiles) || raw.retainedUntrackedFiles.some(entry =>
+      !isRecord(entry) || ['agentId', 'host', 'workdir'].some(key => typeof entry[key] !== 'string' || !entry[key])
+      || !Array.isArray(entry.pathsBase64) || entry.pathsBase64.some(path => typeof path !== 'string' || !path || Buffer.from(path, 'base64').toString('base64') !== path))) {
+      throw taskSchemaError('retainedUntrackedFiles', 'agent, host, workdir and base64 paths');
+    }
+    if (!retainedUntrackedFilesWithinLimit(raw.retainedUntrackedFiles as { pathsBase64: string[] }[])) {
+      throw taskSchemaError('retainedUntrackedFiles', 'at most 1000 paths and 64 KiB per task');
+    }
+  }
   requireString(raw, 'id');
   requireString(raw, 'projectId');
   requireString(raw, 'title');

@@ -30,6 +30,26 @@ function createPayload(overrides: Record<string, unknown> = {}): Record<string, 
   return { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1', ...overrides };
 }
 
+describe('task untracked file actions', () => {
+  it.each([{}, { action: 'discard' }, { action: 'delete', token: 'a'.repeat(64) }, { action: 'keep', token: '../file' }])('rejects invalid choice %j', async body => {
+    const resolve = vi.spyOn(app.ctx.agentManager, 'resolveUntrackedFiles');
+    const response = await post('/api/tasks/task-1/agents/qa-1/untracked-files', body);
+    expect(response.statusCode).toBe(400);
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it.each(['keep', 'discard', 'continue'] as const)('returns the inspection and forwards only %s and the snapshot token', async action => {
+    const report = { agentId: 'qa-1', host: 'mac', workdir: '/repo', token: 'a'.repeat(64), files: [], trackedChanges: false, conflicts: [], manualCleanupRequired: false, keepLimitExceeded: false };
+    vi.spyOn(app.ctx.agentManager, 'getUntrackedFiles').mockResolvedValue(report);
+    const resolve = vi.spyOn(app.ctx.agentManager, 'resolveUntrackedFiles').mockResolvedValue(makeTask());
+    const inspected = await get('/api/tasks/task-1/agents/qa-1/untracked-files');
+    expect(inspected.json()).toEqual(report);
+    const handled = await post('/api/tasks/task-1/agents/qa-1/untracked-files', { action, token: report.token, paths: ['/do-not-trust-client-paths'] });
+    expect(handled.statusCode).toBe(200);
+    expect(resolve).toHaveBeenCalledWith('task-1', 'qa-1', action, report.token);
+  });
+});
+
 // Unassigned tasks are queued without starting an agent session, so the stored task is the whole outcome.
 function unassignedPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return createPayload({ preferredAgentId: '', ...overrides });

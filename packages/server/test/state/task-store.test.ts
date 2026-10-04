@@ -56,6 +56,17 @@ afterEach(async () => {
 });
 
 describe('TaskStore', () => {
+  it.each(['count', 'bytes'] as const)('rejects oversized retained file state by %s before replacing the saved task', async limit => {
+    const task = makeTask({ id: 'task-limit' });
+    await store.set(task);
+    const pathsBase64 = limit === 'count'
+      ? Array.from({ length: 1001 }, (_, i) => Buffer.from(`file-${i}`).toString('base64'))
+      : [Buffer.from('x'.repeat(50_000)).toString('base64')];
+    await expect(store.set({ ...task, retainedUntrackedFiles: [{ agentId: 'qa-1', host: 'host', workdir: '/repo', pathsBase64 }] }))
+      .rejects.toThrow('retainedUntrackedFiles');
+    expect(await store.get(task.id)).toEqual(task);
+  });
+
   it('writes and reads task state', async () => {
     const task = makeTask({ id: 'task-001', status: 'pending' });
     await store.set(task);

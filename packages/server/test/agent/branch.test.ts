@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -280,6 +280,43 @@ describe('BranchManager', () => {
     ).rejects.toBeInstanceOf(DirtyWorkdirError);
     expect(await run(`test -f ${shellQuote(join(workdir, 'untracked.txt'))}; echo $?`)).toBe('0');
     expect(await manager.currentRef(workdir)).toBe('refs/heads/main');
+  });
+
+  it('continues across review/default branch ignore changes after the files were retained', async () => {
+    await run(`git -C ${shellQuote(seed)} switch -q -c review-head`);
+    await writeFile(join(seed, '.gitignore'), 'test-results/\n');
+    await run(`git -C ${shellQuote(seed)} add .gitignore && git -C ${shellQuote(seed)} commit -qm ignore && git -C ${shellQuote(seed)} push -q origin review-head`);
+    const head = await run(`git -C ${shellQuote(seed)} rev-parse HEAD`);
+    const manager = new BranchManager(local, async () => [Buffer.from('test-results/desktop.png').toString('base64')]);
+    await manager.switchToRemoteBranchDetached(workdir, 'review-head', head);
+    await mkdir(join(workdir, 'test-results'));
+    await writeFile(join(workdir, 'test-results', 'desktop.png'), 'keep image');
+    await manager.parkOnDefaultDetached(workdir);
+    await manager.switchToRemoteBranchDetached(workdir, 'review-head', head);
+    expect(await run(`git -C ${shellQuote(workdir)} rev-parse HEAD`)).toBe(head);
+    expect(await readFile(join(workdir, 'test-results', 'desktop.png'), 'utf8')).toBe('keep image');
+    await writeFile(join(workdir, 'new-notes.txt'), 'new');
+    await expect(manager.assertClean(workdir)).rejects.toBeInstanceOf(DirtyWorkdirError);
+  });
+
+  it.each([false, true])('refuses to overwrite retained files when ignored=%s', async ignored => {
+    await run(`git -C ${shellQuote(seed)} switch -q -c review-head`);
+    await writeFile(join(seed, 'notes.txt'), 'committed');
+    await run(`git -C ${shellQuote(seed)} add notes.txt && git -C ${shellQuote(seed)} commit -qm notes && git -C ${shellQuote(seed)} push -q origin review-head`);
+    const head = await run(`git -C ${shellQuote(seed)} rev-parse HEAD`);
+    await writeFile(join(workdir, 'notes.txt'), 'local notes');
+    if (ignored) await writeFile(join(workdir, '.git', 'info', 'exclude'), 'notes.txt\n');
+    const manager = new BranchManager(local, async () => [Buffer.from('notes.txt').toString('base64')]);
+    await expect(manager.switchToRemoteBranchDetached(workdir, 'review-head', head)).rejects.toThrow(/would be overwritten/);
+    expect(await readFile(join(workdir, 'notes.txt'), 'utf8')).toBe('local notes');
+    expect(await manager.currentRef(workdir)).toBe('refs/heads/main');
+  });
+
+  it('keeps protecting tracked edits alongside retained files', async () => {
+    await writeFile(join(workdir, 'notes.txt'), 'retained');
+    await writeFile(join(workdir, 'file.txt'), 'edited');
+    await expect(new BranchManager(local, async () => [Buffer.from('notes.txt').toString('base64')]).assertClean(workdir)).rejects.toBeInstanceOf(DirtyWorkdirError);
+    expect(await readFile(join(workdir, 'file.txt'), 'utf8')).toBe('edited');
   });
 
   it.each([

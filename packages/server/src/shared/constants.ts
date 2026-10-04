@@ -49,6 +49,14 @@ export const MAX_CONFIG_BACKUPS = 7;
 
 export const MAX_INLINE_CONTENT_BYTES = 10 * 1024;
 
+export const RETAINED_UNTRACKED_MAX_PATHS = 1000;
+export const RETAINED_UNTRACKED_MAX_BYTES = 64 * 1024;
+
+export function retainedUntrackedFilesWithinLimit(entries: { pathsBase64: string[] }[]): boolean {
+  return entries.reduce((sum, entry) => sum + entry.pathsBase64.length, 0) <= RETAINED_UNTRACKED_MAX_PATHS
+    && new TextEncoder().encode(JSON.stringify(entries)).byteLength <= RETAINED_UNTRACKED_MAX_BYTES;
+}
+
 export const CONTROL_CHAR_RE = /\p{Cc}/u;
 
 export type DispatchPhase =

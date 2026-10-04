@@ -208,6 +208,18 @@ export interface TaskState {
   updatedAt: string;
 }
 
+export interface UntrackedFilesReport {
+  agentId: string;
+  host: string;
+  workdir: string;
+  token: string;
+  files: { path: string; pathBase64?: string; size: number; kind: 'file' | 'symlink' | 'directory' }[];
+  trackedChanges: boolean;
+  conflicts?: UntrackedFilesReport['files'];
+  manualCleanupRequired?: boolean;
+  keepLimitExceeded?: boolean;
+}
+
 export function needsGitReviewRecovery(
   task: Pick<TaskState, 'phase' | 'deliveryConfirmation' | 'prNumber'>,
 ): boolean {

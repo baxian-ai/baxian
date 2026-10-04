@@ -261,6 +261,7 @@ export interface TaskState {
     remoteTipSha: string;
     updatedAt: string;
   };
+  retainedUntrackedFiles?: { agentId: string; host: string; workdir: string; pathsBase64: string[] }[];
   latestHeadSha?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;

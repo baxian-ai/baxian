@@ -33,6 +33,8 @@ export function createApiMock(): ApiModule {
         uploadImage: vi.fn(),
       },
       tasks: {
+        untrackedFiles: vi.fn<ApiModule['api']['tasks']['untrackedFiles']>().mockResolvedValue(null),
+        resolveUntrackedFiles: vi.fn(),
         list: vi.fn(),
         page: vi.fn(),
         get: vi.fn(),

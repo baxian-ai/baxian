@@ -2,6 +2,7 @@ import { BRANCH_PREFIX, isValidBranchName } from '../shared/index.js';
 import { execNetwork, GIT_NET_ENV } from './net-exec.js';
 import type { CommandRunner } from './runner.js';
 import { shellQuote } from './runner.js';
+import { untrackedFilePaths } from './untracked-files.js';
 
 export interface AutoDeleteIdentity {
   taskId?: string;
@@ -40,7 +41,10 @@ export type BranchCleanupResult =
   | { status: 'pending'; reason: string; remoteTipSha?: string };
 
 export class BranchManager {
-  constructor(private runner: CommandRunner) {}
+  constructor(
+    private runner: CommandRunner,
+    private retainedUntrackedPaths?: (workdir: string) => Promise<string[]>,
+  ) {}
 
   async assertClean(workdir: string): Promise<void> {
     const result = await this.runner.exec(
@@ -50,7 +54,16 @@ export class BranchManager {
     if (result.exitCode !== 0) {
       throw new Error(`git status failed in ${workdir}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
     }
-    if (result.stdout.length > 0) throw new DirtyWorkdirError(workdir);
+    if (result.stdout.length === 0) return;
+    const entries = result.stdout.split('\0').filter(Boolean);
+    if (entries.every(entry => entry.startsWith('?? ')) && this.retainedUntrackedPaths) {
+      const retained = new Set(await this.retainedUntrackedPaths(workdir));
+      if (retained.size > 0) {
+        const untracked = await untrackedFilePaths(this.runner, workdir);
+        if (!untracked.trackedChanges && untracked.pathsBase64.every(path => retained.has(path))) return;
+      }
+    }
+    throw new DirtyWorkdirError(workdir);
   }
 
   // 前置条件:调用方已刷新远端(RepoStore.ensure 的 30s 节流窗口),所以这里不自己 fetch
@@ -524,7 +537,7 @@ export class BranchManager {
   }
 
   private async switch(workdir: string, args: string): Promise<void> {
-    const result = await this.runner.exec(`git -C ${shellQuote(workdir)} switch ${args}`);
+    const result = await this.runner.exec(`git -C ${shellQuote(workdir)} switch --no-overwrite-ignore ${args}`);
     if (result.exitCode !== 0) throw new Error(`git switch failed in ${workdir}: ${result.stderr.trim()}`);
   }
 

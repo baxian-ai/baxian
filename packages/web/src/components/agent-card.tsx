@@ -17,6 +17,7 @@ import { PaneTerminal } from './pane-terminal.tsx';
 import { agentRuntimeLabel, agentRuntimeTitle } from '../shared/index.js';
 import { useT, type Messages } from '../i18n/index.tsx';
 import { taskDetailPath } from './task-status.tsx';
+import { UntrackedFiles } from './untracked-files.tsx';
 
 export type TerminalMode = 'activity-preview' | 'embedded-full';
 
@@ -176,6 +177,7 @@ export function AgentCard({
     busy: actionBusy,
   } = useAgentActions(projectId, [agent.id], onDeleted);
   const [resuming, setResuming] = useState(false);
+  const [untrackedPending, setUntrackedPending] = useState(false);
   const [retryingBootstrap, setRetryingBootstrap] = useState(false);
 
   const taskId = agent.binding?.taskId;
@@ -326,8 +328,11 @@ export function AgentCard({
             <span className="font-mono">{agent.binding?.awaitingPhase}</span>
             {agent.binding?.awaitingReason && <span> · {agent.binding.awaitingReason}</span>}
           </div>
-          <div className="text-og-700">{t.agents.holdRecovery[holdRecovery]}</div>
+          {!untrackedPending && <div className="text-og-700">{t.agents.holdRecovery[holdRecovery]}</div>}
         </div>
+      )}
+      {isAwaitingHuman && taskId && (
+        <UntrackedFiles key={`${taskId}:${agent.id}`} taskId={taskId} agentId={agent.id} onPendingChange={setUntrackedPending} />
       )}
       {!isBootstrapping && agent.runtimeStatus === 'pending' && (
         <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
@@ -433,7 +438,7 @@ export function AgentCard({
               {stopping ? t.agents.stopping : t.agents.stop}
             </button>
           )}
-          {isAwaitingHuman && (holdRecovery === 'resume' || holdRecovery === 'restart-runtime') && (
+          {isAwaitingHuman && !untrackedPending && (holdRecovery === 'resume' || holdRecovery === 'restart-runtime') && (
             <button
               type="button"
               onClick={handleResume}
