@@ -212,7 +212,7 @@ catch (error) {
 async function runInspection(runner: CommandRunner, workdir: string, input: Record<string, unknown>) {
   const result = await runner.execWithStdin(`node -e ${shellQuote(SCRIPT)}`, Buffer.from(JSON.stringify({
     workdir, timeout: UNTRACKED_FILES_TIMEOUT_MS - 1000, ...input,
-  })), { timeout: UNTRACKED_FILES_TIMEOUT_MS });
+  })), { timeout: UNTRACKED_FILES_TIMEOUT_MS, remoteShell: 'login-interactive' });
   const line = result.stdout.split('\n').reverse().find(line => line.startsWith(OUTPUT_MARKER));
   if (!line) throw new Error(`Untracked file inspection unavailable: ${result.stderr.trim().slice(0, 1000) || 'missing result; verify Node.js is available on the agent host'}`);
   const report = JSON.parse(line.slice(OUTPUT_MARKER.length));

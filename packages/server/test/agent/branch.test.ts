@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, realpath, rm, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   BranchManager,
   DirtyWorkdirError,
@@ -1280,4 +1280,210 @@ describe('BranchManager', () => {
     expect(acquireSpy).not.toHaveBeenCalled();
   });
 
+});
+
+describe('BranchManager submodules', () => {
+  it('keeps an initialized submodule on the commit the checked-out tree records', async () => {
+    const q = shellQuote;
+    const subOrigin = join(tempDir, 'sub.git');
+    const subWork = join(tempDir, 'sub-work');
+    await run(
+      `git init -q --bare ${q(subOrigin)} && git init -q ${q(subWork)} && ` +
+      `git -C ${q(subWork)} config user.name test && git -C ${q(subWork)} config user.email test@example.com && ` +
+      `printf one > ${q(join(subWork, 'lib.txt'))} && git -C ${q(subWork)} add lib.txt && git -C ${q(subWork)} commit -q -m one && ` +
+      `git -C ${q(subWork)} branch -M main && git -C ${q(subWork)} push -q ${q(subOrigin)} main && ` +
+      `git -C ${q(subOrigin)} symbolic-ref HEAD refs/heads/main && ` +
+      `git -C ${q(seed)} -c protocol.file.allow=always submodule add -q ${q(subOrigin)} vendor/sub && ` +
+      `git -C ${q(seed)} commit -q -m add-sub && git -C ${q(seed)} push -q origin main`,
+    );
+    await rm(workdir, { recursive: true, force: true });
+    await run(`git -c protocol.file.allow=always clone -q --recurse-submodules ${q(origin)} ${q(workdir)}`);
+    const first = await run(`git -C ${q(join(workdir, 'vendor/sub'))} rev-parse HEAD`);
+
+    await run(
+      `printf two > ${q(join(subWork, 'lib.txt'))} && git -C ${q(subWork)} commit -q -am two && ` +
+      `git -C ${q(subWork)} push -q ${q(subOrigin)} main`,
+    );
+    const second = await run(`git -C ${q(subWork)} rev-parse HEAD`);
+    expect(second).not.toBe(first);
+    await run(
+      `git -C ${q(join(seed, 'vendor/sub'))} fetch -q origin && git -C ${q(join(seed, 'vendor/sub'))} checkout -q ${second} && ` +
+      `git -C ${q(seed)} commit -q -am repin && git -C ${q(seed)} push -q origin main && ` +
+      `git -C ${q(workdir)} -c protocol.file.allow=always fetch -q origin`,
+    );
+
+    const branches = new BranchManager(local);
+    await branches.parkOnDefaultDetached(workdir);
+
+    expect(await run(`git -C ${q(join(workdir, 'vendor/sub'))} rev-parse HEAD`)).toBe(second);
+    await expect(branches.assertClean(workdir)).resolves.toBeUndefined();
+  });
+});
+
+describe('BranchManager submodule switch safety', () => {
+  const q = shellQuote;
+
+  async function commitFiles(repo: string, files: Record<string, string>): Promise<string> {
+    for (const [path, content] of Object.entries(files)) {
+      await mkdir(dirname(join(repo, path)), { recursive: true });
+      await writeFile(join(repo, path), content);
+    }
+    // -f: the upstream commit starts tracking paths its own .gitignore still lists
+    await run(`git -C ${q(repo)} add -f -A && git -C ${q(repo)} commit -q -m update`);
+    return run(`git -C ${q(repo)} rev-parse HEAD`);
+  }
+
+  async function publishRepo(work: string, bare: string, files: Record<string, string>): Promise<void> {
+    await run(
+      `git init -q --bare ${q(bare)} && git init -q ${q(work)} && ` +
+      `git -C ${q(work)} config user.name test && git -C ${q(work)} config user.email test@example.com`,
+    );
+    await commitFiles(work, files);
+    await run(
+      `git -C ${q(work)} branch -M main && git -C ${q(work)} push -q ${q(bare)} main && ` +
+      `git -C ${q(bare)} symbolic-ref HEAD refs/heads/main`,
+    );
+  }
+
+  async function addSubmodule(superWork: string, bare: string, path: string): Promise<void> {
+    await run(
+      `git -C ${q(superWork)} -c protocol.file.allow=always submodule add -q ${q(bare)} ${q(path)} && ` +
+      `git -C ${q(superWork)} commit -q -m add-sub`,
+    );
+  }
+
+  async function repinSubmodule(superWork: string, path: string, tip: string): Promise<string> {
+    const sub = join(superWork, path);
+    await run(
+      `git -C ${q(sub)} -c protocol.file.allow=always fetch -q origin && git -C ${q(sub)} checkout -q ${tip} && ` +
+      `git -C ${q(superWork)} commit -q -am repin`,
+    );
+    return run(`git -C ${q(superWork)} rev-parse HEAD`);
+  }
+
+  async function cloneAgentWorkdir(): Promise<void> {
+    await rm(workdir, { recursive: true, force: true });
+    await run(`git -c protocol.file.allow=always clone -q --recurse-submodules ${q(origin)} ${q(workdir)}`);
+  }
+
+  async function publishSeed(): Promise<void> {
+    await run(
+      `git -C ${q(seed)} push -q origin main && ` +
+      `git -C ${q(workdir)} -c protocol.file.allow=always fetch -q origin`,
+    );
+  }
+
+  async function headOf(repo: string): Promise<string> {
+    return run(`git -C ${q(repo)} rev-parse HEAD`);
+  }
+
+  let subOrigin: string;
+  let subWork: string;
+  const sub = () => join(workdir, 'vendor/sub');
+
+  beforeEach(async () => {
+    subOrigin = join(tempDir, 'sub.git');
+    subWork = join(tempDir, 'sub-work');
+    await publishRepo(subWork, subOrigin, { '.gitignore': 'ignored.txt\ncache\n', 'lib.txt': 'one' });
+    await addSubmodule(seed, subOrigin, 'vendor/sub');
+    await run(`git -C ${q(seed)} push -q origin main`);
+    await cloneAgentWorkdir();
+  });
+
+  async function upstreamAddsToSubmodule(files: Record<string, string>): Promise<string> {
+    const tip = await commitFiles(subWork, files);
+    await run(`git -C ${q(subWork)} push -q ${q(subOrigin)} main`);
+    await repinSubmodule(seed, 'vendor/sub', tip);
+    await publishSeed();
+    return tip;
+  }
+
+  it('refuses to switch when the target submodule commit would overwrite an ignored local file inside the submodule', async () => {
+    const localFile = join(sub(), 'ignored.txt');
+    await writeFile(localFile, 'local only');
+    const superBefore = await headOf(workdir);
+    const subBefore = await headOf(sub());
+    await upstreamAddsToSubmodule({ 'ignored.txt': 'upstream' });
+
+    const branches = new BranchManager(local);
+    await expect(branches.parkOnDefaultDetached(workdir)).rejects.toThrow(/vendor\/sub[\s\S]*ignored\.txt/);
+
+    expect(await readFile(localFile, 'utf8')).toBe('local only');
+    expect(await headOf(workdir)).toBe(superBefore);
+    expect(await headOf(sub())).toBe(subBefore);
+  });
+
+  it('refuses to switch when the target submodule commit turns an ignored local file into a directory', async () => {
+    const localFile = join(sub(), 'cache');
+    await writeFile(localFile, 'local only');
+    const superBefore = await headOf(workdir);
+    const subBefore = await headOf(sub());
+    await upstreamAddsToSubmodule({ 'cache/tracked.txt': 'upstream' });
+
+    const branches = new BranchManager(local);
+    await expect(branches.parkOnDefaultDetached(workdir)).rejects.toThrow(/vendor\/sub[\s\S]*cache/);
+
+    expect(await readFile(localFile, 'utf8')).toBe('local only');
+    expect(await headOf(workdir)).toBe(superBefore);
+    expect(await headOf(sub())).toBe(subBefore);
+  });
+
+  it('refuses to switch when the target submodule commit replaces an ignored local directory with a file', async () => {
+    const localFile = join(sub(), 'cache/local.log');
+    await mkdir(dirname(localFile));
+    await writeFile(localFile, 'local only');
+    const superBefore = await headOf(workdir);
+    const subBefore = await headOf(sub());
+    await upstreamAddsToSubmodule({ cache: 'upstream' });
+
+    const branches = new BranchManager(local);
+    await expect(branches.parkOnDefaultDetached(workdir)).rejects.toThrow(/vendor\/sub[\s\S]*cache\/local\.log/);
+
+    expect(await readFile(localFile, 'utf8')).toBe('local only');
+    expect(await headOf(workdir)).toBe(superBefore);
+    expect(await headOf(sub())).toBe(subBefore);
+  });
+
+  it('switches when the target submodule commit only adds files beside an ignored local directory', async () => {
+    const localFile = join(sub(), 'cache/local.log');
+    await mkdir(dirname(localFile));
+    await writeFile(localFile, 'local only');
+    const tip = await upstreamAddsToSubmodule({ 'cache/tracked.txt': 'upstream' });
+
+    const branches = new BranchManager(local);
+    await branches.parkOnDefaultDetached(workdir);
+
+    expect(await readFile(localFile, 'utf8')).toBe('local only');
+    expect(await readFile(join(sub(), 'cache/tracked.txt'), 'utf8')).toBe('upstream');
+    expect(await headOf(sub())).toBe(tip);
+    await expect(branches.assertClean(workdir)).resolves.toBeUndefined();
+  });
+
+  it('refuses to switch when a nested submodule commit would overwrite an ignored local file', async () => {
+    const innerOrigin = join(tempDir, 'inner.git');
+    const innerWork = join(tempDir, 'inner-work');
+    await publishRepo(innerWork, innerOrigin, { '.gitignore': 'ignored.txt\n', 'lib.txt': 'one' });
+    await addSubmodule(subWork, innerOrigin, 'inner');
+    await run(`git -C ${q(subWork)} push -q ${q(subOrigin)} main`);
+    await repinSubmodule(seed, 'vendor/sub', await headOf(subWork));
+    await run(`git -C ${q(seed)} push -q origin main`);
+    await cloneAgentWorkdir();
+    const inner = join(sub(), 'inner');
+    const localFile = join(inner, 'ignored.txt');
+    await writeFile(localFile, 'local only');
+    const before = [await headOf(workdir), await headOf(sub()), await headOf(inner)];
+
+    const innerTip = await commitFiles(innerWork, { 'ignored.txt': 'upstream' });
+    await run(`git -C ${q(innerWork)} push -q ${q(innerOrigin)} main`);
+    const subTip = await repinSubmodule(subWork, 'inner', innerTip);
+    await run(`git -C ${q(subWork)} push -q ${q(subOrigin)} main`);
+    await repinSubmodule(seed, 'vendor/sub', subTip);
+    await publishSeed();
+
+    const branches = new BranchManager(local);
+    await expect(branches.parkOnDefaultDetached(workdir)).rejects.toThrow(/vendor\/sub\/inner[\s\S]*ignored\.txt/);
+
+    expect(await readFile(localFile, 'utf8')).toBe('local only');
+    expect([await headOf(workdir), await headOf(sub()), await headOf(inner)]).toEqual(before);
+  });
 });

@@ -231,6 +231,18 @@ const cases: Case[] = [
     expect: { state: 'working', rule: 'screen_working_fallback' },
   },
   {
+    name: 'codex 0.160: the shortcuts/warning hint row under the status line must not push • Working out of the bottom window',
+    lines: [
+      '• Working (12s • esc to interrupt)',
+      '',
+      '› Ask Codex to do anything',
+      '',
+      '  gpt-6-astra xhigh · ~/repo · summary',
+      '  ? for shortcuts                       ⚠ 1 warning · f2 to view',
+    ],
+    expect: { state: 'working', rule: 'screen_working_fallback' },
+  },
+  {
     name: '■ Conversation interrupted suppresses screen_working_fallback',
     lines: [
       '■ Conversation interrupted',

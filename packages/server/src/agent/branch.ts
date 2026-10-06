@@ -86,7 +86,7 @@ export class BranchManager {
     if (local.exitCode === 0) {
       await this.verifyTaskBranchMarker(workdir, branch, taskId);
       await this.ensureTaskBranchUpstream(workdir, branch);
-      await this.switch(workdir, `--no-guess ${shellQuote(branch)}`);
+      await this.switch(workdir, branch, `--no-guess ${shellQuote(branch)}`);
     } else if (local.exitCode === 1) {
       if (opts.restorableRemoteTip) {
         if (!await this.remoteBranchExists(workdir, branch)) {
@@ -105,6 +105,7 @@ export class BranchManager {
         const baseSha = await this.resolveCommit(workdir, 'origin/HEAD');
         await this.switch(
           workdir,
+          baseSha,
           `--no-track -c ${shellQuote(branch)} ${shellQuote(baseSha)}`,
         );
         await this.markTaskBranch(workdir, branch, taskId);
@@ -144,7 +145,7 @@ export class BranchManager {
     if (contained !== true) {
       throw new Error(`Remote ancestry probe failed for ${branch}: ${contained.error}`);
     }
-    await this.switch(workdir, `--no-guess -c ${shellQuote(branch)} --track ${shellQuote(remoteRef)}`);
+    await this.switch(workdir, remoteRef, `--no-guess -c ${shellQuote(branch)} --track ${shellQuote(remoteRef)}`);
     await this.markTaskBranch(workdir, branch, taskId);
   }
 
@@ -536,13 +537,60 @@ export class BranchManager {
     if (result.exitCode !== 0) throw new Error(`git fetch failed in ${workdir}: ${result.stderr.trim()}`);
   }
 
-  private async switch(workdir: string, args: string): Promise<void> {
-    const result = await this.runner.exec(`git -C ${shellQuote(workdir)} switch --no-overwrite-ignore ${args}`);
+  private async switch(workdir: string, target: string, args: string): Promise<void> {
+    await this.assertSubmodulesSwitchable(workdir, target);
+    const result = await this.runner.exec(`git -C ${shellQuote(workdir)} switch --no-overwrite-ignore --recurse-submodules ${args}`);
     if (result.exitCode !== 0) throw new Error(`git switch failed in ${workdir}: ${result.stderr.trim()}`);
   }
 
+  // --no-overwrite-ignore only guards the superproject: the recursive submodule checkout overwrites ignored files silently
+  private async assertSubmodulesSwitchable(repo: string, target: string, prefix = ''): Promise<void> {
+    const listed = await this.runner.exec(
+      `git -C ${shellQuote(repo)} submodule --quiet foreach ${shellQuote('printf "%s\\0" "$sm_path"')}`,
+    );
+    if (listed.exitCode !== 0) throw new Error(`Failed to list submodules in ${repo}: ${listed.stderr.trim()}`);
+    for (const path of listed.stdout.split('\0').filter(Boolean)) {
+      const next = await this.runner.exec(
+        `git -C ${shellQuote(repo)} rev-parse --verify --quiet ${shellQuote(`${target}:${path}`)}`,
+      );
+      if (next.exitCode !== 0) continue;
+      const sub = `${repo}/${path}`;
+      const nextSha = next.stdout.trim();
+      if (nextSha === await this.resolveCommit(sub, 'HEAD')) continue;
+      const label = `${prefix}${path}`;
+      const files = await this.localFilesLostByCheckout(sub, nextSha, label);
+      if (files.length > 0) {
+        throw new Error(`Submodule ${label} has local files that switching to ${target} would overwrite: ${files.join(', ')}`);
+      }
+      // nested gitlinks resolve against this submodule's target commit, not the superproject tree
+      await this.assertSubmodulesSwitchable(sub, nextSha, `${label}/`);
+    }
+  }
+
+  private async localFilesLostByCheckout(repo: string, nextSha: string, label: string): Promise<string[]> {
+    const added = (flags: string) =>
+      `git -C ${shellQuote(repo)} diff-tree -r ${flags}-z --name-only --no-renames --diff-filter=A HEAD ${shellQuote(nextSha)}`;
+    // ls-files --others without --exclude-standard also lists ignored files; xargs -0 keeps paths byte-exact
+    const present = (flags: string) =>
+      `${added(flags)} | xargs -0 -r git -C ${shellQuote(repo)} --literal-pathspecs ls-files -z --others --`;
+    const probe = await this.runner.exec(added('-t '));
+    if (probe.exitCode !== 0) throw new Error(`Cannot compare submodule ${label} with ${nextSha}: ${probe.stderr.trim()}`);
+    if (!probe.stdout) return [];
+    const inspect = async (flags: string): Promise<string[]> => {
+      const result = await this.runner.exec(present(flags));
+      if (result.exitCode !== 0) throw new Error(`Cannot inspect submodule ${label}: ${result.stderr.trim()}`);
+      return result.stdout.split('\0').filter(Boolean);
+    };
+    // a local directory standing where the target puts a file is removed whole, so anything under an added blob is lost;
+    // an added tree only displaces a local file at exactly its own path
+    const addedPaths = new Set(probe.stdout.split('\0'));
+    const underBlobs = await inspect('');
+    const atTrees = (await inspect('-t ')).filter((file) => addedPaths.has(file));
+    return [...new Set([...underBlobs, ...atTrees])];
+  }
+
   private async switchDetached(workdir: string, commit: string): Promise<void> {
-    await this.switch(workdir, `--detach ${shellQuote(commit)}`);
+    await this.switch(workdir, commit, `--detach ${shellQuote(commit)}`);
     const head = await this.resolveCommit(workdir, 'HEAD');
     if (head !== commit) throw new Error(`Detached checkout mismatch: expected ${commit}, got ${head}`);
   }

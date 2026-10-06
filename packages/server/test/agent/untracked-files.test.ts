@@ -650,6 +650,20 @@ describe('untracked file decisions on real workdirs', () => {
     expect((await inspectUntrackedFiles(remote, workdir)).files).toEqual([]);
   });
 
+  it('reaches a Node.js that only the interactive login shell puts on PATH (nvm loaded from the shell rc)', async () => {
+    await writeFile(join(workdir, 'rc-only-node.txt'), 'keep');
+    const home = join(root, 'home');
+    await mkdir(home);
+    await writeFile(join(home, '.bash_profile'), 'case $- in *i*) ;; *) PATH=/nonexistent ;; esac\n');
+    const local: CommandRunner = {
+      exec: runner.exec.bind(runner), writeFile: runner.writeFile.bind(runner),
+      execWithStdin: (command, stdin, options) => runner.execWithStdin(String.raw`ssh() { /bin/sh -c "${'${@: -1}'}"; }; ` + command,
+        stdin, { ...options, env: { SHELL: '/bin/bash', HOME: home } }),
+    };
+    const remote = new SshRunner({ hostname: 'inspection-test.invalid', user: 'tester' }, local);
+    expect((await inspectUntrackedFiles(remote, workdir)).files.map(file => file.path)).toEqual(['rc-only-node.txt']);
+  });
+
   it('reports concise remote failures without exposing the evaluated Node script or stack', async () => {
     await expect(inspectUntrackedFiles(runner, join(root, 'missing'))).rejects.toThrow('Untracked file inspection failed: ENOENT');
     try { await inspectUntrackedFiles(runner, join(root, 'missing')); }

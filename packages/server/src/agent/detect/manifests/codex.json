@@ -150,7 +150,7 @@
       "id": "screen_working_fallback",
       "state": "working",
       "priority": 500,
-      "region": "bottom_non_empty_lines(3)",
+      "region": "bottom_non_empty_lines(4)",
       "visibleWorking": true,
       "lineRegex": [
         "^[•◦]\\s+Working \\([^)]*esc to interrupt\\)(?: · .*)?$"

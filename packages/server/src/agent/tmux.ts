@@ -296,8 +296,10 @@ const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = Object.fromEntries(
 
 const READY_ANCHORS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /⏵⏵ bypass permissions on/,
-  // tmux keeps styled blank cells, so the row between composer and footer may hold whitespace
-  codex: /permissions: YOLO mode|(?:^|\n)› [^\n]+\n[^\S\n]*\n\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\s+·[^\n]*(?:\n\s*)?$/,
+  // tmux keeps styled blank cells, so the row between composer and footer may hold whitespace;
+  // codex ≥0.160 adds a hint row under the status line: "? for shortcuts" on an empty composer, plus a warnings badge
+  // that narrows with the pane ("⚠ N warnings · <key> to view" → "⚠ N · <key>" → "⚠ N"; the key is remappable)
+  codex: /permissions: YOLO mode|(?:^|\n)› [^\n]+\n[^\S\n]*\n\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\s+·[^\n]*(?:\n[ \t]*(?:\? for shortcuts[^\n]*|⚠ \d+(?: warnings?)?(?: · [^\n]+)?[ \t]*))?(?:\n\s*)?$/,
   opencode: NEVER_RE,
   qodercli: NEVER_RE,
 };
