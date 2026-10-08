@@ -166,6 +166,10 @@ export const zhCN: Messages = {
     deletedWithTeamBody: (otherAgentIds) => `同一 Agent Team 的 Agent ${otherAgentIds} 也被一并移除。`,
     deletedTitle: (agentId) => `Agent ${agentId} 已删除`,
     retryBootstrap: '重试 bootstrap',
+    retrySession: '重试启动',
+    retrySessionReady: 'agent 会话已就绪',
+    retrySessionPending: '请打开终端处理启动弹窗',
+    retrySessionFailed: 'agent 启动失败',
     retryBootstrapSucceededTitle: '重试 bootstrap 完成',
     retryBootstrapSucceededBody: 'agent 状态将在下一次刷新生效。',
     retryBootstrapStillFailingTitle: '重试 bootstrap 仍失败',
@@ -572,7 +576,10 @@ export const zhCN: Messages = {
     platformRateLimited: (repo, until) => `平台轮询触发限流（${repo}），将于 ${new Date(until).toLocaleTimeString()} 后自动恢复`,
   },
   terminal: {
-    sessionEnded: '会话已结束',
+    sessionEnded: '终端会话不存在或已结束。',
+    sessionRecovery: '请回到项目页面检查 agent 并重试启动；若已绑定任务，请按任务页的恢复提示处理。会话就绪后，在这里重新连接。',
+    reconnect: '重新连接',
+    backToProject: '返回项目',
     keyPadAriaLabel: '终端按键',
     arrowAriaLabel: (label) => `方向键 ${label}`,
     arrowLabel: {

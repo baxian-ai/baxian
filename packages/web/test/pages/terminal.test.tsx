@@ -34,6 +34,7 @@ describe('Terminal page', () => {
     );
 
     await waitFor(() => expect(screen.getByText('dev-1').getAttribute('title')).toBe('dev-1 (Claude Code)'));
+    expect(screen.getByRole('link', { name: 'Back to project' }).getAttribute('href')).toBe('/project/proj');
     expect(screen.queryByText(/Ctrl\+Q/i)).toBeNull();
     const terminal = screen.getByTestId('pane-terminal');
     expect(terminal.getAttribute('data-agent-id')).toBe('dev-1');

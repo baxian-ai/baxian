@@ -218,10 +218,12 @@ export function PaneTerminal({
     }
   };
 
-  const { send, resize } = usePaneStream({
+  const { send, resize, reconnect } = usePaneStream({
     agentId,
     mode: streamMode,
     onSnapshot: ({ cols, rows, data }) => {
+      setError(null);
+      setSessionGone(false);
       const term = termRef.current;
       if (!term) return;
       try {
@@ -245,7 +247,10 @@ export function PaneTerminal({
     onData: (data) => {
       scheduleLiveWrite(data);
     },
-    onError: (m) => setError(`${m.code}: ${m.message}`),
+    onError: (m) => {
+      setSessionGone(m.code === 'session_not_found');
+      setError(m.code === 'session_not_found' ? null : `${m.code}: ${m.message}`);
+    },
     onSessionGone: () => setSessionGone(true),
   });
 
@@ -439,8 +444,17 @@ export function PaneTerminal({
   return (
     <div className={className ?? 'flex flex-col h-full w-full min-h-0 bg-term'}>
       {(error || sessionGone) && (
-        <div className="border-b border-accent/25 bg-accent-soft px-3 py-1 font-mono text-xs text-accent">
-          {sessionGone ? t.terminal.sessionEnded : error}
+        <div role="alert" className="border-b border-accent/25 bg-accent-soft px-3 py-1 text-xs text-accent">
+          <div>{sessionGone ? t.terminal.sessionEnded : error}</div>
+          {sessionGone && <div>{t.terminal.sessionRecovery}</div>}
+          <button
+            type="button"
+            className="btn-secondary mt-1"
+            onKeyDown={event => event.stopPropagation()}
+            onClick={event => { event.stopPropagation(); reconnect(); }}
+          >
+            {t.terminal.reconnect}
+          </button>
         </div>
       )}
       <div className="flex flex-1 min-h-0 px-2 py-1.5" style={containerStyle}>

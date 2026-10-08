@@ -156,6 +156,35 @@ describe('AgentCard', () => {
     flagDirtyMock.mockReset();
   });
 
+  it.each([undefined, 'pending'])('retries an unbound missing session and reports the %s startup result', async (runtimeStatus) => {
+    retryAgentMock.mockResolvedValue({ ok: true, agentId: 'dev-1', runtimeStatus });
+    renderCard(makeSnapshot({ tmuxSessionStatus: 'absent' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.agents.retrySession }));
+    await expectToast({ title: runtimeStatus === 'pending' ? enUS.agents.retrySessionPending : enUS.agents.retrySessionReady });
+    expect(retryAgentMock).toHaveBeenCalledWith('proj', 'dev-1');
+    expect(bootstrapMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps startup failures actionable and permits retry after an API failure', async () => {
+    retryAgentMock.mockRejectedValue(new Error('SSH connection failed'));
+    renderCard(makeSnapshot({ tmuxSessionStatus: 'absent' }));
+    fireEvent.click(screen.getByRole('button', { name: enUS.agents.retrySession }));
+    await expectToast({ title: enUS.agents.retrySessionFailed, body: 'SSH connection failed' });
+    expect((screen.getByRole('button', { name: enUS.agents.retrySession }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it.each([
+    { tmuxSessionStatus: 'present' as const },
+    { tmuxSessionStatus: 'unreachable' as const },
+    { stale: true },
+    { binding: makeBinding('dev-1', { taskId: 'task-1' }) },
+    { binding: makeBinding('dev-1', { creationToken: 'creating' }) },
+    { binding: makeBinding('dev-1', { status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' }) },
+  ])('does not offer session creation when the live state does not authorize it: %j', (overrides) => {
+    renderCard(makeSnapshot({ tmuxSessionStatus: 'absent', ...overrides }));
+    expect(screen.queryByRole('button', { name: enUS.agents.retrySession })).toBeNull();
+  });
+
   it('shows untracked-file decisions in the held QA card and hides the generic Resume action', async () => {
     vi.mocked(api.tasks.untrackedFiles).mockResolvedValueOnce({
       agentId: 'qa-1', host: 'remote-mac', workdir: '/work/qa', token: 'a'.repeat(64),

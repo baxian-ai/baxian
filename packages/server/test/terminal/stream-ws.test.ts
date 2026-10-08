@@ -47,6 +47,7 @@ function createProbeAwarePty(cmd: { args: string[] }): MinimalPty {
 async function startApp(opts?: {
   configToken?: string;
   withPaneStreamerManager?: boolean;
+  sessionPresent?: () => boolean;
 }): Promise<{ app: FastifyInstance; port: number; ctx: AppContext }> {
   const ctx = await createTestContext(tempDir);
   if (opts?.configToken) {
@@ -58,6 +59,7 @@ async function startApp(opts?: {
       runnerFactory: () => ({
         exec: vi.fn().mockImplementation(async (cmd: string) => {
           if (cmd.includes('list-sessions')) {
+            if (opts.sessionPresent?.() === false) return { stdout: '', stderr: '', exitCode: 0 };
             const name = /#\{==:#\{session_name\},([^}]+)\}/.exec(cmd)?.[1] ?? 'dev-1';
             return { stdout: `4242|1700000000|$1|${name}\n`, stderr: '', exitCode: 0 };
           }
@@ -650,6 +652,37 @@ describe('streamWsPlugin /api/stream — transport error handling', () => {
 });
 
 describe('streamWsPlugin /api/stream — streamer unavailable & subscribe failures', () => {
+  it('reports an absent real streamer as session_not_found and allows a fresh subscription after recovery', async () => {
+    let present = false;
+    const { app, port } = await startApp({ withPaneStreamerManager: true, sessionPresent: () => present });
+    runningApp = app;
+    const ws = openWs(port);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
+    expect(await reader.next()).toMatchObject({ type: 'error', subscriberId: 'sub-1', code: 'session_not_found' });
+
+    present = true;
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
+    expect(await reader.next()).toMatchObject({ type: 'snapshot', subscriberId: 'sub-1' });
+    expect(await reader.next()).toMatchObject({ type: 'subscribed', subscriberId: 'sub-1' });
+    ws.close();
+  });
+
+  it('does not label an unrelated streamer destruction as a missing session', async () => {
+    const { app, port, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    streamer.subscribeAtomic.mockRejectedValue(new Error('PaneStreamer destroyed before subscribe'));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(port);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
+    expect(await reader.next()).toMatchObject({ type: 'error', code: 'subscribe_failed' });
+    ws.close();
+  });
+
   it('subscribe without a PaneStreamerManager returns streamer_unavailable and releases the sub', async () => {
     const { app, port: p } = await startApp();
     runningApp = app;

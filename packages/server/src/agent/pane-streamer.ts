@@ -10,7 +10,7 @@ import {
   type AttachCommand,
 } from '../terminal/attach.js';
 import { sshEnv } from './runner.js';
-import { TmuxManager, desiredTty, type TmuxSessionRef, type TtySize, type WindowGeometry } from './tmux.js';
+import { SessionAbsentError, TmuxManager, desiredTty, type TmuxSessionRef, type TtySize, type WindowGeometry } from './tmux.js';
 import { computeBackoffMs } from '../timing/backoff.js';
 import { VisibleTextExtractor } from './vt-visible-text.js';
 
@@ -230,6 +230,7 @@ export class PaneStreamer {
   private quarantineDrain: Promise<void> | null = null;
   private expectedRef: TmuxSessionRef | null = null;
   private destroyed = false;
+  private sessionGoneError: SessionAbsentError | null = null;
   private starting: Promise<void> | null = null;
   private started = false;
   private followTimer: ReturnType<typeof setInterval> | null = null;
@@ -303,8 +304,12 @@ export class PaneStreamer {
     return this.sgrMouse ? data + SGR_MOUSE_ON : data;
   }
 
+  private destroyedError(): Error {
+    return this.sessionGoneError ?? new Error('PaneStreamer is destroyed');
+  }
+
   private async ensureStarted(): Promise<void> {
-    if (this.destroyed) throw new Error('PaneStreamer is destroyed');
+    if (this.destroyed) throw this.destroyedError();
     if (this.started) {
       if (!this.pty) await this.ensureAttachPty();
       return;
@@ -324,7 +329,7 @@ export class PaneStreamer {
   }
 
   private async ensureAttachPty(): Promise<void> {
-    if (this.destroyed) throw new Error('PaneStreamer is destroyed');
+    if (this.destroyed) throw this.destroyedError();
     if (this.pty) return;
     if (this.reattachTimer) {
       clearTimeout(this.reattachTimer);
@@ -445,15 +450,15 @@ export class PaneStreamer {
 
   private async spawnAttachPty(): Promise<void> {
     const factory = this.ptyFactoryProvided ?? (await defaultPtyFactory());
-    if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
+    if (this.destroyed) throw this.destroyedError();
     const host = this.resolveHost();
     const env = await sshEnv(host);
     const flagged = await this.resolveAttachCapability(factory, host, env);
-    if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
+    if (this.destroyed) throw this.destroyedError();
     await this.enqueueStreamMutation(() => undefined);
-    if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
+    if (this.destroyed) throw this.destroyedError();
     await this.alignSpawnBaseline(flagged);
-    if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
+    if (this.destroyed) throw this.destroyedError();
     const expected = this.expectedRef
       ? {
           serverPid: this.expectedRef.serverPid,
@@ -704,7 +709,7 @@ export class PaneStreamer {
       return await new Promise((resolve, reject) => {
         this.onPtyDataChain = this.onPtyDataChain.then(() => {
           if (this.destroyed) {
-            reject(new Error('PaneStreamer destroyed before subscribe'));
+            reject(this.destroyedError());
             return;
           }
           const snapshot: PaneSnapshot = {
@@ -736,7 +741,7 @@ export class PaneStreamer {
       return await new Promise<GetSnapshotResult>((resolve, reject) => {
         this.onPtyDataChain = this.onPtyDataChain.then(() => {
           if (this.destroyed) {
-            reject(new Error('PaneStreamer destroyed before snapshot'));
+            reject(this.destroyedError());
             return;
           }
           const snapshot: PaneSnapshot = {
@@ -753,7 +758,7 @@ export class PaneStreamer {
   }
 
   async resize(cols: number, rows: number): Promise<void> {
-    if (this.destroyed) throw new Error('PaneStreamer is destroyed');
+    if (this.destroyed) throw this.destroyedError();
     const g = this.geometry;
     g?.recordFullTarget({ cols, rows });
     await this.enqueueStreamMutation(() => {
@@ -767,7 +772,7 @@ export class PaneStreamer {
   }
 
   async sendInput(data: string): Promise<void> {
-    if (this.destroyed) throw new Error('PaneStreamer is destroyed');
+    if (this.destroyed) throw this.destroyedError();
     if (data.length === 0) return;
     await this.ensureStarted();
     if (!this.pty) throw new Error('PaneStreamer pty unavailable');
@@ -868,6 +873,7 @@ export class PaneStreamer {
 
   private markSessionGone(): void {
     if (this.destroyed) return;
+    this.sessionGoneError = new SessionAbsentError(this.agent.id, 'session ended or ownership changed');
     this.destroyed = true;
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);

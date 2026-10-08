@@ -306,7 +306,7 @@ const READY_ANCHORS: Record<AgentRuntimeKind, RegExp> = {
 
 const TRUST_DIALOGS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /Quick safety check[\s\S]{0,500}Yes, I trust this folder/,
-  codex: /Do you trust the contents[\s\S]{0,500}Yes, continue/,
+  codex: /Do you trust the contents[\s\S]{0,500}Yes, continue|Trust this folder\?[\s\S]{0,600}?\n[ \t]*[›>]?[ \t]*1\.[ \t]+Trust and continue[ \t]*\n[\s\S]{0,200}?\n[ \t]*enter\s+continue(?: and create sandbox)?\s*·\s*esc\s+quit\s*$/,
   opencode: NEVER_RE,
   qodercli: /Do you trust the files in this folder[\s\S]{0,500}Trust folder/,
 };
@@ -314,6 +314,7 @@ const TRUST_DIALOGS: Record<AgentRuntimeKind, RegExp> = {
 // claude-code 2.1.26x 起对话框预选 No, exit,盲按 Enter 会直接退出 REPL
 const TRUST_ACCEPT_CURSOR: Partial<Record<AgentRuntimeKind, RegExp>> = {
   'claude-code': /^[ \t]*[❯›>][ \t]*(?:\d+\.[ \t]*)?Yes, I trust this folder/m,
+  codex: /^[ \t]*[›>][ \t]*(?:\d+\.[ \t]*)?(?:Yes, continue|Trust and continue)[ \t]*$/m,
 };
 
 const STARTUP_DIALOG_SIGNALS: readonly RegExp[] = [
@@ -324,6 +325,7 @@ const STARTUP_DIALOG_SIGNALS: readonly RegExp[] = [
 
 const RUNTIME_STARTUP_DIALOG_SIGNALS: Partial<Record<AgentRuntimeKind, readonly RegExp[]>> = {
   codex: [
+    /(?:^|\n)[ \t]*Update available[^\n]*\n[\s\S]*?\bSkip until next version[^\n]*\n\s*enter\s+continue\s*·\s*esc\s+skip\s*$/i,
     /Welcome to Codex[\s\S]{0,300}?Sign in with ChatGPT[\s\S]{0,300}?Provide your own API key/i,
     /Update ran successfully[\s\S]{0,200}?Please restart Codex/i,
   ],
@@ -335,6 +337,7 @@ const RUNTIME_STARTUP_DIALOG_SIGNALS: Partial<Record<AgentRuntimeKind, readonly 
 export function detectStartupDialog(stripped: string, runtime?: AgentRuntimeKind): boolean {
   if (STARTUP_DIALOG_SIGNALS.some(re => re.test(stripped))) return true;
   if (!runtime) return false;
+  if (runtime === 'codex' && TRUST_DIALOGS.codex.test(stripped)) return true;
   return RUNTIME_STARTUP_DIALOG_SIGNALS[runtime]?.some(re => re.test(stripped)) ?? false;
 }
 

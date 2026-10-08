@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { StreamSubMode } from '../shared/index.js';
 import {
   getPaneStreamClient,
@@ -18,11 +18,13 @@ export interface UsePaneStreamArgs {
 export interface UsePaneStreamApi {
   send: (data: string) => void;
   resize: (cols: number, rows: number) => void;
+  reconnect: () => void;
 }
 
 export function usePaneStream(args: UsePaneStreamArgs): UsePaneStreamApi {
   const { agentId, mode } = args;
   const subscriberIdRef = useRef<string | null>(null);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
 
   const callbacksRef = useRef({
     onSnapshot: args.onSnapshot,
@@ -52,7 +54,7 @@ export function usePaneStream(args: UsePaneStreamArgs): UsePaneStreamApi {
       subscriberIdRef.current = null;
       handle.unsubscribe();
     };
-  }, [agentId, mode]);
+  }, [agentId, mode, connectionAttempt]);
 
   const send = useCallback((data: string) => {
     const sid = subscriberIdRef.current;
@@ -64,5 +66,7 @@ export function usePaneStream(args: UsePaneStreamArgs): UsePaneStreamApi {
     if (sid) getPaneStreamClient().resize(sid, cols, rows);
   }, []);
 
-  return { send, resize };
+  const reconnect = useCallback(() => setConnectionAttempt(value => value + 1), []);
+
+  return { send, resize, reconnect };
 }

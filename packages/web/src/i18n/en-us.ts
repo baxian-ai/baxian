@@ -166,6 +166,10 @@ export const enUS = {
     deletedWithTeamBody: (otherAgentIds: string) => `The Agent Team member ${otherAgentIds} was removed as well.`,
     deletedTitle: (agentId: string) => `Agent ${agentId} deleted`,
     retryBootstrap: 'Retry bootstrap',
+    retrySession: 'Retry startup',
+    retrySessionReady: 'Agent session is ready',
+    retrySessionPending: 'Open the terminal to handle the startup dialog',
+    retrySessionFailed: 'Agent startup failed',
     retryBootstrapSucceededTitle: 'Retry bootstrap succeeded',
     retryBootstrapSucceededBody: 'Agent status will update on the next refresh.',
     retryBootstrapStillFailingTitle: 'Retry bootstrap still failed',
@@ -573,7 +577,10 @@ export const enUS = {
     platformRateLimited: (repo: string, until: string) => `Platform polling rate-limited for ${repo} until ${new Date(until).toLocaleTimeString()} — updates will resume automatically`,
   },
   terminal: {
-    sessionEnded: 'Session ended',
+    sessionEnded: 'The terminal session is missing or has ended.',
+    sessionRecovery: 'Check the agent on the project page and retry startup. If it is bound to a task, follow the task recovery steps. Once the session is ready, reconnect here.',
+    reconnect: 'Reconnect',
+    backToProject: 'Back to project',
     keyPadAriaLabel: 'Terminal keys',
     arrowAriaLabel: (label: string) => `${label} arrow key`,
     arrowLabel: {

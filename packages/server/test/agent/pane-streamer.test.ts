@@ -14,7 +14,7 @@ import {
   type StreamerGeometryHooks,
   type SubscriberCallbacks,
 } from '../../src/agent/pane-streamer.js';
-import { TmuxManager } from '../../src/agent/tmux.js';
+import { SessionAbsentError, TmuxManager } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecOptions, ExecResult } from '../../src/agent/runner.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string, options?: ExecOptions) => Promise<ExecResult>>>;
@@ -610,7 +610,7 @@ describe('PaneStreamer', () => {
       fakePty.emitExit(0);
       await tick();
       expect(streamer.isDestroyed()).toBe(true);
-      await expect(streamer.subscribeAtomic(cbs)).rejects.toThrow(/destroyed/);
+      await expect(streamer.subscribeAtomic(cbs)).rejects.toBeInstanceOf(SessionAbsentError);
     });
 
     it('does not reattach and marks gone when the reconnect ownership probe resolves foreign/absent', async () => {
@@ -661,7 +661,7 @@ describe('PaneStreamer', () => {
       });
       const { streamer } = makeStreamer({ ptyFactory: factory, runner });
 
-      await expect(streamer.subscribeAtomic(cbs)).rejects.toThrow(/destroyed/i);
+      await expect(streamer.subscribeAtomic(cbs)).rejects.toBeInstanceOf(SessionAbsentError);
       expect(streamer.isDestroyed()).toBe(true);
       expect(calls()).toBe(1);
     });
@@ -954,6 +954,16 @@ it('without geometry hooks: local pty+headless resize only, zero tmux writes', a
   });
 
   describe('destroy', () => {
+    it.each(['subscribe', 'snapshot'] as const)('%s reports a typed missing-session error before any subscriber exists', async (operation) => {
+      const runner = mockRunner();
+      runner.exec.mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
+      const { streamer, fakePty } = makeStreamer({ runner });
+      const result = operation === 'subscribe' ? streamer.subscribeAtomic(cbs) : streamer.getSnapshotAtomic();
+      await expect(result).rejects.toBeInstanceOf(SessionAbsentError);
+      expect(streamer.isDestroyed()).toBe(true);
+      expect(fakePty.writes).toEqual([]);
+    });
+
     it('idempotent: second destroy is a no-op', async () => {
       const { streamer, fakePty } = await subscribed();
       streamer.destroy();

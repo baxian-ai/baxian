@@ -869,6 +869,59 @@ describe('PaneTerminal', () => {
     });
     expect(container.textContent).not.toContain(enUS.terminal.sessionEnded);
   });
+
+  it.each(['session_not_found', 'session_gone'])('%s offers recovery and reconnects with a fresh subscription', async (signal) => {
+    const { ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true });
+    await act(async () => {
+      ws.deliver(signal === 'session_gone'
+        ? { type: 'session_gone', agentId: 'dev-1' }
+        : { type: 'error', subscriberId: sid, code: signal, message: 'session is absent' });
+    });
+    expect(screen.getByRole('alert').textContent).toContain(enUS.terminal.sessionRecovery);
+    expect(screen.queryByText(/session is absent/)).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: enUS.terminal.reconnect }));
+    });
+    await act(flushMacrotask);
+    const nextWs = lastMockWs()!;
+    const nextSid = sentMessages(nextWs).filter(m => m.op === 'subscribe').at(-1)!.subscriberId!;
+    expect(nextSid).not.toBe(sid);
+    expect(sentMessages(ws)).toContainEqual({ op: 'unsubscribe', subscriberId: sid });
+    expect(screen.getByRole('alert')).toBeTruthy();
+    await deliverHandshake(nextWs, nextSid, { data: 'recovered terminal' });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(lastTerminal().writes.join('')).toContain('recovered terminal');
+  });
+
+  it('keeps unrelated subscription failures visible and clears them only after a successful snapshot', async () => {
+    const { ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true });
+    await act(async () => {
+      ws.deliver({ type: 'error', subscriberId: sid, code: 'subscribe_failed', message: 'SSH probe failed' });
+    });
+    expect(screen.getByRole('alert').textContent).toContain('SSH probe failed');
+    expect(screen.queryByText(enUS.terminal.sessionRecovery)).toBeNull();
+    await deliverHandshake(ws, sid);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('reconnect controls do not activate an enclosing selectable agent card', async () => {
+    await installPaneStreamForTest();
+    const { PaneTerminal } = await importPane();
+    const activateCard = vi.fn();
+    render(
+      <div onClick={activateCard} onKeyDown={activateCard}>
+        <PaneTerminal agentId="dev-1" mode="preview" />
+      </div>,
+      { wrapper: ToastProvider },
+    );
+    await act(flushMacrotask);
+    await act(async () => { lastMockWs()!.deliver({ type: 'session_gone', agentId: 'dev-1' }); });
+    const button = screen.getByRole('button', { name: enUS.terminal.reconnect });
+    fireEvent.keyDown(button, { key: 'Enter' });
+    fireEvent.click(button);
+    expect(activateCard).not.toHaveBeenCalled();
+  });
 });
 
 describe('PaneTerminal image upload bar', () => {
@@ -1028,9 +1081,9 @@ async function deliverHandshake(
   opts: { cols?: number; rows?: number; data?: string; snapshotSeq?: number } = {},
 ): Promise<void> {
   const { cols = 80, rows = 24, data = '', snapshotSeq = 1 } = opts;
-  ws.deliver({ type: 'snapshot', subscriberId: sid, cols, rows, data, snapshotSeq });
-  ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols, rows, snapshotSeq });
   await act(async () => {
+    ws.deliver({ type: 'snapshot', subscriberId: sid, cols, rows, data, snapshotSeq });
+    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols, rows, snapshotSeq });
     await Promise.resolve();
   });
 }

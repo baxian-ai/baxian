@@ -179,6 +179,7 @@ export function AgentCard({
   const [resuming, setResuming] = useState(false);
   const [untrackedPending, setUntrackedPending] = useState(false);
   const [retryingBootstrap, setRetryingBootstrap] = useState(false);
+  const [retryingSession, setRetryingSession] = useState(false);
 
   const taskId = agent.binding?.taskId;
   const boundTask = task?.id === taskId ? task : undefined;
@@ -187,6 +188,8 @@ export function AgentCard({
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
   const holdRecovery = agentHoldRecovery(agent.binding?.awaitingPhase, role, boundTask, !!taskId);
   const isBootstrapping = isAgentBootstrapping(agent);
+  const canRetrySession = !pendingRestart && !terminalLoading && !agent.stale && !isAwaitingHuman
+    && agent.tmuxSessionStatus === 'absent' && !agent.binding?.creationToken && !taskId;
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
   const badge = resolveAgentBadge(agent, t.agents);
   const showTerminalPreview = terminalMode === 'activity-preview' &&
@@ -227,6 +230,21 @@ export function AgentCard({
       show({ kind: 'error', title: t.agents.retryBootstrapFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setRetryingBootstrap(false);
+    }
+  };
+
+  const handleRetrySession = async () => {
+    setRetryingSession(true);
+    try {
+      const result = await api.projects.retryAgent(projectId, agent.id);
+      show({
+        kind: result.runtimeStatus === 'pending' ? 'warn' : 'success',
+        title: result.runtimeStatus === 'pending' ? t.agents.retrySessionPending : t.agents.retrySessionReady,
+      });
+    } catch (err) {
+      show({ kind: 'error', title: t.agents.retrySessionFailed, body: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setRetryingSession(false);
     }
   };
 
@@ -422,6 +440,11 @@ export function AgentCard({
       )}
       <div className="mt-3 flex items-center gap-2">
         <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto scrollbar-none">
+          {canRetrySession && (
+            <button type="button" className="btn-primary shrink-0" disabled={retryingSession} onClick={handleRetrySession}>
+              {retryingSession ? t.common.retrying : t.agents.retrySession}
+            </button>
+          )}
           {terminalDisabled ? (
             <span className="shrink-0 cursor-not-allowed text-sm text-og-400" title={terminalDisabledMessage}>
               {t.agents.terminal}

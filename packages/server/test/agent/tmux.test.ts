@@ -4,7 +4,7 @@ import { fakeRunner, foregroundCondAccepts } from '../helpers/fake-runner.js';
 import type { PaneRef } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { ExecNotStartedError } from '../../src/agent/runner.js';
-import { blank, CC_NONYOLO_BASH_PERMISSION, CODEX_NONYOLO_ESCALATION } from './runtime-captures.js';
+import { blank, CC_NONYOLO_BASH_PERMISSION, CODEX_NONYOLO_ESCALATION, CODEX_UPDATE_PROMPT, CODEX_TRUST_PROMPT } from './runtime-captures.js';
 import { classifyScreen } from '../../src/agent/detect/classify.js';
 
 type ExecMock = ReturnType<typeof vi.fn<CommandRunner['exec']>>;
@@ -2248,6 +2248,31 @@ describe('TmuxManager', () => {
     const CC_TRUST_NO_PRESELECTED = `${CC_TRUST_BODY} ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n`;
     const CC_TRUST_YES_HIGHLIGHTED = `${CC_TRUST_BODY}   No, exit\n ❯ Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n`;
 
+    it('accepts the Codex 0.161 folder prompt with Trust and continue selected', async () => {
+      primeExec(okBody(CODEX_TRUST_PROMPT), '');
+      expect(await tmux.handleTrustDialog(PANE, 'codex', { timeoutMs: 1000 })).toBe(true);
+      expect(sentKeys()).toHaveLength(1);
+      expect(sentKeys()[0]).toContain("'Enter'");
+    });
+
+    it('verifies the Codex trust choice before confirming when Quit is selected', async () => {
+      const quitSelected = CODEX_TRUST_PROMPT.replace('› 1.', '  1.').replace('  2.', '› 2.');
+      primeExec(okBody(quitSelected), '', okBody(CODEX_TRUST_PROMPT), '');
+      expect(await tmux.handleTrustDialog(PANE, 'codex', { timeoutMs: 1500, intervalMs: 50 })).toBe(true);
+      expect(sentKeys()).toHaveLength(2);
+      expect(sentKeys()[0]).toContain("'Down'");
+      expect(sentKeys()[1]).toContain("'Enter'");
+    });
+
+    it('does not confirm a Codex update prompt as a trust dialog', async () => {
+      runner.exec.mockImplementation(async (cmd: string) => ({
+        stdout: cmd.includes('capture-pane') ? okBody(CODEX_UPDATE_PROMPT) : okHeader('codex'),
+        stderr: '', exitCode: 0,
+      }));
+      expect(await tmux.handleTrustDialog(PANE, 'codex', { timeoutMs: 100, intervalMs: 25 })).toBe(false);
+      expect(sentKeys()).toEqual([]);
+    });
+
     it('legacy claude dialog preselecting Yes: sends Enter directly', async () => {
       primeExec(okBody('Quick safety check\n❯ 1. Yes, I trust this folder\n'), '');
       const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 50 });
@@ -3001,6 +3026,9 @@ describe('detectStartupDialog', () => {
   ];
 
   const CODEX_POSITIVE: Array<[string, string]> = [
+    ['Codex 0.160 update prompt', CODEX_UPDATE_PROMPT],
+    ['Codex update prompt with a wrapped footer', CODEX_UPDATE_PROMPT.replace('continue · esc', 'continue ·\n  esc')],
+    ['Codex 0.161 trust prompt left for human intervention', CODEX_TRUST_PROMPT],
     [
       'codex auth menu observed on hz1 bootstrap',
       [
@@ -3037,6 +3065,11 @@ describe('detectStartupDialog', () => {
   ];
 
   const CODEX_NEGATIVE: Array<[string, string]> = [
+    ['update heading without the interactive footer', CODEX_UPDATE_PROMPT.replace('enter continue · esc skip', '')],
+    ['generic footer without an update menu', 'enter continue · esc skip'],
+    ['a quoted update prompt above a ready composer', `${CODEX_UPDATE_PROMPT}\n› \n  ? for shortcuts`],
+    ['trust option alone in agent output', 'Consider choosing Trust and continue.'],
+    ['a quoted trust prompt above a ready composer', `${CODEX_TRUST_PROMPT}\n› \n  ? for shortcuts`],
     [
       'codex auth markers beyond bounded window',
       `Welcome to Codex${'x'.repeat(301)}Sign in with ChatGPT\nProvide your own API key`,

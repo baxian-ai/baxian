@@ -13,6 +13,7 @@ import {
   sanitizePtySize,
 } from './ws-auth.js';
 import { sanitizeWebInput } from './key-sanitizer.js';
+import { SessionAbsentError } from '../agent/tmux.js';
 
 let ptyModule: typeof import('node-pty') | null = null;
 try {
@@ -242,7 +243,9 @@ function handleConnection(
     } catch (err) {
       releaseSub(subscriberId);
       let code = 'subscribe_failed';
-      if (err instanceof Error) {
+      if (err instanceof SessionAbsentError) {
+        code = 'session_not_found';
+      } else if (err instanceof Error) {
         const msg = err.message.toLowerCase();
         if (msg.includes('tmux_too_old')) code = 'tmux_too_old';
         else if (

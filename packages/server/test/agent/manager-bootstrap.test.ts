@@ -3,6 +3,7 @@ import type { AgentManager, AgentManagerDeps } from '../../src/agent/manager.js'
 import type { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
 import { createManagerSuiteRunner, useManagerSuiteHarness, workdirsOf } from '../helpers/manager-harness.js';
 import type { FakeRunner, FakeRunnerOptions } from '../helpers/fake-runner.js';
+import { CODEX_UPDATE_PROMPT, CODEX_TRUST_PROMPT } from './runtime-captures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
 const TOKEN = 'token-abc';
@@ -52,6 +53,16 @@ beforeEach(async () => {
 });
 
 describe('AgentManager.startBootstrapAsync', () => {
+  it('boots Codex through the new folder trust prompt', async () => {
+    harness.config.project[0].agent[0][0].runtime = 'codex';
+    useRunner({ agents: { 'dev-1': { runtime: 'codex', trustDialog: CODEX_TRUST_PROMPT } } });
+    withoutSession();
+    await harness.manager.startBootstrapAsync('dev-1', TOKEN);
+    expect(eventTypes()).toContain('agent.bootstrap_succeeded');
+    expect((await harness.agentStore.get('dev-1'))?.creationToken).toBeUndefined();
+    expect(sawKill()).toBe(false);
+  });
+
   it('success records paneId and clears the creation token', async () => {
     await harness.manager.startBootstrapAsync('dev-1', TOKEN);
 
@@ -658,6 +669,24 @@ describe('dialog-pending slow poll (no hard-fail timeout)', () => {
     expect(state?.awaitingPhase).toBe('agent_dialog_pending');
     expect(eventTypes()).not.toContain('agent.bootstrap_failed');
   }
+
+  it('preserves the Codex update-blocked session and completes bootstrap after the dialog is dismissed', async () => {
+    harness.config.project[0].agent[0][0].runtime = 'codex';
+    await bootstrapIntoSlowPoll({ agents: { 'dev-1': { runtime: 'codex', trustDialog: CODEX_UPDATE_PROMPT } } });
+
+    expect(runner.sessions.present('dev-1')).toBe(true);
+    expect(sawKill()).toBe(false);
+    expect(eventTypes()).not.toContain('agent.bootstrap_failed');
+    expect(pastedBodies()).toEqual([]);
+
+    runner.sessions.setProcess('dev-1', 'codex');
+    await waitForEvent('agent.bootstrap_succeeded');
+    const state = await harness.agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
+    expect(state?.paneId).toBe(runner.sessions.pane('dev-1')?.id);
+    expect(sawKill()).toBe(false);
+  });
 
   it('REPL exited to a shell → rolls back the dead session and clears the dialog hold so Retry/Resume can rebuild', async () => {
     await bootstrapIntoSlowPoll();

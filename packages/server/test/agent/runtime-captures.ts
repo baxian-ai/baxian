@@ -196,3 +196,26 @@ export const QODER_NONYOLO_SHELL_PERMISSION_LINES = [
 ];
 
 export const QODER_NONYOLO_SHELL_PERMISSION = [...QODER_NONYOLO_SHELL_PERMISSION_LINES, ...blank(20)].join('\n');
+
+export const CODEX_UPDATE_PROMPT = [
+  '  Update available · 0.160.0 → 0.160.1',
+  '  Release notes: https://github.com/openai/codex/releases/latest',
+  '› 1. Update now (runs `npm install -g @openai/codex`)',
+  '  2. Skip',
+  '  3. Skip until next version',
+  '',
+  '  enter continue · esc skip',
+  '',
+].join('\n');
+
+export const CODEX_TRUST_PROMPT = [
+  '  Folder access',
+  '  /Users/example/.baxian/agents/dev-1/repo',
+  '  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings.',
+  '',
+  '› 1. Trust and continue',
+  '  2. Quit',
+  '',
+  '  enter continue · esc quit',
+  '',
+].join('\n');
