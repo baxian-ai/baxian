@@ -6,6 +6,7 @@ import {
   ManualObserver,
   SyncVisibleObserver,
   expectMascotIntact,
+  expectTerminalTextReadable,
   isBlack,
   mountTerminal,
   probeScreen,
@@ -24,6 +25,17 @@ afterEach(() => {
 });
 
 describe('terminal renderer policy renders block glyphs edge to edge (real Chromium)', () => {
+  it('keeps light CLI input and status text readable with WebGL', async () => {
+    const entry = mountTerminal();
+    await until(() => entry.renderer?.kind === 'webgl', 'webgl renderer');
+    await expectTerminalTextReadable(entry);
+  });
+
+  it('keeps light CLI input and status text readable with the DOM fallback', async () => {
+    const entry = mountTerminal({ policy: false });
+    await expectTerminalTextReadable(entry);
+  });
+
   it('probe sanity: the DOM renderer alone shows the reported defect (background bar above the block glyph)', async () => {
     const entry = mountTerminal({ policy: false });
     expect(entry.container.querySelectorAll('canvas')).toHaveLength(0);

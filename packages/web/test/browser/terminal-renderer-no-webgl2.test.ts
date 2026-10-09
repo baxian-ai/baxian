@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import {
   MASCOT,
   expectMascotIntact,
+  expectTerminalTextReadable,
   mountTerminal,
   probeScreen,
   resourceCounts,
@@ -31,6 +32,12 @@ afterEach(() => {
 });
 
 describe('terminal renderer policy without WebGL2 (real Chromium)', () => {
+  it('keeps light CLI input and status text readable with the canvas fallback', async () => {
+    const entry = mountTerminal();
+    await until(() => entry.renderer?.kind === 'canvas', 'canvas renderer');
+    await expectTerminalTextReadable(entry);
+  });
+
   // 第一个终端就是探测发生的地方，隐藏后画布和登记/监听都要回到 attach 之前
   it('renders on canvas with the mascot intact and leaves nothing behind once hidden', async () => {
     const spacer = document.createElement('div');

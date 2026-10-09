@@ -698,12 +698,11 @@ describe('index.html', () => {
     'utf8',
   );
 
-  it('declares the brand PNG for browser and iOS icons', () => {
-    expect(indexHtml).toMatch(
-      /<link\s+rel="icon"\s+type="image\/png"\s+href="\/baxian-logo\.png"\s*\/?>/,
-    );
-    expect(indexHtml).toMatch(
-      /<link\s+rel="apple-touch-icon"\s+href="\/baxian-logo\.png"\s*\/?>/,
-    );
+  it.each(['icon', 'apple-touch-icon'])('declares the brand PNG for %s', (rel) => {
+    const page = new DOMParser().parseFromString(indexHtml, 'text/html');
+    const icon = page.head.querySelector<HTMLLinkElement>(`link[rel~="${rel}"]`);
+    expect(icon).not.toBeNull();
+    expect(icon!.getAttribute('href')).toBe('/baxian-logo.png');
+    if (rel === 'icon') expect(icon!.type).toBe('image/png');
   });
 });

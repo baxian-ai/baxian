@@ -20,6 +20,7 @@ const LIVE_FLUSH_FALLBACK_MS = 250;
 const LIVE_QUEUE_MAX_CHARS = 256 * 1024;
 
 export const TERMINAL_BG = '#fdfdfd';
+export const TERMINAL_MINIMUM_CONTRAST = 4.5;
 
 export const TERMINAL_MONO_STACK =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
@@ -297,6 +298,7 @@ export function PaneTerminal({
       cursorBlink: interactive,
       disableStdin: !interactive,
       theme: ZED_LIGHT_THEME,
+      minimumContrastRatio: TERMINAL_MINIMUM_CONTRAST,
       fontFamily: TERMINAL_MONO_STACK,
       fontSize: 13,
       lineHeight: 1.4,

@@ -3,7 +3,7 @@ import { page } from '@vitest/browser/context';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { attachRenderer, type TerminalRenderer } from '../../src/components/terminal-renderer.ts';
-import { TERMINAL_MONO_STACK, ZED_LIGHT_THEME } from '../../src/components/pane-terminal.tsx';
+import { TERMINAL_MINIMUM_CONTRAST, TERMINAL_MONO_STACK, ZED_LIGHT_THEME } from '../../src/components/pane-terminal.tsx';
 
 const E = '\x1b';
 // Claude Code 启动画面的吉祥物原始字节：粉色前景 + 黑色背景的块字符，眼睛是 ▛ 缺角漏出的黑底
@@ -86,6 +86,7 @@ export function mountTerminal(opts: { policy?: boolean; offscreen?: boolean } = 
   document.body.appendChild(container);
   const term = new Terminal({
     theme: ZED_LIGHT_THEME,
+    minimumContrastRatio: TERMINAL_MINIMUM_CONTRAST,
     fontFamily: TERMINAL_MONO_STACK,
     fontSize: 13,
     lineHeight: 1.4,
@@ -183,4 +184,51 @@ export function expectMascotIntact(probe: Probe): void {
   expect(isPink(probe.at(bodyX, cellH + 1)), 'top edge of second body row').toBe(true);
   expect(isBlack(probe.at(2 * cellW + cellW * 0.75, cellH * 0.8)), 'eye quadrant').toBe(true);
   expect(isPink(probe.at(2 * cellW + cellW * 0.25, cellH * 0.25)), 'brow quadrant').toBe(true);
+}
+
+function contrastRatio(a: Rgb, b: Rgb): number {
+  const luminance = (rgb: Rgb): number => {
+    const linear = rgb.map(value => {
+      const channel = value / 255;
+      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return linear[0]! * 0.2126 + linear[1]! * 0.7152 + linear[2]! * 0.0722;
+  };
+  const first = luminance(a);
+  const second = luminance(b);
+  return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05);
+}
+
+export async function expectTerminalTextReadable(entry: Mounted): Promise<void> {
+  const light: Rgb = [253, 253, 253];
+  const dark: Rgb = [64, 64, 64];
+  const samples = [
+    { name: 'RGB white input', sgr: '38;2;255;255;255', bg: light, min: 4.5 },
+    { name: 'RGB gray status', sgr: '38;2;170;170;170', bg: light, min: 4.5 },
+    { name: '256-color white', sgr: '38;5;231', bg: light, min: 4.5 },
+    { name: '256-color gray', sgr: '38;5;255', bg: light, min: 4.5 },
+    { name: 'dim text', sgr: '2;38;2;255;255;255', bg: light, min: 2.25 },
+    { name: 'white on dark background', sgr: '38;2;255;255;255;48;2;64;64;64', bg: dark, min: 4.5 },
+    { name: 'inverse text', sgr: '7;38;2;64;64;64;48;2;255;255;255', bg: dark, min: 4.5 },
+    { name: 'readable RGB text', sgr: '38;2;71;76;85', bg: light, min: 4.5 },
+    { name: 'ANSI white', sgr: '97', bg: light, min: 4.5 },
+    { name: 'intentionally hidden text', sgr: '8;38;2;255;255;255', bg: light, min: 1 },
+  ];
+  const lines = [samples.slice(0, 5), samples.slice(5)]
+    .map(row => row.map(sample => `${E}[${sample.sgr}mINPUT${E}[0m   `).join(''));
+  await writeAndRender(entry.term, `${E}[?25l${lines.join('\r\n')}`);
+  const probe = await probeScreen(entry);
+  for (const [index, sample] of samples.entries()) {
+    const left = (index % 5) * 8 * probe.cellW;
+    const top = Math.floor(index / 5) * probe.cellH;
+    expect(probe.at(left + probe.cellW / 2, top + 1), `${sample.name} background`).toEqual(sample.bg);
+    let strongestContrast = 1;
+    for (let y = 0; y < probe.cellH; y++) {
+      for (let x = 0; x < 5 * probe.cellW; x++) {
+        strongestContrast = Math.max(strongestContrast, contrastRatio(probe.at(left + x, top + y), sample.bg));
+      }
+    }
+    if (sample.min === 1) expect(strongestContrast, sample.name).toBe(1);
+    else expect(strongestContrast, sample.name).toBeGreaterThanOrEqual(sample.min);
+  }
 }

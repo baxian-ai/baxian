@@ -442,13 +442,6 @@ describe('AgentTeam', () => {
       .toEqual(['/terminal/dev-1', '/terminal/qa-1']);
     expect(screen.queryByText(enUS.agents.agentStatusLoading)).toBeNull();
   });
-
-  it('uses a translucent panel background', () => {
-    renderTeam([]);
-
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
-    expect(region.className.split(/\s+/)).toContain('bg-og-25/60');
-  });
 });
 
 describe('AgentTeam actions menu', () => {

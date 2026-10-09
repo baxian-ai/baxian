@@ -50,6 +50,10 @@ jobs:
 
       - run: pnpm test:coverage
 
+      - name: Test release scripts
+        if: ${{ hashFiles('docs/scripts/*.test.mjs') != '' }}
+        run: pnpm test:docs
+
       - run: pnpm test:browser
 
       - name: Coverage summary

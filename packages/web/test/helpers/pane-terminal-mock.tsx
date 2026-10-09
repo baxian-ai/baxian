@@ -21,6 +21,7 @@ export function createPaneTerminalMock(): PaneTerminalModule {
   return {
     arrowKeyToSequence: vi.fn(),
     TERMINAL_BG: '#fdfdfd',
+    TERMINAL_MINIMUM_CONTRAST: 4.5,
     TERMINAL_MONO_STACK:
       'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
     ZED_LIGHT_THEME: { background: '#fdfdfd' },

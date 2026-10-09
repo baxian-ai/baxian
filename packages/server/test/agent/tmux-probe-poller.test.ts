@@ -1882,21 +1882,31 @@ describe('TmuxProbePoller', () => {
   });
 
   it('logs once on state transition and stays silent while tmux status is steady', async () => {
-    const logs: string[] = [];
-    const logSpy = vi.spyOn(console, 'log').mockImplementation((msg: string) => { logs.push(msg); });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const poller = makePoller({
-      exec: makeExec({ hasSession: scripted([present, present, absent]) }),
+      exec: makeExec({ hasSession: scripted([present, present, absent, absent, present]) }),
     });
 
-    await poller.pollOnce();
-    await poller.pollOnce();
-    await poller.pollOnce();
-
-    expect(logs.filter(l => l.includes('[tmux-session] dev-1'))).toEqual([
-      '[tmux-session] dev-1 unknown -> present',
-      '[tmux-session] dev-1 present -> absent',
-    ]);
-    logSpy.mockRestore();
+    try {
+      for (const [from, to] of [
+        ['unknown', 'present'],
+        ['present', 'present'],
+        ['present', 'absent'],
+        ['absent', 'absent'],
+        ['absent', 'present'],
+      ]) {
+        logSpy.mockClear();
+        await poller.pollOnce();
+        const logs = logSpy.mock.calls.map(args => args.map(String).join(' '));
+        expect(logs).toHaveLength(from === to ? 0 : 1);
+        if (from !== to) {
+          expect(logs[0]).toContain('dev-1');
+          expect(logs[0]).toMatch(new RegExp(`\\b${from}\\b[\\s\\S]*\\b${to}\\b`));
+        }
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it('a generation change resets the unreachable failure count, so the new instance is not published unreachable on its first failure', async () => {
@@ -2001,13 +2011,17 @@ describe('TmuxProbePoller', () => {
     expect(store.get('dev-1').reason).toBeUndefined();
   });
 
-  it('replaceConfig reschedules the periodic timer when tmuxProbePollIntervalMs changes', async () => {
+  it.each([
+    { name: 'increased', beforeIntervalMs: 2000, intervalMs: 8000, server: { ...DEFAULT_SERVER_CONFIG, tmuxProbePollIntervalMs: 8000 } },
+    { name: 'reduced', beforeIntervalMs: 8000, intervalMs: 2000, server: { ...DEFAULT_SERVER_CONFIG, tmuxProbePollIntervalMs: 2000 } },
+    { name: 'default', beforeIntervalMs: 2000, intervalMs: 10_000, server: DEFAULT_SERVER_CONFIG },
+  ])('replaceConfig uses the $name polling interval for subsequent probes', async ({ beforeIntervalMs, intervalMs, server }) => {
     vi.useFakeTimers();
     const store = new TmuxSessionStatusStore();
     const ag1 = makeAgent('dev-1');
     const baseConfig: BaxianConfig = {
       review: { rounds: 10 },
-      server: { ...DEFAULT_SERVER_CONFIG, tmuxProbePollIntervalMs: 2000 },
+      server: { ...DEFAULT_SERVER_CONFIG, tmuxProbePollIntervalMs: beforeIntervalMs },
       host: [],
       project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[ag1]] }],
     };
@@ -2017,94 +2031,94 @@ describe('TmuxProbePoller', () => {
       store,
       runnerFactory: () => makeCommandRunner({ exec }),
     });
-    poller.start();
-    await vi.advanceTimersByTimeAsync(0);
-    const callsAtBoot = exec.mock.calls.length;
-    expect(callsAtBoot).toBeGreaterThan(0);
+    try {
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      const callsAtBoot = exec.mock.calls.length;
+      expect(callsAtBoot).toBeGreaterThan(0);
 
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(exec.mock.calls.length).toBeGreaterThan(callsAtBoot);
-    const callsAt2s = exec.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(beforeIntervalMs);
+      expect(exec.mock.calls.length).toBeGreaterThan(callsAtBoot);
+      const callsBeforeReload = exec.mock.calls.length;
 
-    poller.replaceConfig({
-      ...baseConfig,
-      server: { ...baseConfig.server, tmuxProbePollIntervalMs: 8000 },
-    });
+      poller.replaceConfig({ ...baseConfig, server });
 
-    await vi.advanceTimersByTimeAsync(7999);
-    expect(exec.mock.calls.length).toBe(callsAt2s);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(exec.mock.calls.length).toBeGreaterThan(callsAt2s);
-
-    poller.stop();
-    vi.useRealTimers();
+      await vi.advanceTimersByTimeAsync(intervalMs - 1);
+      expect(exec.mock.calls.length).toBe(callsBeforeReload);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(exec.mock.calls.length).toBeGreaterThan(callsBeforeReload);
+    } finally {
+      poller.stop();
+      vi.useRealTimers();
+    }
   });
 
-  it('replaceConfig picks up updated tmuxProbeConcurrency and tmuxProbeTimeoutMs', async () => {
+  it.each([
+    { name: 'increased', beforeConcurrency: 2, beforeTimeout: 1500, concurrency: 6, timeout: 4000 },
+    { name: 'reduced', beforeConcurrency: 6, beforeTimeout: 4000, concurrency: 2, timeout: 1500 },
+    { name: 'default', beforeConcurrency: 8, beforeTimeout: 4000, concurrency: 4, timeout: 3000 },
+  ])('replaceConfig applies $name concurrency and timeout to actual probes', async ({ name, beforeConcurrency, beforeTimeout, concurrency, timeout }) => {
+    vi.useFakeTimers();
     const store = new TmuxSessionStatusStore();
-    const baseConfig: BaxianConfig = {
-      review: { rounds: 10 },
-      server: { ...DEFAULT_SERVER_CONFIG, tmuxProbeConcurrency: 2, tmuxProbeTimeoutMs: 1500 },
-      host: [],
-      project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[makeAgent('dev-1')]] }],
-    };
-    const poller = makePoller({
-      config: baseConfig,
-      store,
-      runnerFactory: () => makeCommandRunner({ exec: vi.fn(async () => present) }),
-    }) as unknown as { concurrency: number; probeTimeoutMs: number; replaceConfig: (c: BaxianConfig) => void };
-
-    expect(poller.concurrency).toBe(2);
-    expect(poller.probeTimeoutMs).toBe(1500);
-
-    poller.replaceConfig({
-      ...baseConfig,
-      server: { ...baseConfig.server, tmuxProbeConcurrency: 6, tmuxProbeTimeoutMs: 4000 },
-    });
-    expect(poller.concurrency).toBe(6);
-    expect(poller.probeTimeoutMs).toBe(4000);
-  });
-
-  it('replaceConfig clearing optional server fields reverts to defaults (not stale runtime values)', async () => {
-    const store = new TmuxSessionStatusStore();
-    const customConfig: BaxianConfig = {
-      review: { rounds: 10 },
+    const agents = Array.from({ length: 8 }, (_, i) => makeAgent(`agent-${i}`));
+    const config: BaxianConfig = {
+      ...makeConfig(agents),
       server: {
         ...DEFAULT_SERVER_CONFIG,
-        tmuxProbePollIntervalMs: 5000,
-        tmuxProbeTimeoutMs: 4000,
-        tmuxProbeConcurrency: 8,
+        tmuxProbeConcurrency: beforeConcurrency,
+        tmuxProbeTimeoutMs: beforeTimeout,
       },
-      host: [],
-      project: [{ id: 'proj', repo: 'https://github.com/user/repo.git', merge: null, agent: [[makeAgent('dev-1')]] }],
     };
+    let active = 0;
+    let maxActive = 0;
+    const timeouts: Array<number | undefined> = [];
+    const exec = makeExec({
+      sessionSnapshot: async cmd => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await new Promise(resolve => setTimeout(resolve, 1));
+        active--;
+        return defaultSessionSnapshot(cmd);
+      },
+    });
     const poller = makePoller({
-      config: customConfig,
+      config,
       store,
-      runnerFactory: () => makeCommandRunner({ exec: vi.fn(async () => present) }),
-    }) as unknown as {
-      concurrency: number;
-      probeTimeoutMs: number;
-      pollIntervalMs: number;
-      periodicRunner: { getIntervalMs: () => number };
-      replaceConfig: (c: BaxianConfig) => void;
-    };
-
-    expect(poller.concurrency).toBe(8);
-    expect(poller.probeTimeoutMs).toBe(4000);
-    expect(poller.pollIntervalMs).toBe(5000);
-
-    poller.replaceConfig({
-      review: { rounds: 10 },
-      server: DEFAULT_SERVER_CONFIG,
-      host: [],
-      project: customConfig.project,
+      runnerFactory: () => makeCommandRunner({
+        exec: (cmd, options) => {
+          timeouts.push(options?.timeout);
+          return exec(cmd, options);
+        },
+      }),
     });
 
-    expect(poller.concurrency).toBe(4);
-    expect(poller.probeTimeoutMs).toBe(3000);
-    expect(poller.pollIntervalMs).toBe(10_000);
-    expect(poller.periodicRunner.getIntervalMs()).toBe(10_000);
+    async function probe(expectedConcurrency: number, expectedTimeout: number): Promise<void> {
+      maxActive = 0;
+      timeouts.length = 0;
+      const pending = poller.pollOnce();
+      await vi.runAllTimersAsync();
+      await pending;
+      expect(maxActive).toBe(expectedConcurrency);
+      expect(timeouts.length).toBeGreaterThanOrEqual(agents.length);
+      expect(new Set(timeouts)).toEqual(new Set([expectedTimeout]));
+      for (const agent of agents) expect(store.get(agent.id).tmuxSessionStatus).toBe('present');
+    }
+
+    try {
+      await probe(beforeConcurrency, beforeTimeout);
+      poller.replaceConfig({
+        ...config,
+        server: name === 'default' ? DEFAULT_SERVER_CONFIG : {
+          ...DEFAULT_SERVER_CONFIG,
+          tmuxProbeConcurrency: concurrency,
+          tmuxProbeTimeoutMs: timeout,
+        },
+      });
+      await probe(concurrency, timeout);
+    } finally {
+      poller.stop();
+      vi.useRealTimers();
+    }
   });
 
   it('purgeAgent removes every per-agent map entry', async () => {

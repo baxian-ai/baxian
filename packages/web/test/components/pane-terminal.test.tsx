@@ -312,6 +312,14 @@ describe('PaneTerminal', () => {
     expect(container.querySelector(`[class*="bg-term"]`)).not.toBeNull();
   });
 
+  it.each([
+    { mode: 'preview' as const, interactive: false },
+    { mode: 'full' as const, interactive: true },
+  ])('enables readable text contrast in $mode terminals', async (props) => {
+    const { term } = await renderPane(props);
+    expect(term.opts.minimumContrastRatio).toBe(4.5);
+  });
+
   it('forwards Ctrl+Q as terminal input', async () => {
     const { term, ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true });
     const before = ws.sent.length;
