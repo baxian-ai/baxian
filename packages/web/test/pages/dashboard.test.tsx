@@ -106,11 +106,11 @@ beforeEach(() => {
 });
 
 describe('Dashboard layout', () => {
-  it('exposes a level-1 "Dashboard" heading to screen readers even though no visible title is shown', async () => {
+  it('exposes a level-1 page heading to screen readers even though no visible title is shown', async () => {
     seed([]);
     renderDashboard();
 
-    const h1 = await screen.findByRole('heading', { level: 1, name: 'Dashboard' });
+    const h1 = await screen.findByRole('heading', { level: 1, name: enUS.dashboard.title });
     // visually-hidden contract: jsdom cannot evaluate the utility, so the class itself is the guard
     expect(h1.className.split(/\s+/)).toContain('sr-only');
   });

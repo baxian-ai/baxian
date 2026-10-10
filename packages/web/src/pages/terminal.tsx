@@ -20,7 +20,7 @@ export function Terminal() {
     return undefined;
   }, [agentId, projects]);
 
-  if (!agentId) return <div className="text-sm text-accent">No agent specified</div>;
+  if (!agentId) return <div className="text-sm text-accent">{t.terminal.noAgent}</div>;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden border border-hairline bg-surface">

@@ -1,5 +1,7 @@
+import { zhCN } from '../../src/i18n/zh-cn.ts';
+import { I18nProvider, syncLocaleFromConfig, __resetI18nForTests } from '../../src/i18n/index.tsx';
 import { enUS } from '../../src/i18n/en-us.ts';
-import { it, expect, vi, beforeEach } from 'vitest';
+import { it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { AgentConfig, BaxianConfig, ProjectConfig } from '../../src/shared/index.js';
 
@@ -17,6 +19,8 @@ const configGetMock = vi.mocked(api.config.get);
 const probeMock = vi.mocked(api.agents.probe);
 const installTmuxMock = vi.mocked(api.agents.installTmux);
 const addAgentTeamMock = vi.mocked(api.projects.addAgentTeam);
+
+afterEach(__resetI18nForTests);
 
 function cfg(hosts: BaxianConfig['host']): BaxianConfig {
   return {
@@ -437,21 +441,48 @@ it('renders the SSH ✓ line and the tmux install success message', async () => 
   expect(await screen.findByText(/tmux 3.4 installed via apt-get/)).toBeTruthy();
 });
 
-it('describes YOLO by the selected runtime real launch flag instead of explaining the mode', async () => {
-  await renderReady();
+it.each([
+  ['en-US', enUS],
+  ['zh-CN', zhCN],
+] as const)('explains automatic permissions and localizes setup fields in %s', async (locale, t) => {
+  syncLocaleFromConfig(locale);
+  configGetMock.mockResolvedValue(cfg([]));
+  render(
+    <I18nProvider>
+      <ToastProvider>
+        <CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />
+      </ToastProvider>
+    </I18nProvider>,
+  );
+  await waitFor(() => expect(probeMock).toHaveBeenCalled());
 
-  expect(screen.getByText('--permission-mode bypassPermissions')).toBeTruthy();
+  expect(screen.getByLabelText(/^Agent /)).toBeTruthy();
+  expect(screen.getByText(/^Dev agent\b/)).toBeTruthy();
+  expect(screen.getByText(t.createAgent.runtimeLabel)).toBeTruthy();
+  const permissions = screen.getByRole('checkbox', { name: name => name.includes(t.createAgent.yoloTitle) }) as HTMLInputElement;
+  expect(permissions.checked).toBe(true);
+  expect(screen.getByText(t.createAgent.yoloBody)).toBeTruthy();
+  expect(t.createAgent.yoloBody).toMatch(/无需逐次确认|without asking for approval/);
+  expect(t.createAgent.yoloBody).toMatch(/关闭后.*终端确认|When off.*terminal/);
 
+  for (const tool of ['Claude Code', 'Codex', 'OpenCode', 'Qoder CLI']) {
+    fireEvent.click(screen.getByRole('radio', { name: new RegExp(tool) }));
+    const description = tool === 'Codex' ? t.createAgent.yoloCodexBody : t.createAgent.yoloBody;
+    expect(screen.getByText(description)).toBeTruthy();
+    if (tool === 'Codex') {
+      expect(description).toMatch(/关闭.*沙箱|turn off the sandbox/);
+      expect(description).toMatch(/文件访问和命令执行|file access and command execution/);
+    } else {
+      expect(screen.queryByText(t.createAgent.yoloCodexBody)).toBeNull();
+    }
+    expect(screen.queryByText(/--permission-mode|--dangerously-|--auto/)).toBeNull();
+  }
   fireEvent.click(screen.getByRole('radio', { name: /Codex/ }));
-  expect(screen.getByText('--dangerously-bypass-approvals-and-sandbox')).toBeTruthy();
-
-  fireEvent.click(screen.getByRole('radio', { name: /OpenCode/ }));
-  expect(screen.getByText('--auto')).toBeTruthy();
-
-  fireEvent.click(screen.getByRole('radio', { name: /Qoder CLI/ }));
-  expect(screen.getByText('--dangerously-skip-permissions')).toBeTruthy();
-
-  expect(screen.queryByText(/without asking for confirmation|controlled environment/)).toBeNull();
+  fireEvent.click(permissions);
+  expect(permissions.checked).toBe(false);
+  expect(screen.getByText(t.createAgent.yoloCodexBody)).toBeTruthy();
+  fireEvent.click(screen.getByRole('radio', { name: t.createAgent.remoteModeLabel }));
+  expect(screen.getByText(t.createAgent.noHostsHint)).toBeTruthy();
 });
 
 it('validates the agent id format and global uniqueness', async () => {

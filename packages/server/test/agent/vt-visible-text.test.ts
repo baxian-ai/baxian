@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import xterm from '@xterm/headless';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { VisibleTextExtractor, visibleText } from '../../src/agent/vt-visible-text.js';
@@ -11,6 +11,15 @@ const BOM = '﻿';
 const HI = '\ud83d';
 const LO = '\ude00';
 const MARKER = '[bx:pr-fixed:tok123abc]';
+
+beforeEach(() => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }));
+afterEach(() => vi.useRealTimers());
+
+async function writeTerminal(term: xterm.Terminal, data: string): Promise<void> {
+  const written = new Promise<void>(resolve => term.write(data, resolve));
+  await vi.runAllTimersAsync();
+  await written;
+}
 
 interface PrintProbe {
   feed: (data: string) => Promise<void>;
@@ -29,7 +38,7 @@ function printProbe(): PrintProbe {
     for (let i = start; i < end; i++) printed += String.fromCodePoint(data[i]);
   });
   return {
-    feed: (data) => new Promise<void>(resolve => term.write(data, () => resolve())),
+    feed: (data) => writeTerminal(term, data),
     take: () => { const out = printed; printed = ''; return out; },
     dispose: () => term.dispose(),
   };
@@ -39,7 +48,7 @@ async function renderScreen(input: string): Promise<string> {
   const term = new xterm.Terminal({ cols: 80, rows: 24, scrollback: 200, allowProposedApi: true });
   const serialize = new SerializeAddon();
   term.loadAddon(serialize);
-  await new Promise<void>(resolve => term.write(input, () => resolve()));
+  await writeTerminal(term, input);
   const out = serialize.serialize().replace(/\x1b\[[0-9;]*m/g, '').replace(/\s+$/, '');
   term.dispose();
   return out;
@@ -49,7 +58,7 @@ const NON_PRINT_WE_ADD = /[\x00-\x1f\x7f-\x9f]/g;
 
 async function wideRow0(input: string): Promise<string> {
   const term = new xterm.Terminal({ cols: 250, rows: 4, allowProposedApi: true });
-  await new Promise<void>(resolve => term.write(input, () => resolve()));
+  await writeTerminal(term, input);
   const out = term.buffer.active.getLine(0)?.translateToString(false) ?? '';
   term.dispose();
   return out;
@@ -57,7 +66,7 @@ async function wideRow0(input: string): Promise<string> {
 
 async function screenText(input: string): Promise<string> {
   const term = new xterm.Terminal({ cols: 80, rows: 24, scrollback: 200, allowProposedApi: true });
-  await new Promise<void>(resolve => term.write(input, () => resolve()));
+  await writeTerminal(term, input);
   const buffer = term.buffer.active;
   const rows: string[] = [];
   for (let i = 0; i < buffer.length; i++) rows.push(buffer.getLine(i)?.translateToString(true) ?? '');
@@ -77,7 +86,7 @@ async function withoutParserNoise<T>(run: () => Promise<T>): Promise<T> {
 
 async function screenHides(prefix: string): Promise<boolean> {
   const term = new xterm.Terminal({ cols: 80, rows: 24, allowProposedApi: true });
-  await new Promise<void>(resolve => term.write(`${prefix}X`, () => resolve()));
+  await writeTerminal(term, `${prefix}X`);
   const buffer = term.buffer.active;
   for (let y = 0; y < buffer.length; y++) {
     const line = buffer.getLine(y);

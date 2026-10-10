@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { zhCN } from '../../src/i18n/zh-cn.ts';
+import { I18nProvider, syncLocaleFromConfig, __resetI18nForTests } from '../../src/i18n/index.tsx';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type {
@@ -26,6 +28,8 @@ import { flagDirtyMock } from '../helpers/pending-restart-mock.tsx';
 import { expectToast } from '../helpers/toast.tsx';
 import { makeTask } from '../helpers/fixtures.ts';
 
+afterEach(__resetI18nForTests);
+
 const deleteAgentMock = vi.mocked(api.projects.deleteAgent);
 const compactMock = vi.mocked(api.agents.compact);
 const clearMock = vi.mocked(api.agents.clear);
@@ -49,22 +53,24 @@ function renderCard(agent: AgentSnapshot, options: RenderCardOptions = {}): void
   const { runtime, model, role = 'dev', terminalMode, terminalLoading, active, onActivate, task } = options;
   render(
     <MemoryRouter>
-      <ToastProvider>
-        <ConfirmProvider>
-          <AgentCard
-            agent={agent}
-            projectId="proj"
-            role={role}
-            runtime={runtime}
-            model={model}
-            terminalMode={terminalMode}
-            terminalLoading={terminalLoading}
-            active={active}
-            onActivate={onActivate}
-            task={task}
-          />
-        </ConfirmProvider>
-      </ToastProvider>
+      <I18nProvider>
+        <ToastProvider>
+          <ConfirmProvider>
+            <AgentCard
+              agent={agent}
+              projectId="proj"
+              role={role}
+              runtime={runtime}
+              model={model}
+              terminalMode={terminalMode}
+              terminalLoading={terminalLoading}
+              active={active}
+              onActivate={onActivate}
+              task={task}
+            />
+          </ConfirmProvider>
+        </ToastProvider>
+      </I18nProvider>
     </MemoryRouter>,
   );
 }
@@ -449,7 +455,7 @@ describe('AgentCard', () => {
     renderCard(makeSnapshot({ id: 'dev-codex' }), { runtime: 'codex' });
 
     const nameTokens = screen.getByText('dev-codex').className.split(/\s+/);
-    const roleTokens = screen.getByText('Dev').className.split(/\s+/);
+    const roleTokens = screen.getByText(enUS.agents.devRole).className.split(/\s+/);
     expect(nameTokens).toContain('text-xs');
     expect(roleTokens).toContain('text-xs');
     expect(nameTokens.some(token => token.startsWith('font-') && token !== 'font-display')).toBe(false);
@@ -1030,4 +1036,28 @@ describe('AgentCard', () => {
       });
     });
   });
+});
+
+it.each([
+  ['en-US', 'greeting_failed', enUS],
+  ['zh-CN', 'greeting_failed', zhCN],
+  ['en-US', 'unknown-internal-state', enUS],
+  ['zh-CN', 'unknown-internal-state', zhCN],
+] as const)('shows recovery guidance with optional diagnostics in %s for %s', (locale, phase, t) => {
+  syncLocaleFromConfig(locale);
+  renderCard(makeSnapshot({
+    binding: makeBinding('dev-1', {
+      status: 'awaiting_human', awaitingPhase: phase, awaitingReason: 'diagnostic detail',
+    }),
+  }));
+
+  const recovery = phase === 'greeting_failed' ? 'restart-runtime' : 'resume';
+  expect(screen.getByText(t.agents.holdRecovery[recovery])).toBeTruthy();
+  expect(screen.getByRole('button', { name: recovery === 'resume' ? t.agents.resume : t.agents.restartRuntime })).toBeTruthy();
+  const details = screen.getByText(phase).closest('details')!;
+  expect(details).toBeTruthy();
+  expect(details.open).toBe(false);
+  fireEvent.click(within(details).getByText(t.common.technicalDetails));
+  expect(details.open).toBe(true);
+  expect(details.textContent).toContain('diagnostic detail');
 });

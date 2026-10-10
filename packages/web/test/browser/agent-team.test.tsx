@@ -5,7 +5,9 @@ import { AgentTeam } from '../../src/components/agent-team.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { ToastProvider } from '../../src/components/toast.tsx';
 import { PendingRestartProvider } from '../../src/hooks/use-pending-restart.tsx';
-import { I18nProvider } from '../../src/i18n/index.tsx';
+import { enUS } from '../../src/i18n/en-us.ts';
+import { zhCN } from '../../src/i18n/zh-cn.ts';
+import { I18nProvider, syncLocaleFromConfig, __resetI18nForTests } from '../../src/i18n/index.tsx';
 import { makeAgent, makeTask } from '../helpers/fixtures.ts';
 import '../../src/index.css';
 
@@ -16,10 +18,17 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  __resetI18nForTests();
 });
 
 describe('AgentTeam background in Chromium', () => {
-  it.each(['empty', 'active'])('keeps the %s panel background light and translucent', async state => {
+  it.each([
+    ['empty', 'en-US', enUS],
+    ['active', 'en-US', enUS],
+    ['empty', 'zh-CN', zhCN],
+    ['active', 'zh-CN', zhCN],
+  ] as const)('renders a localized %s panel in %s with a light background', async (state, locale, t) => {
+    syncLocaleFromConfig(locale);
     await act(async () => {
       render(
         <MemoryRouter>
@@ -45,7 +54,10 @@ describe('AgentTeam background in Chromium', () => {
       );
     });
 
-    const panel = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const panel = screen.getByRole('group', { name: t.agents.teamLabel('dev-1 / qa-1') });
+    expect(screen.getByText('Agent Team')).toBeTruthy();
+    expect(screen.getByText('Dev agent')).toBeTruthy();
+    expect(screen.getByText('QA agent')).toBeTruthy();
     expect(getComputedStyle(panel).backgroundColor).toBe('rgba(241, 242, 244, 0.6)');
   });
 });

@@ -175,7 +175,7 @@ describe('Project Task panel', () => {
     renderProjectPage();
     const panel = await waitFor(() => screen.getByRole('complementary', { name: enUS.taskPanel.ariaLabel }));
     const heading = screen.getByRole('heading', { name: 'Tasks' });
-    expect(screen.getByRole('heading', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: enUS.projectPage.agentsHeading })).toBeTruthy();
     const closeBtn = screen.getByRole('button', { name: enUS.projectPage.closeTaskPanel });
     expect(panel.contains(heading)).toBe(false);
     expect(panel.contains(closeBtn)).toBe(false);

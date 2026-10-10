@@ -56,6 +56,19 @@ jobs:
 
       - run: pnpm test:browser
 
+      - name: Pack tested release
+        if: ${{ github.repository == 'baxian-ai/baxian' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: npm pack
+
+      - name: Upload tested release
+        if: ${{ github.repository == 'baxian-ai/baxian' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: baxian-tarball-${{ github.run_attempt }}
+          path: baxian-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Coverage summary
         if: always()
         run: |

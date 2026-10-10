@@ -1,5 +1,7 @@
+import { zhCN } from '../../src/i18n/zh-cn.ts';
+import { I18nProvider, syncLocaleFromConfig, __resetI18nForTests } from '../../src/i18n/index.tsx';
 import { enUS } from '../../src/i18n/en-us.ts';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { StrictMode } from 'react';
@@ -22,6 +24,8 @@ import {
   makeTask as makeTaskFixture,
 } from '../helpers/fixtures.ts';
 import { expectToast } from '../helpers/toast.tsx';
+
+afterEach(__resetI18nForTests);
 
 const projectsListMock = vi.mocked(api.projects.list);
 const agentsListMock = vi.mocked(api.agents.list);
@@ -637,4 +641,29 @@ describe('CreateTaskModal — Dev agent defaults to the first available dev', ()
     fireEvent.change(projectSelect, { target: { value: 'proj-a' } });
     await waitFor(() => expect(devSelect().value).toBe(''));
   });
+});
+
+it.each([
+  ['en-US', enUS],
+  ['zh-CN', zhCN],
+] as const)('uses localized task fields and explains an unavailable agent in %s', async (locale, t) => {
+  syncLocaleFromConfig(locale);
+  agentsListMock.mockResolvedValue([]);
+  render(
+    <MemoryRouter>
+      <I18nProvider>
+        <ToastProvider>
+          <CreateTaskModal open onClose={() => {}} />
+        </ToastProvider>
+      </I18nProvider>
+    </MemoryRouter>,
+  );
+  await flushApi();
+
+  const project = screen.getByLabelText(t.createTask.projectLabel);
+  fireEvent.change(project, { target: { value: 'baxian' } });
+  expect(screen.getByLabelText(t.createTask.titleLabel)).toBeTruthy();
+  expect(screen.getByLabelText(t.createTask.descriptionLabel)).toBeTruthy();
+  expect(screen.getByText(t.createTask.noDevGlobalPendingRestartHint)).toBeTruthy();
+  expect(screen.queryByText(/baxian\.json|runtime/)).toBeNull();
 });

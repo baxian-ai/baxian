@@ -70,7 +70,7 @@ export function Dashboard() {
           )}
         </KebabMenu>
       </TopbarActions>
-      <h1 className="sr-only">Dashboard</h1>
+      <h1 className="sr-only">{t.dashboard.title}</h1>
       {error && <div className="mb-4 text-sm text-accent">{t.common.loadFailed(error)}</div>}
       {projectsLoaded && projects.length === 0 && !projectsError && (
         <div className="rounded-lg border border-hairline bg-surface py-12 text-center text-sm text-og-500">

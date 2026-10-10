@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { AgentMode, AgentRuntime, AgentRole, AgentConfig, HostConfig } from '../shared/index.js';
-import { AGENT_RUNTIME_LAUNCH_FLAG } from '../shared/index.js';
 import { Modal } from './modal.tsx';
 import { inputCls, labelCls, fieldErrCls, helpCls, radioCls } from './form-styles.ts';
 import { api, type ProbeResponse } from '../api.ts';
@@ -314,7 +313,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
         )}
 
         <div>
-          <label className={labelCls} htmlFor="agent-id">Agent ID</label>
+          <label className={labelCls} htmlFor="agent-id">{t.createAgent.idLabel}</label>
           <input
             id="agent-id"
             type="text"
@@ -359,7 +358,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
         {form.mode === 'remote' && (
           <div>
-            <label className={labelCls} htmlFor="host">Host</label>
+            <label className={labelCls} htmlFor="host">{t.createAgent.hostLabel}</label>
             {hosts.length === 0 ? (
               <div className="rounded-md border border-og-100 bg-og-50/40 px-3 py-2 text-xs text-og-600">
                 {t.createAgent.noHostsHint}
@@ -474,7 +473,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <div className="text-sm text-og-800">
               <div className="font-medium">{t.createAgent.yoloTitle}</div>
               <div className="mt-1 text-xs text-accent">
-                {t.createAgent.yoloBodyLead}<code>{AGENT_RUNTIME_LAUNCH_FLAG[form.runtime || 'claude-code']}</code>{t.createAgent.yoloBodyTrail}
+                {form.runtime === 'codex' ? t.createAgent.yoloCodexBody : t.createAgent.yoloBody}
               </div>
             </div>
           </label>

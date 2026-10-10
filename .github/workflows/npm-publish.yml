@@ -7,6 +7,10 @@ on:
         description: "Validate package only, do not publish to npm"
         type: boolean
         default: true
+      test-run-id:
+        description: "Successful public main test run for this commit"
+        type: string
+        required: true
   repository_dispatch:
     types:
       - npm-publish
@@ -74,44 +78,36 @@ jobs:
     needs: validate-repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha256: ${{ steps.artifact.outputs.sha256 }}
+      artifact-id: ${{ steps.verified-artifact.outputs.artifact-id }}
+      test-run-id: ${{ steps.artifact.outputs.test-run-id }}
+      test-run-attempt: ${{ steps.artifact.outputs.test-run-attempt }}
 
     steps:
       - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10
-
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.13
-          cache: pnpm
+          node-version: 22.23.1
+          package-manager-cache: false
 
-      - run: npm install -g node-gyp@12.3.0
-
-      - name: Ensure tmux is available
-        shell: bash
-        run: |
-          if ! command -v tmux >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y tmux
-          fi
-          tmux -V
-
-      - run: pnpm install --frozen-lockfile
-
-      - run: pnpm lint
-
-      - run: pnpm test
-
-      - run: pnpm -r build
-
-      - run: npm pack
+      - name: Verify and download tested release
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BAXIAN_TEST_RUN_ID: ${{ inputs['test-run-id'] || github.event.client_payload.test_run_id }}
+          BAXIAN_PUBLIC_SHA: ${{ github.event.client_payload.public_sha }}
+        run: node scripts/release-artifact.mjs
 
       - uses: actions/upload-artifact@v7
+        id: verified-artifact
         with:
-          name: baxian-tarball
-          path: baxian-*.tgz
+          name: baxian-tarball-${{ github.run_attempt }}
+          path: release-package/baxian-*.tgz
           if-no-files-found: error
           retention-days: 7
 
@@ -126,8 +122,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: read
 
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -138,10 +137,13 @@ jobs:
 
       - uses: actions/download-artifact@v7
         with:
-          name: baxian-tarball
+          artifact-ids: ${{ needs.validate.outputs.artifact-id }}
+          merge-multiple: true
           path: .
 
       - name: Check version is unpublished
+        env:
+          TARBALL_SHA256: ${{ needs.validate.outputs.sha256 }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -150,6 +152,12 @@ jobs:
             echo "Expected exactly one baxian tarball, found ${#tarballs[@]}."
             exit 1
           fi
+          node --input-type=module - "${tarballs[0]}" <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          const actual = createHash('sha256').update(readFileSync(process.argv[2])).digest('hex');
+          if (actual !== process.env.TARBALL_SHA256) throw new Error('release tarball digest mismatch');
+          NODE
           version="$(tar -xOf "${tarballs[0]}" package/package.json | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => console.log(JSON.parse(input).version));')"
           if npm view "baxian@$version" version >/dev/null 2>&1; then
             echo "baxian@$version already exists on npm."
@@ -157,6 +165,11 @@ jobs:
           fi
 
       - name: Publish tarball to npm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BAXIAN_PUBLIC_SHA: ${{ github.sha }}
+          BAXIAN_TEST_RUN_ID: ${{ needs.validate.outputs.test-run-id }}
+          BAXIAN_TEST_RUN_ATTEMPT: ${{ needs.validate.outputs.test-run-attempt }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -165,4 +178,5 @@ jobs:
             echo "Expected exactly one baxian tarball, found ${#tarballs[@]}."
             exit 1
           fi
+          node scripts/release-artifact.mjs --verify-run
           npm publish "${tarballs[0]}"

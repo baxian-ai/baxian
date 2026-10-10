@@ -309,7 +309,7 @@ export function HostManagementModal({ open, onClose }: Props) {
             <label className={labelCls} htmlFor="host-alias">{t.hostMgmt.aliasLabel}</label>
             <input id="host-alias" type="text" value={form.alias}
               onChange={e => setForm({ ...form, alias: e.target.value })}
-              className={inputCls} placeholder="Prod worker" disabled={submitting} />
+              className={inputCls} placeholder={t.hostMgmt.aliasPlaceholder} disabled={submitting} />
           </div>
           <div>
             <label className={labelCls} htmlFor="host-user">{t.hostMgmt.userLabel}</label>

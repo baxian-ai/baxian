@@ -42,7 +42,7 @@ export function AgentTeam({
     : [];
 
   const teamIds = team.map(agent => agent.id).join(' / ');
-  const label = `Agent Team ${teamIds}`;
+  const label = t.agents.teamLabel(teamIds);
   const navigate = useNavigate();
   const {
     compact: handleCompact,
@@ -76,7 +76,7 @@ export function AgentTeam({
     <div role="group" aria-label={label} className="min-w-0 rounded-lg border border-og-100 bg-og-25/60 p-3">
       <div className="mb-2 flex items-center gap-2">
         <span className="shrink-0 font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">
-          Team
+          {t.agents.teamHeading}
         </span>
         <span className="min-w-0 truncate font-mono text-xs text-og-700" title={teamIds}>{teamIds}</span>
         <KebabMenu
@@ -233,7 +233,7 @@ function ClaimableList({ tasks, devId, agentsById, label }: ClaimableListProps) 
     <div
       role="group"
       className="card mb-2 max-h-28 overflow-y-auto divide-y divide-hairline"
-      aria-label={`${label} claimable tasks for ${devId}`}
+      aria-label={t.agents.claimableTasksLabel(label, devId)}
     >
       {tasks.map(task => {
         const targetId = task.preferredAgentId || devId;

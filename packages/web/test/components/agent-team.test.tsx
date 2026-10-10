@@ -119,7 +119,7 @@ describe('AgentTeam', () => {
   it('shows active task summary above the team\'s agent cards', () => {
     renderTeam([task()]);
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     const idCell = within(region).getByText('001');
     expect(idCell.getAttribute('title')).toBe('task-001');
     expect(within(region).getByText('梳理绑定逻辑')).toBeTruthy();
@@ -144,14 +144,14 @@ describe('AgentTeam', () => {
       ]),
     });
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-2' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-2') });
     expect(within(region).getByText('梳理绑定逻辑')).toBeTruthy();
   });
 
   it('passes configured runtime labels to the team\'s agent card names', () => {
     renderTeam([]);
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText('dev-1').getAttribute('title')).toBe('dev-1 (Claude Code)');
     expect(within(region).getByText('qa-1').getAttribute('title')).toBe('qa-1 (Codex)');
     expect(within(region).getByText('(Claude Code)')).toBeTruthy();
@@ -166,7 +166,7 @@ describe('AgentTeam', () => {
       ],
     });
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText('dev-1').getAttribute('title')).toBe('dev-1 (Claude Code · opus)');
     expect(within(region).getByText('(Claude Code · opus)')).toBeTruthy();
     expect(within(region).getByText('qa-1').getAttribute('title')).toBe('qa-1 (Codex)');
@@ -175,7 +175,7 @@ describe('AgentTeam', () => {
   it('task summary shows the round without re-printing the dev/qa agent ids that the cards below already show', () => {
     renderTeam([task({ reviewRound: 3 })]);
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     const taskButton = within(region).getByRole('button', { name: /梳理绑定逻辑/ });
     expect(within(taskButton).getByText(enUS.agents.round(3))).toBeTruthy();
     expect(within(taskButton).queryByText(/Dev /)).toBeNull();
@@ -185,14 +185,14 @@ describe('AgentTeam', () => {
   it('uses specReviewRound for the Round text when the task is in the spec phase', () => {
     renderTeam([task({ phase: 'spec', specReviewRound: 2, reviewRound: 0 })]);
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText(enUS.agents.round(2))).toBeTruthy();
   });
 
   it('shows a muted "No active task" placeholder above the agent cards when no active task is bound to the team', () => {
     renderTeam([]);
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText(enUS.agents.noActiveTask)).toBeTruthy();
     expect(within(region).queryByRole('button', { name: /task-/ })).toBeNull();
   });
@@ -200,7 +200,7 @@ describe('AgentTeam', () => {
   it('shows the same placeholder when the only matching task has reached a terminal status', () => {
     renderTeam([task({ status: 'merged' })]);
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).queryByText('001')).toBeNull();
     expect(within(region).queryByText('梳理绑定逻辑')).toBeNull();
     expect(within(region).getByText(enUS.agents.noActiveTask)).toBeTruthy();
@@ -361,14 +361,14 @@ describe('AgentTeam', () => {
 
   it('claimable list: shows pending task assigned to dev with a Start button when no active task is bound', () => {
     renderTeam([task({ id: 'task-q', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]);
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText('task-q')).toBeTruthy();
     expect(within(region).getByRole('button', { name: enUS.agents.start })).toBeTruthy();
   });
 
   it('claimable list: unassigned task (preferredAgentId="") shows "Unassigned" pill and is still claimable', () => {
     renderTeam([task({ id: 'task-u', status: 'pending', preferredAgentId: '', agentId: '' })]);
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText('task-u')).toBeTruthy();
     expect(within(region).getByText(enUS.agents.unassigned)).toBeTruthy();
   });
@@ -389,7 +389,7 @@ describe('AgentTeam', () => {
     renderTeam([
       task({ id: 'task-other', projectId: 'OTHER', status: 'pending', preferredAgentId: '', agentId: '' }),
     ]);
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).queryByText('task-other')).toBeNull();
     expect(within(region).getByText(enUS.agents.noActiveTask)).toBeTruthy();
   });
@@ -398,7 +398,7 @@ describe('AgentTeam', () => {
     const activeApproved = task({ id: 'task-old', status: 'approved', preferredAgentId: 'dev-1', agentId: 'dev-1' });
     const pendingForDev = task({ id: 'task-new', status: 'pending', preferredAgentId: 'dev-1', agentId: '' });
     renderTeam([activeApproved, pendingForDev]);
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText('task-old')).toBeTruthy();
     expect(within(region).getByText('task-new')).toBeTruthy();
     expect(within(region).getByRole('button', { name: enUS.agents.start })).toBeTruthy();
@@ -423,8 +423,8 @@ describe('AgentTeam', () => {
     const activeApproved = task({ id: 'task-old', status: 'approved', preferredAgentId: 'dev-1', agentId: 'dev-1' });
     const pendingForDev = task({ id: 'task-new', status: 'pending', preferredAgentId: 'dev-1', agentId: '' });
     renderTeam([activeApproved, pendingForDev]);
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
-    const claimable = within(region).getByRole('group', { name: /claimable tasks for dev-1/ });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
+    const claimable = within(region).getByRole('group', { name: enUS.agents.claimableTasksLabel(enUS.agents.teamLabel('dev-1 / qa-1'), 'dev-1') });
     const activeRow = within(region).getByRole('button', { name: /task-old/ });
     expect(claimable.compareDocumentPosition(activeRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
@@ -466,7 +466,7 @@ describe('AgentTeam actions menu', () => {
   it('shows the team identity and a menu with Compact, Clear and Delete', () => {
     renderTeam([]);
 
-    const region = screen.getByRole('group', { name: 'Agent Team dev-1 / qa-1' });
+    const region = screen.getByRole('group', { name: enUS.agents.teamLabel('dev-1 / qa-1') });
     expect(within(region).getByText('dev-1 / qa-1')).toBeTruthy();
     openTeamMenu();
     const items = screen.getAllByRole('menuitem');

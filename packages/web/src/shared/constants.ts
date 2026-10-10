@@ -7,13 +7,6 @@ const AGENT_RUNTIME_LABELS: Record<AgentRuntime, string> = {
   qodercli: 'Qoder CLI',
 };
 
-export const AGENT_RUNTIME_LAUNCH_FLAG: Record<AgentRuntime, string> = {
-  'claude-code': '--permission-mode bypassPermissions',
-  codex: '--dangerously-bypass-approvals-and-sandbox',
-  opencode: '--auto',
-  qodercli: '--dangerously-skip-permissions',
-};
-
 export function agentRuntimeLabel(runtime: AgentRuntime | undefined, model?: string): string | null {
   const parts = [runtime ? AGENT_RUNTIME_LABELS[runtime] : null, model || null].filter(Boolean);
   return parts.length > 0 ? parts.join(' · ') : null;

@@ -359,7 +359,7 @@ export function CreateTaskModal(props: Props) {
 
         {showProjectSelect && (
           <div>
-            <label className={labelCls} htmlFor="task-project">Project</label>
+            <label className={labelCls} htmlFor="task-project">{t.createTask.projectLabel}</label>
             <select
               id="task-project"
               value={selectedProjectId}
@@ -401,7 +401,7 @@ export function CreateTaskModal(props: Props) {
         </div>
 
         <div>
-          <label className={labelCls} htmlFor="task-title">Title</label>
+          <label className={labelCls} htmlFor="task-title">{t.createTask.titleLabel}</label>
           <input
             id="task-title"
             type="text"

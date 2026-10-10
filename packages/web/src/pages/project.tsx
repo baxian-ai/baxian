@@ -147,7 +147,7 @@ export function Project() {
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
         <div className="min-w-0 flex-1">
           <div className="mb-3 flex h-8 items-center gap-2">
-            <h2 className="font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">Agents</h2>
+            <h2 className="font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">{t.projectPage.agentsHeading}</h2>
           </div>
           {project.agent.flat().length === 0 ? (
             <div className="mb-8 rounded-lg border border-hairline bg-surface py-6 text-center text-sm text-og-500">
@@ -175,7 +175,7 @@ export function Project() {
         {taskPanelOpen && (
           <div className="w-full lg:w-[340px] lg:shrink-0 xl:w-[380px]">
             <div className="mb-3 flex h-8 items-center justify-between gap-2">
-              <h2 className="font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">Tasks</h2>
+              <h2 className="font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">{t.projectPage.tasksHeading}</h2>
               <button
                 type="button"
                 onClick={() => { setTaskPanelOpen(false); menuButtonRef.current?.focus(); }}
@@ -235,7 +235,7 @@ export function Project() {
       >
         <div className="space-y-4">
           <p className="text-sm text-og-700">
-            {t.projectPage.deleteBodyLead}<code className="font-mono text-og-1000">baxian.json</code>{t.projectPage.deleteBodyMid}
+            {t.projectPage.deleteBodyLead}
             <span className="font-mono text-og-1000">{project.id}</span>{t.projectPage.deleteBodySuffix}
           </p>
           <p className="text-sm text-og-700">

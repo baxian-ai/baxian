@@ -310,7 +310,7 @@ export function AgentCard({
       <div className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-xs font-medium tracking-[0.05em] text-og-500">
-            {role === 'qa' ? 'QA' : 'Dev'}
+            {role === 'qa' ? t.agents.qaRole : t.agents.devRole}
           </span>
           <span
             className="min-w-0 truncate whitespace-nowrap font-display text-xs text-og-1000"
@@ -342,11 +342,14 @@ export function AgentCard({
       )}
       {isAwaitingHuman && (
         <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
-          <div>
-            <span className="font-mono">{agent.binding?.awaitingPhase}</span>
-            {agent.binding?.awaitingReason && <span> · {agent.binding.awaitingReason}</span>}
-          </div>
           {!untrackedPending && <div className="text-og-700">{t.agents.holdRecovery[holdRecovery]}</div>}
+          <details>
+            <summary className="cursor-pointer">{t.common.technicalDetails}</summary>
+            <div className="break-words">
+              <span className="font-mono">{agent.binding?.awaitingPhase}</span>
+              {agent.binding?.awaitingReason && <span> · {agent.binding.awaitingReason}</span>}
+            </div>
+          </details>
         </div>
       )}
       {isAwaitingHuman && taskId && (
